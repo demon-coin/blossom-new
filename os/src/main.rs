@@ -55,8 +55,12 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
     console::initialize();
     let hardware_id = arch::boot_hardware_id(arguments);
     // SAFETY: BSP 保留实际固件参数并建立 DTB 映射；本核独占尚未发布的永久资源槽。
-    let resources = unsafe { platform::discover(arguments, hardware_id) }
-        .unwrap_or_else(|error| panic!("boot resource discovery failed: {}", error));
+    let resources = unsafe { platform::discover(arguments, hardware_id) }.unwrap_or_else(|error| {
+        panic!(
+            "boot resource discovery failed: {} args={:#x?}",
+            error, arguments
+        )
+    });
     let kernel = boot::kernel_region();
     assert!(
         resources.memory[..resources.memory_count]
@@ -82,9 +86,9 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
 /// # Safety
 /// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
 /// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
-/// 原始参数遵守固件协议，DTB 头部及声明的完整存储范围可读且不覆盖内核；
-/// QEMU LA 的 a1 命令行在快照容量内可读；板固件的 UHI/bootm/go 参数及引用的
-/// argv 与地址字符串须遵守对应 ABI，原始四参数在 BSS 清理前已被保存。
+/// 原始四参数在 BSS 清理前已保存，DTB 头部及声明全文可读且不覆盖内核。
+/// 板固件提供的 EFI 系统表及配置表数组须在解析期间可读且不变；
+/// 所选命令行须保活到快照复制结束，相关存储均不得与永久 BootInfo 槽重叠。
 #[no_mangle]
 pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> ! {
     // 引导构造帧先真实返回，避免 LTO 把大数组留在 Boot 展开的 64KiB 栈上。
@@ -117,6 +121,19 @@ pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize, arg
 #[inline(never)]
 unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) -> ! {
     let resources = boot::info();
+    early_println!(
+        "BOOT arch={} platform={:?} cpus={} bsp={} args={:#x},{:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
+        arch::NAME,
+        resources.platform,
+        resources.cpu_count,
+        resources.bsp_hardware_id,
+        resources.raw_args[0],
+        resources.raw_args[1],
+        resources.raw_args[2],
+        resources.raw_args[3],
+        resources.dtb.start,
+        resources.dtb.end
+    );
     // SAFETY: BSP 尚未释放 AP，IRQ 仍关闭；实际 RAM 永久可写的一一直映已完成，
     // BootInfo 已保留内核、启动栈、页表与固件资源。此时没有其他空闲 RAM 使用者，
     // 后续物理页使用以此描述符表为唯一边界，不通过别名修改或回收元数据 backing。
@@ -156,19 +173,6 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     arch::enable_interrupts();
     cpu::publish_online();
 
-    early_println!(
-        "BOOT arch={} platform={:?} cpus={} bsp={} args={:#x},{:#x},{:#x},{:#x} dtb={:#x}..{:#x}",
-        arch::NAME,
-        resources.platform,
-        resources.cpu_count,
-        resources.bsp_hardware_id,
-        resources.raw_args[0],
-        resources.raw_args[1],
-        resources.raw_args[2],
-        resources.raw_args[3],
-        resources.dtb.start,
-        resources.dtb.end
-    );
     for region in &resources.memory[..resources.memory_count] {
         early_println!("RAM start={:#x} end={:#x}", region.start, region.end);
     }

@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import struct
+import subprocess
 import tempfile
 import zlib
 
@@ -158,9 +159,43 @@ def validate_root_ext4_image(root_ext4_image_path):
         raise ValueError("root ext4 image journal/recovery features are not supported")
 
 
+def board_runtime_address(architecture, physical):
+    """LoongArch 固件命令通过 cached DMW 访问镜像，容器头和范围记录仍使用物理地址。"""
+    return physical | 0x9000000000000000 if architecture == "loongarch64" else physical
+
+
+def write_os_dtb(source_path, target_path, initrd_range):
+    """只修改独立 OS 树副本的 RAM 根范围，再为固件原地修改树保留 64KiB 空间。"""
+    require_regular_file(source_path)
+    with source_path.open("rb") as source:
+        header = source.read(8)
+    if not (len(header) == 8 and header[:4] == b"\xd0\x0d\xfe\xed"):
+        raise ValueError("OS DTB header is invalid")
+    total = struct.unpack_from(">I", header, 4)[0]
+    if not 40 <= total <= source_path.stat().st_size:
+        raise ValueError("OS DTB size is invalid")
+    shutil.copyfile(source_path, target_path)
+    if initrd_range is not None:
+        for name, address in zip(("linux,initrd-start", "linux,initrd-end"), initrd_range):
+            result = subprocess.run(
+                ["fdtput", "-p", "-t", "x", str(target_path), "/chosen", name,
+                 f"{address >> 32:x}", f"{address & (U32_LIMIT - 1):x}"],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                raise ValueError(f"fdtput failed for {name}: {result.stderr.strip()}")
+    size = target_path.stat().st_size + 64 * 1024
+    if not size < U32_LIMIT:
+        raise ValueError("padded OS DTB exceeds format bounds")
+    with target_path.open("r+b") as target:
+        target.truncate(size)
+        target.seek(4)
+        target.write(struct.pack(">I", size))
+    return size
+
+
 def write_boot_environment(architecture, target_platform, layout, raw_kernel_path, output_directory,
                            epoch, root_ext4_image_path, os_dtb_path, root_device, root_mode, init_program):
-    """以 ELF 完整内存范围和输入长度安排互不重叠的暂存区，输出唯一地址说明。"""
+    """按物理范围安排独立暂存区，并输出各板 bootm 实际使用的运行地址。"""
     architecture_id = 26 if architecture == "riscv64" else 27
     load = min(segment["physical"] for segment in layout["loads"])
     memory_end = max(segment["physical"] + segment["memory_size"] for segment in layout["loads"])
@@ -175,47 +210,36 @@ def write_boot_environment(architecture, target_platform, layout, raw_kernel_pat
             "# kernel_elf 是内核输入，root_ext4_image 是可选的 RAM 根卷输入。",
             "# 单架构板卷使用 rootdir=/。",
             f"blossom_platform={target_platform}", "blossom_rootdir=/",
-            "kernel_file=kernel.uImage", f"kernel_addr_r={staging:#x}",
+            "kernel_file=kernel.uImage",
+            f"kernel_addr_r={board_runtime_address(architecture, staging):#x}",
             f"kernel_load={load:#x}", f"kernel_entry={entry:#x}",
             f"kernel_elf_entry={layout['entry']:#x}",
             f"kernel_raw_size={raw_kernel_path.stat().st_size:#x}", f"kernel_image_size={kernel_size:#x}",
             f"kernel_mem_end={memory_end:#x}"]
     cursor = align_staging_address(staging + kernel_size)
     ramdisk_argument = "-"
+    initrd_range = None
     if root_ext4_image_path is not None:
         validate_root_ext4_image(root_ext4_image_path)
         payload = cursor + LEGACY_HEADER.size
         size = write_legacy_image(root_ext4_image_path, output_directory / "root.uInitrd",
                                   architecture_id, 3, payload, payload, epoch)
         spans.append((cursor, cursor + size, "ramdisk container"))
-        rows += ["ramdisk_file=root.uInitrd", f"ramdisk_addr_r={cursor:#x}",
+        initrd_range = (payload, cursor + size)
+        rows += ["ramdisk_file=root.uInitrd",
+                 f"ramdisk_addr_r={board_runtime_address(architecture, cursor):#x}",
                  f"ramdisk_image_size={size:#x}", f"initrd_start={payload:#x}",
                  f"initrd_end={cursor + size:#x}", "initrd_high=0xffffffffffffffff"]
-        ramdisk_argument = f"{cursor:#x}"
+        ramdisk_argument = f"{board_runtime_address(architecture, cursor):#x}"
         cursor = align_staging_address(cursor + size)
     if os_dtb_path is not None:
-        require_regular_file(os_dtb_path)
-        with os_dtb_path.open("rb") as source:
-            header = source.read(8)
-        if not (len(header) == 8 and header[:4] == b"\xd0\x0d\xfe\xed"):
-            raise ValueError("OS DTB header is invalid")
-        total = struct.unpack_from(">I", header, 4)[0]
-        size = os_dtb_path.stat().st_size
-        if not 40 <= total <= size:
-            raise ValueError("OS DTB size is invalid")
-        # bootm 原地增加 chosen 属性需要独立空隙；这部分也计入实际文件和装载范围。
-        size += 64 * 1024
-        if not size < U32_LIMIT:
-            raise ValueError("padded OS DTB exceeds format bounds")
-        target = output_directory / "board.dtb"
-        shutil.copyfile(os_dtb_path, target)
-        with target.open("r+b") as output:
-            output.truncate(size)
-            output.seek(4)
-            output.write(struct.pack(">I", size))
+        size = write_os_dtb(os_dtb_path, output_directory / "board.dtb", initrd_range)
         spans.append((cursor, cursor + size, "OS DTB"))
-        rows += ["fdt_file=board.dtb", f"fdt_addr_r={cursor:#x}", f"fdt_size={size:#x}",
+        fdt_address = board_runtime_address(architecture, cursor)
+        rows += ["fdt_file=board.dtb", f"fdt_addr_r={fdt_address:#x}", f"fdt_size={size:#x}",
                  "fdt_high=0xffffffffffffffff"]
+        if architecture == "loongarch64":
+            rows.append(f"fdt_addr={fdt_address:#x}")
     else:
         rows.append("# 未提供 os_dtb；启动前须准备实际传给内核的 OS DTB。")
     if not all(0 <= start < end <= U32_LIMIT for start, end, _ in spans):
@@ -232,7 +256,12 @@ def write_boot_environment(architecture, target_platform, layout, raw_kernel_pat
             raise ValueError("invalid board init path")
         rows.append(f"bootargs=root={root_device} rootdir=/ {root_mode} init={init_program}")
         if os_dtb_path is not None:
-            rows.append(f"blossom_boot=bootm {staging:#x} {ramdisk_argument} {cursor:#x}")
+            command = f"bootm {board_runtime_address(architecture, staging):#x}"
+            if architecture == "riscv64":
+                command += f" {ramdisk_argument} {fdt_address:#x}"
+            elif root_ext4_image_path is not None:
+                command += f" {ramdisk_argument}"
+            rows.append(f"blossom_boot={command}")
     else:
         rows.append("# 未选择 root_device；未生成 bootargs 或启动命令。")
     rows.append("# blossom_boot 仅供手动执行；实际固件、ABI 和 RAM 尚未验证。")

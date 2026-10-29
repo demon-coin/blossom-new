@@ -1,5 +1,7 @@
 //! 2K1000LA 的 LIOINTC、Loongson PCI 与原生外设绑定。
 
+use core::convert::{TryFrom, TryInto};
+
 use super::resources;
 use super::{
     cells, compatible, device_region, enabled, identity_address, interrupt_parent, number, parent,
@@ -10,55 +12,125 @@ use crate::boot::{
     PciRange, Region, SysconAction,
 };
 
-/// 仅解释有来源的 UHI、Linux bootm 或精确 go kernel dtb 交接，不扫描物理内存。
+/// 固件交接中已归一化的物理地址，解析完成后不保留 EFI 表借用。
+pub(super) struct FirmwareParameters {
+    pub(super) dtb: usize,
+    pub(super) command_line: Option<usize>,
+}
+
+const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
+const EFI_SYSTEM_TABLE_SIZE: usize = 0x78;
+const EFI_HEADER_SIZE_OFFSET: usize = 0x0c;
+const EFI_NR_TABLES_OFFSET: usize = 0x68;
+const EFI_TABLES_OFFSET: usize = 0x70;
+const EFI_CONFIG_TABLE_SIZE: usize = 24;
+const EFI_CONFIG_TABLE_POINTER_OFFSET: usize = 16;
+const EFI_FDT_GUID: [u8; 16] = [
+    0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
+];
+
+/// 一次解释 UHI、显式 a3 DTB 或 EFI64 bootm 交接，不扫描物理内存。
 ///
 /// # Safety
-/// 固件须保证对应 ABI 的 a1/argv 及 argv[1] 指向有界可读存储，完整 DTB 的可读性由 discover 调用者承担。
-pub(super) unsafe fn dtb_address(args: [usize; 4]) -> Result<usize, &'static str> {
-    let candidate = if args[0] == usize::MAX - 1 {
-        args[1]
-    } else if (2..=16).contains(&args[0]) && args[1] != 0 {
-        let argv = crate::arch::phys_to_virt(physical(args[1])?) as *const usize;
-        // SAFETY: 固件 go ABI 保证 argc 个指针可读；范围已限制且只读必有的 argv[1]。
-        let address = unsafe { argv.add(1).read_unaligned() };
-        let pointer = crate::arch::phys_to_virt(physical(address)?) as *const u8;
-        if address == 0 {
-            return Err("U-Boot DTB address argument is null");
-        }
-        let mut value = 0usize;
-        let mut digits = 0;
-        for index in 0..19 {
-            // SAFETY: 固件 ABI 保证 argv[1] 的十六进制字符串最多 18 字节及终止 NUL 可读。
-            let byte = unsafe { pointer.add(index).read() };
-            if byte == 0 {
-                if digits == 0 {
-                    return Err("U-Boot DTB address argument is empty");
-                }
-                return physical(value);
-            }
-            if index == 1 && byte == b'x' && value == 0 {
-                digits = 0;
-                continue;
-            }
-            let digit = match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                b'A'..=b'F' => byte - b'A' + 10,
-                _ => return Err("U-Boot DTB address argument is not hexadecimal"),
-            };
-            value = value
-                .checked_mul(16)
-                .and_then(|v| v.checked_add(digit as usize))
-                .ok_or("U-Boot DTB address overflows")?;
-            digits += 1;
-        }
-        return Err("U-Boot DTB address argument is too long");
-    } else if args[3] != 0 {
-        args[3]
+/// 固件须保证所选 ABI 引用的 EFI 系统表、其声明的完整头部与配置表数组在解析期间可读、
+/// 无并发修改，且对应 RAM 映射已经建立；内容校验不能证明指针可读。
+/// 返回的 DTB 与命令行仍由调用者保活，直到完整 FDT 解析和命令行复制结束。
+pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParameters, &'static str> {
+    if args[0] == usize::MAX - 1 {
+        return Ok(FirmwareParameters {
+            dtb: physical(args[1])?,
+            command_line: None,
+        });
+    }
+    let command_line = if args[0] <= 1 && args[1] != 0 {
+        Some(physical(args[1])?)
     } else {
-        return Err("LoongArch firmware did not supply an OS DTB");
+        None
     };
-    physical(candidate)
+    let dtb = if args[3] != 0 {
+        physical(args[3])?
+    } else if args[0] <= 1 && args[2] != 0 {
+        // SAFETY: 调用者保证 EFI 系统表及其声明的配置表在本次解析期间可读且不变。
+        unsafe { efi_dtb(args[2])? }
+    } else {
+        return Err("LoongArch firmware did not supply a supported OS DTB handoff");
+    };
+    Ok(FirmwareParameters { dtb, command_line })
+}
+
+/// 从 EFI64 系统表的配置表数组取得唯一 FDT GUID 对应的物理地址。
+///
+/// # Safety
+/// 调用者须保活系统表声明的完整头部与 nr_tables 个配置表项，保证解析期间可读且无并发修改；
+/// 所有物理地址的当前 RAM 映射须已建立，返回的 DTB 另由上层保活并校验。
+unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
+    // SAFETY: 调用者保证 EFI64 系统表的固定字段可读且不变；此处只借用最小布局。
+    let header = unsafe { firmware_bytes(address, EFI_SYSTEM_TABLE_SIZE)? };
+    if u64::from_le_bytes(header[..8].try_into().unwrap()) != EFI_SYSTEM_TABLE_SIGNATURE {
+        return Err("EFI system table signature is invalid");
+    }
+    let header_size = u32::from_le_bytes(
+        header[EFI_HEADER_SIZE_OFFSET..EFI_HEADER_SIZE_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    if header_size < EFI_SYSTEM_TABLE_SIZE {
+        return Err("EFI system table header is too small");
+    }
+    // SAFETY: 调用者保证头部声明的存储范围可读且不变；长度仅作表示范围校验，不证明可读性。
+    unsafe { firmware_bytes(address, header_size)? };
+    let count = usize::try_from(u64::from_le_bytes(
+        header[EFI_NR_TABLES_OFFSET..EFI_NR_TABLES_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    ))
+    .map_err(|_| "EFI configuration table count is not representable")?;
+    let tables_address = usize::try_from(u64::from_le_bytes(
+        header[EFI_TABLES_OFFSET..EFI_TABLES_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    ))
+    .map_err(|_| "EFI configuration table address is not representable")?;
+    let size = count
+        .checked_mul(EFI_CONFIG_TABLE_SIZE)
+        .ok_or("EFI configuration table array size overflows")?;
+    // SAFETY: 调用者保证 nr_tables 个 EFI64 表项可读且不变；乘法及地址表示范围在借用前检查。
+    let tables = unsafe { firmware_bytes(tables_address, size)? };
+    let mut dtb = None;
+    for entry in tables.chunks_exact(EFI_CONFIG_TABLE_SIZE) {
+        if entry[..EFI_CONFIG_TABLE_POINTER_OFFSET] != EFI_FDT_GUID {
+            continue;
+        }
+        if dtb.is_some() {
+            return Err("EFI FDT configuration table GUID is duplicated");
+        }
+        let pointer = usize::try_from(u64::from_le_bytes(
+            entry[EFI_CONFIG_TABLE_POINTER_OFFSET..].try_into().unwrap(),
+        ))
+        .map_err(|_| "EFI FDT address is not representable")?;
+        dtb = Some(physical(pointer)?);
+    }
+    dtb.ok_or("EFI FDT configuration table GUID is missing")
+}
+
+/// 检查固件存储的地址表示范围后借用字节，不推断实际可读性。
+///
+/// # Safety
+/// 调用者须保证指定范围在返回借用存续期间可读且无并发修改，并已建立当前 RAM 映射。
+unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'static str> {
+    let address = physical(address)?;
+    let end = address
+        .checked_add(size)
+        .ok_or("firmware physical storage range overflows")?;
+    if (1usize << 60) < end || (isize::MAX as usize) < size {
+        return Err("firmware storage range is not representable");
+    }
+    let pointer = crate::arch::phys_to_virt(address) as *const u8;
+    if (pointer as usize).checked_add(size).is_none() {
+        return Err("firmware virtual storage range overflows");
+    }
+    // SAFETY: 可读性、无并发写及借用寿命由调用者保证；非空地址、切片长度与地址加法已检查。
+    Ok(unsafe { core::slice::from_raw_parts(pointer, size) })
 }
 
 /// 固件可传物理地址或 cached/uncached DMW 地址；其他地址类别拒绝。
@@ -66,7 +138,11 @@ fn physical(address: usize) -> Result<usize, &'static str> {
     if !matches!(address >> 60, 0 | 8 | 9) {
         return Err("firmware address is neither physical nor a supported DMW alias");
     }
-    Ok(address & 0x0fff_ffff_ffff_ffff)
+    let address = address & 0x0fff_ffff_ffff_ffff;
+    if address == 0 {
+        return Err("firmware address is null");
+    }
+    Ok(address)
 }
 
 /// 由实际 LIOINTC 与 PCI 身份构造板快照，PCI reg 从不作为 BAR。

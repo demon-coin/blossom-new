@@ -539,6 +539,62 @@ fn discover_bootargs(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'stat
     Ok(())
 }
 
+/// 复制 LA 固件命令行；板卡按完整子串去重后追加，QEMU 保持直接替换语义。
+///
+/// # Safety
+/// address 的当前 RAM 映射须已建立，命令行直到首个 NUL 或快照容量的范围须可读、
+/// 无并发修改且与 info 不重叠；调用者须保活存储直到本次复制结束。
+#[cfg(target_arch = "loongarch64")]
+unsafe fn discover_command_line(
+    info: &mut BootInfo,
+    address: usize,
+    append: bool,
+) -> Result<(), &'static str> {
+    let pointer = crate::arch::phys_to_virt(address) as *const u8;
+    if address.checked_add(info.bootargs.len()).is_none()
+        || (pointer as usize)
+            .checked_add(info.bootargs.len())
+            .is_none()
+    {
+        return Err("firmware command line address overflows");
+    }
+    let mut length = 0;
+    loop {
+        if length == info.bootargs.len() {
+            return Err("firmware command line exceeds boot snapshot capacity");
+        }
+        // SAFETY: 调用者保证当前映射中命令行至 NUL 或容量边界可读且不变；尚未访问容量外字节。
+        if unsafe { pointer.add(length).read() } == 0 {
+            break;
+        }
+        length += 1;
+    }
+    // SAFETY: 调用者保活并保证存储不变且不与 info 重叠；刚才逐字节读到了长度内的完整命令行。
+    let command = unsafe { core::slice::from_raw_parts(pointer, length) };
+    if append
+        && (command.is_empty()
+            || info
+                .bootargs()
+                .windows(command.len())
+                .any(|window| window == command))
+    {
+        return Ok(());
+    }
+    let start = if append { info.bootargs_len } else { 0 };
+    let separator = usize::from(append && start != 0);
+    let end = start + separator + command.len();
+    if info.bootargs.len() <= end {
+        return Err("firmware command line exceeds boot snapshot capacity");
+    }
+    if separator != 0 {
+        info.bootargs[start] = b' ';
+    }
+    info.bootargs[start + separator..end].copy_from_slice(command);
+    info.bootargs[end] = 0;
+    info.bootargs_len = end;
+    Ok(())
+}
+
 /// 标准 initrd 属性必须成对出现，完整 RAM 范围在 buddy 建立前保留。
 fn discover_initrd(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static str> {
     let start = chosen.property("linux,initrd-start");
@@ -955,13 +1011,15 @@ fn discover_plic(
     Ok(())
 }
 
-/// 从显式固件交接在永久槽中完成唯一DTB与命令行发现，不在引导栈传递整份快照。
+/// 从显式固件交接在永久槽中完成唯一 DTB 与命令行发现，不在引导栈传递整份快照。
 ///
 /// # Safety
-/// 固件必须提供至少可读的 FDT 头部及头部所声明的完整存储范围；本函数检查内容边界，
-/// 不能验证任意物理指针是否实际可读。调用时 BSP 必须已建立对应 RAM 访问映射；
-/// QEMU LA 的 a1 命令行须在快照容量内可读；板固件须满足 UHI/bootm/go 的显式参数
-/// 契约，其中go的argv[1]须为最多18字节的可读NUL结尾十六进制DTB地址；只能由BSP调用一次。
+/// 固件必须保活至少 40 字节的 FDT 头部及其声明的完整存储，直到资源发现结束。
+/// 板固件须满足 UHI、显式 a3 DTB 或 EFI64 交接协议，保活系统表声明的完整头部及
+/// nr_tables 个配置表项直到参数解析结束。所选命令行至首个 NUL 或快照容量的范围须
+/// 保活到复制结束，QEMU LA 的 a1 物理地址零亦可用。上述存储均须可读、无并发修改，
+/// 不与永久 BootInfo 槽重叠，BSP 须已建立对应 RAM 映射；内容校验不能证明指针可读。
+/// 只能由 BSP 在 IRQ 关闭、AP 未释放且永久槽尚无借用时调用一次。
 pub unsafe fn discover(
     raw_args: [usize; 4],
     bsp_hardware_id: usize,
@@ -969,17 +1027,25 @@ pub unsafe fn discover(
     #[cfg(target_arch = "riscv64")]
     let physical = raw_args[1];
     #[cfg(target_arch = "loongarch64")]
-    let physical: usize = if current() == Platform::QemuVirt {
-        0x10_0000
+    let parameters = if current() == Platform::QemuVirt {
+        ls2k1000la::FirmwareParameters {
+            dtb: 0x10_0000,
+            command_line: Some(raw_args[1]),
+        }
     } else {
-        // SAFETY: 固件调用者保证所选 UHI/bootm/go 参数及其引用的有界 argv 可读。
-        unsafe { ls2k1000la::dtb_address(raw_args)? }
+        // SAFETY: 调用者保证所选 ABI 的 EFI 系统表及其声明的存储在解析期间可读、不变且已映射。
+        unsafe { ls2k1000la::boot_parameters(raw_args)? }
     };
+    #[cfg(target_arch = "loongarch64")]
+    let physical = parameters.dtb;
     if physical == 0 || physical % 8 != 0 || physical.checked_add(40).is_none() {
         return Err("firmware DTB physical address is zero or unaligned");
     }
     let pointer = crate::arch::phys_to_virt(physical) as *const u8;
-    // SAFETY: caller 保证固件头部可读，物理地址已转换为当前 RAM 映射。
+    if (pointer as usize).checked_add(40).is_none() {
+        return Err("firmware DTB header virtual address overflows");
+    }
+    // SAFETY: 调用者保证固件头部可读、不变且不与 BootInfo 重叠；物理地址已转换为当前 RAM 映射。
     let header = unsafe { core::slice::from_raw_parts(pointer, 40) };
     if word(header, 0)? != 0xd00d_feed {
         return Err("firmware DTB magic is invalid");
@@ -991,31 +1057,17 @@ pub unsafe fn discover(
     {
         return Err("firmware DTB size is invalid or address overflows");
     }
-    // SAFETY: caller 保证固件声明的完整存储可读；长度、物理和虚拟地址范围已验证。
+    // SAFETY: 调用者保活固件声明的完整存储并保证可读且不变；长度、物理和虚拟地址范围已验证。
     let bytes = unsafe { core::slice::from_raw_parts(pointer, total) };
-    // SAFETY: discover只由BSP在IRQ关闭且AP未释放时调用一次；永久槽尚无引用，下面借用持续到发布。
+    // SAFETY: 调用者保证 BSP 在 IRQ 关闭且 AP 未释放时调用一次；永久槽尚无引用，借用持续到发布。
     let info = unsafe { crate::boot::prepare(raw_args, bsp_hardware_id) };
     discover_tree(bytes, info, physical)?;
     #[cfg(target_arch = "loongarch64")]
-    {
-        if current() != Platform::QemuVirt {
-            return Ok(info);
+    if let Some(command_line) = parameters.command_line {
+        // SAFETY: 调用者保活所选命令行至本次复制结束，并保证可读、不变、已映射且不与快照重叠。
+        unsafe {
+            discover_command_line(info, command_line, current() != Platform::QemuVirt)?;
         }
-        // LA 直接装载协议把命令行放在 a1 指向的低 RAM，不写入 DTB /chosen。
-        let command = crate::arch::phys_to_virt(raw_args[1]) as *const u8;
-        for index in 0..info.bootargs.len() {
-            // SAFETY: caller 保证固件命令行在当前 RAM 映射可读；QEMU 保留其低 RAM，
-            // 地址零也是有效物理地址。读取受快照容量限制，遇到终止 NUL 立即停止。
-            let byte = unsafe { command.add(index).read() };
-            if byte == 0 {
-                info.bootargs[index] = 0;
-                info.bootargs_len = index;
-                return Ok(info);
-            }
-            info.bootargs[index] = byte;
-        }
-        Err("firmware command line exceeds boot snapshot capacity")
     }
-    #[cfg(target_arch = "riscv64")]
     Ok(info)
 }

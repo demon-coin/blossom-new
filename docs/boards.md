@@ -77,7 +77,9 @@ make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
 
 每次包装产生 `kernel.elf`、`kernel.bin`、`kernel.uImage`、`boot.env`，有对应输入才产生 `root.uInitrd`、`board.dtb`。缺 DTB 或明确 root 时，不生成不可证明的完整启动命令；这类离线容器不是可部署成功或实板启动证明。LoongArch 容器使用实际架构编码，不伪装成 MIPS。
 
-`boot.env` 区分 `kernel_addr_r` 容器暂存地址、`kernel_load`、物理 `kernel_entry`、ELF entry 和完整 `kernel_mem_end`，并列出 DTB/initrd 范围。包装检查对象间不重叠，但不能证明它们落在该实板真实可用 RAM 内；需与固件、DT memory/reservation 和整个 BSS 展开范围共同核对。
+有 RAM 根输入时，包装器在输出 DTB 副本中写入本次 `root.uInitrd` 的准确 payload 范围，排除 64 字节 legacy 头；输入 DTB 和卷均保持不变。此步骤需要 PATH 中的 `fdtput`，失败不会发表本次包。
+
+`boot.env` 区分容器暂存地址、物理 `kernel_load/kernel_entry`、ELF entry 和完整 `kernel_mem_end`，并列出 DTB/initrd 范围。LoongArch 的 `*_addr_r`、`fdt_addr` 使用 cached DMW 地址，容器头和 initrd 属性保留物理地址；RISC-V 运行地址仍为物理地址。包装检查对象间不重叠，但不能证明它们落在实板可用 RAM 内，须与实际 RAM、保留区和整个 BSS 范围共同核对。
 
 ## 4. RAM 根：两板分别人工启动
 
@@ -86,6 +88,8 @@ make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
 ```text
 setenv serverip <开发机TFTP地址>
 setenv ipaddr <开发板固件地址>
+setenv fdt_high ffffffffffffffff
+setenv initrd_high ffffffffffffffff
 tftpboot ${kernel_addr_r} kernel.uImage
 tftpboot ${fdt_addr_r} board.dtb
 tftpboot ${ramdisk_addr_r} root.uInitrd
@@ -93,10 +97,24 @@ iminfo ${kernel_addr_r}
 fdt addr ${fdt_addr_r}
 fdt print /chosen
 setenv bootargs 'root=/dev/ram0 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+```
+
+完成上述装载和校验后，分别采用对应板的交接协议，不把两板的启动命令混用。[2]
+
+**VisionFive 2：**
+
+```text
 bootm ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
 ```
 
-这是 kernel/ramdisk/OS FDT 三参数模板，必须由本固件帮助和实际启动 ABI 确认。[2] LA 原始 a0–a3、RV hart/DTB 等仍须内核收到正确输入。改用固件 FAT/ext4/USB 加载只替换 load 命令，不代表内核运行期支持那些设备。
+**2K1000LA 的 U-Boot `g2ed41674`：**
+
+```text
+setenv fdt_addr ${fdt_addr_r}
+bootm ${kernel_addr_r} ${ramdisk_addr_r}
+```
+
+此版龙芯固件由 `fdt_addr` 指定 OS DTB，使用 LoongArch 的命令行／EFI system table 交接。实际三参数形式在固件命令行指针读取处触发异常；不能仅凭通用帮助套用其他板命令。更换固件须重新核对 ABI。改用固件 FAT/ext4/USB 加载只替换 load 命令，不代表内核运行期支持这些设备。
 
 `blossom.boot=shell` 经同一 BusyBox PID1/start-session 选择 Shell，不把 Shell 改成 PID1。默认会话会运行比赛执行器 `/sbin/contest-run /dev/vda`，板上没有该比赛设备时不得省略会话选择后假定自动进入 Shell。Shell 退出不转跑比赛；正常结束用 `sync` 和 `/bin/busybox poweroff`。
 
@@ -121,10 +139,11 @@ bootm ${kernel_addr_r} - ${fdt_addr_r}
 
 # LA：实际 SATA 分区示例
 setenv bootargs 'root=/dev/sda2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
-bootm ${kernel_addr_r} - ${fdt_addr_r}
+setenv fdt_addr ${fdt_addr_r}
+bootm ${kernel_addr_r}
 ```
 
-`-` 表示无 RAM disk。不存在的明确分区应失败，不能改选最大分区或 RAM 根。需要持久根的 `boot.env` 时，包装选择实际 `BOARD_ROOT_DEVICE`，不传 `BOARD_ROOT_EXT4_IMAGE`；根卷部署仍是独立步骤。保持实际 OS DTB，不覆盖固件仍在使用的 control FDT。
+VF2 示例中的 `-` 表示无 RAM disk；上述 LA 固件不传第二参数。不存在的明确分区应失败，不能改选最大分区或 RAM 根。需要持久根的 `boot.env` 时，包装选择实际 `BOARD_ROOT_DEVICE`，不传 `BOARD_ROOT_EXT4_IMAGE`；根卷部署仍是独立步骤。保持实际 OS DTB，不覆盖固件仍在使用的 control FDT。
 
 ## 6. 持久性与普通用户测试
 
@@ -158,7 +177,7 @@ cd /test/selftests/fs
 |---|---|
 | VF2 RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
 | VF2 SD 分区直接根 | 待原生 SD、DMA/IRQ 与同介质同步重启 |
-| LA RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
+| LA RAM 根 | 本轮 `g2ed41674` 经 bootm 到 PID1/Shell、子进程退出及 RAM 文件写读/sync 已验；实板停止和重启未验 |
 | LA SATA 分区直接根 | 待原生 AHCI、DMA/IRQ 与同介质同步重启 |
 
 每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络还需各自实板证据，固件 ping 不证明内核网络。SMP 要观察任务迁核或真实并行，不只看上线数量。

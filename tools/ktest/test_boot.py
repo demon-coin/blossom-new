@@ -2,10 +2,13 @@
 
 import contextlib
 import io
+import os
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 from host_helpers import case_record
@@ -138,18 +141,68 @@ class BootELFTests(unittest.TestCase):
                     read_kernel_elf(kernel, "riscv64")
 
 
+def write_root_payload(directory):
+    """构造包装器可识别的最小 ext4 头及载荷字节，不模拟文件系统挂载。"""
+    target = directory / "root.ext4"
+    payload = bytearray(4096)
+    payload[1080:1082] = b"\x53\xef"
+    target.write_bytes(payload)
+    return target, payload
+
+
+def write_os_tree(directory, with_chosen=True):
+    """通过 dtc 生成可消费的树，已有 initrd 属性故意保留与本次包装无关的历史范围。"""
+    chosen = """
+        chosen {
+            bootargs = "console=ttyS0";
+            linux,initrd-start = <0x0 0x12340000>;
+            linux,initrd-end = <0x0 0x12341000>;
+        };
+    """ if with_chosen else ""
+    source = f"""/dts-v1/;
+    / {{
+        #address-cells = <2>;
+        #size-cells = <2>;
+        compatible = "blossom,packaging-test";
+        {chosen}
+        memory@80000000 {{
+            device_type = "memory";
+            reg = <0x0 0x80000000 0x0 0x20000000>;
+        }};
+    }};
+    """
+    target = directory / "OS tree.dtb"
+    subprocess.run(["dtc", "-I", "dts", "-O", "dtb", "-o", str(target)],
+                   input=source, text=True, capture_output=True, check=True)
+    return target
+
+
+def read_fdt_address(path, property_name):
+    """让 fdtget 实际解析输出树的 chosen 地址，按大端 cell 顺序还原物理值。"""
+    result = subprocess.run(["fdtget", "-t", "x", str(path), "/chosen", property_name],
+                            text=True, capture_output=True, check=True)
+    return int("".join(f"{int(cell, 16):08x}" for cell in result.stdout.split()), 16)
+
+
+def read_boot_environment(directory):
+    """读取可交给固件的环境变量，忽略不影响执行语义的说明文字。"""
+    return dict(line.split("=", 1) for line in (directory / "boot.env").read_text().splitlines()
+                if line and not line.startswith("#"))
+
+
 class BoardPackagingTests(unittest.TestCase):
     """验证离线文件内容、发布边界和正式 CLI，不把生成物当作实板运行证据。"""
 
     def test_production_images_crc_memory_spans_and_optional_inputs(self):
-        """两板使用无测试节 ELF，保真实 CRC、完整 BSS 末端及缺输入不生成命令。"""
+        """两板最终树指向容器实际载荷，固件命令地址与物理装载范围分别满足各自协议。"""
         for architecture, platform in (("riscv64", "visionfive2"), ("loongarch64", "ls2k1000la")):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 kernel = directory / "input kernel.elf"
-                image, _, loads = kernel_image(architecture, platform)
+                image, entry, loads = kernel_image(architecture, platform)
                 kernel.write_bytes(image)
                 output = directory / "boot images"
+                direct_base = 0 if architecture == "riscv64" else 0x9000000000000000
                 package_board_boot_images(architecture, platform, kernel, output)
                 self.assertEqual((output / "kernel.elf").read_bytes(), image)
                 raw = (output / "kernel.bin").read_bytes()
@@ -162,53 +215,118 @@ class BoardPackagingTests(unittest.TestCase):
                 self.assertEqual(fields[0], 0x27051956)
                 self.assertEqual(fields[3:7], (len(raw), loads[0][3], loads[0][3], zlib.crc32(raw)))
                 self.assertEqual(fields[7:11], (5, 26 if architecture == "riscv64" else 27, 2, 0))
+                self.assertFalse(fields[11].rstrip(b"\0").startswith(b"Linux-"))
                 self.assertEqual(fields[1], zlib.crc32(container[:4] + bytes(4) + container[8:LEGACY_HEADER.size]))
                 self.assertEqual(container[LEGACY_HEADER.size:], raw)
-                environment = (output / "boot.env").read_text()
-                self.assertNotIn("\nblossom_boot=", environment)
-                self.assertNotIn("\nbootargs=", environment)
-                rows = dict(line.split("=", 1) for line in environment.splitlines() if not line.startswith("#"))
+                rows = read_boot_environment(output)
+                self.assertNotIn("blossom_boot", rows)
+                self.assertNotIn("bootargs", rows)
                 memory_end = loads[-1][3] + loads[-1][5]
                 self.assertEqual(int(rows["kernel_mem_end"], 16), memory_end)
-                self.assertLessEqual(memory_end, int(rows["kernel_addr_r"], 16))
-                dtb = directory / "OS tree.dtb"
-                dtb.write_bytes(struct.pack(">II", 0xD00DFEED, 40) + bytes(32))
-                root = directory / "root.ext4"
-                root_bytes = bytearray(4096)
-                root_bytes[1080:1082] = b"\x53\xef"
-                root.write_bytes(root_bytes)
+                self.assertEqual(int(rows["kernel_elf_entry"], 16), entry)
+                self.assertEqual(int(rows["kernel_load"], 16), fields[4])
+                self.assertEqual(int(rows["kernel_entry"], 16), fields[5])
+                kernel_address = int(rows["kernel_addr_r"], 16)
+                self.assertEqual(kernel_address & ~(U32_LIMIT - 1), direct_base)
+                self.assertLessEqual(memory_end, kernel_address - direct_base)
+                dtb = write_os_tree(directory)
+                original_dtb = dtb.read_bytes()
                 package_board_boot_images(architecture, platform, kernel, output, os_dtb_path=dtb)
-                environment = (output / "boot.env").read_text()
-                self.assertNotIn("\nblossom_boot=", environment)
-                self.assertNotIn("\nbootargs=", environment)
+                rows = read_boot_environment(output)
+                self.assertNotIn("blossom_boot", rows)
+                self.assertNotIn("bootargs", rows)
+                package_board_boot_images(architecture, platform, kernel, output,
+                                          os_dtb_path=dtb, root_device="/dev/sda1")
+                rows = read_boot_environment(output)
+                command = rows["blossom_boot"].split()
+                self.assertEqual(command, ["bootm", rows["kernel_addr_r"]] +
+                                 (["-", rows["fdt_addr_r"]] if architecture == "riscv64" else []))
+                self.assertFalse((output / "root.uInitrd").exists())
+                self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-start"), 0x12340000)
+                self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-end"), 0x12341000)
+                root, root_bytes = write_root_payload(directory)
                 package_board_boot_images(architecture, platform, kernel, output,
                                           root, dtb, "/dev/ram0")
-                environment = (output / "boot.env").read_text()
-                self.assertIn("\nbootargs=root=/dev/ram0 rootdir=/ ro init=/sbin/init\n", environment)
-                self.assertIn("\nblossom_boot=bootm ", environment)
+                rows = read_boot_environment(output)
+                bootargs = rows["bootargs"].split()
+                self.assertEqual(dict(word.split("=", 1) for word in bootargs if "=" in word),
+                                 {"root": "/dev/ram0", "rootdir": "/", "init": "/sbin/init"})
+                self.assertIn("ro", bootargs)
+                self.assertNotIn("rw", bootargs)
+                self.assertEqual(rows["blossom_boot"].split(),
+                                 ["bootm", rows["kernel_addr_r"], rows["ramdisk_addr_r"]] +
+                                 ([rows["fdt_addr_r"]] if architecture == "riscv64" else []))
+                addresses = [int(rows[name], 16) for name in ("kernel_addr_r", "ramdisk_addr_r", "fdt_addr_r")]
+                for address in addresses:
+                    self.assertEqual(address & ~(U32_LIMIT - 1), direct_base)
+                kernel_physical, ramdisk_physical, fdt_physical = [address - direct_base for address in addresses]
+                self.assertLessEqual(memory_end, kernel_physical)
+                self.assertLessEqual(kernel_physical + len(container), ramdisk_physical)
                 initrd = (output / "root.uInitrd").read_bytes()
-                self.assertEqual(initrd[LEGACY_HEADER.size:], root_bytes)
-                self.assertEqual(LEGACY_HEADER.unpack(initrd[:LEGACY_HEADER.size])[6], zlib.crc32(root_bytes))
+                initrd_fields = LEGACY_HEADER.unpack(initrd[:LEGACY_HEADER.size])
+                self.assertEqual(initrd_fields[3], len(root_bytes))
+                self.assertEqual(initrd_fields[6], zlib.crc32(root_bytes))
+                self.assertEqual(initrd_fields[7:11], (5, 26 if architecture == "riscv64" else 27, 3, 0))
+                self.assertEqual(initrd_fields[1], zlib.crc32(initrd[:4] + bytes(4) + initrd[8:LEGACY_HEADER.size]))
+                start = read_fdt_address(output / "board.dtb", "linux,initrd-start")
+                end = read_fdt_address(output / "board.dtb", "linux,initrd-end")
+                self.assertEqual(start, ramdisk_physical + LEGACY_HEADER.size)
+                self.assertEqual(end, ramdisk_physical + len(initrd))
+                self.assertEqual(initrd_fields[4:6], (start, start))
+                self.assertEqual((int(rows["initrd_start"], 16), int(rows["initrd_end"], 16)), (start, end))
+                self.assertEqual(initrd[start - ramdisk_physical:end - ramdisk_physical], root_bytes)
+                self.assertLessEqual(end, fdt_physical)
                 padded_dtb = (output / "board.dtb").read_bytes()
-                self.assertEqual(len(padded_dtb), 40 + 64 * 1024)
                 self.assertEqual(struct.unpack_from(">I", padded_dtb, 4)[0], len(padded_dtb))
+                self.assertEqual(int(rows["fdt_size"], 16), len(padded_dtb))
+                header = struct.unpack_from(">10I", padded_dtb)
+                used_end = max(header[2] + header[9], header[3] + header[8])
+                self.assertLessEqual(used_end + 64 * 1024, len(padded_dtb))
+                if architecture == "loongarch64":
+                    self.assertEqual(rows["fdt_addr"], rows["fdt_addr_r"])
+                self.assertEqual(kernel.read_bytes(), image)
                 self.assertEqual(root.read_bytes(), root_bytes)
-                self.assertEqual(dtb.read_bytes(), struct.pack(">II", 0xD00DFEED, 40) + bytes(32))
+                self.assertEqual(dtb.read_bytes(), original_dtb)
                 package_board_boot_images(architecture, platform, kernel, output, root_device="/dev/sda1")
-                self.assertNotIn("\nblossom_boot=", (output / "boot.env").read_text())
+                self.assertNotIn("blossom_boot", read_boot_environment(output))
                 self.assertFalse((output / "root.uInitrd").exists())
                 self.assertFalse((output / "board.dtb").exists())
 
-    def test_failed_packaging_leaves_published_files_unchanged(self):
-        """错误输入只影响临时目录，先前发表的镜像不被半成品覆盖。"""
+    def test_ram_root_creates_missing_chosen_node(self):
+        """无 chosen 的真实树由 fdtput 创建节点，地址覆盖完整的 RAM 根载荷。"""
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             kernel = directory / "kernel.elf"
             image, _, _ = kernel_image("riscv64", "visionfive2")
             kernel.write_bytes(image)
+            dtb = write_os_tree(directory, with_chosen=False)
+            original_dtb = dtb.read_bytes()
+            root, root_bytes = write_root_payload(directory)
             output = directory / "output"
-            package_board_boot_images("riscv64", "visionfive2", kernel, output)
+            package_board_boot_images("riscv64", "visionfive2", kernel, output, root, dtb)
+            rows = read_boot_environment(output)
+            self.assertNotIn("blossom_boot", rows)
+            start = read_fdt_address(output / "board.dtb", "linux,initrd-start")
+            end = read_fdt_address(output / "board.dtb", "linux,initrd-end")
+            payload_offset = start - int(rows["ramdisk_addr_r"], 16)
+            self.assertEqual(payload_offset, LEGACY_HEADER.size)
+            self.assertEqual((output / "root.uInitrd").read_bytes()[payload_offset:payload_offset + end - start],
+                             root_bytes)
+            self.assertEqual(dtb.read_bytes(), original_dtb)
+
+    def test_failed_packaging_leaves_published_files_unchanged(self):
+        """输入或真实 FDT 工具失败不发表半成品，CLI 返回非零且源输入保持不变。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            kernel = directory / "kernel.elf"
+            image, _, _ = kernel_image("riscv64", "visionfive2")
+            kernel.write_bytes(image)
+            dtb = write_os_tree(directory)
+            root, root_bytes = write_root_payload(directory)
+            output = directory / "output"
+            package_board_boot_images("riscv64", "visionfive2", kernel, output, root, dtb, "/dev/ram0")
             published = {path.name: path.read_bytes() for path in output.iterdir()}
+            inputs = {path: path.read_bytes() for path in (kernel, root, dtb)}
             invalid_input = directory / "invalid-input"
             invalid_input.write_bytes(b"invalid")
             for options in ({"root_device": "/dev/ram0"}, {"root_device": "/dev/sda1;bad"},
@@ -217,32 +335,28 @@ class BoardPackagingTests(unittest.TestCase):
                 with self.subTest(options=options), self.assertRaises(ValueError):
                     package_board_boot_images("riscv64", "visionfive2", kernel, output, **options)
                 self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, published)
+            broken_dtb = directory / "broken tree.dtb"
+            broken = bytearray(dtb.read_bytes())
+            struct.pack_into(">I", broken, 8, len(broken) + 4)
+            broken_dtb.write_bytes(broken)
+            arguments = ["--arch", "riscv64", "--target-platform", "visionfive2",
+                         "--kernel-elf", str(kernel), "--output-directory", str(output),
+                         "--root-ext4-image", str(root), "--root-device", "/dev/ram0", "--os-dtb"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main(arguments + [str(broken_dtb)])
+            self.assertEqual(error.exception.code, 1)
+            self.assertEqual(broken_dtb.read_bytes(), broken)
+            self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, published)
+            with mock.patch.dict(os.environ, {"PATH": ""}):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    main(arguments + [str(dtb)])
+            self.assertEqual(error.exception.code, 1)
+            self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, published)
+            self.assertEqual({path: path.read_bytes() for path in inputs}, inputs)
             with self.assertRaises(ValueError):
                 package_board_boot_images("loongarch64", "ls2k1000la", kernel, output)
             with self.assertRaises(ValueError):
                 make_legacy_header(1, 0, 26, 2, U32_LIMIT, 0, 0)
-
-    def test_cli_requires_full_names_and_accepts_documented_inputs(self):
-        """正式 CLI 拒绝旧参数和缩写，完整参数发布文件且默认根权限为只读。"""
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            kernel = directory / "kernel.elf"
-            image, _, _ = kernel_image("riscv64", "visionfive2")
-            kernel.write_bytes(image)
-            output = directory / "output"
-            arguments = ["--arch", "riscv64", "--target-platform", "visionfive2",
-                         "--kernel-elf", str(kernel), "--output-directory", str(output)]
-            for invalid in (["--platform", "visionfive2"], ["--kernel", str(kernel)],
-                            ["--output", str(output)], ["--root", "/dev/sda1"]):
-                with self.subTest(invalid=invalid), contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit) as error:
-                        main(arguments + invalid)
-                    self.assertEqual(error.exception.code, 2)
-                self.assertFalse(output.exists())
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(arguments + ["--root-device", "/dev/sda1"])
-            self.assertIn("bootargs=root=/dev/sda1 rootdir=/ ro init=/sbin/init\n",
-                          (output / "boot.env").read_text())
 
 
 class BootTrapTests(unittest.TestCase):
