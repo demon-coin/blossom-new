@@ -9,7 +9,7 @@
 ```text
 version
 bdinfo
-printenv bootcmd bootargs loadaddr kernel_addr_r fdt_addr_r ramdisk_addr_r
+printenv bootcmd bootargs loadaddr kernel_addr_r fdt_addr ramdisk_addr_r
 help bootm
 help bootelf
 help fdt
@@ -75,42 +75,39 @@ make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
 
 `BOARD_ROOT_EXT4_IMAGE` 是只读输入，不是制盘输出。包装从最终普通 ELF 的公开符号和 LOAD 取得实际布局，不导入测试包、不要求测试节或展开信息；已有固定 ELF 也可直接交 `tools/package_board_boot_images.py --help` 所示 CLI，不重编内核。
 
-每次包装产生 `kernel.elf`、`kernel.bin`、`kernel.uImage`、`boot.env`，有对应输入才产生 `root.uInitrd`、`board.dtb`。缺 DTB 或明确 root 时，不生成不可证明的完整启动命令；这类离线容器不是可部署成功或实板启动证明。LoongArch 容器使用实际架构编码，不伪装成 MIPS。
+每次包装产生 `kernel.elf`、`kernel.bin`、`kernel.uImage`、`boot.env`，有对应输入才产生 `root.uInitrd`、`board.dtb`。`boot.env` 只提供装载地址和内核参数，不生成启动命令；缺 DTB 或明确 root 时不能据此认定可部署成功。LoongArch 容器使用实际架构编码，不伪装成 MIPS。
 
 有 RAM 根输入时，包装器在输出 DTB 副本中写入本次 `root.uInitrd` 的准确 payload 范围，排除 64 字节 legacy 头；输入 DTB 和卷均保持不变。此步骤需要 PATH 中的 `fdtput`，失败不会发表本次包。
 
-`boot.env` 区分容器暂存地址、物理 `kernel_load/kernel_entry`、ELF entry 和完整 `kernel_mem_end`，并列出 DTB/initrd 范围。LoongArch 的 `*_addr_r`、`fdt_addr` 使用 cached DMW 地址，容器头和 initrd 属性保留物理地址；RISC-V 运行地址仍为物理地址。包装检查对象间不重叠，但不能证明它们落在实板可用 RAM 内，须与实际 RAM、保留区和整个 BSS 范围共同核对。
+`boot.env` 区分容器暂存地址、物理 `kernel_load/kernel_entry`、ELF entry 和完整 `kernel_mem_end`，并列出 DTB/initrd 范围。两板统一使用 `fdt_addr`，供下载和固件交接使用。LoongArch 的 `kernel_addr_r`、`ramdisk_addr_r`、`fdt_addr` 使用 cached DMW 地址，容器头和 initrd 属性保留物理地址；RISC-V 运行地址仍为物理地址。包装检查对象间不重叠，但不能证明它们落在实板可用 RAM 内，须与实际 RAM、保留区和整个 BSS 范围共同核对。
 
 ## 4. RAM 根：两板分别人工启动
 
-先核对本固件支持容器格式和 `bootm` 交接方式。下列变量来自本次 `boot.env` 和实际地址安排；只执行临时命令，不保存环境：
+固件须支持文本环境导入和对应的 `bootm` 交接方式，已有 `loadaddr` 须位于可用暂存 RAM。先下载并导入本次 `boot.env`，每条成功后才继续；`${filesize}` 在导入前必须仍是环境文件的长度。只修改当前 RAM 环境，不执行 `saveenv`：
 
 ```text
 setenv serverip <开发机TFTP地址>
 setenv ipaddr <开发板固件地址>
-setenv fdt_high ffffffffffffffff
-setenv initrd_high ffffffffffffffff
+tftpboot ${loadaddr} boot.env
+env import -t ${loadaddr} ${filesize}
 tftpboot ${kernel_addr_r} kernel.uImage
-tftpboot ${fdt_addr_r} board.dtb
+tftpboot ${fdt_addr} board.dtb
 tftpboot ${ramdisk_addr_r} root.uInitrd
-iminfo ${kernel_addr_r}
-fdt addr ${fdt_addr_r}
-fdt print /chosen
+fdt addr ${fdt_addr}
 setenv bootargs 'root=/dev/ram0 rootdir=/ rw init=/sbin/init blossom.boot=shell'
 ```
 
-完成上述装载和校验后，分别采用对应板的交接协议，不把两板的启动命令混用。[2]
+本节显式设置 `blossom.boot=shell`，不假设外部输入的 DTB 已选择 Shell 会话。完成装载后，直接执行对应板的 `bootm`，不把两板的启动参数混用。[2]
 
 **VisionFive 2：**
 
 ```text
-bootm ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
+bootm ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr}
 ```
 
 **2K1000LA 的 U-Boot `g2ed41674`：**
 
 ```text
-setenv fdt_addr ${fdt_addr_r}
 bootm ${kernel_addr_r} ${ramdisk_addr_r}
 ```
 
@@ -135,11 +132,10 @@ RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设�
 ```text
 # VF2：实际 SD 分区示例
 setenv bootargs 'root=/dev/mmcblk0p2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
-bootm ${kernel_addr_r} - ${fdt_addr_r}
+bootm ${kernel_addr_r} - ${fdt_addr}
 
 # LA：实际 SATA 分区示例
 setenv bootargs 'root=/dev/sda2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
-setenv fdt_addr ${fdt_addr_r}
 bootm ${kernel_addr_r}
 ```
 

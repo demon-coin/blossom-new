@@ -195,7 +195,7 @@ def write_os_dtb(source_path, target_path, initrd_range):
 
 def write_boot_environment(architecture, target_platform, layout, raw_kernel_path, output_directory,
                            epoch, root_ext4_image_path, os_dtb_path, root_device, root_mode, init_program):
-    """按物理范围安排独立暂存区，并输出各板 bootm 实际使用的运行地址。"""
+    """按物理范围安排独立暂存区，输出装载地址与内核参数，不生成固件执行命令。"""
     architecture_id = 26 if architecture == "riscv64" else 27
     load = min(segment["physical"] for segment in layout["loads"])
     memory_end = max(segment["physical"] + segment["memory_size"] for segment in layout["loads"])
@@ -217,7 +217,6 @@ def write_boot_environment(architecture, target_platform, layout, raw_kernel_pat
             f"kernel_raw_size={raw_kernel_path.stat().st_size:#x}", f"kernel_image_size={kernel_size:#x}",
             f"kernel_mem_end={memory_end:#x}"]
     cursor = align_staging_address(staging + kernel_size)
-    ramdisk_argument = "-"
     initrd_range = None
     if root_ext4_image_path is not None:
         validate_root_ext4_image(root_ext4_image_path)
@@ -230,16 +229,13 @@ def write_boot_environment(architecture, target_platform, layout, raw_kernel_pat
                  f"ramdisk_addr_r={board_runtime_address(architecture, cursor):#x}",
                  f"ramdisk_image_size={size:#x}", f"initrd_start={payload:#x}",
                  f"initrd_end={cursor + size:#x}", "initrd_high=0xffffffffffffffff"]
-        ramdisk_argument = f"{board_runtime_address(architecture, cursor):#x}"
         cursor = align_staging_address(cursor + size)
     if os_dtb_path is not None:
         size = write_os_dtb(os_dtb_path, output_directory / "board.dtb", initrd_range)
         spans.append((cursor, cursor + size, "OS DTB"))
         fdt_address = board_runtime_address(architecture, cursor)
-        rows += ["fdt_file=board.dtb", f"fdt_addr_r={fdt_address:#x}", f"fdt_size={size:#x}",
+        rows += ["fdt_file=board.dtb", f"fdt_addr={fdt_address:#x}", f"fdt_size={size:#x}",
                  "fdt_high=0xffffffffffffffff"]
-        if architecture == "loongarch64":
-            rows.append(f"fdt_addr={fdt_address:#x}")
     else:
         rows.append("# 未提供 os_dtb；启动前须准备实际传给内核的 OS DTB。")
     if not all(0 <= start < end <= U32_LIMIT for start, end, _ in spans):
@@ -255,16 +251,8 @@ def write_boot_environment(architecture, target_platform, layout, raw_kernel_pat
         if not re.fullmatch(r"/[A-Za-z0-9_./-]+", init_program):
             raise ValueError("invalid board init path")
         rows.append(f"bootargs=root={root_device} rootdir=/ {root_mode} init={init_program}")
-        if os_dtb_path is not None:
-            command = f"bootm {board_runtime_address(architecture, staging):#x}"
-            if architecture == "riscv64":
-                command += f" {ramdisk_argument} {fdt_address:#x}"
-            elif root_ext4_image_path is not None:
-                command += f" {ramdisk_argument}"
-            rows.append(f"blossom_boot={command}")
     else:
-        rows.append("# 未选择 root_device；未生成 bootargs 或启动命令。")
-    rows.append("# blossom_boot 仅供手动执行；实际固件、ABI 和 RAM 尚未验证。")
+        rows.append("# 未选择 root_device；未生成 bootargs。")
     (output_directory / "boot.env").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 

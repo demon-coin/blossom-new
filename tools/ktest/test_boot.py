@@ -194,7 +194,7 @@ class BoardPackagingTests(unittest.TestCase):
     """验证离线文件内容、发布边界和正式 CLI，不把生成物当作实板运行证据。"""
 
     def test_production_images_crc_memory_spans_and_optional_inputs(self):
-        """两板最终树指向容器实际载荷，固件命令地址与物理装载范围分别满足各自协议。"""
+        """两板容器地址、CRC 与 DTB 载荷范围满足各自运行地址协议。"""
         for architecture, platform in (("riscv64", "visionfive2"), ("loongarch64", "ls2k1000la")):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -219,7 +219,6 @@ class BoardPackagingTests(unittest.TestCase):
                 self.assertEqual(fields[1], zlib.crc32(container[:4] + bytes(4) + container[8:LEGACY_HEADER.size]))
                 self.assertEqual(container[LEGACY_HEADER.size:], raw)
                 rows = read_boot_environment(output)
-                self.assertNotIn("blossom_boot", rows)
                 self.assertNotIn("bootargs", rows)
                 memory_end = loads[-1][3] + loads[-1][5]
                 self.assertEqual(int(rows["kernel_mem_end"], 16), memory_end)
@@ -233,14 +232,9 @@ class BoardPackagingTests(unittest.TestCase):
                 original_dtb = dtb.read_bytes()
                 package_board_boot_images(architecture, platform, kernel, output, os_dtb_path=dtb)
                 rows = read_boot_environment(output)
-                self.assertNotIn("blossom_boot", rows)
                 self.assertNotIn("bootargs", rows)
                 package_board_boot_images(architecture, platform, kernel, output,
                                           os_dtb_path=dtb, root_device="/dev/sda1")
-                rows = read_boot_environment(output)
-                command = rows["blossom_boot"].split()
-                self.assertEqual(command, ["bootm", rows["kernel_addr_r"]] +
-                                 (["-", rows["fdt_addr_r"]] if architecture == "riscv64" else []))
                 self.assertFalse((output / "root.uInitrd").exists())
                 self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-start"), 0x12340000)
                 self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-end"), 0x12341000)
@@ -253,10 +247,7 @@ class BoardPackagingTests(unittest.TestCase):
                                  {"root": "/dev/ram0", "rootdir": "/", "init": "/sbin/init"})
                 self.assertIn("ro", bootargs)
                 self.assertNotIn("rw", bootargs)
-                self.assertEqual(rows["blossom_boot"].split(),
-                                 ["bootm", rows["kernel_addr_r"], rows["ramdisk_addr_r"]] +
-                                 ([rows["fdt_addr_r"]] if architecture == "riscv64" else []))
-                addresses = [int(rows[name], 16) for name in ("kernel_addr_r", "ramdisk_addr_r", "fdt_addr_r")]
+                addresses = [int(rows[name], 16) for name in ("kernel_addr_r", "ramdisk_addr_r", "fdt_addr")]
                 for address in addresses:
                     self.assertEqual(address & ~(U32_LIMIT - 1), direct_base)
                 kernel_physical, ramdisk_physical, fdt_physical = [address - direct_base for address in addresses]
@@ -282,13 +273,10 @@ class BoardPackagingTests(unittest.TestCase):
                 header = struct.unpack_from(">10I", padded_dtb)
                 used_end = max(header[2] + header[9], header[3] + header[8])
                 self.assertLessEqual(used_end + 64 * 1024, len(padded_dtb))
-                if architecture == "loongarch64":
-                    self.assertEqual(rows["fdt_addr"], rows["fdt_addr_r"])
                 self.assertEqual(kernel.read_bytes(), image)
                 self.assertEqual(root.read_bytes(), root_bytes)
                 self.assertEqual(dtb.read_bytes(), original_dtb)
                 package_board_boot_images(architecture, platform, kernel, output, root_device="/dev/sda1")
-                self.assertNotIn("blossom_boot", read_boot_environment(output))
                 self.assertFalse((output / "root.uInitrd").exists())
                 self.assertFalse((output / "board.dtb").exists())
 
@@ -305,7 +293,6 @@ class BoardPackagingTests(unittest.TestCase):
             output = directory / "output"
             package_board_boot_images("riscv64", "visionfive2", kernel, output, root, dtb)
             rows = read_boot_environment(output)
-            self.assertNotIn("blossom_boot", rows)
             start = read_fdt_address(output / "board.dtb", "linux,initrd-start")
             end = read_fdt_address(output / "board.dtb", "linux,initrd-end")
             payload_offset = start - int(rows["ramdisk_addr_r"], 16)
