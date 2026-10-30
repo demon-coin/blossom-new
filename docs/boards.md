@@ -180,9 +180,19 @@ cd /test/selftests/fs
 
 ## 7. 运行边界与记录
 
-以下实板状态与数据保留此前各 ELF 的验证身份。本次三处解析修正尚未使用完整 OS DT 重新上板，不把表中结果转记到修后内核。
+### 完整 OS DT 的最近一次实板尝试
 
-| 必须分开的路径 | 当前硬件状态 |
+源码 `43389aa1` 的 VF2 普通 debug 内核已用完整输入实际执行一次。ELF SHA256为`2ca3e55d973c71f1dcf7f7506624bdd7ac8ee8a373c2bede0903ea405bea6ddd`；本轮包装前后硬件描述均为292节点/1924属性，CMA动态请求、ccache三段reg及两个enabled GMAC全部保留。正式无initrd `bootm` 前，kernel.uImage与DTB的固件全文CRC32分别为`ab3e5a2d`、`861f605e`，均等于宿主输入。
+
+本次已到`BOOT platform=VisionFive2 cpus=4 bsp=1`、`MEMORY`和`BUDDY`，随后实际停止在`FAIL panic: panicked at src/time.rs:337:49`。该位置为RTC日历转换的`expect`：采样返回了日历，通用公历校验未通过；原串口没有打印六个日期字段，尚不能确定是未校时还是采样/解码问题。
+
+这不是完整启动通过：四个CPU仅已发现，尚未启动AP或到READY，也未执行内核Storage/SD根挂载、GMAC数据、PID1/TTY/Shell及正常Halt。固件使用GMAC1成功TFTP不证明本内核网络。没有关闭RTC节点绕过、校时、改驱动、重写SD或刷固件。原文和输入身份见`build/vf2-full-native/{native-summary.json,uart.log,package-identity.json}`；最后观测为panic而非正常停机，已停止本轮TFTP并交还串口。
+
+### 此前各 ELF 的实板记录
+
+下表及后续PHY、网络和停止段落只保各旧ELF的当时事实，其中“本轮”“当前”均指对应记录时点，不转记为上述完整输入已通过。
+
+| 必须分开的路径 | 当时验证状态 |
 |---|---|
 | VF2 RAM 根 | 本轮正式bootm已到四应用核、完整PID1/TTY/Shell，文件写读/sync、同原始RAM卷重载后的易失性及正常Halt已验；自然SBI cold restart的PMIC失败保留 |
 | VF2 SD 分区直接根 | 本轮`/dev/mmcblk0p1`唯一RW根、两次无initrd bootm、现有std/用户程序、marker及8229字节文件同步Halt后用户RESET冷读一致已验；不签自然SBI restart、poweroff或掉电 |
