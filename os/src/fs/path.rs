@@ -1491,7 +1491,7 @@ impl Vfs {
         self.retire_mount(mount)
     }
 
-    /// 保有同一实例直到锁外同步完成，重查后摘表，名字与后端的最后释放始终在表锁外。
+    /// 保同一实例同步后重查摘表；表锁外释放挂载并回收缓存，最后同步退休无 canonical 槽的卷绑定。
     fn retire_mount(&self, mount: Arc<Mount>) -> Result<(), FsError> {
         let covered = mount.covered.as_ref().ok_or(FsError::InvalidOperation)?;
         mount.filesystem.sync()?;
@@ -1508,6 +1508,7 @@ impl Vfs {
         self.inodes.prune_unused();
         if let Filesystem::Ext4(volume) = filesystem {
             volume.prune_unused();
+            self.inodes.retire_volume(&volume);
         }
         Ok(())
     }

@@ -1,6 +1,7 @@
 //! 真实目录名字、逐组件路径和只读挂载的拥有与消费回归。
 
 use crate::fs::dentry::DentryRef;
+use crate::fs::file::{open_path_with_flags, FileIoContext};
 use crate::fs::ktest::*;
 use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{FsContext, Path, ResolveMode, Vfs};
@@ -292,15 +293,6 @@ pub(crate) mod walk {
             ),
         )?;
         context.expect_eq(Arc::ptr_eq(&volume, &reopened), true);
-        context.expect_eq(
-            Ext4Volume::open(
-                BlockView::whole(fixture.owner.disk()?.clone()),
-                AccessMode::ReadOnly,
-                64,
-            )
-            .err(),
-            Some(FsError::Busy),
-        );
         let ro = checked(
             context,
             Vfs::try_new(
@@ -352,6 +344,139 @@ pub(crate) mod walk {
         context.diagnostic(format_args!(
             "mount-mode volume-RW=1 same-volume=1 canonical-inode=1 RO-write-intent-rejected=1 RW-access-granted=1 full-read-pattern=1 file-write-fsync-covered=0"
         ));
+        Ok(())
+    }
+
+    /// RAM 根与原 inode 缓存持续存活时，同盘普通卸载允许切换写模式并冷读同步后的完整数据。
+    #[test]
+    #[ktest(tags("fs-mount-lifetime"))]
+    fn ro_unmount_rw_reopen_persists_file(
+        context: &mut TestContext<'_>,
+        fixture: &mut PathOwner,
+    ) -> TestResult {
+        let memory = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o755))?;
+        fixture.vfs = Some(
+            Arc::try_new(checked(
+                context,
+                Vfs::try_new(
+                    Filesystem::Memory(memory),
+                    fixture.owner.cache().clone(),
+                    128,
+                    2,
+                    AccessMode::ReadWrite,
+                ),
+            )?)
+            .map_err(|_| TestError("mount lifetime RAM root OOM"))?,
+        );
+        fixture.context = Some(checked(
+            context,
+            FsContext::new(fixture.vfs().root(), fixture.vfs().root()),
+        )?);
+        let vfs = fixture.vfs();
+        let fs_context = fixture.context();
+        checked(
+            context,
+            vfs.mkdir_from(fs_context, fs_context.root(), b"/disk", 0o755, (0, 0), 0),
+        )?;
+        let covered = fixture.resolve(context, b"/disk")?;
+        let view = BlockView::whole(fixture.owner.disk()?.clone());
+        let volume = checked(
+            context,
+            Ext4Volume::open(view.clone(), AccessMode::ReadOnly, 64),
+        )?;
+        checked(
+            context,
+            vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly),
+        )?;
+        {
+            let path = fixture.resolve(context, b"/disk/pattern")?;
+            let file = checked(
+                context,
+                open_path_with_flags(vfs, path, 0, FileIoContext::Kernel),
+            )?;
+            context.expect_eq(checked(context, file.stat())?.size, PATTERN_SIZE);
+            let mut bytes = [0xa7; 4096];
+            let mut offset = 0;
+            while offset < PATTERN_SIZE {
+                let length = (PATTERN_SIZE - offset).min(bytes.len() as u64) as usize;
+                context.expect_eq(
+                    checked(context, file.read_at(offset, &mut bytes[..length]))?,
+                    length,
+                );
+                context.expect_eq(patterned(&bytes[..length], offset), true);
+                offset += length as u64;
+            }
+        }
+        checked(context, vfs.unmount(&covered))?;
+
+        let volume = checked(
+            context,
+            Ext4Volume::open(view.clone(), AccessMode::ReadWrite, 64),
+        )?;
+        checked(
+            context,
+            vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadWrite),
+        )?;
+        const WRITTEN: &[u8] = b"persisted after unmount";
+        const EXPECTED: &[u8] = b"persisted";
+        {
+            let file = checked(
+                context,
+                vfs.open_with(
+                    fs_context,
+                    fs_context.root(),
+                    b"/disk/mount-lifetime.tmp",
+                    (0, 0),
+                    Some((0o644, 0)),
+                    true,
+                    false,
+                    |path, _| open_path_with_flags(vfs, path, 2, FileIoContext::Kernel),
+                ),
+            )?;
+            context.expect_eq(checked(context, file.write_at(0, WRITTEN))?, WRITTEN.len());
+            checked(
+                context,
+                vfs.rename_from(
+                    fs_context,
+                    fs_context.root(),
+                    b"/disk/mount-lifetime.tmp",
+                    fs_context.root(),
+                    b"/disk/mount-lifetime.done",
+                    false,
+                    (0, 0),
+                ),
+            )?;
+            checked(context, file.truncate(EXPECTED.len() as u64))?;
+            checked(context, file.sync_range(0..u64::MAX, false))?;
+            checked(context, vfs.sync())?;
+        }
+        checked(context, vfs.unmount(&covered))?;
+
+        let volume = checked(context, Ext4Volume::open(view, AccessMode::ReadOnly, 64))?;
+        checked(
+            context,
+            vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly),
+        )?;
+        {
+            context.expect_eq(
+                vfs.resolve(fs_context, b"/disk/mount-lifetime.tmp", ResolveMode::Follow)
+                    .err(),
+                Some(FsError::NotFound),
+            );
+            let path = fixture.resolve(context, b"/disk/mount-lifetime.done")?;
+            let file = checked(
+                context,
+                open_path_with_flags(vfs, path, 0, FileIoContext::Kernel),
+            )?;
+            context.expect_eq(checked(context, file.stat())?.size, EXPECTED.len() as u64);
+            let mut bytes = [0xa7; WRITTEN.len()];
+            context.expect_eq(
+                checked(context, file.read_at(0, &mut bytes))?,
+                EXPECTED.len(),
+            );
+            context.expect_eq(&bytes[..EXPECTED.len()], EXPECTED);
+        }
+        checked(context, vfs.unmount(&covered))?;
         Ok(())
     }
 

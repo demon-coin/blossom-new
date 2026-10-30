@@ -58,7 +58,7 @@ struct InodeIndex {
     /// 活视图唯一共享的有限名字索引，失去最后拥有后可重新选择预算。
     dentry_cache: Weak<DentryCache>,
     slots: Vec<Option<InodeSlot>>,
-    /// 每个实际绑定卷保留至域关闭后的同步停止；容量与 canonical 槽预算相同。
+    /// 实际卷绑定保留至显式卸载或域关闭后的同步停止；容量与 canonical 槽预算相同。
     volumes: Vec<Arc<Ext4Volume>>,
     cache_open: bool,
     evicted: usize,
@@ -176,6 +176,24 @@ impl InodeDomain {
         }
         index.volumes.push(volume.clone());
         Ok(())
+    }
+
+    /// 调用者持目标卷绑定锁；仅在全部 canonical 槽均不属于该卷时移交原 Arc，锁外同步停止。
+    pub(crate) fn take_unused_volume(&self, volume: &Arc<Ext4Volume>) -> Option<Arc<Ext4Volume>> {
+        let mut index = self.index.lock();
+        if index
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| Arc::ptr_eq(&slot.inode.disk().filesystem, volume))
+        {
+            return None;
+        }
+        let position = index
+            .volumes
+            .iter()
+            .position(|bound| Arc::ptr_eq(bound, volume))?;
+        Some(index.volumes.swap_remove(position))
     }
 
     /// 回收 Work 在 Task 中停止已关闭域的无槽卷，活 inode 和失败槽继续保留各自卷绑定。
@@ -337,8 +355,8 @@ impl InodeDomain {
         }
     }
 
-    /// 双查同身份后发表 Loading；槽强拥有不计作外部使用。
-    /// 返回 None 将首次加载责任留给调用者，调用者随后必须完成原候选的结果发表。
+    /// 每轮先在原索引锁内确认卷绑定仍存在，再双查同身份并发表 Loading；槽拥有不计外部使用。
+    /// 已摘绑定返回 Busy；返回 None 后调用者必须完成原候选的结果发表。
     fn publish(
         self: &Arc<Self>,
         candidate: &InodeRef,
@@ -346,6 +364,13 @@ impl InodeDomain {
     ) -> Result<Option<InodeRef>, FsError> {
         loop {
             let mut index = self.index.lock();
+            if !index
+                .volumes
+                .iter()
+                .any(|volume| Arc::ptr_eq(volume, &candidate.disk().filesystem))
+            {
+                return Err(FsError::Busy);
+            }
             match find(
                 &mut index,
                 self,
@@ -1513,6 +1538,11 @@ impl InodeCache {
     /// 把 cache-only 页和真实脏义务交给原 pool 中的 Task，返回已经结束回收的槽数。
     pub fn prune_unused(&self) -> usize {
         self.domain.prune_unused()
+    }
+
+    /// 普通 Task 在显式卸载回收完成后，请原卷同步退休本缓存域的无槽绑定。
+    pub(crate) fn retire_volume(&self, volume: &Arc<Ext4Volume>) {
+        volume.retire_inode_domain(&self.domain);
     }
 
     /// 返回 Loading、缓存以及待回收对象共同占用的槽数。

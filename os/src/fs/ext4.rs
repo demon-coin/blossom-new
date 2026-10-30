@@ -333,6 +333,28 @@ impl Ext4Volume {
         Ok(())
     }
 
+    /// 普通 Task 仅退休目标域的无槽绑定；旧 Weak 保留到锁外 WB 全尾结束，阻止提前 activate。
+    pub(crate) fn retire_inode_domain(self: &Arc<Self>, domain: &Arc<InodeDomain>) {
+        let expected = Arc::downgrade(domain);
+        let volume = {
+            let binding = self.inode_domain.lock();
+            if !Weak::ptr_eq(&binding, &expected) {
+                return;
+            }
+            domain.take_unused_volume(self)
+        };
+        let Some(volume) = volume else {
+            return;
+        };
+        volume.writeback_domain().stop_sync();
+        let retired = {
+            let mut binding = self.inode_domain.lock();
+            core::mem::replace(&mut *binding, Weak::new())
+        };
+        drop(retired);
+        drop(volume);
+    }
+
     /// 隐藏 EA 使用原活卷与 canonical 域取得，不创建第二个缓存或从裸地址构造 Arc。
     pub(crate) fn iget_ea_inode(
         &self,
