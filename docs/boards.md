@@ -73,7 +73,7 @@ make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
   BOARD_ROOT_MODE=rw BOARD_OS_DTB=/absolute/actual-ls2k1000la-os.dtb
 ```
 
-`BOARD_ROOT_EXT4_IMAGE` 是只读输入，不是制盘输出。包装从最终普通 ELF 的公开符号和 LOAD 取得实际布局，不导入测试包、不要求测试节或展开信息；已有固定 ELF 也可直接交 `tools/package_board_boot_images.py --help` 所示 CLI，不重编内核。
+`BOARD_ROOT_EXT4_IMAGE` 是只读输入，不是制盘输出。构建和包装统一通过根 Makefile 的 `package-board-boot-images`；包装从最终普通 ELF 的公开符号和 LOAD 取得实际布局，不导入测试包、不要求测试节或展开信息。
 
 每次包装产生 `kernel.elf`、`kernel.bin`、`kernel.uImage`、`boot.env`，有对应输入才产生 `root.uInitrd`、`board.dtb`。`boot.env` 只提供装载地址和内核参数，不生成启动命令；缺 DTB 或明确 root 时不能据此认定可部署成功。LoongArch 容器使用实际架构编码，不伪装成 MIPS。
 
@@ -127,9 +127,9 @@ RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设�
 
 2K1000LA 的主机只生成镜像和提供 TFTP，不拆 SSD 接宿主，不在宿主执行 `dd`。首次部署由板卡 U-Boot 将 raw ext4 下载到可用 RAM，再执行 `scsi write <RAM地址> <起始LBA> <扇区数>`；普通启动不重复写盘。写入对象是 ext4 卷本身，不能使用带 legacy 头的 `root.uInitrd`。
 
-历史板端记录为 SCSI 设备 0、DOS 第一分区起始 LBA `0x40003f`，当前内核根名为 `/dev/sda1`；这只是已记录的布局，写入前必须核对当前磁盘、分区边界、扇区大小和镜像长度。不能因固件位于 SPI 就把 SSD 认定为空盘并从 LBA 0 覆盖，也不无依据地声称 SATA 上有原厂系统。较大卷按可用 RAM 分块传输，每块的长度和写入 LBA 独立计算，不沿用历史镜像的最后一块长度。
+历史板端记录为 SCSI 设备 0、DOS 第一分区起始 LBA `0x40003f`，若明确选择覆写该旧根卷，当前内核根名为 `/dev/sda1`；这不表示本轮镜像已部署到该分区，也不构成覆盖授权。写入前必须核对当前磁盘、分区边界、扇区大小和镜像长度。不能因固件位于 SPI 就把 SSD 认定为空盘并从 LBA 0 覆盖，也不无依据地声称 SATA 上有原厂系统。较大卷按可用 RAM 分块传输，每块的长度和写入 LBA 独立计算，不沿用历史镜像的最后一块长度。
 
-无 RAM 根的独立 OS DTB 必须删除 `/chosen/linux,initrd-start` 与 `linux,initrd-end`，并将 `root=` 改为同一明确持久分区；不能直接沿用 RAM 启动树中的旧范围。包装复用已有生产 ELF，不传 `--root-ext4-image`，只提供 OS DTB、明确 root 和模式。先前的 RAM 包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
+无 RAM 根的独立 OS DTB 必须删除 `/chosen/linux,initrd-start` 与 `linux,initrd-end`，并将 `root=` 改为同一明确持久分区；不能直接沿用 RAM 启动树中的旧范围。统一使用 `make package-board-boot-images`，以 `BOARD_OS_DTB`、`BOARD_ROOT_DEVICE`、`BOARD_ROOT_MODE` 指定输入，并用 `BOARD_ROOT_EXT4_IMAGE=` 排除 ramdisk。先前的 RAM 包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
 
 直接根启动不加载 initrd。分区名仅示例，必须替换为实际目标；kernel/DTB 仍可由 TFTP 载入：
 
