@@ -79,6 +79,12 @@ BOARD_OS_DTB ?=
 BOARD_ROOT_DEVICE ?=
 BOARD_ROOT_MODE ?= ro
 BOARD_INIT_PROGRAM ?= /sbin/init
+BOARD_DTB_OUTPUT ?= build/board/$(ARCH)/$(TARGET_PLATFORM)/board-input.dtb
+BOARD_DTS_SOURCE_visionfive2 := os/dts/riscv64/starfive/visionfive2-full.dts
+BOARD_DTS_SOURCE_ls2k1000la := os/dts/loongarch64/loongson/ls2k1000-dp.dts
+BOARD_DTS_SOURCE := $(BOARD_DTS_SOURCE_$(TARGET_PLATFORM))
+HOSTCC ?= cc
+DTC ?= dtc
 LIBC_SOURCES := tests/user/abi/libc_smoke.c tests/user/abi/libc_common.c tests/user/process/libc_lifecycle.c tests/user/process/script.c tests/user/fs/libc_file.c tests/user/abi/libc_system.c tests/user/process/limits.c tests/user/fs/file_time.c tests/user/abi/clock.c tests/user/net/socket_timeout.c
 LIBC_HEADERS := tests/user/include/libc_common.h tests/user/include/fp.h
 NETWORK_SOURCES := tests/user/net/network_smoke.c $(addprefix tests/user/net/,common.c tcp.c udp.c unix.c options.c ipv6.c peer.c control.c)
@@ -126,6 +132,11 @@ $(error build-kernel-test-elf/list-kernel-tests/run-kernel-tests require TARGET_
 endif
 endif
 ifeq ($(TARGET_PLATFORM),qemu-virt)
+ifneq ($(filter build-board-dtb,$(MAKECMDGOALS)),)
+$(error build-board-dtb requires TARGET_PLATFORM=visionfive2 or ls2k1000la)
+endif
+endif
+ifeq ($(TARGET_PLATFORM),qemu-virt)
 ifneq ($(filter package-board-boot-images,$(MAKECMDGOALS)),)
 $(error package-board-boot-images requires TARGET_PLATFORM=visionfive2 or TARGET_PLATFORM=ls2k1000la)
 endif
@@ -144,7 +155,7 @@ else
 $(error KTEST_PANIC_STRATEGY must be unwind or abort)
 endif
 
-.PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts package-board-boot-images
+.PHONY: all build-kernel build-guest-userland prepare-guest-runtime-libraries assemble-root-filesystem create-ext4-image build-qemu-artifacts build-board-dtb package-board-boot-images
 .PHONY: build-contest-runner user-tests build-kernel-test-elf list-kernel-tests run-kernel-tests run-qemu clean-build-artifacts clean-qemu-working-disks help
 .PHONY: build-user-selftests install-user-selftests run-user-selftests
 .PHONY: build-linux-user-selftests run-linux-user-selftests
@@ -176,6 +187,19 @@ assemble-root-filesystem: build-guest-userland prepare-guest-runtime-libraries
 
 create-ext4-image:
 	python3 tools/create_ext4_image.py --source-tree "$(ROOTFS_TREE_DIR)" --output-image "$(SYSTEM_ROOT_EXT4_IMAGE)" --profile "$(EXT4_PROFILE)" --size-mib "$(EXT4_SIZE_MIB)"
+
+build-board-dtb:
+	@directory="$$(dirname -- "$(BOARD_DTB_OUTPUT)")"; \
+	mkdir -p "$$directory" || exit $$?; \
+	temporary="$$(mktemp -d "$$directory/.board-dtb.XXXXXX")" || exit $$?; \
+	trap 'status=$$?; rm -rf -- "$$temporary"; exit "$$status"' EXIT; \
+	trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+	$(HOSTCC) -E -P -C -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
+	  -I os/dts/include -I "$$(dirname -- "$(BOARD_DTS_SOURCE)")" \
+	  "$(BOARD_DTS_SOURCE)" -o "$$temporary/board-source.dts" || exit $$?; \
+	$(DTC) $(if $(filter visionfive2,$(TARGET_PLATFORM)),-@) -I dts -O dtb -p 65536 \
+	  -o "$$temporary/board-input.dtb" "$$temporary/board-source.dts" || exit $$?; \
+	mv -fT -- "$$temporary/board-input.dtb" "$(BOARD_DTB_OUTPUT)" || exit $$?
 
 package-board-boot-images: build-kernel
 	python3 tools/package_board_boot_images.py --arch $(ARCH) --target-platform $(TARGET_PLATFORM) --kernel-elf "$(KERNEL_ELF_OUTPUT)" --output-directory "$(BOARD_BOOT_IMAGES_OUTPUT_DIR)" $(if $(BOARD_ROOT_EXT4_IMAGE),--root-ext4-image "$(BOARD_ROOT_EXT4_IMAGE)") $(if $(BOARD_OS_DTB),--os-dtb "$(BOARD_OS_DTB)") $(if $(BOARD_ROOT_DEVICE),--root-device "$(BOARD_ROOT_DEVICE)") --root-mode "$(BOARD_ROOT_MODE)" --init-program "$(BOARD_INIT_PROGRAM)"
@@ -334,6 +358,8 @@ help:
 	  'create-ext4-image                   Only consume ROOTFS_TREE_DIR; write SYSTEM_ROOT_EXT4_IMAGE.' \
 	  'build-qemu-artifacts ARCH=...        Fixed release/abort QEMU kernel and one single-root disk.' \
 	  'all                                Export kernel-rv/kernel-la/disk.img/disk-la.img.' \
+	  'build-board-dtb                     Build the selected board DTB from in-repository sources.' \
+	  '  BOARD_DTB_OUTPUT selects the output; HOSTCC and DTC select installed host tools.' \
 	  'package-board-boot-images           Build board kernel and generate offline boot files.' \
 	  '  BOARD_BOOT_IMAGES_OUTPUT_DIR, BOARD_ROOT_EXT4_IMAGE, BOARD_OS_DTB,' \
 	  '  BOARD_ROOT_DEVICE, BOARD_ROOT_MODE and BOARD_INIT_PROGRAM map directly to packaging.' \

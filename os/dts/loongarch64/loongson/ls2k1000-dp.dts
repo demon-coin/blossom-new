@@ -1,0 +1,68 @@
+/dts-v1/;
+
+#include "loongson-2k1000.dtsi"
+
+/ {
+	model = "Loongson LS2K1000-DP (1 GiB)";
+	compatible = "loongson,ls2k1000-dp", "loongson,ls2k1000";
+
+	aliases {
+		serial0 = &uart0;
+		ethernet0 = &gmac0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x00000000 0x0 0x10000000>,
+		      <0x0 0x90000000 0x0 0x30000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		firmware@cbf4c30 {
+			reg = <0x0 0x0cbf4c30 0x0 0x0200b3d0>;
+			no-map;
+		};
+
+		bootparam@f000000 {
+			reg = <0x0 0x0f000000 0x0 0x01000000>;
+			no-map;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&rtc0 {
+	status = "okay";
+};
+
+&gmac0 {
+	status = "okay";
+	phy-mode = "rgmii";
+	phy-handle = <&phy0>;
+
+	mdio {
+		compatible = "snps,dwmac-mdio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		phy0: ethernet-phy@0 {
+			reg = <0>;
+		};
+	};
+};
+
+&sata {
+	ports-implemented = <1>;
+	status = "okay";
+};

@@ -4,7 +4,7 @@
 
 ## 1. 环境与构建职责
 
-宿主命令在仓库根执行。准备固定 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC，以及需要的 QEMU 9.2.1。制盘使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；运行库检查使用支持目标 ELF 的 `readelf`。工具由 PATH 或明确参数提供；构建不下载或升级工具链，Nix 仅是个人环境。
+宿主命令在仓库根执行。准备固定 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC，以及需要的 QEMU 9.2.1。制盘使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；运行库检查使用支持目标 ELF 的 `readelf`。板卡设备树从仓内源码生成，宿主需提供C预处理器和 `dtc`，RAM根包装还需 `fdtput`。工具由PATH或明确参数提供；构建不下载或升级工具链，Nix仅是个人环境。
 
 普通内核与 ktest 都需要该固定工具链的 `rust-src`，由 `os/.cargo/config.toml` 统一重编 `core/alloc` 及 `compiler-builtins-mem`。LoongArch 统一关闭 `ual`，使内核和标准库都生成严格对齐的访存；不能只约束内核后继续链接预编译的标准库。Make 清除外部 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS`，通过 Cargo 原生 `--config` 数组合并 panic/unwind 参数与目标 ISA 约束。直接 Cargo 构建仍从 `os/` 执行；独立用户 std 程序继续消费已准备的目标标准库和 sysroot，不读取内核配置。
 
@@ -24,6 +24,7 @@ make prepare-guest-runtime-libraries ARCH=riscv64
 | `assemble-root-filesystem` | 消费用户程序、库和配置，替换项目拥有的单根输出树 |
 | `create-ext4-image` | 只消费指定完整树，生成无 journal 的 raw ext4 卷 |
 | `build-qemu-artifacts` | 生成一个架构的固定 release/abort 内核和单根系统卷 |
+| `build-board-dtb` | 从仓内完整源码生成所选实体板OS DTB，不读取个人SDK或旧构建树 |
 | `all` | 生成并导出 `kernel-rv`、`kernel-la`、`disk.img`、`disk-la.img` |
 
 两张导出卷分别只有对应架构的根 `/`，不再复制 `/riscv64`、`/loongarch64` 双根。普通 ELF 不启用 ktest；显式 debug 构建不替换固定交付。
@@ -192,5 +193,5 @@ Plain/LTP 保原输出端点；需要正文的 Basic、固定 Pre2025、Tap 使�
 
 板内核、固件容器、RAM/持久根和普通用户程序的人工步骤见[上板与根卷指南](boards.md)。
 
-板构建与离线包装不依赖 ktest；ktest 不支持实体板传输。实际固件、OS DTB、RAM、分区与串口参数由用户上板时确认，四种真实根、DMA/IRQ/PHY 和同介质持久重启仍待硬件验证。保留完整日志、输入身份和实际失败，QEMU 或离线产物不签实板 Pass；LA NX 既有暂缓不计 Pass。不扩 journal/recovery、恶意坏盘防护或新的测试管理框架。
+板构建与离线包装不依赖ktest；ktest不支持实体板传输。仓内设备树只适用于各自记录的板卡及固件事实，实际装载范围、分区和串口参数须按设备确认；实板、DMA/IRQ/PHY及同介质持久重启只按各自输入和运行证据记录。保留完整日志、输入身份和实际失败，QEMU或离线产物不签实板Pass；LA NX既有暂缓不计Pass。不扩journal/recovery、恶意坏盘防护或新的测试管理框架。
 

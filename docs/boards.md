@@ -67,17 +67,28 @@ make create-ext4-image ARCH=loongarch64 \
 
 两卷各自以 `/` 为根，含匹配 ISA 的 `/sbin/init`、Shell、std 执行器和配置，不含另一架构目录。已有外部完整树直接交 `ROOTFS_TREE_DIR`，制盘不向其补程序或改写输入。保留支持的无 journal 格式，不启用 replay/recovery。
 
-准备实际 OS DTB 后包装 RAM 启动输入；下列 DTB 路径必须替换为真实输入：
+仓内为当前支持的两板提供设备树源码。先从仓库源码生成对应 OS DTB：
+
+```sh
+make build-board-dtb ARCH=riscv64 TARGET_PLATFORM=visionfive2
+make build-board-dtb ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la
+```
+
+默认分别输出 `build/board/riscv64/visionfive2/board-input.dtb` 和 `build/board/loongarch64/ls2k1000la/board-input.dtb`；`BOARD_DTB_OUTPUT` 可明确指定其他输出。宿主通过 PATH 提供 `cc`、`dtc` 和包装RAM根所需的 `fdtput`；`HOSTCC`、`DTC` 可选择已安装工具。构建不读取个人 `.docs/`、`ref/`、旧 `build/` 源或厂商SDK，也不下载工具。工具失败保留诊断，不能拿旧输出冒充本次结果。
+
+VF2入口及其固定StarFive SDK `4cecf169f38eb94b40e307f5f870055e4d9d64f1` 的DTS/DTSI、引脚和绑定头位于 `os/dts/`，完整硬件节点与原版权/SPDX保留。2K入口由本机此前使用的板级源码及Linux 7.3-rc4 SoC DTSI组成，`ports-implemented = <1>` 的硬件资料来自官方DP-V10；该树包含此前实测DP板的RAM和固件保留区，不能自动推广到其他板型、修订或固件。第三方文件按各自SPDX使用，相关许可证原文位于 `os/dts/LICENSES/`；2K本项目板级入口原无SPDX，不将现场固件源码身份冒认为已确认。
+
+包装RAM启动输入时，明确选择实际根卷及刚生成的板树：
 
 ```sh
 make package-board-boot-images ARCH=riscv64 TARGET_PLATFORM=visionfive2 \
   KERNEL_BUILD_PROFILE=release BOARD_BOOT_IMAGES_OUTPUT_DIR=build/vf2-boot \
   BOARD_ROOT_EXT4_IMAGE=build/board-root-rv.ext4 BOARD_ROOT_DEVICE=/dev/ram0 \
-  BOARD_ROOT_MODE=rw BOARD_OS_DTB=/absolute/actual-visionfive2-os.dtb
+  BOARD_ROOT_MODE=rw BOARD_OS_DTB=build/board/riscv64/visionfive2/board-input.dtb
 make package-board-boot-images ARCH=loongarch64 TARGET_PLATFORM=ls2k1000la \
   KERNEL_BUILD_PROFILE=release BOARD_BOOT_IMAGES_OUTPUT_DIR=build/2k-boot \
   BOARD_ROOT_EXT4_IMAGE=build/board-root-la.ext4 BOARD_ROOT_DEVICE=/dev/ram0 \
-  BOARD_ROOT_MODE=rw BOARD_OS_DTB=/absolute/actual-ls2k1000la-os.dtb
+  BOARD_ROOT_MODE=rw BOARD_OS_DTB=build/board/loongarch64/ls2k1000la/board-input.dtb
 ```
 
 `BOARD_ROOT_EXT4_IMAGE` 是只读输入，不是制盘输出。构建和包装统一通过根 Makefile 的 `package-board-boot-images`；包装从最终普通 ELF 的公开符号和 LOAD 取得实际布局，不导入测试包、不要求测试节或展开信息。
@@ -136,7 +147,7 @@ RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设�
 
 本轮已在所选 Kingchuxing SATA 盘创建并验证 `/dev/sda2`：起始 LBA `0x3b62800`，长度 `0x40000` 个 512 字节扇区（128 MiB）。经用户确认，只收短旧第一分区表项的末端，没有移动或缩容其 ext4 文件系统；原第三分区 swap 表项未改。MBR 前后备份、读回及本轮包身份沿 `build/sata-p2-live/final-evidence.json`。这些数值不是其他磁盘的默认布局；日常启动不再建表或写根卷，更新镜像前必须按实际分区容量核对范围。
 
-无 RAM 根的独立 OS DTB 必须删除 `/chosen/linux,initrd-start` 与 `linux,initrd-end`，并将 `root=` 改为同一明确持久分区；不能直接沿用 RAM 启动树中的旧范围。统一使用 `make package-board-boot-images`，以 `BOARD_OS_DTB`、`BOARD_ROOT_DEVICE`、`BOARD_ROOT_MODE` 指定输入，并用 `BOARD_ROOT_EXT4_IMAGE=` 排除 ramdisk。先前的 RAM 包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
+仓内基础OS DTB不携带旧 `linux,initrd-start/end`；无RAM根的输出仍须确认没有旧范围，并将 `root=` 明确为持久分区。外部DTB若带这些属性，调用者必须先在独立副本中删除，包装器不自动清除。统一使用 `make package-board-boot-images`，以 `BOARD_OS_DTB`、`BOARD_ROOT_DEVICE`、`BOARD_ROOT_MODE` 指定输入，并用 `BOARD_ROOT_EXT4_IMAGE=` 排除ramdisk。RAM包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
 
 直接根启动不加载 initrd。分区名仅示例，必须替换为实际目标；kernel/DTB 仍可由 TFTP 载入：
 
@@ -180,6 +191,15 @@ cd /test/selftests/fs
 
 ## 7. 运行边界与记录
 
+### 仓内设备树的本次VF2验证
+
+本代release内核和仓内VF2设备树已分别实际启动RAM根及SD根；两模式均到四核READY、明确的唯一RW根和PID1/Shell，文件共享2TAP与affinity5TAP各自通过，两程序及shell退出0，sync0后均完整正常Halt。RAM根为`/dev/ram0`，用户人工RESET后第二次启动选择`/dev/mmcblk0p1`，没有重刷卡；原有SD标记只读结果未变。两次ELF、根卷、DTB、固件CRC及原始命令分别见`build/dts-inrepo/{vf2-ram-native,vf2-sd-native}.json`与`vf2-uart.log`。
+
+SD模式固件自动扫描曾报`Card did not respond to voltage select! : -110`，未重复固件卡探测；本代内核随后真实识卡、挂载并完成SD文件自测，不据此声称固件错误的根因已修复。RTC仍未校时，`source=unset`不代表可信UTC。两次Halt与期间人工RESET不等于自然Restart、PowerOff或掉电测试。
+
+本代两次均已完整Halt，最后设备命令为`/bin/busybox halt`，串口已交还；本轮日志已关闭，用户已有TFTP服务仍运行。2K新仓内树已做离线等价与两模式包装，但本轮未上2K实板。完整状态沿`build/dts-inrepo/evidence.json`。
+
+
 ### RTC授时边界修复后的完整OS DT实板结果
 
 本代VF2普通debug内核已用同一完整树实际运行成功，ELF SHA256为`f9e09e65387c23c5f451d3e11cb0193c7d39cbc6d3e6152f548bfcc635e07e75`。包装前后292节点/1924属性逐项相等，未裁RTC、CMA、ccache别名或两个enabled GMAC；无initrd，既有`/dev/mmcblk0p1`仍为唯一ReadWrite根。固件核对本代kernel.uImage/DTB全文CRC32为`0407a341`/`861f605e`，与宿主相等，仅一次修后`bootm`。
@@ -188,7 +208,7 @@ cd /test/selftests/fs
 
 本代内核实际登记`0x70000000..0x90000000`预留，启动四个应用核至`READY cpus=4`、原生SD根、GMAC1 PHY准备及PID1/BusyBox Shell。Shell命令和`true`正常，已有`fs:file_shared`两TAP及`process:affinity`五TAP全部通过，两程序退出0、summary pass2/fail0/error0/status0。`/proc/uptime`由`267.45 1069.10`推进至`271.63 1085.78`，现有`busybox sleep 1`退出0；不把命令间隔写成精确时钟校准。现有userland缺`date`和`uptime`命令，原组合最终127保留，未扩applet，也未宣称日期CLI通过。
 
-最后`sync`返回0，一次`busybox halt`完成PID1退出0、NET停止、ROOTFS同步退休、CPU ack14及本核事件源关闭。当前最后观测是完整正常Halt，串口已交还，本轮TFTP/日志已关闭，不再输入；这不是自然Restart、PowerOff或掉电试验。本代没有重做内核网络数据测试，不转签下文旧ELF的ARP/ICMP/TCP；也未重写SD、固件、saveenv或RTC日期。完整输入身份、逐次命令、原始UART、双ISA定向回归和质量结果见`build/vf2-rtc/{final-evidence.json,package-identity.json,uart.log}`。
+该次最后`sync`返回0，一次`busybox halt`完成PID1退出0、NET停止、ROOTFS同步退休、CPU ack14及本核事件源关闭；当时已交还串口并关闭本轮TFTP/日志。这不是自然Restart、PowerOff或掉电试验。本代没有重做内核网络数据测试，不转签下文旧ELF的ARP/ICMP/TCP；也未重写SD、固件、saveenv或RTC日期。完整输入身份、逐次命令、原始UART、双ISA定向回归和质量结果见`build/vf2-rtc/{final-evidence.json,package-identity.json,uart.log}`；后续板态和新源码只按各自记录。
 
 ### 修前完整OS DT的实板失败
 
@@ -200,7 +220,7 @@ cd /test/selftests/fs
 
 ### 此前各 ELF 的实板记录
 
-下表及后续PHY、网络和停止段落只保各旧ELF的当时事实，其中“本轮”“当前”均指对应记录时点，不转记为上述完整输入已通过。
+下表及后续PHY、网络和停止段落只保各旧ELF的当时事实，其中“本轮”“当前”均指对应记录时点，不转签到其他ELF或新的设备树输入。
 
 | 必须分开的路径 | 当时验证状态 |
 |---|---|
@@ -219,7 +239,7 @@ cd /test/selftests/fs
 
 Host入站仍有未完成方向：Native连接Host18086未完成，同步窗口WSL eth2未捕到SYN，原因未确定；不写成已修复或确定防火墙问题，普通反向TCP成功不替代该结果，Host规则未改。现有userland不支持`ifconfig`状态显示，缺`cmp/stat` applet；完整ASCII流含LF用后缀哨兵与全文字符串相等核对，未为此扩applet、errno或内核ABI。
 
-当前板态为本代已sync0并完整正常Halt，PID1退出0、NET停止、ROOTFS退休、CPU ack14及本核事件源关闭；无需再等用户RESET，也不再对设备输入。旧SBI cold restart的PMIC失败保留，未重试；未做poweroff、自然重启或掉电试验，不把先前人工RESET及本次Halt计入这些结果。
+该旧ELF当时已sync0并完整正常Halt，PID1退出0、NET停止、ROOTFS退休、CPU ack14及本核事件源关闭；当时已交还串口。旧SBI cold restart的PMIC失败保留，未重试；未做poweroff、自然重启或掉电试验，不把先前人工RESET及当次Halt计入这些结果。
 
 VF2计划C01–C48共48/48已完成；同一独立五域终审为correct/confidence0.97，原文沿`vf6-c47-final-five-domain-review.json`。本次源码与指南已聚焦jj保存，串口已在完整Halt状态交还，事实沿`vf6-final-handback.json`，交还后不再输入。四Clippy/格式、双ISA公共五行为共10Pass及最终格式/四Clippy保当前各自产物身份，公共Boot的`resources={}`不写MM/metadata相等账。2K原结果/备份与LA NX暂缓非Pass保持；旧图UNKNOWN/private/错域/采样和LSP NoServer不作为安全证明。
 

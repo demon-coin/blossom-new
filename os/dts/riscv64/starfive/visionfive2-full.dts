@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+/*
+ * Copyright (C) 2022 StarFive Technology Co., Ltd.
+ * Copyright (C) 2022 Hal Feng <hal.feng@starfivetech.com>
+ */
+
+#include "jh7110-starfive-visionfive-2-v1.3b.dts"
+
+/* 保留原厂全部节点和默认状态，补充本板固件保留区及有据可核的硬件描述。 */
+/ {
+    reserved-memory {
+        /* SDK Release31 的交接声明；不能用其它板的固件保留范围替换。 */
+        opensbi@40000000 {
+            reg = <0x0 0x40000000 0x0 0x80000>;
+            no-map;
+        };
+    };
+};
+
+&{/soc} {
+    otp: otp@17050000 {
+        compatible = "starfive,jh7110-otp";
+        reg = <0x0 0x17050000 0x0 0x10000>;
+        clock-frequency = <4000000>;
+        clocks = <&aoncrg JH7110_AONCLK_OTPC_APB>;
+        clock-names = "apb";
+    };
+
+    memory-controller@15700000 {
+        compatible = "starfive,jh7110-dmc";
+        reg = <0x0 0x15700000 0x0 0x10000>,
+              <0x0 0x13000000 0x0 0x10000>;
+        clocks = <&pllclk JH7110_PLLCLK_PLL1_OUT>;
+        clock-names = "pll";
+        resets = <&syscrg JH7110_SYSRST_DDR_AXI>,
+                 <&syscrg JH7110_SYSRST_DDR_OSC>,
+                 <&syscrg JH7110_SYSRST_DDR_APB>;
+        reset-names = "axi", "osc", "apb";
+    };
+};
+
+&i2c5 {
+    eeprom@50 {
+        compatible = "atmel,24c04";
+        reg = <0x50>;
+        pagesize = <16>;
+    };
+};

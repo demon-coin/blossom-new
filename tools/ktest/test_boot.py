@@ -190,6 +190,55 @@ def read_boot_environment(directory):
                 if line and not line.startswith("#"))
 
 
+class BoardDtbSourceTests(unittest.TestCase):
+    """验证仓内板树生成及失败时保留已有输出。"""
+
+    def test_board_trees_use_repository_sources_and_exclude_stale_boot_state(self):
+        """两板真实DTB来自仓内源码，编译失败不能替换上一次结果。"""
+        repository = Path(__file__).resolve().parents[2]
+        environment = dict(os.environ, VF2_LINUX_SRC="/nonexistent/unused-sdk")
+        boards = (
+            ("riscv64", "visionfive2", "starfive,visionfive-2-v1.3b"),
+            ("loongarch64", "ls2k1000la", "loongson,ls2k1000-dp"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for architecture, platform, compatible in boards:
+                with self.subTest(platform=platform):
+                    output = Path(temporary) / f"{platform} output" / "board-input.dtb"
+                    command = [
+                        "make", "--no-print-directory", "build-board-dtb",
+                        f"ARCH={architecture}", f"TARGET_PLATFORM={platform}",
+                        f"BOARD_DTB_OUTPUT={output}",
+                    ]
+                    subprocess.run(command, cwd=repository, env=environment,
+                                   text=True, capture_output=True, check=True)
+                    actual = subprocess.run(["fdtget", "-t", "s", str(output), "/", "compatible"],
+                                            text=True, capture_output=True, check=True).stdout.split()
+                    self.assertIn(compatible, actual)
+                    chosen = subprocess.run(["fdtget", "-p", str(output), "/chosen"],
+                                            text=True, capture_output=True, check=True).stdout.splitlines()
+                    self.assertIn("stdout-path", chosen)
+                    self.assertNotIn("bootargs", chosen)
+                    self.assertNotIn("linux,initrd-start", chosen)
+                    self.assertNotIn("linux,initrd-end", chosen)
+                    if platform == "ls2k1000la":
+                        ports = subprocess.run(
+                            ["fdtget", "-t", "x", str(output),
+                             "/bus@10000000/pcie@1a000000/sata@8,0", "ports-implemented"],
+                            text=True, capture_output=True, check=True).stdout.strip()
+                        self.assertEqual(ports, "1")
+                    else:
+                        for node in ("/soc/ethernet@16030000", "/soc/ethernet@16040000"):
+                            status = subprocess.run(["fdtget", "-t", "s", str(output), node, "status"],
+                                                    text=True, capture_output=True, check=True).stdout.strip()
+                            self.assertEqual(status, "okay")
+                    before = output.read_bytes()
+                    failed = subprocess.run([*command, "HOSTCC=false"], cwd=repository, env=environment,
+                                            text=True, capture_output=True)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(output.read_bytes(), before)
+
+
 class BoardPackagingTests(unittest.TestCase):
     """验证离线文件内容、发布边界和正式 CLI，不把生成物当作实板运行证据。"""
 
