@@ -127,7 +127,7 @@ RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设�
 
 2K1000LA 的主机只生成镜像和提供 TFTP，不拆 SSD 接宿主，不在宿主执行 `dd`。首次部署由板卡 U-Boot 将 raw ext4 下载到可用 RAM，再执行 `scsi write <RAM地址> <起始LBA> <扇区数>`；普通启动不重复写盘。写入对象是 ext4 卷本身，不能使用带 legacy 头的 `root.uInitrd`。
 
-历史板端记录为 SCSI 设备 0、DOS 第一分区起始 LBA `0x40003f`，若明确选择覆写该旧根卷，当前内核根名为 `/dev/sda1`；这不表示本轮镜像已部署到该分区，也不构成覆盖授权。写入前必须核对当前磁盘、分区边界、扇区大小和镜像长度。不能因固件位于 SPI 就把 SSD 认定为空盘并从 LBA 0 覆盖，也不无依据地声称 SATA 上有原厂系统。较大卷按可用 RAM 分块传输，每块的长度和写入 LBA 独立计算，不沿用历史镜像的最后一块长度。
+本轮已在所选 Kingchuxing SATA 盘创建并验证 `/dev/sda2`：起始 LBA `0x3b62800`，长度 `0x40000` 个 512 字节扇区（128 MiB）。经用户确认，只收短旧第一分区表项的末端，没有移动或缩容其 ext4 文件系统；原第三分区 swap 表项未改。MBR 前后备份、读回及本轮包身份沿 `build/sata-p2-live/final-evidence.json`。这些数值不是其他磁盘的默认布局；日常启动不再建表或写根卷，更新镜像前必须按实际分区容量核对范围。
 
 无 RAM 根的独立 OS DTB 必须删除 `/chosen/linux,initrd-start` 与 `linux,initrd-end`，并将 `root=` 改为同一明确持久分区；不能直接沿用 RAM 启动树中的旧范围。统一使用 `make package-board-boot-images`，以 `BOARD_OS_DTB`、`BOARD_ROOT_DEVICE`、`BOARD_ROOT_MODE` 指定输入，并用 `BOARD_ROOT_EXT4_IMAGE=` 排除 ramdisk。先前的 RAM 包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
 
@@ -139,7 +139,7 @@ setenv bootargs 'root=/dev/mmcblk0p2 rootdir=/ rw init=/sbin/init blossom.boot=s
 bootm ${kernel_addr_r} - ${fdt_addr}
 
 # LA：实际 SATA 分区示例
-setenv bootargs 'root=/dev/sda1 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+setenv bootargs 'root=/dev/sda2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
 bootm ${kernel_addr_r}
 ```
 
@@ -178,7 +178,7 @@ cd /test/selftests/fs
 | VF2 RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
 | VF2 SD 分区直接根 | 待原生 SD、DMA/IRQ 与同介质同步重启 |
 | LA RAM 根 | 本轮 `g2ed41674` 经 bootm 到 PID1/Shell、子进程退出及 RAM 文件写读/sync 已验；实板停止和重启未验 |
-| LA SATA 分区直接根 | 待原生 AHCI、DMA/IRQ 与同介质同步重启 |
+| LA SATA 分区直接根 | 本轮 `/dev/sda2` 真实两次 bootm 到 PID1/Shell、文件写读及正常同步 Restart 后独立读回已验；未签断电恢复或全部设备窗口 |
 
 每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络还需各自实板证据，固件 ping 不证明内核网络。SMP 要观察任务迁核或真实并行，不只看上线数量。
 
