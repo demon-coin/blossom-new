@@ -113,7 +113,7 @@ bootm ${kernel_addr_r} ${ramdisk_addr_r}
 
 此版龙芯固件由 `fdt_addr` 指定 OS DTB，使用 LoongArch 的命令行／EFI system table 交接。实际三参数形式在固件命令行指针读取处触发异常；不能仅凭通用帮助套用其他板命令。更换固件须重新核对 ABI。改用固件 FAT/ext4/USB 加载只替换 load 命令，不代表内核运行期支持这些设备。
 
-`blossom.boot=shell` 经同一 BusyBox PID1/start-session 选择 Shell，不把 Shell 改成 PID1。默认会话会运行比赛执行器 `/sbin/contest-run /dev/vda`，板上没有该比赛设备时不得省略会话选择后假定自动进入 Shell。Shell 退出不转跑比赛；正常结束用 `sync` 和 `/bin/busybox poweroff`。
+`blossom.boot=shell` 经同一 BusyBox PID1/start-session 选择 Shell，不把 Shell 改成 PID1。默认会话会运行比赛执行器 `/sbin/contest-run /dev/vda`，板上没有该比赛设备时不得省略会话选择后假定自动进入 Shell。Shell 退出不转跑比赛；正常同步Halt使用 `sync` 和 `/bin/busybox halt`，不据此宣称物理关电或自然重启。
 
 观察实际 `ram0`、initrd payload 范围、根卷及 INIT。写一份文件后结束，再重新加载原 RAM 卷时文件消失，这是 RAM 易失性，不是持久盘失败。RAM 卷包括空闲空间在内都占 RAM，只装当前需要的程序。
 
@@ -135,7 +135,7 @@ RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设�
 
 ```text
 # VF2：实际 SD 分区示例
-setenv bootargs 'root=/dev/mmcblk0p2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+setenv bootargs 'root=/dev/mmcblk0p1 rootdir=/ rw init=/sbin/init blossom.boot=shell'
 bootm ${kernel_addr_r} - ${fdt_addr}
 
 # LA：实际 SATA 分区示例
@@ -153,10 +153,10 @@ VF2 示例中的 `-` 表示无 RAM disk；上述 LA 固件不传第二参数。�
 mkdir -p /root/board-check
 printf '%s\n' 'persistent board root' > /root/board-check/marker
 sync
-/bin/busybox poweroff
+/bin/busybox halt
 ```
 
-确认真实结束，再启动**同一持久分区**，不重新部署来源 root.ext4、不刷新或还原卷。读取 marker，并运行已有跨页图样、共享映射、rename/truncate、fsync/sync 相关程序；停止后从外部读取和冷启动重读分别记录。页缓存热读不能代替冷重开，固件看到 SSD 也不能代替内核 AHCI 请求完成。
+确认内核已完成同步及设备、CPU停止，再启动**同一持久分区**，不重新部署来源root.ext4、不刷新或还原卷。示例请求正常Halt，不代表物理关电或自然重启成功；人工RESET、固件restart与掉电分别记录。读取marker并运行已有跨页图样、共享映射、rename/truncate、fsync/sync相关程序；停止后外部读取和冷启动重读分别记录。页缓存热读不能代替冷重开，固件看到SSD也不能代替内核AHCI请求完成。
 
 已安装的用户自测作为普通程序人工运行，不加板专属执行器或测试协议：
 
@@ -175,12 +175,24 @@ cd /test/selftests/fs
 
 | 必须分开的路径 | 当前硬件状态 |
 |---|---|
-| VF2 RAM 根 | 待用户实际固件/OS DTB/RAM 启动 |
-| VF2 SD 分区直接根 | 待原生 SD、DMA/IRQ 与同介质同步重启 |
+| VF2 RAM 根 | 本轮正式bootm已到四应用核、完整PID1/TTY/Shell，文件写读/sync、同原始RAM卷重载后的易失性及正常Halt已验；自然SBI cold restart的PMIC失败保留 |
+| VF2 SD 分区直接根 | 本轮`/dev/mmcblk0p1`唯一RW根、两次无initrd bootm、现有std/用户程序、marker及8229字节文件同步Halt后用户RESET冷读一致已验；不签自然SBI restart、poweroff或掉电 |
 | LA RAM 根 | 本轮 `g2ed41674` 经 bootm 到 PID1/Shell、子进程退出及 RAM 文件写读/sync 已验；实板停止和重启未验 |
 | LA SATA 分区直接根 | 本轮 `/dev/sda2` 真实两次 bootm 到 PID1/Shell、文件写读及正常同步 Restart 后独立读回已验；未签断电恢复或全部设备窗口 |
 
-每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络还需各自实板证据，固件 ping 不证明内核网络。SMP 要观察任务迁核或真实并行，不只看上线数量。
+每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络须保各自实板证据，固件 ping 不证明内核网络；本代VF2实据见下文，不外推LA或其他网口。SMP 要观察任务迁核或真实并行，不只看上线数量。
+
+VF2保留真实`ethernet0/ethernet1` alias，只允许其中一个目标启用；零口不创建NIC，两口同时启用报错，逻辑接口始终为`eth0`，不要求它对应alias0。当前接线选择GMAC1 `/soc/ethernet@16040000`（`ethernet1`），另一口保持disabled；损坏声明或所选设备初始化失败均报原错误，不换口或退回lo。本代内核实读PHY ID `0x4f51e91b`、address0、CSR divider4，地址来自PHY `reg=0`而非节点名`ethernet-phy@1`。DT无MAC，原驱动读到所选控制器硬件地址`6c:cf:39:00:7a:7d`，Host二层抓包一致；没有为本次数据试验调整PHY或DMA参数，也未取得全部CRG字段或协商速率的数值回读。
+
+当前事实沿`build/stage11-vf2/vf6-native-final-evidence.json`及其中原文，ELF为`da986c641625b80b2309c5f14f41a08a8b67933a0005fc9ad135fecf518fd7d0`。该内核已按上节无initrd三参数`bootm`合同在同一`/dev/mmcblk0p1`唯一RW根运行，不需重刷卡。已安装network脚本的`10.0.2.15/24`及gateway`10.0.2.2`只适用QEMU；此次先从`route -n`确认该默认路由存在，删除成功后配置Native `192.168.77.2/24`，直连Host `192.168.77.1`，最终只有lo及`192.168.77.0/24`直连路由。后续配置须按真实已有route处理，不默认删除不存在项或吞掉失败，不改Host网络规则。
+
+本代ARP与ICMP双向已实际通过，ICMP为98字节Ethernet帧/84字节IP包/56字节payload全文一致；Host连接Native18087后两方向各25字节TCP数据完整，Host收到回复及EOF、Native退出0。另一普通TCP流由Host发送87194字节，Native回复`VF6_BIG_106006\n`并退出0；后缀哨兵保留末尾LF后两字符串各87195字节，全文比较0。该流RX由731字节/11帧增至91419字节/75帧，TX由3237字节/52帧增至4506字节/75帧；64帧RX增量支持32槽ring正常累计复用，不证明逐描述符地址或全部故障窗口。最终收发errors/drops均0，source78为81次IRQ、source75为995次IRQ；同代`file_shared`两TAP和`affinity`五TAP均退出0，summary pass2/status0。
+
+Host入站仍有未完成方向：Native连接Host18086未完成，同步窗口WSL eth2未捕到SYN，原因未确定；不写成已修复或确定防火墙问题，普通反向TCP成功不替代该结果，Host规则未改。现有userland不支持`ifconfig`状态显示，缺`cmp/stat` applet；完整ASCII流含LF用后缀哨兵与全文字符串相等核对，未为此扩applet、errno或内核ABI。
+
+当前板态为本代已sync0并完整正常Halt，PID1退出0、NET停止、ROOTFS退休、CPU ack14及本核事件源关闭；无需再等用户RESET，也不再对设备输入。旧SBI cold restart的PMIC失败保留，未重试；未做poweroff、自然重启或掉电试验，不把先前人工RESET及本次Halt计入这些结果。
+
+VF2计划C01–C48共48/48已完成；同一独立五域终审为correct/confidence0.97，原文沿`vf6-c47-final-five-domain-review.json`。本次源码与指南已聚焦jj保存，串口已在完整Halt状态交还，事实沿`vf6-final-handback.json`，交还后不再输入。四Clippy/格式、双ISA公共五行为共10Pass及最终格式/四Clippy保当前各自产物身份，公共Boot的`resources={}`不写MM/metadata相等账。2K原结果/备份与LA NX暂缓非Pass保持；旧图UNKNOWN/private/错域/采样和LSP NoServer不作为安全证明。
 
 定位按固件装载 → 入口/FDT → MM/CPU → IRQ → 控制器命令与 DMA → ext4 → ELF/运行库 → 用户选择逐层判断；错误归原层处理，不降核、猜地址、重放未知写或切换根来掩盖失败。ktest 仅双 QEMU，不提供 serial/loader/实体板 transport。LA NX 既有暂缓非 Pass；离线输入和 QEMU 软件验证不替四条实板路径签名。
 

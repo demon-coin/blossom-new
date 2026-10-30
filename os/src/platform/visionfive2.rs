@@ -169,17 +169,22 @@ fn card_detect_gpio<'a>(
     }))
 }
 
-/// 只为 ethernet0 所选且启用的 GMAC 登记资源，另一网口不取得运行期拥有。
+/// 只为两个真实 alias 中唯一启用的 GMAC 登记资源，未选网口不取得运行期拥有。
 fn discover_gmac<'a>(
     tree: &'a Fdt<'a>,
     controller: Node<'a>,
     info: &mut BootInfo,
 ) -> Result<Option<GmacResources>, &'static str> {
-    let Some(mac) = resources::optional_alias(tree, "ethernet0")? else {
-        return Ok(None);
+    let mac = match (
+        resources::optional_alias(tree, "ethernet0")?,
+        resources::optional_alias(tree, "ethernet1")?,
+    ) {
+        (None, None) => return Ok(None),
+        (Some(mac), None) | (None, Some(mac)) => mac,
+        (Some(_), Some(_)) => return Err("FDT VF2 requires at most one enabled GMAC"),
     };
     if !compatible(mac, "starfive,jh7110-dwmac") {
-        return Err("FDT ethernet0 is not a JH7110 GMAC");
+        return Err("FDT selected Ethernet device is not a JH7110 GMAC");
     }
     require_plic(tree, mac, controller)?;
     let mut resource = resources::gmac(tree, mac, true)?;
