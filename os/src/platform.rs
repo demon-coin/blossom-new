@@ -4,6 +4,7 @@ use crate::boot::{
     BootInfo, PciConfiguration, PciIntxRoute, PciRange, Platform, Region, VirtioMmioResource,
     MAX_CPUS, MAX_INTERRUPT_SOURCES, MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO,
 };
+use crate::mm::PAGE_SIZE;
 use fdt::{node::FdtNode, Fdt};
 
 pub mod layout;
@@ -44,6 +45,7 @@ pub const EARLY_UART_BASE: usize = if cfg!(blossom_platform = "ls2k1000la") {
 };
 
 const MAX_DTB_SIZE: usize = 2 * 1024 * 1024;
+const DEFAULT_RESERVED_ALIGNMENT: usize = 64;
 type Node<'a> = FdtNode<'a, 'a>;
 
 /// 从已取得的字节切片读取一个大端 cell，拒绝截断和偏移溢出。
@@ -348,6 +350,201 @@ fn single_region<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Region, &'stat
     Ok(first)
 }
 
+/// 取得绑定指定的寄存器资源，不要求设备只描述这一段窗口。
+fn region_at<'a>(tree: &'a Fdt<'a>, node: Node<'a>, index: usize) -> Result<Region, &'static str> {
+    identity_address(tree, node)?;
+    regions(node)?
+        .nth(index)
+        .ok_or("FDT register resource index is missing")?
+}
+
+/// 从当前游标开始取得下一个连续 RAM 并集，不把相邻 bank 误当孔洞。
+fn next_ram_region(info: &BootInfo, minimum: usize, limit: usize) -> Option<Region> {
+    if limit <= minimum {
+        return None;
+    }
+    let memory = &info.memory[..info.memory_count];
+    let start = memory
+        .iter()
+        .filter(|ram| minimum < ram.end && ram.start < limit)
+        .map(|ram| ram.start.max(minimum))
+        .min()?;
+    let mut end = start;
+    loop {
+        let next = memory
+            .iter()
+            .filter(|ram| ram.start <= end && start < ram.end)
+            .map(|ram| ram.end.min(limit))
+            .max()
+            .unwrap_or(end);
+        if next == end {
+            return Some(Region { start, end });
+        }
+        end = next;
+    }
+}
+
+/// 禁映射属性作用于整页；选址时必须同时避开该页中的其它存活对象。
+fn reservation_extent(region: Region, page_aligned: bool) -> Result<Region, &'static str> {
+    if !page_aligned {
+        return Ok(region);
+    }
+    let mask = PAGE_SIZE - 1;
+    let end = region
+        .end
+        .checked_add(mask)
+        .ok_or("FDT reserved-memory page boundary overflows")?
+        & !mask;
+    Ok(Region {
+        start: region.start & !mask,
+        end,
+    })
+}
+
+/// 已验证的二次幂对齐按字节计算；溢出表示当前窗口没有候选地址。
+fn align_reserved_address(address: usize, alignment: usize) -> Option<usize> {
+    address
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+}
+
+/// 在声明窗口内查找未占用 RAM，只登记地址，不写入尚未交接的物理内存。
+fn find_reserved_region(
+    info: &BootInfo,
+    size: usize,
+    alignment: usize,
+    window: Region,
+    no_map: bool,
+) -> Result<Option<Region>, &'static str> {
+    let kernel = crate::boot::kernel_region();
+    let mut cursor = window.start.max(PAGE_SIZE);
+    while let Some(ram) = next_ram_region(info, cursor, window.end) {
+        let Some(mut start) = align_reserved_address(ram.start, alignment) else {
+            return Ok(None);
+        };
+        while let Some(end) = start.checked_add(size).filter(|end| *end <= ram.end) {
+            let candidate = Region { start, end };
+            let mut next = start;
+            for (index, region) in info.reserved[..info.reserved_count].iter().enumerate() {
+                let occupied = reservation_extent(*region, no_map || info.reserved_no_map[index])?;
+                if candidate.overlaps(occupied) {
+                    next = next.max(occupied.end);
+                }
+            }
+            // 内核在资源发现返回后才正式登记，选址不得覆盖当前代码、栈和页表。
+            let occupied = reservation_extent(kernel, no_map)?;
+            if candidate.overlaps(occupied) {
+                next = next.max(occupied.end);
+            }
+            if next == start {
+                return Ok(Some(candidate));
+            }
+            let Some(aligned) = align_reserved_address(next, alignment) else {
+                break;
+            };
+            start = aligned;
+        }
+        cursor = ram.end;
+    }
+    Ok(None)
+}
+
+/// 按父节点规定的 cell 宽度读取动态预留属性，不接受截断或额外数值。
+fn reserved_value(node: Node<'_>, name: &str, width: usize) -> Result<usize, &'static str> {
+    let value = property(node, name)?;
+    if value.len() != width {
+        return Err("FDT dynamic reserved-memory cell width is invalid");
+    }
+    cells(value)
+}
+
+/// 静态占用和 initrd 已明确后落实 size 请求，后续请求复用同一保留表避让前项。
+fn discover_dynamic_reserved_memory(
+    tree: &Fdt<'_>,
+    info: &mut BootInfo,
+) -> Result<(), &'static str> {
+    let Some(reserved) = tree
+        .find_node("/reserved-memory")
+        .filter(|node| enabled(*node))
+    else {
+        return Ok(());
+    };
+    let mut requests = reserved
+        .children()
+        .filter(|node| enabled(*node) && node.property("reg").is_none());
+    let Some(first) = requests.next() else {
+        return Ok(());
+    };
+    let root = tree.find_node("/").ok_or("FDT root is missing")?;
+    let address_cells = number(reserved, "#address-cells")?;
+    let size_cells = number(reserved, "#size-cells")?;
+    if !matches!(address_cells, 1 | 2)
+        || !matches!(size_cells, 1 | 2)
+        || address_cells != number(root, "#address-cells")?
+        || size_cells != number(root, "#size-cells")?
+    {
+        return Err("FDT reserved-memory cells do not match the root");
+    }
+    let address_width = address_cells as usize * 4;
+    let size_width = size_cells as usize * 4;
+    for node in core::iter::once(first).chain(requests) {
+        let size = reserved_value(node, "size", size_width)?;
+        if size == 0 {
+            return Err("FDT dynamic reserved-memory size is zero");
+        }
+        let alignment = if node.property("alignment").is_some() {
+            reserved_value(node, "alignment", address_width)?
+        } else {
+            0
+        };
+        let alignment = if alignment == 0 {
+            DEFAULT_RESERVED_ALIGNMENT
+        } else {
+            alignment
+        };
+        if !alignment.is_power_of_two() {
+            return Err("FDT dynamic reserved-memory alignment is invalid");
+        }
+        let no_map = node.property("no-map").is_some();
+        let region = if let Some(ranges) = node.property("alloc-ranges") {
+            let stride = address_width + size_width;
+            if ranges.value.len() % stride != 0 {
+                return Err("FDT reserved-memory alloc-ranges is truncated");
+            }
+            let mut selected = None;
+            for range in ranges.value.chunks_exact(stride) {
+                let window = Region::from_size(
+                    cells(&range[..address_width])?,
+                    cells(&range[address_width..])?,
+                )?;
+                selected = find_reserved_region(info, size, alignment, window, no_map)?;
+                if selected.is_some() {
+                    break;
+                }
+            }
+            selected
+        } else {
+            find_reserved_region(
+                info,
+                size,
+                alignment,
+                Region {
+                    start: 0,
+                    end: usize::MAX,
+                },
+                no_map,
+            )?
+        }
+        .ok_or("FDT dynamic reserved-memory has no available range")?;
+        if no_map {
+            info.reserve_no_map(region)?;
+        } else {
+            info.reserve(region)?;
+        }
+    }
+    Ok(())
+}
+
 /// 读取与父控制器绑定一致的真实中断源号。
 fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
     let value = property(node, "interrupts")?;
@@ -357,7 +554,7 @@ fn irq(node: Node<'_>, controller: Node<'_>) -> Result<u32, &'static str> {
     word(value, 0)
 }
 
-/// 在调用者独占的空快照中发现全部资源，早期调用链不返回或复制大型BootInfo值。
+/// 在独占快照中发现资源并落实动态预留，早期调用链不返回或复制大型 BootInfo。
 fn discover_tree(
     bytes: &[u8],
     info: &mut BootInfo,
@@ -389,6 +586,12 @@ fn discover_tree(
         }
         for child in reserved.children().filter(|n| enabled(*n)) {
             identity_address(&tree, child)?;
+            if child.property("reg").is_none() {
+                if child.property("size").is_none() {
+                    return Err("FDT reserved-memory node has neither reg nor size");
+                }
+                continue;
+            }
             let no_map = child.property("no-map").is_some();
             for region in regions(child)? {
                 if no_map {
@@ -501,6 +704,7 @@ fn discover_tree(
         Platform::VisionFive2 => visionfive2::discover(&tree, cpus, uart, info)?,
         Platform::Ls2k1000la => ls2k1000la::discover(&tree, uart, info)?,
     }
+    discover_dynamic_reserved_memory(&tree, info)?;
     Ok(())
 }
 
@@ -540,6 +744,18 @@ pub(crate) fn ktest_dma_coherent(
     let tree = Fdt::new(bytes).map_err(|_| "FDT parse failed")?;
     let node = tree.find_node(path).ok_or("FDT DMA test node is missing")?;
     resources::coherent(&tree, node, default_coherent)
+}
+
+/// 在测试独占快照上验证动态预留选址，不修改永久资源表或访问所选物理内存。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_find_reserved_region(
+    info: &BootInfo,
+    size: usize,
+    alignment: usize,
+    window: Region,
+    no_map: bool,
+) -> Result<Option<Region>, &'static str> {
+    find_reserved_region(info, size, alignment, window, no_map)
 }
 
 /// 保存完整 NUL 结尾的单一命令行，拒绝截断、内嵌 NUL 和容量外输入。

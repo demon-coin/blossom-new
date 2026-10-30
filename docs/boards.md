@@ -21,6 +21,13 @@ U-Boot control FDT 服务固件自身，working FDT 才交给 OS；有实际 OS 
 
 能运行原厂 Linux 时，可记录 `uname -m`、`/proc/iomem`、设备树 model 及 `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS`。这些信息用于选择实际介质和分区，不要求 BLOSSOM 增加同名工具。
 
+### OS DTB 的资源约定
+
+完整硬件描述不以当前驱动覆盖率删减。`/reserved-memory` 有 `reg` 时保留静态区间；无 `reg` 时按 `size`、`alignment` 和可选 `alloc-ranges` 完成早期预留。动态请求必须避开 RAM 孔洞、内核、固件、DTB、initrd 及已保留范围，no-map 按整页避让；无法满足时启动报错。这不提供 CMA 迁移或可重用内存池。
+
+VisionFive 2 的 ccache 取 `reg` 第0段控制区，其余窗口描述保留。当前只运行明确的 `ethernet1` 网口和 `mmc1` SDIO；其它设备包括 enabled GMAC0 可以保留，不会因此被本轮驱动认领。所选设备缺席或明确 disabled 时按缺席处理，所选资源错误仍报错，不换口或回退到另一设备。
+
+
 ## 2. 分清离线文件与运行期设备
 
 | 对象 | 语义 |
@@ -173,6 +180,8 @@ cd /test/selftests/fs
 
 ## 7. 运行边界与记录
 
+以下实板状态与数据保留此前各 ELF 的验证身份。本次三处解析修正尚未使用完整 OS DT 重新上板，不把表中结果转记到修后内核。
+
 | 必须分开的路径 | 当前硬件状态 |
 |---|---|
 | VF2 RAM 根 | 本轮正式bootm已到四应用核、完整PID1/TTY/Shell，文件写读/sync、同原始RAM卷重载后的易失性及正常Halt已验；自然SBI cold restart的PMIC失败保留 |
@@ -182,7 +191,7 @@ cd /test/selftests/fs
 
 每次保留所选 ELF/卷/DTB 身份、实际 bootargs、完整 UART、设备/分区范围、请求与完成、真实结束及重启输入。原生 MAC/PHY/网络须保各自实板证据，固件 ping 不证明内核网络；本代VF2实据见下文，不外推LA或其他网口。SMP 要观察任务迁核或真实并行，不只看上线数量。
 
-VF2保留真实`ethernet0/ethernet1` alias，只允许其中一个目标启用；零口不创建NIC，两口同时启用报错，逻辑接口始终为`eth0`，不要求它对应alias0。当前接线选择GMAC1 `/soc/ethernet@16040000`（`ethernet1`），另一口保持disabled；损坏声明或所选设备初始化失败均报原错误，不换口或退回lo。本代内核实读PHY ID `0x4f51e91b`、address0、CSR divider4，地址来自PHY `reg=0`而非节点名`ethernet-phy@1`。DT无MAC，原驱动读到所选控制器硬件地址`6c:cf:39:00:7a:7d`，Host二层抓包一致；没有为本次数据试验调整PHY或DMA参数，也未取得全部CRG字段或协商速率的数值回读。
+当前VF2保留真实`ethernet0/ethernet1` alias，单NIC明确选`ethernet1`，逻辑接口仍为`eth0`；GMAC0可以保持enabled描述而不被本轮认领。原`da986c64`实板输入曾仅启用GMAC1 `/soc/ethernet@16040000`，不是新完整树的硬件前提。所选目标损坏或初始化失败仍报原错误，不换口或退回lo。以下PHY/数据结果仅属于该旧ELF：实读PHY ID `0x4f51e91b`、address0、CSR divider4，地址来自PHY `reg=0`而非节点名`ethernet-phy@1`；DT无MAC，原驱动读到所选控制器硬件地址`6c:cf:39:00:7a:7d`，Host二层抓包一致。原试验未调整PHY或DMA参数，未取得全部CRG字段或协商速率的数值回读，不替修后内核使用完整树验收。
 
 当前事实沿`build/stage11-vf2/vf6-native-final-evidence.json`及其中原文，ELF为`da986c641625b80b2309c5f14f41a08a8b67933a0005fc9ad135fecf518fd7d0`。该内核已按上节无initrd三参数`bootm`合同在同一`/dev/mmcblk0p1`唯一RW根运行，不需重刷卡。已安装network脚本的`10.0.2.15/24`及gateway`10.0.2.2`只适用QEMU；此次先从`route -n`确认该默认路由存在，删除成功后配置Native `192.168.77.2/24`，直连Host `192.168.77.1`，最终只有lo及`192.168.77.0/24`直连路由。后续配置须按真实已有route处理，不默认删除不存在项或吞掉失败，不改Host网络规则。
 

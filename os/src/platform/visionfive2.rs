@@ -3,11 +3,11 @@
 use super::resources;
 use super::{
     compatible, device_region, device_source, enabled, interrupt_parent, number, property,
-    single_region, word, Fdt, Node,
+    region_at, single_region, word, Fdt, Node,
 };
 use crate::boot::{BootInfo, GmacResources, GpioInputResource, MmcResources};
 
-/// 从当前 OS DT 的真实绑定构造 VF2 设备快照。
+/// 从当前 OS DT 构造所用资源快照，未认领的完整硬件描述不取得运行期拥有。
 pub(super) fn discover<'a>(
     tree: &'a Fdt<'a>,
     cpus: Node<'a>,
@@ -32,7 +32,7 @@ pub(super) fn discover<'a>(
             return Err("FDT VF2 CPU is not an application U74 hart");
         }
         let ccache = unique(tree, "starfive,jh7110-ccache")?;
-        let registers = single_region(tree, ccache)?;
+        let registers = region_at(tree, ccache, 0)?;
         device_region(registers, info)?;
         info.board.ccache = registers;
         info.board.cache_line_size = number(ccache, "cache-block-size")? as usize;
@@ -169,19 +169,14 @@ fn card_detect_gpio<'a>(
     }))
 }
 
-/// 只为两个真实 alias 中唯一启用的 GMAC 登记资源，未选网口不取得运行期拥有。
+/// 只认领本板选用的 ethernet1，另一网口的描述和状态不决定本实例能否绑定。
 fn discover_gmac<'a>(
     tree: &'a Fdt<'a>,
     controller: Node<'a>,
     info: &mut BootInfo,
 ) -> Result<Option<GmacResources>, &'static str> {
-    let mac = match (
-        resources::optional_alias(tree, "ethernet0")?,
-        resources::optional_alias(tree, "ethernet1")?,
-    ) {
-        (None, None) => return Ok(None),
-        (Some(mac), None) | (None, Some(mac)) => mac,
-        (Some(_), Some(_)) => return Err("FDT VF2 requires at most one enabled GMAC"),
+    let Some(mac) = resources::optional_alias(tree, "ethernet1")? else {
+        return Ok(None);
     };
     if !compatible(mac, "starfive,jh7110-dwmac") {
         return Err("FDT selected Ethernet device is not a JH7110 GMAC");

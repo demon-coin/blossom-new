@@ -653,6 +653,99 @@ pub(crate) mod cases {
         context.expect_eq(&actual.reserved_no_map[..], &expected.reserved_no_map[..]);
     }
 
+    /// 动态预留可跨无序相邻 RAM 段，真实孔洞不能由两端地址合并成可用内存。
+    #[test]
+    #[case("adjacent", true)]
+    #[case("hole", false)]
+    fn dynamic_ram_boundaries(
+        context: &mut TestContext<'_>,
+        fixture: &mut Dtb,
+        adjacent: bool,
+    ) {
+        let page = crate::mm::PAGE_SIZE;
+        let base = (boot::kernel_region().end + page - 1) & !(page - 1);
+        let base = base + 16 * page;
+        let info = parse(
+            &fixture.bytes[..fixture.length], fixture.actual, boot::info().bsp_hardware_id,
+        );
+        info.reserved_count = 0;
+        info.memory_count = 2;
+        let second = base + if adjacent { page } else { 2 * page };
+        info.memory[..2].copy_from_slice(&[
+            boot::Region { start: second, end: second + page },
+            boot::Region { start: base, end: base + page },
+        ]);
+        let size = page + page / 2;
+        let selected = platform::ktest_find_reserved_region(
+            info, size, page, boot::Region { start: base, end: base + 3 * page }, false,
+        ).expect("dynamic RAM selection failed");
+        let expected = adjacent.then_some(boot::Region { start: base, end: base + size });
+        context.expect_eq(selected, expected);
+    }
+
+    /// 内核尚未登记时仍须避开其跨度，并与 DTB、initrd 和先前请求保持独占。
+    #[test]
+    fn dynamic_occupied_regions(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let page = crate::mm::PAGE_SIZE;
+        let kernel = boot::kernel_region();
+        let base = (kernel.end + page - 1) & !(page - 1);
+        let info = parse(
+            &fixture.bytes[..fixture.length], fixture.actual, boot::info().bsp_hardware_id,
+        );
+        let window = boot::Region { start: kernel.start, end: base + 8 * page };
+        info.memory_count = 1;
+        info.memory[0] = window;
+        info.reserved_count = 0;
+        info.dtb = boot::Region { start: base, end: base + page };
+        info.initrd = Some(boot::Region { start: base + page, end: base + 2 * page });
+        info.reserve(info.dtb).unwrap();
+        info.reserve(info.initrd.unwrap()).unwrap();
+        info.reserve(boot::Region { start: base + 2 * page, end: base + 3 * page }).unwrap();
+        let first = platform::ktest_find_reserved_region(info, page, page, window, false)
+            .expect("dynamic reservation failed").expect("dynamic reservation absent");
+        context.expect_eq(first, boot::Region { start: base + 3 * page, end: base + 4 * page });
+        info.reserve(first).unwrap();
+        let second = platform::ktest_find_reserved_region(info, page, page, window, false)
+            .expect("second dynamic reservation failed");
+        context.expect_eq(second, Some(boot::Region { start: base + 4 * page, end: base + 5 * page }));
+    }
+
+    /// 字节区间互不重叠仍可能共用禁映页，普通请求和 no-map 请求均须避开整页。
+    #[test]
+    #[case("existing_no_map", true)]
+    #[case("requested_no_map", false)]
+    fn dynamic_no_map_pages(
+        context: &mut TestContext<'_>,
+        fixture: &mut Dtb,
+        existing_no_map: bool,
+    ) {
+        let page = crate::mm::PAGE_SIZE;
+        let base = (boot::kernel_region().end + page - 1) & !(page - 1);
+        let base = base + 16 * page;
+        let info = parse(
+            &fixture.bytes[..fixture.length], fixture.actual, boot::info().bsp_hardware_id,
+        );
+        info.memory_count = 1;
+        info.memory[0] = boot::Region { start: base, end: base + 4 * page };
+        info.reserved_count = 0;
+        let occupied = boot::Region { start: base + 0x801, end: base + 0x900 };
+        if existing_no_map {
+            info.reserve_no_map(occupied).unwrap();
+        } else {
+            info.reserve(occupied).unwrap();
+        }
+        let blocked = platform::ktest_find_reserved_region(
+            info, 64, 64, boot::Region { start: base + 0x940, end: base + 0xb40 },
+            !existing_no_map,
+        ).expect("same-page selection failed");
+        context.expect_eq(blocked, None);
+        let selected = platform::ktest_find_reserved_region(
+            info, 64, 64, boot::Region { start: base + 0x940, end: base + 2 * page },
+            !existing_no_map,
+        ).expect("next-page selection failed");
+        context.expect_eq(selected, Some(boot::Region { start: base + page, end: base + page + 64 }));
+    }
+
     $($qemu_rtc)*
 
     /// 所有不完整前缀都必须由生产边界验证拒绝。
