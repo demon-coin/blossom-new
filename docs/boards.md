@@ -119,15 +119,15 @@ bootm ${kernel_addr_r} ${ramdisk_addr_r}
 
 ## 5. VF2 SD 与 LA SATA 持久根
 
-先保留原厂固件、分区表和引导分区。VF2 用固件实际支持的 `mmc list`、`mmc info`、`part list mmc <实际编号>`；LA 若由 SCSI 层呈现 SATA，用本固件支持的 `scsi reset`、`scsi info`、`part list scsi <实际编号>`。固件编号、Linux 设备名和内核分区号不能互相猜测。
+介质布局按实际盘面确定，不假设有原厂系统，也不假设是空盘。VF2 用固件实际支持的 `mmc list`、`mmc info`、`part list mmc <实际编号>`；2K1000LA 沿用 `scsi reset`、`scsi info`、`scsi device 0`、`scsi part 0` 核对板上 SATA。U-Boot 的 SPI Flash 与 SATA 根卷不是同一个存储对象。
 
 LA 的 OS DTB 中，PCI 与直接 MMIO 路径都接收 SATA 节点的 `ports-implemented`（单个 u32 bitmask），值须来自匹配板型与修订的资料，并经实际配置验收。PI 为零且未声明该属性时仍失败，不能因 CAP 报告一个端口就自动猜测 port0，也不能依赖先运行固件 `scsi reset` 初始化 PI。
 
 RAM 根同样需要正确的 AHCI 资源；内核不会跳过未选作根的设备，也不会忽略其资源或初始化错误。
 
-部署前在原厂 Linux/宿主核对目标分区身份、未挂载状态和容量。写卷是用户明确选择目标介质后的单独操作，不属于任何 Make 目标；不得把目标分区误换为含固件的整卡/整 SSD，也不把 raw ext4 交厂商 NAND 升级菜单。
+2K1000LA 的主机只生成镜像和提供 TFTP，不拆 SSD 接宿主，不在宿主执行 `dd`。首次部署由板卡 U-Boot 将 raw ext4 下载到可用 RAM，再执行 `scsi write <RAM地址> <起始LBA> <扇区数>`；普通启动不重复写盘。写入对象是 ext4 卷本身，不能使用带 legacy 头的 `root.uInitrd`。
 
-部署时写入的是 raw ext4 卷的内容，不能只把镜像文件复制到分区中。写入端须按磁盘身份、分区号、容量和卸载状态确认目标；宿主 Linux 的设备名不等于板端名字。可临时通过 USB-SATA 在 Linux 部署，完成后接回板卡原生 SATA，不能把 USB 介质当成已支持的原生 SATA 根。分区大于镜像时不自动扩展文件系统，也不为每次重启重新刷卷。
+历史板端记录为 SCSI 设备 0、DOS 第一分区起始 LBA `0x40003f`，当前内核根名为 `/dev/sda1`；这只是已记录的布局，写入前必须核对当前磁盘、分区边界、扇区大小和镜像长度。不能因固件位于 SPI 就把 SSD 认定为空盘并从 LBA 0 覆盖，也不无依据地声称 SATA 上有原厂系统。较大卷按可用 RAM 分块传输，每块的长度和写入 LBA 独立计算，不沿用历史镜像的最后一块长度。
 
 无 RAM 根的独立 OS DTB 必须删除 `/chosen/linux,initrd-start` 与 `linux,initrd-end`，并将 `root=` 改为同一明确持久分区；不能直接沿用 RAM 启动树中的旧范围。包装复用已有生产 ELF，不传 `--root-ext4-image`，只提供 OS DTB、明确 root 和模式。先前的 RAM 包和磁盘包使用不同输出目录，避免混用环境文件与设备树。
 
@@ -139,7 +139,7 @@ setenv bootargs 'root=/dev/mmcblk0p2 rootdir=/ rw init=/sbin/init blossom.boot=s
 bootm ${kernel_addr_r} - ${fdt_addr}
 
 # LA：实际 SATA 分区示例
-setenv bootargs 'root=/dev/sda2 rootdir=/ rw init=/sbin/init blossom.boot=shell'
+setenv bootargs 'root=/dev/sda1 rootdir=/ rw init=/sbin/init blossom.boot=shell'
 bootm ${kernel_addr_r}
 ```
 
