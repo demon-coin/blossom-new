@@ -2,4 +2,9 @@
 channel = "nightly-2025-01-18"
 profile = "minimal"
 components = ["rust-src", "llvm-tools-preview"]
-targets = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"]
+targets = [
+    "riscv64gc-unknown-none-elf",
+    "loongarch64-unknown-none",
+    "riscv64gc-unknown-linux-musl",
+    "loongarch64-unknown-linux-musl",
+]

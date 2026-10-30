@@ -4,7 +4,9 @@
 
 ## 1. 环境与构建职责
 
-宿主命令在仓库根执行。准备固定 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC，以及需要的 QEMU 9.2.1。制盘使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；运行库检查使用支持目标 ELF 的 `readelf`。板卡设备树从仓内源码生成，宿主需提供C预处理器和 `dtc`，RAM根包装还需 `fdtput`。工具由PATH或明确参数提供；构建不下载或升级工具链，Nix仅是个人环境。
+宿主命令在仓库根执行。准备固定 `nightly-2025-01-18`、GNU Make、Python3、两架构 musl 交叉 GCC，以及需要的 QEMU 9.2.1。制盘使用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs`；运行库检查使用支持目标 ELF 的 `readelf`。板卡设备树从仓内源码生成，宿主需提供 C 预处理器和 `dtc`，RAM 根包装还需 `fdtput`。工具由 PATH 或明确参数提供；Make 不调用系统包管理器，Nix 仅是个人环境。
+
+Cargo 依赖使用仓内 vendor。使用 Rustup 代理且允许自动安装时，Rustup 可按根 `rust-toolchain.toml` 联网准备缺失的固定工具链组件和目标标准库；Cargo 离线配置不限制 Rustup。直接单独构建 std 执行器时仍禁用 Rustup 自动安装，所需目标须事先准备。
 
 普通内核与 ktest 都需要该固定工具链的 `rust-src`，由 `os/.cargo/config.toml` 统一重编 `core/alloc` 及 `compiler-builtins-mem`。LoongArch 统一关闭 `ual`，使内核和标准库都生成严格对齐的访存；不能只约束内核后继续链接预编译的标准库。Make 清除外部 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS`，通过 Cargo 原生 `--config` 数组合并 panic/unwind 参数与目标 ISA 约束。直接 Cargo 构建仍从 `os/` 执行；独立用户 std 程序继续消费已准备的目标标准库和 sysroot，不读取内核配置。
 
