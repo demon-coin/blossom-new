@@ -3,11 +3,11 @@
 use crate::ktest::execution_core::{baseline, reclaimed, until, Baseline};
 use crate::ktest::execution_services::SuiteBaseline;
 use crate::ktest::{spawn_result, spawn_result_on, ChildHandle, ChildToken};
-use crate::sync::{Completion, SpinLock};
+use crate::sync::{Completion, IrqSaveGuard, SpinLock};
 use crate::{arch, cpu, mm, sched, task};
 use ::ktest::{Fixture, TestContext, TestError, TestResult};
 use alloc::sync::Arc;
-use core::hint::black_box;
+use core::hint::{black_box, spin_loop};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const ROUNDS: usize = 8;
@@ -28,12 +28,14 @@ struct Control {
     drops: [AtomicUsize; 2],
     frames: AtomicUsize,
     external: SpinLock<Option<Arc<task::Task>>>,
+    notification_tasks: [SpinLock<Option<Arc<task::Task>>>; 2],
     exit: Completion,
 }
 struct Tasks {
     initial: Baseline,
     state: Arc<Control>,
     handles: [Option<ChildHandle>; 2],
+    idle_pause: Option<usize>,
 }
 impl Fixture<SuiteBaseline> for Tasks {
     /// 在发表真实 Task 前建立每例独立控制拥有与本次停稳基线。
@@ -53,6 +55,7 @@ impl Fixture<SuiteBaseline> for Tasks {
             drops: core::array::from_fn(|_| AtomicUsize::new(0)),
             frames: AtomicUsize::new(0),
             external: SpinLock::new(None),
+            notification_tasks: core::array::from_fn(|_| SpinLock::new(None)),
             exit: Completion::new(),
         })
         .map_err(|_| TestError("NoMemory: context controls"))?;
@@ -60,13 +63,19 @@ impl Fixture<SuiteBaseline> for Tasks {
             initial,
             state,
             handles: core::array::from_fn(|_| None),
+            idle_pause: None,
         })
     }
-    /// 失败也开入口门、结束交替等待并放行退出；不释放仍在使用的原 owner。
+    /// 失败也放行所有子任务，只撤销本例已成功武装的 idle 停点，保留仍在使用的原 owner。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
         self.state.go.store(true, Ordering::Release);
         self.state.exit.complete();
+        if let Some(target) = self.idle_pause.take() {
+            if self.state.active[1].swap(0, Ordering::AcqRel) != 0 {
+                cpu::test_cancel_pause(target, cpu::TestPause::Idle);
+            }
+        }
         until(
             || {
                 self.handles
@@ -87,6 +96,7 @@ impl Fixture<SuiteBaseline> for Tasks {
             initial,
             state,
             handles,
+            idle_pause: _,
         } = self;
         if handles
             .iter()
@@ -97,6 +107,10 @@ impl Fixture<SuiteBaseline> for Tasks {
         }
         let external = state.external.lock().take();
         drop(external);
+        for slot in &state.notification_tasks {
+            let task = slot.lock().take();
+            drop(task);
+        }
         drop(handles);
         while state.exit.try_wait() {}
         if state.exit.test_waiting() != 0 {
@@ -215,6 +229,80 @@ fn page_total() -> usize {
     let stats = mm::stats();
     stats.buddy_free_pages + stats.pcp_cached_pages + stats.slab_backing_pages
 }
+
+/// 持核参与者只观察原子门，并以合作停止和单调期限结束等待，不制造额外 Yield 通知。
+fn notification_until(
+    state: &Control,
+    token: &ChildToken,
+    mut ready: impl FnMut() -> bool,
+    reason: &'static str,
+) -> TestResult {
+    let end = crate::time::now()
+        .checked_add(crate::time::Duration::from_secs(2))
+        .ok_or(TestError("notification deadline overflow"))?;
+    loop {
+        if state.stop.load(Ordering::Acquire) || token.stop_requested() {
+            return Err(TestError("notification participant stopped"));
+        }
+        if ready() {
+            return Ok(());
+        }
+        if end <= crate::time::now() {
+            return Err(TestError(reason));
+        }
+        spin_loop();
+    }
+}
+
+/// 只克隆本例保活的真实 Task，状态与 ready 成员仍由原调度锁读取。
+fn notification_task(state: &Control, slot: usize) -> Arc<task::Task> {
+    state.notification_tasks[slot]
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("notification Task not published")
+}
+
+/// Any 任务先真实迁至 CPU0，再普通 Yield；恢复后保持存活直到协调者完成通知断言。
+fn notification_yielder(
+    state: Arc<Control>,
+    token: ChildToken,
+    idle: bool,
+) -> Result<i32, TestError> {
+    if idle {
+        sched::set_affinity(&task::current_task(), cpu::CpuSet::prefix(2));
+    }
+    sched::test_migrate_to(0);
+    assert_eq!(cpu::current().id, 0);
+    assert!(arch::irq_enabled());
+    assert!(state.notification_tasks[0]
+        .lock()
+        .replace(task::current_task())
+        .is_none());
+    state.starts[0].store(1, Ordering::Release);
+    notification_until(
+        &state,
+        &token,
+        || state.go.load(Ordering::Acquire),
+        "notification Yield gate",
+    )?;
+    sched::yield_now();
+    assert!(arch::irq_enabled());
+    if idle {
+        assert_eq!(cpu::current().id, 1);
+    }
+    state.steps[0].store(1, Ordering::Release);
+    notification_until(
+        &state,
+        &token,
+        || state.frames.load(Ordering::Acquire) == 1,
+        "notification Yield release",
+    )?;
+    Ok(20)
+}
+
+/// 空 CSD 回调只建立目标 CPU 的处理顺序，不读写通知位或任务状态。
+unsafe fn notification_barrier(_: *mut ()) {}
 
 #[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "context"), timeout_ms = 15000)]
 pub(crate) mod context {
@@ -368,6 +456,206 @@ pub(crate) mod migration {
             handle.task_id().as_usize(),
             fixture.state.ids[0].load(Ordering::Acquire)
         );
+        Ok(())
+    }
+
+    /// 普通 Yield 返回且原任务仍存活时，忙核的真实 pending 不得新增抢占通知。
+    #[test]
+    #[ktest(min_cpus = 3)]
+    fn yield_does_not_reschedule_busy_cpu(
+        _: &mut TestContext<'_>,
+        fixture: &mut Tasks,
+    ) -> TestResult {
+        let state = Arc::clone(&fixture.state);
+        fixture.handles[0] = Some(spawn_result_on(2, move |token| {
+            assert_eq!(cpu::current().id, 2);
+            let a_state = Arc::clone(&state);
+            let a = spawn_result(move |token| notification_yielder(a_state, token, false))?;
+            notification_until(
+                &state,
+                &token,
+                || state.starts[0].load(Ordering::Acquire) == 1,
+                "busy notification A arrival",
+            )?;
+            let b_state = Arc::clone(&state);
+            let b = spawn_result_on(1, move |token| {
+                assert_eq!(cpu::current().id, 1);
+                assert!(arch::irq_enabled());
+                assert!(b_state.notification_tasks[1]
+                    .lock()
+                    .replace(task::current_task())
+                    .is_none());
+                b_state.starts[1].store(1, Ordering::Release);
+                notification_until(
+                    &b_state,
+                    &token,
+                    || b_state.turn.load(Ordering::Acquire) == 1,
+                    "busy notification IRQ gate",
+                )?;
+                let irq = IrqSaveGuard::new();
+                b_state.steps[1].store(1, Ordering::Release);
+                let held = notification_until(
+                    &b_state,
+                    &token,
+                    || b_state.frames.load(Ordering::Acquire) == 1,
+                    "busy notification IRQ release",
+                );
+                drop(irq);
+                held?;
+                Ok(21)
+            })?;
+            notification_until(
+                &state,
+                &token,
+                || state.starts[1].load(Ordering::Acquire) == 1,
+                "busy notification B arrival",
+            )?;
+            let a_task = notification_task(&state, 0);
+            let b_task = notification_task(&state, 1);
+            assert_eq!(sched::test_state(&a_task), task::State::Running(0));
+            assert_eq!(sched::test_state(&b_task), task::State::Running(1));
+            // SAFETY: 协调者固定 CPU2、IRQ 可服务且无锁；CPU1 在开 IRQ 的有限自旋段。
+            // 回调是永久函数，不访问空参数、不睡眠、不取锁，也不递归调用 CSD。
+            unsafe { cpu::call(1, notification_barrier, core::ptr::null_mut()) };
+            state.turn.store(1, Ordering::Release);
+            notification_until(
+                &state,
+                &token,
+                || state.steps[1].load(Ordering::Acquire) == 1,
+                "busy notification IRQ held",
+            )?;
+            assert!(!cpu::get(1).idle.load(Ordering::Acquire));
+            assert_eq!(cpu::test_pending_kicks(1) & cpu::KICK_RESCHEDULE, 0);
+            state.go.store(true, Ordering::Release);
+            notification_until(
+                &state,
+                &token,
+                || state.steps[0].load(Ordering::Acquire) == 1,
+                "busy notification Yield returned",
+            )?;
+            assert!(matches!(
+                sched::test_state(&a_task),
+                task::State::Running(_)
+            ));
+            assert_eq!(sched::test_ready_occurrences(&a_task), 0);
+            assert_eq!(sched::test_state(&b_task), task::State::Running(1));
+            assert_eq!(cpu::test_pending_kicks(1) & cpu::KICK_RESCHEDULE, 0);
+            assert_eq!(a.try_join(), None);
+            assert_eq!(b.try_join(), None);
+            state.frames.store(1, Ordering::Release);
+            assert_eq!(a.join()?, 20);
+            assert_eq!(b.join()?, 21);
+            Ok(31)
+        })?);
+        assert_eq!(fixture.handles[0].as_ref().unwrap().join()?, 31);
+        Ok(())
+    }
+
+    /// owner 仍许可执行的普通 Yield 必须唤醒 idle 核，Ready 任务随后真实恢复且不制造抢占位。
+    #[test]
+    #[ktest(min_cpus = 3)]
+    fn yield_wakes_idle_cpu_without_reschedule(
+        _: &mut TestContext<'_>,
+        fixture: &mut Tasks,
+    ) -> TestResult {
+        fixture.idle_pause = Some(1);
+        let state = Arc::clone(&fixture.state);
+        fixture.handles[0] = Some(spawn_result_on(2, move |token| {
+            assert_eq!(cpu::current().id, 2);
+            let b_state = Arc::clone(&state);
+            let b = spawn_result_on(0, move |token| {
+                assert_eq!(cpu::current().id, 0);
+                assert!(b_state.notification_tasks[1]
+                    .lock()
+                    .replace(task::current_task())
+                    .is_none());
+                b_state.starts[1].store(1, Ordering::Release);
+                b_state.exit.wait();
+                assert_eq!(cpu::current().id, 0);
+                b_state.steps[1].store(1, Ordering::Release);
+                notification_until(
+                    &b_state,
+                    &token,
+                    || b_state.frames.load(Ordering::Acquire) == 1,
+                    "idle notification B release",
+                )?;
+                Ok(21)
+            })?;
+            notification_until(
+                &state,
+                &token,
+                || {
+                    state.starts[1].load(Ordering::Acquire) == 1
+                        && sched::test_state(&notification_task(&state, 1)) == task::State::Blocked
+                },
+                "idle notification B blocked",
+            )?;
+            let a_state = Arc::clone(&state);
+            let a = spawn_result(move |token| notification_yielder(a_state, token, true))?;
+            notification_until(
+                &state,
+                &token,
+                || state.starts[0].load(Ordering::Acquire) == 1,
+                "idle notification A arrival",
+            )?;
+            let a_task = notification_task(&state, 0);
+            let b_task = notification_task(&state, 1);
+            assert_eq!(sched::test_state(&a_task), task::State::Running(0));
+            assert_eq!(sched::affinity(&a_task), cpu::CpuSet::prefix(2));
+            assert_eq!(sched::affinity(&b_task), cpu::CpuSet::single(0));
+            state.exit.complete();
+            assert_eq!(sched::test_state(&b_task), task::State::Ready);
+            assert_eq!(sched::test_ready_occurrences(&b_task), 1);
+            // SAFETY: 协调者固定 CPU2、IRQ 可服务且无锁；CPU1 尚未武装停点，可处理 IPI。
+            // 永久空回调不访问参数、不睡眠、不取锁；返回前原通知已由真实 handler 取走。
+            unsafe { cpu::call(1, notification_barrier, core::ptr::null_mut()) };
+            cpu::test_arm_pause(1, cpu::TestPause::Idle);
+            // 只有武装成功才发布拥有；主任务等待协调者离栈后才可能进入 fixture 清理。
+            state.active[1].store(1, Ordering::Release);
+            cpu::kick(1, cpu::KICK_TIMER_REPROGRAM);
+            notification_until(
+                &state,
+                &token,
+                || cpu::test_is_paused(1, cpu::TestPause::Idle),
+                "idle notification boundary",
+            )?;
+            assert!(cpu::get(1).idle.load(Ordering::Acquire));
+            assert_eq!(
+                cpu::test_pending_kicks(1) & (cpu::KICK_SCHED_WAKE | cpu::KICK_RESCHEDULE),
+                0
+            );
+            state.go.store(true, Ordering::Release);
+            notification_until(
+                &state,
+                &token,
+                || state.steps[1].load(Ordering::Acquire) == 1,
+                "idle notification B running",
+            )?;
+            assert_eq!(sched::test_state(&b_task), task::State::Running(0));
+            assert_eq!(sched::test_ready_occurrences(&b_task), 0);
+            assert_eq!(sched::test_state(&a_task), task::State::Ready);
+            assert_eq!(sched::test_ready_occurrences(&a_task), 1);
+            assert_eq!(state.steps[0].load(Ordering::Acquire), 0);
+            let pending = cpu::test_pending_kicks(1);
+            assert_eq!(pending & cpu::KICK_SCHED_WAKE, cpu::KICK_SCHED_WAKE);
+            assert_eq!(pending & cpu::KICK_RESCHEDULE, 0);
+            cpu::test_release_pause(1, cpu::TestPause::Idle);
+            state.active[1].store(0, Ordering::Release);
+            notification_until(
+                &state,
+                &token,
+                || state.steps[0].load(Ordering::Acquire) == 1,
+                "idle notification A resumed",
+            )?;
+            assert_eq!(sched::test_state(&a_task), task::State::Running(1));
+            assert_eq!(sched::test_ready_occurrences(&a_task), 0);
+            assert_eq!(a.try_join(), None);
+            state.frames.store(1, Ordering::Release);
+            assert_eq!(a.join()?, 20);
+            assert_eq!(b.join()?, 21);
+            Ok(31)
+        })?);
+        assert_eq!(fixture.handles[0].as_ref().unwrap().join()?, 31);
         Ok(())
     }
 }

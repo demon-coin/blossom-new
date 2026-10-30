@@ -57,7 +57,7 @@ impl Scheduler {
         }
     }
 
-    /// 接收一次原始强拥有并登记活任务，随后以独立节点加入 ready 尾部。
+    /// 接收一次原始强拥有并登记活任务，加入 ready 尾部后允许向忙核请求调度。
     fn publish(&mut self, task: *const Task) {
         // SAFETY: task 是新 Arc::into_raw 的唯一活登记拥有，尚未发表；锁独占全部链接。
         unsafe {
@@ -68,11 +68,12 @@ impl Scheduler {
             }
             self.live_head = task;
         }
-        self.push_ready(task);
+        self.push_ready(task, true);
     }
 
-    /// 锁内发表独立 ready 节点；本核忙于调度时不自发提示，idle及其余合法目标保持原通知。
-    fn push_ready(&mut self, task: *const Task) {
+    /// 锁内发表独立 ready 节点并唤醒合法 idle 核；preempt_running 允许通知忙核，
+    /// 但本核已离栈且即将直接 pick 时仍不自发重调度 IPI。
+    fn push_ready(&mut self, task: *const Task, preempt_running: bool) {
         // SAFETY: 私有调用点保证 task 活着且为 Ready、不在 ready；锁独占独立 ready 链接。
         unsafe {
             let data = &mut *(*task).scheduling.get();
@@ -85,17 +86,19 @@ impl Scheduler {
                 (*(*self.ready_tail).scheduling.get()).ready_next = task;
             }
             self.ready_tail = task;
-            // 本核离栈后会直接 pick；自发 IPI 反而在下一 Task 开 IRQ 时重建已消费提示，
-            // 令用户安全点反复让出而到不了真实用户入口；idle窗口仍保留原IPI唤醒。
+            // idle 与 ready 在同一调度锁下发表，纯唤醒即使迟到也不能抢占下一 Running Task。
+            // 本核离栈后会直接 pick，额外的自重调度会在下一 Task 开 IRQ 时重新制造提示。
             let local = cpu::current();
             for owner in data.allowed.iter() {
-                if allowed_on(data, owner)
-                    && cpu::get(owner).online.load(Ordering::Acquire)
-                    && (owner != local.id
-                        || local.current_task_id.load(Ordering::Relaxed) != 0
-                        || local.idle.load(Ordering::Acquire))
-                {
-                    cpu::kick(owner, cpu::KICK_RESCHEDULE);
+                let target = cpu::get(owner);
+                if allowed_on(data, owner) && target.online.load(Ordering::Acquire) {
+                    if target.idle.load(Ordering::Acquire) {
+                        cpu::kick(owner, cpu::KICK_SCHED_WAKE);
+                    } else if preempt_running
+                        && (owner != local.id || local.current_task_id.load(Ordering::Relaxed) != 0)
+                    {
+                        cpu::kick(owner, cpu::KICK_RESCHEDULE);
+                    }
                 }
             }
         }
@@ -157,14 +160,16 @@ impl Scheduler {
         false
     }
 
-    /// ctx 已保存以后结束 SwitchingOut，退出资源仅移出而不在锁内析构。
+    /// ctx 保存后结束 SwitchingOut；普通 Yield 只通知 idle，原核被许可排除时才请求忙核调度，
+    /// Park 的真实通知保留抢占提示，退出资源仅移出而不在锁内析构。
     fn finish(&mut self, task: *const Task, owner: usize) -> Option<(Resources, i32)> {
         // SAFETY: 本 CPU 刚回调度栈，活登记保留 task，旧 CPU 已结束 ctx 保存；锁独占状态。
         let data = unsafe { &mut *(*task).scheduling.get() };
         match data.state {
             State::SwitchingOut(cpu, SwitchIntent::Yield) if cpu == owner => {
                 data.state = State::Ready;
-                self.push_ready(task);
+                let preempt_running = !allowed_on(data, owner);
+                self.push_ready(task, preempt_running);
                 None
             }
             State::SwitchingOut(cpu, SwitchIntent::Park(id)) if cpu == owner => {
@@ -176,7 +181,7 @@ impl Scheduler {
                     State::Blocked
                 };
                 if active.notified {
-                    self.push_ready(task);
+                    self.push_ready(task, true);
                 }
                 None
             }
@@ -515,7 +520,7 @@ pub(crate) fn end_wait(task: &Task, id: WaitId) {
     data.active_wait = None;
 }
 
-/// 接受本轮首次通知；Ready 保留已有成员，切换保存前仅记通知，只有 Blocked 需要入队。
+/// 接受本轮首次通知；切换保存前仅记通知，Blocked 入队后允许请求忙核调度，Ready 不重复入队。
 pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
     let mut scheduler = SCHED_LOCK.lock();
     // SAFETY: 调度锁独占状态和等待；调用者在锁外升级的强引用覆盖整个访问。
@@ -536,7 +541,7 @@ pub(crate) fn notify(task: &Task, id: WaitId) -> bool {
     active.notified = true;
     if data.state == State::Blocked {
         data.state = State::Ready;
-        scheduler.push_ready(task);
+        scheduler.push_ready(task, true);
     }
     true
 }

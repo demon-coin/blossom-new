@@ -27,6 +27,8 @@ pub(crate) const KICK_RESCHEDULE: usize = 1 << 0;
 pub(crate) const KICK_TIMER_REPROGRAM: usize = 1 << 1;
 pub(crate) const KICK_LOG_PRINTER: usize = 1 << 2;
 const KICK_STOP: usize = 1 << 3;
+/// 仅唤醒 idle 核重查 ready 队列，不向可能已经运行的新任务请求抢占。
+pub(crate) const KICK_SCHED_WAKE: usize = 1 << 4;
 
 /// 链接期保留的主核启动栈，不依赖页分配器。
 #[repr(C, align(16))]
@@ -492,11 +494,12 @@ impl Drop for CallbackGuard {
     }
 }
 
-/// 在硬件通知已清除后执行真实 CSD 并发布完成；永久停机只在队列处理结束后消费。
+/// 在硬件通知已清除后消费软件原因、执行 CSD；调度唤醒不请求抢占，永久停机在队列处理后消费。
 pub fn handle_ipi() {
     let local = current();
     local.ipi_interrupts.fetch_add(1, Ordering::Relaxed);
-    // 硬件已确认后一次取走旧位；处理期间远端再置位仍留在原子中，并发送新的 IPI。
+    // 硬件已确认后一次取走旧位，KICK_SCHED_WAKE 随之消费而不改变 need_resched；
+    // 处理期间远端再置位仍留在原子中，并发送新的 IPI。
     let reasons = local.kick_reasons.swap(0, Ordering::AcqRel);
     #[cfg(feature = "ktest")]
     test_pause_boundary(&local.test_ipi_pause);
@@ -592,9 +595,9 @@ pub(crate) fn kick(target: usize, reason: usize) {
     }
 }
 
-/// 与 IPI 消费分支保持同一有效原因集合，永久停核沿同一个跨核协议。
+/// 校验全部有效软件原因，包括仅唤醒 idle 的提示和永久停核请求。
 fn kick_mask() -> usize {
-    KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER | KICK_STOP
+    KICK_RESCHEDULE | KICK_TIMER_REPROGRAM | KICK_LOG_PRINTER | KICK_STOP | KICK_SCHED_WAKE
 }
 
 /// 在生命周期停止生产者后永久停稳其它 online 核，返回的 guard 固定协调核直到整机动作。

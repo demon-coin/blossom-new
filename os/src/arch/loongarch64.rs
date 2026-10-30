@@ -101,7 +101,7 @@ extern "C" {
     fn la_kernel_refill();
     /// 按普通函数 ABI 保存旧整数现场并恢复下一执行者，不改写本核 KS0。
     fn la_switch_context(prev: *mut TaskContext, next: *const TaskContext);
-    /// 在启 IE 到 IDLE 的显式窗口内复查软件提示；trap 可把返回地址改到函数入口重新检查。
+    /// 在启 IE 到 IDLE 的显式窗口内复查提示；窗口中断后退出等待并返回调度器。
     fn la_idle_once_asm(
         kick_pending: *const AtomicUsize,
         wake_pending: *const AtomicBool,
@@ -109,6 +109,7 @@ extern "C" {
     );
     static la_idle_window_start: u8;
     static la_idle_window_end: u8;
+    static la_idle_window_exit: u8;
 }
 
 /// 在引导入口确立的 PLV0 环境读取本核 CSR；寄存器编号由本模块常量指定。
@@ -325,7 +326,7 @@ pub fn wait_for_interrupt() {
     }
 }
 
-/// 以启 IE 后重查与 trap 返回回滚避免通知已消费后进入 IDLE，返回保持 IRQ 关闭。
+/// 启 IE 后重查提示，窗口中断直接退出等待，由调度器重新检查队列；返回保持 IRQ 关闭。
 ///
 /// # Safety
 /// 仅允许本核永久 boot/scheduler 栈上的最终等待边界调用：IRQ 关闭、无普通任务、
@@ -339,7 +340,7 @@ pub(crate) unsafe fn idle_once(
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
     // SAFETY: 调用者保证本核永久 boot/scheduler 栈、稳定原子及无锁 IRQ-off 边界；汇编遵守整数 ABI，
-    // 在精确标记的启 IE/重查/IDLE 窗口可被 trap 重启，返回前关闭 IE，不改 FP/KS0。
+    // 窗口内中断转到关闭 IE 的返回边界，调度器随后重查完整队列；不改 FP/KS0。
     // 测试计数指针经 a2 传入；amadd_db.d 的输出 t1、增量 t0、地址 a2 互不重叠，
     // 64 位原子 RMW 的完整屏障与远端 Acquire 读取匹配，trap 保留全部参数和临时寄存器。
     unsafe {
@@ -775,6 +776,7 @@ pub fn trigger_unmapped_fault() -> ! {
 }
 
 /// 分派真实硬中断并记录本核深度；异常直接终止，FP 关闭时不读取条件字段。
+/// 等待窗口被中断时先退出汇编等待，避免原因已消费后再次进入 IDLE。
 #[no_mangle]
 extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
     if (frame.estat >> 16) & 0x3f != 0 {
@@ -793,13 +795,13 @@ extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
         #[cfg(not(feature = "ktest"))]
         crate::console::fatal(frame.era, frame.gpr[3], frame.estat, frame.badv);
     }
-    // 仅显式等待窗口允许回滚。重启包含 mask 初始化，不能复用 csrxchg 已改写的 t0。
+    // 本次中断可能已消费纯唤醒原因，必须先返回调度器重查队列，不能重新进入等待窗口。
     let (idle_start, idle_end) = (
         core::ptr::addr_of!(la_idle_window_start) as usize,
         core::ptr::addr_of!(la_idle_window_end) as usize,
     );
     if idle_start <= frame.era && frame.era < idle_end {
-        frame.era = la_idle_once_asm as usize;
+        frame.era = core::ptr::addr_of!(la_idle_window_exit) as usize;
     }
     handle_hardware_interrupt(frame.estat);
 }
