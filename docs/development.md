@@ -8,6 +8,8 @@
 
 普通内核与 ktest 都需要该固定工具链的 `rust-src`，由 `os/.cargo/config.toml` 统一重编 `core/alloc` 及 `compiler-builtins-mem`。LoongArch 统一关闭 `ual`，使内核和标准库都生成严格对齐的访存；不能只约束内核后继续链接预编译的标准库。Make 清除外部 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS`，通过 Cargo 原生 `--config` 数组合并 panic/unwind 参数与目标 ISA 约束。直接 Cargo 构建仍从 `os/` 执行；独立用户 std 程序继续消费已准备的目标标准库和 sysroot，不读取内核配置。
 
+单架构构建默认按 `ARCH` 选择 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`，分别默认为 `riscv64-linux-musl-` 和 `loongarch64-linux-musl-`；`MUSL_LIBC`、`GLIBC_LIBDIR` 同样默认选择对应的 `_RV` 或 `_LA` 来源。直接设置单架构参数（包括设置为空）优先于上述默认值；`make all` 分别使用两架构参数。未提供运行库来源时，准备器使用其文档中的固定默认路径，缺失则报错。工具链命名或安装路径不同时，应明确覆盖相应前缀和运行库来源。
+
 ```sh
 make help
 make build-kernel ARCH=riscv64
@@ -29,12 +31,16 @@ make prepare-guest-runtime-libraries ARCH=riscv64
 
 两张导出卷分别只有对应架构的根 `/`，不再复制 `/riscv64`、`/loongarch64` 双根。普通 ELF 不启用 ktest；显式 debug 构建不替换固定交付。
 
-std 程序目标为 `riscv64gc-unknown-linux-musl`、`loongarch64-unknown-linux-musl`。`RUNNER_SYSROOT`、`RUNNER_LINKER` 选择已准备的真实目标标准库和交叉链接器；不指定 sysroot 时使用所选工具链自身的 sysroot。直接依赖、锁文件及 vendor 在 `userland/contest-run`，直接 Cargo 命令必须以该目录为工作目录，清除外部交叉 `RUSTFLAGS`，使用 `--locked --offline`。
+std 程序目标为 `riscv64gc-unknown-linux-musl`、`loongarch64-unknown-linux-musl`。`RUNNER_SYSROOT` 指定 Rust 目标标准库所在的 sysroot；不指定时使用当前 `rustc` 的 sysroot。`RUNNER_LINKER` 默认是所选 `MUSL_CROSS` 加 `gcc`，可独立指定交叉链接器；链接器的 C sysroot 与 Rust sysroot、动态运行库资产分别准备。直接依赖、锁文件及 vendor 在 `userland/contest-run`，直接 Cargo 命令必须以该目录为工作目录，清除外部交叉 `RUSTFLAGS`，使用 `--locked --offline`。
+
+默认 BusyBox、项目 C 用户程序和两个 std 执行器均静态链接；外部测试盘也可能包含动态程序。动态程序须在其客体根内找到 `PT_INTERP` 指定的解释器及匹配的依赖库，可用 `readelf -l -d` 核对实际产物。交叉编译器包装器可能把宿主路径写进解释器或运行库搜索路径；构建动态程序时应使用与客体根相匹配的目标工具链和运行库，不修改原比赛输入冒充原始结果。
 
 完整交付的本地输入示例：
 
 ```sh
 make all \
+  MUSL_CROSS_RV=/srv/toolchains/riscv64/bin/riscv64-buildroot-linux-musl- \
+  MUSL_CROSS_LA=/srv/toolchains/loongarch64/bin/loongarch64-linux-musl- \
   MUSL_LIBC_RV=/srv/contest-runtime/riscv64/musl/libc.so \
   GLIBC_LIBDIR_RV=/srv/contest-runtime/riscv64/glibc/lib \
   MUSL_LIBC_LA=/srv/contest-runtime/loongarch64/musl/libc.so \

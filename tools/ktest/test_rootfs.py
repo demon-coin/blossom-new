@@ -26,8 +26,11 @@ def tree_contents(directory):
         if path.is_symlink():
             content = os.readlink(path)
         elif path.is_file():
+            digest = hashlib.sha256()
             with path.open("rb") as stream:
-                content = hashlib.file_digest(stream, "sha256").digest()
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            content = digest.digest()
         else:
             content = None
         result[str(path.relative_to(directory))] = (

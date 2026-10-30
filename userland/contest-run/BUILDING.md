@@ -13,7 +13,7 @@ make build-contest-runner ARCH=riscv64 RUNNER_SYSROOT=/absolute/prepared/sysroot
 make build-contest-runner ARCH=loongarch64 RUNNER_SYSROOT=/absolute/prepared/sysroot RUNNER_LINKER=loongarch64-linux-musl-gcc
 ```
 
-不指定 `RUNNER_SYSROOT` 时使用该工具链自己的 sysroot。`RUNNER_LINKER` 默认是 `$(MUSL_CROSS)gcc`。目标分别为 `riscv64gc-unknown-linux-musl`、`loongarch64-unknown-linux-musl`；程序位于 `build/contest-run/<target>/release/contest-run`。两个目标都固定使用 `+crt-static`、`relocation-model=static`、`link-self-contained=yes`、`-no-pie`，release 使用 `panic=abort`，不关闭 LoongArch 的 LSX/LASX。
+不指定 `RUNNER_SYSROOT` 时使用当前 `rustc` 的 sysroot；它与交叉 GCC 的 C sysroot 和动态运行库资产是不同输入。`RUNNER_LINKER` 默认是 `$(MUSL_CROSS)gcc`，而 `MUSL_CROSS` 未指定时按 `ARCH` 选择 `MUSL_CROSS_RV` 或 `MUSL_CROSS_LA`。目标分别为 `riscv64gc-unknown-linux-musl`、`loongarch64-unknown-linux-musl`；程序位于 `build/contest-run/<target>/release/contest-run`。两个目标都固定使用 `+crt-static`、`relocation-model=static`、`link-self-contained=yes`、`-no-pie`，release 使用 `panic=abort`，不关闭 LoongArch 的 LSX/LASX。
 
 `make build-guest-userland ARCH=...` 安装当前程序到 `GUEST_USERLAND_OUTPUT_DIR/sbin/contest-run`，不安装同名旧 Shell 或构建旧 C helper。BusyBox 与 Cargo 分别通过真实依赖判定是否重新编译；修改 `userland/contest/` 后需要重新装配、制卷并明确刷新系统工作盘，不必重编程序。`make build-kernel` 只编译内核。
 

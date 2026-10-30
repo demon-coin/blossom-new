@@ -26,13 +26,13 @@ GUEST_USERLAND_OUTPUT_DIR ?= build/userland-$(ARCH)
 USER_SELFTEST_BUILD_DIR ?= build/user-selftest-cache/$(ARCH)
 RUNTIME_LIBRARIES_OUTPUT_DIR ?= build/runtime-$(ARCH)
 BUSYBOX_BUILD_DIR ?= build/busybox-$(ARCH)
-MUSL_LIBC ?=
-GLIBC_LIBDIR ?=
+MUSL_LIBC ?= $(if $(filter riscv64,$(ARCH)),$(MUSL_LIBC_RV),$(MUSL_LIBC_LA))
+GLIBC_LIBDIR ?= $(if $(filter riscv64,$(ARCH)),$(GLIBC_LIBDIR_RV),$(GLIBC_LIBDIR_LA))
 MUSL_LIBC_RV ?=
 MUSL_LIBC_LA ?=
 GLIBC_LIBDIR_RV ?=
 GLIBC_LIBDIR_LA ?=
-MUSL_CROSS ?= $(ARCH)-linux-musl-
+MUSL_CROSS ?= $(if $(filter riscv64,$(ARCH)),$(MUSL_CROSS_RV),$(MUSL_CROSS_LA))
 MUSL_CROSS_RV ?= riscv64-linux-musl-
 MUSL_CROSS_LA ?= loongarch64-linux-musl-
 MUSL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -static -fno-pie -no-pie
