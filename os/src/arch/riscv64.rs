@@ -1,6 +1,6 @@
 //! 固定 Sv39/QEMU virt 后端；SBI 只使用 TIME、IPI、HSM、SRST。
 use crate::{
-    boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_VIRTIO_MMIO},
+    boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS, MAX_VIRTIO_MMIO},
     cpu::{CpuBoot, CpuLocal},
     platform::LINK_LAYOUT,
     sched::context::TaskContext,
@@ -285,21 +285,97 @@ struct BootMapping {
 
 // 每套 setup 最多引用两组各八个时钟及其父源、三个复位和十六个引脚 provider。
 // UART 只有时钟，RTC、MMC、GMAC 各有完整 setup；重复 provider 在加入映射时合并。
+// MMC 卡检测 GPIO 单独保留一个 provider 位置，不能依赖它恰好与总线引脚同源。
 const MAX_CLOCK_MAPPINGS: usize = 2 * (8 + 8);
 const MAX_SETUP_MAPPINGS: usize = MAX_CLOCK_MAPPINGS + 3 + 16;
 const MAX_BOOT_MAPPINGS: usize = 1
     + MAX_MEMORY_REGIONS
+    + MAX_RESERVED_REGIONS
     + 6
     + MAX_VIRTIO_MMIO
     + 1
     + 4
     + 5
     + MAX_CLOCK_MAPPINGS
-    + 3 * MAX_SETUP_MAPPINGS;
-// 内核只占 Sv39 高半的 256 个根槽；各映射的 VA/PA 有相同的 2MiB 页内偏移，
-// 因而仅首尾各可能需要一个 L0，其余部分使用 2MiB 叶。保留区不新增映射。
+    + 3 * MAX_SETUP_MAPPINGS
+    + 1;
+// 不相交的 RAM bank 扣除 no-map 并集后，每个禁映射区间至多新增一个片段，
+// 总片段数不超过 RAM 数加 no-map 数。每个片段继续满足 VA/PA 的 2MiB 页内偏移相同。
+// Sv39 高半最多 256 张 L1；每段首尾至多各一张 L0，分裂后的片段也计入上界。
 const MAX_BOOT_BRANCHES: usize = 256 + 2 * MAX_BOOT_MAPPINGS;
 const MAX_BOOT_TABLES: usize = 1 + MAX_BOOT_BRANCHES;
+
+/// 从同一保留表读取 no-map 区间，向外取整以禁止映射任何相交页。
+fn no_map_regions(info: &BootInfo) -> impl Iterator<Item = Region> + '_ {
+    info.reserved[..info.reserved_count]
+        .iter()
+        .zip(&info.reserved_no_map[..info.reserved_count])
+        .filter(|(_, no_map)| **no_map)
+        .map(|(region, _)| {
+            assert!(region.start < region.end, "no-map region is empty");
+            Region {
+                start: region.start & !4095,
+                end: region
+                    .end
+                    .checked_add(4095)
+                    .expect("no-map page rounding overflows")
+                    & !4095,
+            }
+        })
+}
+
+/// 在写入最终表前拒绝禁映射页覆盖仍存活的完整镜像、DTB 或 initrd。
+/// 镜像区间包含静态启动表池、BSP 栈及全部 BSS；普通保留区可以与 no-map 相交。
+pub(crate) fn validate_boot_no_map(info: &BootInfo, kernel: Region) -> Result<(), &'static str> {
+    for region in no_map_regions(info) {
+        if region.overlaps(kernel) {
+            return Err("no-map overlaps the live kernel image, tables, or stack");
+        }
+        if region.overlaps(info.dtb) {
+            return Err("no-map overlaps the live DTB");
+        }
+        if info.initrd.is_some_and(|initrd| region.overlaps(initrd)) {
+            return Err("no-map overlaps the live initrd");
+        }
+    }
+    Ok(())
+}
+
+/// 顺序产生单个 RAM bank 扣除无序 no-map 并集后的直映片段，不复制保留表。
+pub(crate) fn direct_map_regions(
+    info: &BootInfo,
+    mut ram: Region,
+) -> impl Iterator<Item = Region> + '_ {
+    assert!(
+        ram.start < ram.end && (ram.start | ram.end) & 4095 == 0,
+        "RAM bank is not page aligned"
+    );
+    core::iter::from_fn(move || {
+        while ram.start < ram.end {
+            let start = ram.start;
+            let mut end = ram.end;
+            let mut covered_end = start;
+            // 每轮跨过一个覆盖游标的禁映射并集，或返回下一个空隙；重叠和相邻区间无需排序。
+            for hole in no_map_regions(info) {
+                if hole.end <= start || ram.end <= hole.start {
+                    continue;
+                }
+                if hole.start <= start {
+                    covered_end = covered_end.max(hole.end.min(ram.end));
+                } else {
+                    end = end.min(hole.start);
+                }
+            }
+            if start < covered_end {
+                ram.start = covered_end;
+                continue;
+            }
+            ram.start = end;
+            return Some(Region { start, end });
+        }
+        None
+    })
+}
 
 /// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
 fn add_mapping(
@@ -342,6 +418,19 @@ fn add_mapping(
         flags,
     };
     *count += 1;
+}
+
+/// 将全部真实 RAM bank 的剩余片段加入同一预检映射表，普通保留区仍保持直映。
+fn add_ram_mappings(
+    info: &BootInfo,
+    mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
+    count: &mut usize,
+) {
+    for &ram in &info.memory[..info.memory_count] {
+        for region in direct_map_regions(info, ram) {
+            add_mapping(mappings, count, phys_to_virt(region.start), region, 0xc6);
+        }
+    }
 }
 
 /// 将已验证设备范围向外取页边界，仅映射真实 CPU 物理窗口。
@@ -401,7 +490,7 @@ fn add_setup_mappings(
     }
 }
 
-/// 按实际叶项计算唯一 L1/L0 表数，在写表前拒绝超出同源静态池的输入。
+/// 按真实映射所触及的唯一 L1/L0 计算表数，在写表前拒绝超出同源静态池的输入。
 fn mapping_table_count(mappings: &[BootMapping]) -> usize {
     let mut branches = [usize::MAX; MAX_BOOT_BRANCHES];
     let mut count = 0;
@@ -421,12 +510,27 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
                     count += 1;
                 }
             }
-            let step = if huge { 0x200000 } else { 4096 };
+            // 同一 2MiB 槽内的后续小页共用这张 L0，无需为预算逐页重复查找。
+            let step = (0x200000 - (va & 0x1fffff)).min(mapping.physical.end - pa);
             va += step;
             pa += step;
         }
     }
     1 + count
+}
+
+/// 在独占测试快照上执行正式 RAM 分裂和表池预检，不写入或安装任何页表。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_ram_mapping_budget(info: &BootInfo) -> (usize, usize) {
+    let empty = BootMapping {
+        virtual_start: 0,
+        physical: Region { start: 0, end: 0 },
+        flags: 0,
+    };
+    let mut mappings = [empty; MAX_BOOT_MAPPINGS];
+    let mut count = 0;
+    add_ram_mappings(info, &mut mappings, &mut count);
+    (count, mapping_table_count(&mappings[..count]))
 }
 
 /// 在 AP 释放前为实际 RAM、UART、RTC、控制器、MMIO 槽和 PCI 资源安装最终 PTE。
@@ -443,6 +547,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             .expect("kernel page rounding overflows")
             & !4095,
     };
+    validate_boot_no_map(info, kernel).expect("Sv39 boot no-map conflict");
     let empty = BootMapping {
         virtual_start: 0,
         physical: Region { start: 0, end: 0 },
@@ -457,15 +562,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         kernel,
         0xce,
     );
-    for &region in &info.memory[..info.memory_count] {
-        add_mapping(
-            &mut mappings,
-            &mut count,
-            phys_to_virt(region.start),
-            region,
-            0xc6,
-        );
-    }
+    add_ram_mappings(info, &mut mappings, &mut count);
     for region in [
         info.interrupts.uart,
         info.interrupts.controller,
@@ -495,6 +592,9 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         add_device_mapping(&mut mappings, &mut count, mmc.registers);
         add_device_mapping(&mut mappings, &mut count, mmc.syscon);
         add_setup_mappings(&mut mappings, &mut count, &mmc.setup);
+        if let Some(input) = mmc.card_detect {
+            add_device_mapping(&mut mappings, &mut count, input.provider);
+        }
     }
     if let Some(gmac) = info.board.gmac {
         add_device_mapping(&mut mappings, &mut count, gmac.registers);

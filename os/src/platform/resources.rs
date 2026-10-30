@@ -8,7 +8,7 @@ use crate::boot::{
     BoardClockInputs, BootInfo, ClockResource, DeviceClocks, DeviceSetup, GmacResources, PhyMode,
     PinResource, Platform, Region, ResourceReference,
 };
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 
 /// 取得唯一启用的具名路径或 alias，不猜另一设备。
 pub(super) fn alias<'a>(tree: &'a Fdt<'a>, name: &str) -> Result<Node<'a>, &'static str> {
@@ -21,6 +21,28 @@ pub(super) fn alias<'a>(tree: &'a Fdt<'a>, name: &str) -> Result<Node<'a>, &'sta
         return Err("FDT selected alias target is disabled");
     }
     Ok(node)
+}
+
+/// 只选择已声明且启用的 alias；明确禁用不取资源，损坏声明仍返回错误。
+pub(super) fn optional_alias<'a>(
+    tree: &'a Fdt<'a>,
+    name: &str,
+) -> Result<Option<Node<'a>>, &'static str> {
+    let Some(aliases) = tree.find_node("/aliases") else {
+        return Ok(None);
+    };
+    let Some(value) = aliases.property(name) else {
+        return Ok(None);
+    };
+    let path = cstr(value.value)?;
+    let node = tree.find_node(path).ok_or("FDT alias target is missing")?;
+    if node.property("status").and_then(|status| status.as_str()) == Some("disabled") {
+        return Ok(None);
+    }
+    if !enabled(node) {
+        return Err("FDT selected alias target is disabled");
+    }
+    Ok(Some(node))
 }
 
 /// 按 chosen 的 stdout-path 解析控制台，包括标准 alias。
@@ -46,16 +68,77 @@ pub(super) fn optional_number(node: Node<'_>, name: &str) -> Result<Option<u32>,
     node.property(name).map(|_| number(node, name)).transpose()
 }
 
-/// 判断设备及祖先是否声明 DMA 一致性。
-pub(super) fn coherent<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> bool {
-    loop {
+/// 按最近的显式属性判断 DMA 一致性，无声明时沿 DMA 父链使用调用方的架构默认值。
+pub(super) fn coherent<'a>(
+    tree: &'a Fdt<'a>,
+    mut node: Node<'a>,
+    default_coherent: bool,
+) -> Result<bool, &'static str> {
+    // DMA phandle 可以跨越结构祖先；超过真实节点总数仍未结束说明父链存在环。
+    for _ in tree.all_nodes() {
         if node.property("dma-coherent").is_some() {
-            return true;
+            return Ok(true);
         }
-        let Some(bus) = parent(tree, node) else {
-            return false;
+        if node.property("dma-noncoherent").is_some() {
+            return Ok(false);
+        }
+        let Some(bus) = dma_parent(tree, node)? else {
+            return Ok(default_coherent);
         };
         node = bus;
+    }
+    Err("FDT DMA parent chain contains a cycle")
+}
+
+/// 只解析 dma-mem 选中的 interconnect 父节点，不把 provider 当作 clock/reset 或 MMIO。
+fn dma_parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Option<Node<'a>>, &'static str> {
+    let Some(names) = node.property("interconnect-names") else {
+        return Ok(parent(tree, node));
+    };
+    let mut names = names.value;
+    let mut index = 0usize;
+    loop {
+        if names.is_empty() {
+            return Ok(parent(tree, node));
+        }
+        let name = cstr(names)?;
+        if name == "dma-mem" {
+            break;
+        }
+        names = &names[name.len() + 1..];
+        index += 1;
+    }
+
+    let raw = property(node, "interconnects")?;
+    let mut at = 0;
+    loop {
+        let handle = word(raw, at)?;
+        at += 4;
+        // 空 phandle 是零参数占位；只有未选项可以跳过，选中的 DMA 父必须存在。
+        if handle == 0 {
+            if index == 0 {
+                return Err("FDT selected DMA interconnect phandle is missing");
+            }
+            index -= 1;
+            continue;
+        }
+        let provider = tree
+            .find_phandle(handle)
+            .ok_or("FDT DMA interconnect provider is missing")?;
+        let count = usize::try_from(number(provider, "#interconnect-cells")?)
+            .map_err(|_| "FDT DMA interconnect cell count is not representable")?;
+        let end = count
+            .checked_mul(4)
+            .and_then(|size| at.checked_add(size))
+            .ok_or("FDT DMA interconnect argument length overflows")?;
+        if raw.len() < end {
+            return Err("FDT DMA interconnect arguments are truncated");
+        }
+        if index == 0 {
+            return Ok(Some(provider));
+        }
+        at = end;
+        index -= 1;
     }
 }
 
@@ -114,7 +197,7 @@ fn provider_region<'a>(tree: &'a Fdt<'a>, provider: Node<'a>) -> Result<Region, 
 }
 
 /// 按 clock-names 与 clocks 的相同索引取得实际输入，禁止以遍历首项代替具名父源。
-fn named_clock<'a>(
+pub(super) fn named_clock<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,
     wanted: &str,
@@ -133,14 +216,14 @@ fn named_clock<'a>(
     Err("FDT required named clock input is missing")
 }
 
-/// 只沿所选 SDIO 的真实父链保存 PLL 输入，当前 PLL 频率由设备动作读取。
+/// 沿所选 UART 的实际 SYS CRG 父链保存共享 PLL 输入，频率仍由设备动作读取。
 pub(super) fn jh7110_clock_inputs<'a>(
     tree: &'a Fdt<'a>,
-    mmc: Node<'a>,
+    uart: Node<'a>,
 ) -> Result<BoardClockInputs, &'static str> {
-    let (_, syscrg) = named_clock(tree, mmc, "biu")?;
+    let (_, syscrg) = named_clock(tree, uart, "baudclk")?;
     if !compatible(syscrg, "starfive,jh7110-syscrg") {
-        return Err("FDT selected SDIO bus clock does not use the system CRG");
+        return Err("FDT selected UART clock does not use the system CRG");
     }
     let (pll_reference, pll) = named_clock(tree, syscrg, "pll0_out")?;
     if !compatible(pll, "starfive,jh7110-pll") || pll_reference.id != 0 {
@@ -392,8 +475,12 @@ pub(super) fn discover_uart<'a>(
     Ok(())
 }
 
-/// 保存 PHY 和 MAC 的共同真实属性，不扫描 PHY 或生成地址。
-pub(super) fn gmac<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<GmacResources, &'static str> {
+/// 保存 PHY 和 MAC 的共同真实属性，并按调用方的架构默认值解析 DMA 一致性。
+pub(super) fn gmac<'a>(
+    tree: &'a Fdt<'a>,
+    node: Node<'a>,
+    default_coherent: bool,
+) -> Result<GmacResources, &'static str> {
     let phy = tree
         .find_phandle(number(node, "phy-handle")?)
         .ok_or("FDT GMAC PHY is missing")?;
@@ -448,7 +535,7 @@ pub(super) fn gmac<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<GmacResource
         phy_clock_drive_ua: optional_number(phy, "motorcomm,rx-clk-drv-microamp")?,
         phy_data_drive_ua: optional_number(phy, "motorcomm,rx-data-drv-microamp")?,
         tx_use_rgmii_clock: node.property("starfive,tx-use-rgmii-clk").is_some(),
-        dma_coherent: coherent(tree, node),
+        dma_coherent: coherent(tree, node, default_coherent)?,
         dma_mask: dma_mask.min(u32::MAX as u64),
         ..GmacResources::default()
     })

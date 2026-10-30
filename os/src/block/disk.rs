@@ -329,7 +329,7 @@ impl Disk {
     /// 用同一固定请求核心准备真实 SD，原 payload 只交 CPU 复制访问期；无卡不建立 Disk。
     ///
     /// # Safety
-    /// 资源来自唯一快照，控制器及其 clock/reset/pin/syscon 完整永久映射且由调用者独占；
+    /// 资源来自唯一快照，控制器及其 clock/reset/pin/GPIO/syscon 完整永久映射且由调用者独占；
     /// 外部 owner 必须保本 Disk 到 IRQ、命令、Work 和真实停止全部结束。
     pub(crate) unsafe fn prepare_sdmmc(
         resources: &crate::boot::MmcResources,

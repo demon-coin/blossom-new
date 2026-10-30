@@ -193,7 +193,7 @@ impl Backend {
     /// 从唯一资源准备实际 SD；真实无卡返回 None，其余初始化错误保持原类别。
     ///
     /// # Safety
-    /// 调用者须独占启动快照中的真实控制器、syscon/clock/reset/pin，并保其完整永久映射；
+    /// 调用者须独占启动快照中的真实控制器及其 syscon/clock/reset/pin/GPIO，保其完整永久映射；
     /// 外层 Disk 在 publish 前登记 IRQ，之后保活本后端到停止与全部执行尾部。
     pub(super) unsafe fn sdmmc(
         resources: &MmcResources,

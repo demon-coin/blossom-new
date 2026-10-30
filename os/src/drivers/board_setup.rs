@@ -11,7 +11,9 @@
 //! 只改叶设备需要的门、分频、父源和复位；共享 PLL、CPU/总线根的配置保留。
 
 use crate::arch::{dma_barrier, mmio_address};
-use crate::boot::{self, ClockResource, DeviceSetup, PinResource, Region, ResourceReference};
+use crate::boot::{
+    self, ClockResource, DeviceSetup, GpioInputResource, PinResource, Region, ResourceReference,
+};
 use crate::sync::SleepMutex;
 use crate::time::{self, Duration};
 use core::convert::TryFrom;
@@ -31,8 +33,8 @@ static SETUP_LOCK: SleepMutex<()> = SleepMutex::new(());
 
 /// 对一次规范化请求执行实际板设备动作；空请求不取锁、不读取启动快照。
 ///
-/// 只能在时间源已建立、可切换的普通任务中调用。失败前已经完成的动作保留，
-/// 不回滚共享时钟，也不使驱动获得继续发表硬件的许可。
+/// 只能在时间源已建立、可切换的普通任务中调用。所选复位全部 assert 后，
+/// 至少保持 reset_hold 的单调时间；失败前已完成的动作保留，不回滚共享时钟。
 ///
 /// # Safety
 /// 所有 provider、父时钟和启动快照中的 PLL/syscrg 必须来自当前实际板资源，
@@ -40,7 +42,10 @@ static SETUP_LOCK: SleepMutex<()> = SleepMutex::new(());
 /// 全部 CRG/pinctrl 使用者须通过本锁串行，或在外部保证不并发修改同一寄存器；
 /// 调用者还须保证被改变的父时钟没有本请求以外的活动使用者。此处不取得资源拥有权。
 /// 叶驱动必须先检验自己必需的 clock/reset/pin，不能把缺资源传成空请求。
-pub(crate) unsafe fn apply_setup(setup: &DeviceSetup) -> Result<(), &'static str> {
+pub(crate) unsafe fn apply_setup(
+    setup: &DeviceSetup,
+    reset_hold: Duration,
+) -> Result<(), &'static str> {
     validate_setup(setup)?;
     if setup.clocks.count == 0
         && setup.clocks.assigned_count == 0
@@ -65,8 +70,22 @@ pub(crate) unsafe fn apply_setup(setup: &DeviceSetup) -> Result<(), &'static str
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, true)?;
     }
+    let reset_deadline = if setup.reset_count == 0 || reset_hold.is_zero() {
+        None
+    } else {
+        Some(
+            time::now()
+                .checked_add(reset_hold)
+                .ok_or("JH7110 reset hold deadline overflow")?,
+        )
+    };
     for pin in &setup.pins[..setup.pin_count] {
         apply_pin(pin)?;
+    }
+    if let Some(until) = reset_deadline {
+        while time::now() < until {
+            core::hint::spin_loop();
+        }
     }
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, false)?;
@@ -86,6 +105,37 @@ pub(crate) unsafe fn clock_rate(clock: &ClockResource) -> Result<u64, &'static s
     }
     let _guard = SETUP_LOCK.lock();
     rate(clock.reference, 0)
+}
+
+/// 在普通可睡任务中配置独立 SYS GPIO 输入并读取原始电平，不解释卡检测极性。
+///
+/// # Safety
+/// GPIO provider 与所选设备的 SYS CRG 必须来自唯一启动快照，并已有完整永久 MMIO
+/// 映射；调用者独占该 pin 的功能选择，全部共享 CRG/pinctrl 更新遵守 SETUP_LOCK。
+pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, &'static str> {
+    check_region(input.provider, SYS_PIN, 0x2b4)?;
+    if 64 <= input.pin {
+        return Err("JH7110 SYS GPIO input pin is outside the supported range");
+    }
+    let _guard = SETUP_LOCK.lock();
+    let provider = crg(SYS_CRG)?;
+    enable_clock(ResourceReference { provider, id: 112 }, 0)?;
+    set_reset(ResourceReference { provider, id: 2 }, false)?;
+    let pin = input.pin;
+    let offset = pin as usize / 4 * 4;
+    let shift = pin % 4 * 8;
+    update(
+        input.provider,
+        0x120 + pin as usize * 4,
+        (1 << 0) | (1 << 6),
+        (1 << 0) | (1 << 6),
+    )?;
+    update(input.provider, 0x40 + offset, 0x7f << shift, 0)?;
+    update(input.provider, offset, 0x3f << shift, 1 << shift)?;
+    if let Some((offset, shift)) = function_field(pin) {
+        update(input.provider, offset, 3 << shift, 0)?;
+    }
+    Ok(read(input.provider, 0x118 + pin as usize / 32 * 4) & (1 << (pin % 32)) != 0)
 }
 
 /// 检查完整寄存器范围，防止偏移或地址加法溢出后再进行 MMIO。

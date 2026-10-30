@@ -36,7 +36,7 @@ impl Storage {
     ///
     /// # Safety
     /// inventory 须来自本次唯一真实发现，调用者独占全部块设备并保持完整强序映射。
-    /// BootInfo 选定的 MMC/AHCI 及其 setup、实际 ABAR/IRQ 也须独占并永久映射，固件已退出；
+    /// BootInfo 选定的 MMC/AHCI 及其 setup、卡检测 GPIO、实际 ABAR/IRQ 也须独占并永久映射，固件已退出；
     /// AHCI 的 DMA 恒等窗口与各设备 coherency/mask 必须反映真实平台。
     /// 固件 initrd 须由 BootInfo 保留到内核结束且永久直映；固件、用户映射、其他设备和
     /// 另一 RAM disk owner 均不得访问该范围，直到本表 Disk 的 stop 全尾结束。
@@ -59,7 +59,7 @@ impl Storage {
                 index += 1;
             }
             if let Some(resources) = boot::info().board.mmc.as_ref() {
-                // SAFETY: 同一启动快照已映射选定控制器和 setup 资源，调用者独占此设备；
+                // SAFETY: 同一启动快照已映射选定控制器、setup 及独立卡检测 GPIO，调用者独占此设备；
                 // 准备成功后立即进入永久 owning 槽，发表前由 Disk 登记稳定 IRQ action。
                 let disk = unsafe { Disk::prepare_sdmmc(resources, &storage.queue) }?;
                 storage.disks.lock()[index] = disk;

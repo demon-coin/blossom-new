@@ -378,7 +378,7 @@ fn discover_pci<'a>(
         .ok_or("FDT selected GMAC0 function is missing or disabled")?;
     let identity = pci_function(tree, mac, banks)?;
     add_route(info, identity)?;
-    let mut gmac = resources::gmac(tree, mac)?;
+    let mut gmac = resources::gmac(tree, mac, false)?;
     gmac.pci = Some(identity);
     gmac.interrupt_source = identity.interrupt_source;
     info.board.gmac = Some(gmac);
@@ -404,7 +404,7 @@ fn pci_function<'a>(
         device: ((address >> 11) & 31) as u8,
         function: ((address >> 8) & 7) as u8,
         interrupt_source: lio_irq(tree, node, banks)?,
-        dma_coherent: resources::coherent(tree, node),
+        dma_coherent: resources::coherent(tree, node, false)?,
     })
 }
 
@@ -471,7 +471,7 @@ fn discover_mmio<'a>(
         registers,
         pci: None,
         interrupt_source: lio_irq(tree, sata, banks)?,
-        dma_coherent: resources::coherent(tree, sata),
+        dma_coherent: resources::coherent(tree, sata, false)?,
         dma_mask,
         ports_implemented: resources::optional_number(sata, "ports-implemented")?,
     });
@@ -479,7 +479,7 @@ fn discover_mmio<'a>(
     if !(compatible(mac, "snps,dwmac-3.70a") || compatible(mac, "snps,arc-dwmac-3.70a")) {
         return Err("FDT ethernet0 is not a DWMAC1000 MMIO binding");
     }
-    let mut gmac = resources::gmac(tree, mac)?;
+    let mut gmac = resources::gmac(tree, mac, false)?;
     gmac.registers = single_region(tree, mac)?;
     device_region(gmac.registers, info)?;
     if gmac.registers.end - gmac.registers.start < 0x105c {

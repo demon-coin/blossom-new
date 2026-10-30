@@ -377,7 +377,10 @@ fn discover_tree(
             reservation.size(),
         )?)?;
     }
-    if let Some(reserved) = tree.find_node("/reserved-memory") {
+    if let Some(reserved) = tree
+        .find_node("/reserved-memory")
+        .filter(|node| enabled(*node))
+    {
         if reserved
             .property("ranges")
             .is_some_and(|p| !p.value.is_empty())
@@ -386,8 +389,13 @@ fn discover_tree(
         }
         for child in reserved.children().filter(|n| enabled(*n)) {
             identity_address(&tree, child)?;
+            let no_map = child.property("no-map").is_some();
             for region in regions(child)? {
-                info.reserve(region?)?;
+                if no_map {
+                    info.reserve_no_map(region?)?;
+                } else {
+                    info.reserve(region?)?;
+                }
             }
         }
     }
@@ -519,6 +527,19 @@ pub(crate) fn ktest_discover_tree<'a>(
     };
     discover_tree(bytes, info, dtb_address)?;
     Ok(info)
+}
+
+/// 对测试独占的真实 DTB 副本执行同一 DMA 属性与父链解析，不发布资源或访问 MMIO。
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_dma_coherent(
+    bytes: &[u8],
+    path: &str,
+    default_coherent: bool,
+) -> Result<bool, &'static str> {
+    validate(bytes)?;
+    let tree = Fdt::new(bytes).map_err(|_| "FDT parse failed")?;
+    let node = tree.find_node(path).ok_or("FDT DMA test node is missing")?;
+    resources::coherent(&tree, node, default_coherent)
 }
 
 /// 保存完整 NUL 结尾的单一命令行，拒绝截断、内嵌 NUL 和容量外输入。

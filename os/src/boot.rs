@@ -126,6 +126,14 @@ pub struct PinResource {
     pub slew_rate: Option<u32>,
 }
 
+/// GPIO 输入的实际控制器、引脚及电平有效方向，不承载外设总线复用。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpioInputResource {
+    pub provider: Region,
+    pub pin: u32,
+    pub active_low: bool,
+}
+
 /// 原生设备初始化需要的时钟、复位与引脚资源。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceSetup {
@@ -164,8 +172,12 @@ pub struct MmcResources {
     pub sysreg: [u32; 3],
     pub bus_width: u32,
     pub max_frequency: u32,
-    pub fifo_depth: u32,
+    pub fifo_depth: Option<u32>,
     pub data_offset: u32,
+    pub card_detect: Option<GpioInputResource>,
+    pub cd_inverted: bool,
+    pub disable_wp: bool,
+    pub post_power_on_delay_ms: u32,
     pub dma_coherent: bool,
     pub dma_mask: u64,
 }
@@ -337,6 +349,8 @@ pub struct BootInfo {
     pub memory: [Region; MAX_MEMORY_REGIONS],
     pub reserved_count: usize,
     pub reserved: [Region; MAX_RESERVED_REGIONS],
+    /// 与 reserved 同索引；仅固件明确声明 no-map 的区间禁止最终 RAM 直映。
+    pub reserved_no_map: [bool; MAX_RESERVED_REGIONS],
     pub dtb: Region,
     pub initrd: Option<Region>,
     pub uart: UartResources,
@@ -384,6 +398,7 @@ impl BootInfo {
             ptr::addr_of_mut!((*pointer).memory).write([Region::default(); MAX_MEMORY_REGIONS]);
             ptr::addr_of_mut!((*pointer).reserved_count).write(0);
             ptr::addr_of_mut!((*pointer).reserved).write([Region::default(); MAX_RESERVED_REGIONS]);
+            ptr::addr_of_mut!((*pointer).reserved_no_map).write([false; MAX_RESERVED_REGIONS]);
             ptr::addr_of_mut!((*pointer).dtb).write(Region::default());
             ptr::addr_of_mut!((*pointer).initrd).write(None);
             ptr::addr_of_mut!((*pointer).uart).write(UartResources::default());
@@ -405,12 +420,23 @@ impl BootInfo {
         &self.bootargs[..self.bootargs_len]
     }
 
-    /// 在输入边界登记一段实际保留资源。
+    /// 登记阻止分配但仍允许直映的普通保留资源。
     pub fn reserve(&mut self, region: Region) -> Result<(), &'static str> {
-        if self.reserved_count == MAX_RESERVED_REGIONS {
+        self.reserve_with_attribute(region, false)
+    }
+
+    /// 登记同时禁止分配和最终 RAM 直映的固件保留资源。
+    pub fn reserve_no_map(&mut self, region: Region) -> Result<(), &'static str> {
+        self.reserve_with_attribute(region, true)
+    }
+
+    /// 容量检查成功后一次提交区间和属性，失败不修改任何已登记记录。
+    fn reserve_with_attribute(&mut self, region: Region, no_map: bool) -> Result<(), &'static str> {
+        if MAX_RESERVED_REGIONS <= self.reserved_count {
             return Err("boot reservation capacity exceeded");
         }
         self.reserved[self.reserved_count] = region;
+        self.reserved_no_map[self.reserved_count] = no_map;
         self.reserved_count += 1;
         Ok(())
     }

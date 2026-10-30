@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use spin::Once;
 
-use crate::console::{RxSample, SerialSnapshot};
+use crate::console::RxSample;
 use crate::fs::epoll::WatchHead;
 use crate::fs::file::{
     FileIoContext, FileLike, FileRef, FileStat, ReadBuffer, SeekFrom, WriteBuffer,
@@ -1562,15 +1562,17 @@ fn drain_output(caller: FileIoContext<'_>, file: Option<&TtyFile>) -> Result<(),
             waiting = Some((context, table));
         }
     }
-    // 软件队列已空，按当前回读分频计算字符时间并复查真实 TEMT。
+    // 软件队列已空，使用最近已确认的分频安排复查，不为 drain 再切换 DLAB。
     loop {
         check_hangup(file)?;
         if crate::console::transmitter_empty() {
             return Ok(());
         }
-        let snapshot: SerialSnapshot = crate::console::serial_snapshot();
-        let cflag = endpoint().state.lock().termios.cflag;
-        let nanos = termios::character_nanos(snapshot.divisor, snapshot.baud_base, cflag)
+        let (divisor, cflag) = {
+            let state = endpoint().state.lock();
+            (state.divisor, state.termios.cflag)
+        };
+        let nanos = termios::character_nanos(divisor, crate::console::baud_base(), cflag)
             .ok_or(FsError::InvalidOperation)?;
         let deadline = time::now()
             .checked_add(Duration::from_nanos(nanos))

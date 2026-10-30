@@ -61,10 +61,11 @@ pub(crate) struct Sdmmc {
 
 impl Sdmmc {
     /// 在普通可睡任务中预备稳定 Arc、bounce 和 IDMAC 原页后初始化卡，返回时 IRQ 输出关闭。
-    /// 仅真实 CDETECT 无卡返回 None；资源、识别与停止失败不解释为介质缺失。
+    /// 仅真实 GPIO/CDETECT 无卡返回 None；资源、识别与停止失败不解释为介质缺失。
     ///
     /// # Safety
-    /// 资源来自唯一启动快照；寄存器、syscon、clock/reset/pin 已映射且本设备独占。
+    /// 资源来自唯一启动快照；寄存器、syscon、clock/reset/pin 及独立 CD GPIO provider
+    /// 均已有完整永久设备映射；本设备与所选 CD pin 由调用者独占，共享设置遵守板设置锁。
     /// 调用者必须在 publish 前登记保活本对象的 IRQ action，之后按共同 Disk 停止协议使用。
     pub(crate) unsafe fn prepare(
         resources: &MmcResources,
@@ -77,10 +78,11 @@ impl Sdmmc {
             .checked_sub(resources.registers.start)
             .ok_or(BlockError::InvalidRange)?;
         if base % 8 != 0
-            || span < 0x208
+            || span < IDINTEN + 4
             || !(resources.bus_width == 1 || resources.bus_width == 4)
-            || resources.fifo_depth < 2
-            || 4096 < resources.fifo_depth
+            || resources
+                .fifo_depth
+                .is_some_and(|depth| !(2..=4096).contains(&depth))
             || resources.max_frequency == 0
             || resources.setup.clocks.count != 2
         {
@@ -119,7 +121,7 @@ impl Sdmmc {
         })
         .map_err(|_| BlockError::NoMemory)?;
         // SAFETY: 调用者保证规范化 provider 的独占映射，全部可失败分配已完成。
-        unsafe { board_setup::apply_setup(&resources.setup) }
+        unsafe { board_setup::apply_setup(&resources.setup, Duration::from_micros(10)) }
             .map_err(|_| BlockError::Unsupported)?;
         // SAFETY: apply_setup 已成功，时钟 provider 映射由 prepare 的调用契约保活。
         let frequency = unsafe { board_setup::clock_rate(&resources.setup.clocks.entries[1]) }
@@ -368,8 +370,8 @@ impl Sdmmc {
         Ok(self.regs.response())
     }
 
-    /// 关卡时钟、提交除数、重新开钟的三个 update-clock 均确认 START 已清除。
-    fn clock(&self, target: u32) -> Result<(), BlockError> {
+    /// 三个 update-clock 均确认 START 已清除，核分频与开钟读回后返回实际卡时钟。
+    fn clock(&self, target: u32) -> Result<u64, BlockError> {
         if target == 0 {
             return Err(BlockError::InvalidRange);
         }
@@ -391,7 +393,15 @@ impl Sdmmc {
         self.regs.write(CLKDIV, divisor as u32);
         self.update_clock()?;
         self.regs.write(CLKENA, 1);
-        self.update_clock()
+        self.update_clock()?;
+        if self.regs.read(CLKDIV) & 0xff != divisor as u32 || self.regs.read(CLKENA) & 1 == 0 {
+            return Err(BlockError::Io);
+        }
+        Ok(if divisor == 0 {
+            input
+        } else {
+            input / (2 * divisor as u64)
+        })
     }
 
     /// update-clock 是无 CMD_DONE 的控制动作，仅用于尚未发表的识别期。
@@ -405,7 +415,7 @@ impl Sdmmc {
         Ok(())
     }
 
-    /// 识别 SD、解析实际容量并完成 SCR/受支持总线宽度与默认速度配置；false 只表示 CDETECT 无卡。
+    /// 识别 SD、解析实际容量并完成 SCR/受支持总线宽度与默认速度；false 只表示真实缺卡。
     fn initialize(&self) -> Result<bool, BlockError> {
         self.regs.write(CTRL, RESET);
         self.regs.write(BMOD, BMOD_RESET);
@@ -413,23 +423,66 @@ impl Sdmmc {
             self.regs.read(CTRL) & RESET == 0 && self.regs.read(BMOD) & BMOD_RESET == 0
         })?;
         let hcon = self.regs.read(HCON);
+        let version = self.regs.read(VERID);
+        let (fifo_offset, fifo_width) = protocol::fifo_geometry(
+            version,
+            hcon,
+            self.resources.data_offset,
+            self.resources.registers.end - self.resources.registers.start,
+        )?;
         // 仅实现内部 DMA 的 32 位地址格式；64 位 IDMAC 寄存器布局不同。
         if hcon & (1 << 27) != 0 || (hcon >> 16) & 3 != 0 {
             return Err(BlockError::Unsupported);
         }
-        if self.regs.read(CDETECT) & 1 != 0 {
+        let present = if let Some(input) = self.resources.card_detect.as_ref() {
+            // SAFETY: 本对象仅由 prepare 构造；独立 GPIO/SYS CRG 永久映射和 CD pin
+            // 独占由其调用者保证，输入配置与其它板设置通过同一可睡锁串行。
+            let raw = unsafe { board_setup::read_gpio_input(input) }
+                .map_err(|_| BlockError::Unsupported)?;
+            let present = (raw != input.active_low) ^ self.resources.cd_inverted;
+            crate::klog!(
+                crate::klog::Level::Info,
+                "SDMMC CD GPIO pin={} raw={} active_low={} inverted={} present={}",
+                input.pin,
+                raw,
+                input.active_low,
+                self.resources.cd_inverted,
+                present
+            );
+            present
+        } else {
+            let detect = self.regs.read(CDETECT);
+            let present = (detect & 1 == 0) ^ self.resources.cd_inverted;
+            crate::klog!(
+                crate::klog::Level::Info,
+                "SDMMC CD native={:#x} inverted={} present={}",
+                detect,
+                self.resources.cd_inverted,
+                present
+            );
+            present
+        };
+        if !present {
             return Ok(false);
         }
         self.regs.write(INTMASK, 0);
         self.regs.write(IDINTEN, 0);
         self.regs.write(PWREN, 1);
+        let power_delay = Duration::from_millis(self.resources.post_power_on_delay_ms as u64);
+        timer::sleep(power_delay);
         self.regs.write(CTYPE, 0);
         self.regs.write(UHS, 0);
         self.regs.write(TMOUT, u32::MAX);
-        let depth = self.resources.fifo_depth;
+        let fifoth = if self.resources.fifo_depth.is_none() {
+            self.regs.read(FIFOTH)
+        } else {
+            0
+        };
+        let depth = protocol::fifo_depth(self.resources.fifo_depth, fifoth)?;
         self.regs
             .write(FIFOTH, ((depth / 2 - 1) << 16) | (depth / 2));
-        self.clock(400_000)?;
+        let identification_frequency = self.clock(400_000)?;
+        timer::sleep(power_delay);
         self.command_polled(0, 0, INITIALIZE)?;
         let version2 = match self.command_polled(8, 0x1aa, RESPONSE | CRC) {
             Ok(response) if response[0] & 0xfff == 0x1aa => true,
@@ -476,20 +529,52 @@ impl Sdmmc {
             protocol::check_r1(self.command_polled(16, 512, RESPONSE | CRC | WAIT_DATA)?[0])?;
         }
         self.app_polled(card)?;
-        let scr = self.scr()?;
+        let scr = self.scr(fifo_offset, fifo_width)?;
         if scr >> 60 != 0 || scr & (1 << 48) == 0 {
             return Err(BlockError::Unsupported);
         }
+        let mut bus_width = 1;
         if self.resources.bus_width == 4 && scr & (1 << 50) != 0 {
             self.app_polled(card)?;
             protocol::check_r1(self.command_polled(6, 2, RESPONSE | CRC | WAIT_DATA)?[0])?;
             self.regs.write(CTYPE, 1);
+            bus_width = 4;
         }
-        self.clock(protocol::transfer_frequency(csd)?.min(self.resources.max_frequency))?;
+        let card_frequency =
+            self.clock(protocol::transfer_frequency(csd)?.min(self.resources.max_frequency))?;
         self.wait_card(card, deadline(PROGRAM_MS), false)?;
-        self.readonly.store(
-            self.regs.read(WRTPRT) & 1 != 0 || csd & ((1 << 13) | (1 << 12)) != 0,
-            Ordering::Release,
+        let write_protect = self.regs.read(WRTPRT) & 1 != 0;
+        let readonly =
+            (!self.resources.disable_wp && write_protect) || csd & ((1 << 13) | (1 << 12)) != 0;
+        self.readonly.store(readonly, Ordering::Release);
+        crate::klog!(
+            crate::klog::Level::Info,
+            "SDMMC OCR={:#010x} RCA={:#06x} CSD={:#034x} SCR={:#018x}",
+            ocr,
+            card.rca >> 16,
+            csd,
+            scr
+        );
+        crate::klog!(
+            crate::klog::Level::Info,
+            "SDMMC sectors={} bus_width={} readonly={} WRTPRT={} disable_wp={}",
+            sectors,
+            bus_width,
+            readonly,
+            write_protect,
+            self.resources.disable_wp
+        );
+        crate::klog!(
+            crate::klog::Level::Info,
+            "SDMMC input_hz={} identification_hz={} card_hz={} VERID={:#x} HCON={:#x} FIFO={:#x}/{} depth={}",
+            self.input_frequency.load(Ordering::Acquire),
+            identification_frequency,
+            card_frequency,
+            version,
+            hcon,
+            fifo_offset,
+            fifo_width,
+            depth
         );
         self.capacity.store(sectors, Ordering::Release);
         *self.command.lock() = Some(card);
@@ -508,27 +593,8 @@ impl Sdmmc {
         Ok(())
     }
 
-    /// 初始化唯一小数据 PIO：八字节 SCR 按线路大端解释，FIFO 支持实际 HCON 数据宽度。
-    fn scr(&self) -> Result<u64, BlockError> {
-        let version = self.regs.read(VERID) & 0xffff;
-        let offset = if self.resources.data_offset != 0 {
-            self.resources.data_offset as usize
-        } else if 0x240a <= version {
-            0x200
-        } else {
-            0x100
-        };
-        let width = match (self.regs.read(HCON) >> 7) & 7 {
-            0 => 2,
-            1 => 4,
-            2 => 8,
-            _ => return Err(BlockError::Unsupported),
-        };
-        if offset % width != 0
-            || self.resources.registers.end - self.resources.registers.start < offset + width
-        {
-            return Err(BlockError::InvalidRange);
-        }
+    /// 八字节 SCR 按线路大端解释；入口和 item 宽度复用复位后已核的 FIFO 几何。
+    fn scr(&self, offset: usize, width: usize) -> Result<u64, BlockError> {
         self.regs.write(BLKSIZ, 8);
         self.regs.write(BYTCNT, 8);
         self.regs.write(RINTSTS, u32::MAX);

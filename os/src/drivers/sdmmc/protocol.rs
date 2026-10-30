@@ -84,6 +84,41 @@ pub(super) fn address(sector: u64, block_addressed: bool) -> Result<u32, BlockEr
     u32::try_from(value).map_err(|_| BlockError::InvalidRange)
 }
 
+/// 复位后按版本和 HCON 一次确定 FIFO 入口，检查一个完整 item 的对齐和窗口。
+pub(super) fn fifo_geometry(
+    version: u32,
+    hcon: u32,
+    data_offset: u32,
+    span: usize,
+) -> Result<(usize, usize), BlockError> {
+    let offset = if data_offset != 0 {
+        data_offset as usize
+    } else if 0x240a <= (version & 0xffff) {
+        0x200
+    } else {
+        0x100
+    };
+    let width = match (hcon >> 7) & 7 {
+        0 => 2,
+        1 => 4,
+        2 => 8,
+        _ => return Err(BlockError::Unsupported),
+    };
+    if offset % width != 0 || offset.checked_add(width).is_none_or(|end| span < end) {
+        return Err(BlockError::InvalidRange);
+    }
+    Ok((offset, width))
+}
+
+/// 显式深度优先；缺省只解释改写前 FIFOTH 的 RX_WMARK，拒绝单 item FIFO。
+pub(super) fn fifo_depth(explicit: Option<u32>, fifoth: u32) -> Result<u32, BlockError> {
+    let depth = explicit.unwrap_or_else(|| 1 + ((fifoth >> 16) & 0xfff));
+    if !(2..=4096).contains(&depth) {
+        return Err(BlockError::Unsupported);
+    }
+    Ok(depth)
+}
+
 /// STATUS 的 FCNT 按 HCON 指定的 FIFO item 计数；调用者传已核对的 2/4/8 字节宽度。
 pub(super) fn fifo_readable_bytes(status: u32, item_bytes: usize, remaining: usize) -> usize {
     let items = ((status >> 17) & 0x1fff) as usize;
@@ -174,6 +209,46 @@ mod behavior {
         assert_eq!(fifo_readable_bytes(0, 8, 8), 0);
         assert_eq!(fifo_readable_bytes(one_item, 8, 0), 0);
         assert_eq!(fifo_readable_bytes(two_items, 8, 8), 8);
+    }
+
+    /// 旧新版入口、全部合法宽度及完整窗口采用生产校验，缺省深度不读取 HCON。
+    #[test]
+    fn fifo_geometry_and_depth() {
+        assert_eq!(fifo_geometry(0x2409, 0, 0, 0x102), Ok((0x100, 2)));
+        assert_eq!(fifo_geometry(0x2409, 1 << 7, 0, 0x104), Ok((0x100, 4)));
+        assert_eq!(fifo_geometry(0x2409, 2 << 7, 0, 0x108), Ok((0x100, 8)));
+        assert_eq!(fifo_geometry(0x240a, 0, 0, 0x202), Ok((0x200, 2)));
+        assert_eq!(fifo_geometry(0x240a, 1 << 7, 0, 0x204), Ok((0x200, 4)));
+        assert_eq!(fifo_geometry(0x240a, 2 << 7, 0, 0x208), Ok((0x200, 8)));
+        assert_eq!(
+            fifo_geometry(0x2409, 2 << 7, 0, 0x107),
+            Err(BlockError::InvalidRange)
+        );
+        assert_eq!(
+            fifo_geometry(0x240a, 2 << 7, 0, 0x207),
+            Err(BlockError::InvalidRange)
+        );
+        assert_eq!(fifo_geometry(0x240a, 1 << 7, 0x100, 0x104), Ok((0x100, 4)));
+        assert_eq!(
+            fifo_geometry(0x2409, 1 << 7, 0x102, 0x108),
+            Err(BlockError::InvalidRange)
+        );
+        assert_eq!(
+            fifo_geometry(0x240a, 3 << 7, 0, 0x208),
+            Err(BlockError::Unsupported)
+        );
+        assert_eq!(fifo_depth(Some(2), 0), Ok(2));
+        assert_eq!(fifo_depth(Some(4096), 0), Ok(4096));
+        assert_eq!(fifo_depth(Some(0), u32::MAX), Err(BlockError::Unsupported));
+        assert_eq!(fifo_depth(Some(1), u32::MAX), Err(BlockError::Unsupported));
+        assert_eq!(
+            fifo_depth(Some(4097), 1 << 16),
+            Err(BlockError::Unsupported)
+        );
+        assert_eq!(fifo_depth(None, 0), Err(BlockError::Unsupported));
+        assert_eq!(fifo_depth(None, 1 << 16), Ok(2));
+        assert_eq!(fifo_depth(None, 31 << 16), Ok(32));
+        assert_eq!(fifo_depth(None, u32::MAX), Ok(4096));
     }
 
     /// 固定 bounce 的十六段链包含 32 位地址末端，超限链不得截断为低地址。

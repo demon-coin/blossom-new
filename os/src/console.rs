@@ -39,6 +39,10 @@ const DLL: usize = 0;
 const DLM: usize = 1;
 const DLAB: u8 = 0x80;
 const TRANSMITTER_EMPTY: u8 = 0x40;
+const DW_USR: usize = 0x1f;
+const DW_BUSY: u8 = 1;
+const LOOPBACK: u8 = 1 << 4;
+const LCR_STICK_PARITY: u8 = 1 << 5;
 const DATA_TERMINAL_READY: u8 = 1;
 const REQUEST_TO_SEND: u8 = 2;
 
@@ -76,10 +80,10 @@ pub struct SerialConfig {
     pub rts: bool,
 }
 
-/// 真实串口寄存器回读与本平台固定 baudbase，不保存未被硬件接受的逻辑值。
+/// 端口锁内的硬件状态；分频来自最近一次已确认配置，其余字段直接回读。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SerialSnapshot {
-    /// 回读 DLL/DLM 得到的实际分频。
+    /// 最近一次 DLL/DLM 真实回读的分频值。
     pub divisor: u16,
     /// 回读 LCR。
     pub line_control: u8,
@@ -96,13 +100,15 @@ pub struct SerialSnapshot {
 /// 软件接收环容量；固定项数，不随终端模式或测试阶段改变。
 const RX_CAPACITY: usize = 1024;
 
-/// 端口锁内唯一的软件接收状态；生产者是 UART 中断，消费者是行规程工作。
+/// 端口锁内唯一的接收状态；IRQ 和 DW 配置隔离窗采样，行规程工作消费原环。
 struct RxState {
     samples: [RxSample; RX_CAPACITY],
     head: usize,
     tail: usize,
     len: usize,
     overrun: usize,
+    /// 最近一次受确认的分频和 LCR，避免相同线路参数反复中断收发。
+    line_settings: Option<(u16, u8)>,
     #[cfg(feature = "ktest")]
     quota: Option<usize>,
     #[cfg(feature = "ktest")]
@@ -112,7 +118,7 @@ struct RxState {
 }
 
 impl RxState {
-    /// 建立空接收环；测试配额、控制声明与 TTY 接收附着初始均为空，普通构建始终接收至 TTY。
+    /// 建立空接收环；线路回读、测试配额、控制声明与 TTY 接收附着初始均为空。
     const fn new() -> Self {
         Self {
             samples: [RxSample { byte: 0, status: 0 }; RX_CAPACITY],
@@ -120,6 +126,7 @@ impl RxState {
             tail: 0,
             len: 0,
             overrun: 0,
+            line_settings: None,
             #[cfg(feature = "ktest")]
             quota: None,
             #[cfg(feature = "ktest")]
@@ -260,6 +267,72 @@ fn dw_apb() -> bool {
         .map_or(cfg!(blossom_platform = "visionfive2"), |resource| {
             resource.dw_apb
         })
+}
+
+/// 持有 PORT 且 DW 已隔离外部 RX 并确认空闲时切换 LCR，禁止未进入 DLAB 就访问分频别名。
+fn write_line_control(value: u8) {
+    write_register(LCR, value);
+    if dw_apb() {
+        assert_eq!(
+            read_register(LCR) & !LCR_STICK_PARITY,
+            value & !LCR_STICK_PARITY,
+            "UART line control write was not accepted"
+        );
+    }
+}
+
+/// 保存调用者读取的 LSR 及对应 RBR 字节；DLAB 须清零且没有测试控制者。
+/// LSR 错误位读后清，必须消费该快照后才能再读 LSR；本入口不增加 IRQ 计数。
+fn preserve_pending_receive(port: &mut RxState, status: u8) -> bool {
+    if status & DATA_READY == 0 {
+        return false;
+    }
+    let byte = read_register(DATA);
+    port.push(RxSample { byte, status });
+    true
+}
+
+/// 持有 PORT 时仅更新真正变化的线路参数，返回实际分频及需要通知的接收进展。
+fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u16, bool) {
+    if port.line_settings == Some((config.divisor, config.line_control)) {
+        return (config.divisor, false);
+    }
+    let mut received = false;
+    if dw_apb() {
+        #[cfg(feature = "ktest")]
+        assert!(
+            !port.test_control_owned,
+            "DW UART line reconfiguration requires released receive control"
+        );
+        // 只排空已经进入硬件的 TX；PORT 阻止其它输出者继续填充，不等待软件输出队列。
+        loop {
+            let status = read_register(LSR);
+            received |= preserve_pending_receive(port, status);
+            if status & TRANSMITTER_EMPTY != 0 {
+                break;
+            }
+            spin_loop();
+        }
+        // BUSY 包含 RBR 数据。先隔离外部 RX，再保存残留采样，使空闲等待不依赖被阻止的 IRQ。
+        write_register(MCR, saved_mcr | LOOPBACK);
+        loop {
+            let status = read_register(LSR);
+            received |= preserve_pending_receive(port, status);
+            if read_register(DW_USR) & DW_BUSY == 0 {
+                break;
+            }
+            spin_loop();
+        }
+    }
+    write_line_control(config.line_control | DLAB);
+    write_register(DLL, config.divisor as u8);
+    write_register(DLM, (config.divisor >> 8) as u8);
+    let low = read_register(DLL);
+    let high = read_register(DLM);
+    write_line_control(config.line_control);
+    let divisor = u16::from(low) | (u16::from(high) << 8);
+    port.line_settings = Some((divisor, read_register(LCR)));
+    (divisor, received)
 }
 
 /// 已停其它核和本核事件后关闭 UART 中断并排空末尾停止诊断；不确认物理断电，返回后不得再启动输出者。
@@ -425,11 +498,13 @@ fn emergency_budget(mode: u8) -> bool {
     }
 }
 
-/// 在 UART 接管时一次设置字节模式与 FIFO，尚不接入 TTY 行规程。
+/// 接管中断与 FIFO；DW 保留固件线路参数，直到 TTY 在正式配置窗内更新。
 pub fn initialize() {
     let _port = PORT.lock();
     write_register(IER, 0);
-    write_register(LCR, 3);
+    if !dw_apb() {
+        write_line_control(3);
+    }
     write_register(FCR, 7);
 }
 
@@ -571,40 +646,18 @@ pub fn rx_overrun() -> usize {
     PORT.lock().overrun
 }
 
-/// 在同一端口锁内回读真实分频、行控、中断使能、调制解调控制与线路状态，不改变设备配置。
-pub fn serial_snapshot() -> SerialSnapshot {
-    let _port = PORT.lock();
-    let line_control = read_register(LCR);
-    write_register(LCR, line_control | DLAB);
-    let low = read_register(DLL);
-    let high = read_register(DLM);
-    write_register(LCR, line_control);
-    SerialSnapshot {
-        divisor: u16::from(low) | (u16::from(high) << 8),
-        line_control: read_register(LCR),
-        ier: read_register(IER),
-        mcr: read_register(MCR),
-        lsr: read_register(LSR),
-        baud_base: baud_base(),
-    }
-}
-
-/// 在同一端口锁内应用预验证的串口目标并回读核验；分频写入期间保持目标帧格式位而只置 DLAB，只更新 DTR/RTS 而保留其它 MCR 位，按 CREAD 合并接收使能并保留原发送中断位。测试接收控制已声明时，仅当目标要求接收且本段配额未耗尽才打开接收中断，防止已收齐后重开接收吃掉 ACK。
+/// 在 PORT 内提交预验证的串口参数，恢复实际 MCR/IER 后才允许普通 DATA/IER 访问；配置窗采样在锁外通知原行规程工作。
 pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     assert_eq!(
         config.line_control & DLAB,
         0,
         "UART line control must not set DLAB"
     );
-    let _port = PORT.lock();
+    let mut port = PORT.lock();
     let saved_ier = read_register(IER);
     let saved_mcr = read_register(MCR);
     write_register(IER, 0);
-    // 分频写入期间保持目标帧格式位而只置 DLAB，不把硬件临时改为默认帧格式。
-    write_register(LCR, config.line_control | DLAB);
-    write_register(DLL, config.divisor as u8);
-    write_register(DLM, (config.divisor >> 8) as u8);
-    write_register(LCR, config.line_control);
+    let (divisor, received) = configure_line(&mut port, config, saved_mcr);
     let mut mcr = saved_mcr & !(DATA_TERMINAL_READY | REQUEST_TO_SEND);
     if config.dtr {
         mcr |= DATA_TERMINAL_READY;
@@ -614,8 +667,8 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     }
     write_register(MCR, mcr);
     #[cfg(feature = "ktest")]
-    let effective_receiver = if _port.test_control_owned {
-        config.receiver && _port.quota.is_some()
+    let effective_receiver = if port.test_control_owned {
+        config.receiver && port.quota.is_some()
     } else {
         config.receiver
     };
@@ -626,13 +679,8 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         ier |= RECEIVE_INTERRUPT;
     }
     write_register(IER, ier);
-    // 回读分频需要再次置 DLAB，之后立即恢复目标 LCR；全程不与 DATA/IER 访问交错。
-    write_register(LCR, config.line_control | DLAB);
-    let low = read_register(DLL);
-    let high = read_register(DLM);
-    write_register(LCR, config.line_control);
     let snapshot = SerialSnapshot {
-        divisor: u16::from(low) | (u16::from(high) << 8),
+        divisor,
         line_control: read_register(LCR),
         ier: read_register(IER),
         mcr: read_register(MCR),
@@ -646,7 +694,10 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         0,
         "UART line control left DLAB set"
     );
-    drop(_port);
+    drop(port);
+    if received {
+        crate::fs::tty::schedule_receive();
+    }
     // 常规配置不以回读相等作为致命条件；保留完整差异作为硬件事实。
     if (snapshot.divisor != config.divisor
         || snapshot.line_control != config.line_control
@@ -696,7 +747,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
         let mut port = PORT.lock();
         let first_interrupt = read_register(IIR) & 0x0f;
         if first_interrupt == 7 && dw_apb() {
-            let _ = read_register(0x1f);
+            let _ = read_register(DW_USR);
             return true;
         }
         if first_interrupt & 1 != 0 {

@@ -57,6 +57,33 @@ fn translation(address: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// 只遍历最终页表核对 RAM 页属性，不解引用被 no-map 禁止访问的物理页。
+#[cfg(target_arch = "riscv64")]
+fn expect_ram_mapping(context: &mut TestContext<'_>, info: &boot::BootInfo, address: usize) {
+    if !info.memory[..info.memory_count]
+        .iter()
+        .any(|ram| ram.start <= address && address < ram.end)
+    {
+        return;
+    }
+    let no_map = info.reserved[..info.reserved_count]
+        .iter()
+        .zip(&info.reserved_no_map[..info.reserved_count])
+        .any(|(region, no_map)| {
+            *no_map
+                && region.start / 4096 <= address / 4096
+                && address / 4096 < region.end.div_ceil(4096)
+        });
+    if no_map {
+        context.expect_eq(translation(arch::phys_to_virt(address)), None);
+    } else {
+        let (physical, flags) =
+            translation(arch::phys_to_virt(address)).expect("actual RAM direct map missing");
+        context.expect_eq(physical, address);
+        context.expect_eq(flags & 0xe, 0x6);
+    }
+}
+
 #[cfg(target_arch = "loongarch64")]
 /// PLV0 读取实际控制与 DMW CSR，不依赖 GDB 的 CSR 名字支持。
 fn mapping_csrs() -> [usize; 3] {
@@ -103,7 +130,7 @@ pub(crate) mod mapping {
         ));
     }
 
-    /// 低 RAM 别名已撤销；设备与普通 RAM 的最终权限或缓存属性分别核对。
+    /// 低 RAM 别名已撤销；no-map 页与相邻普通保留页的最终映射按真实属性核对。
     #[test]
     fn low_alias_removed(context: &mut TestContext<'_>) {
         #[cfg(target_arch = "riscv64")]
@@ -111,10 +138,39 @@ pub(crate) mod mapping {
             let info = boot::info();
             for region in &info.memory[..info.memory_count] {
                 context.expect_eq(translation(region.start), None);
-                let (physical, flags) = translation(arch::phys_to_virt(region.start))
-                    .expect("actual RAM direct map missing");
-                context.expect_eq(physical, region.start);
-                context.expect_eq(flags & 0xe, 0x6);
+                expect_ram_mapping(context, info, region.start);
+                expect_ram_mapping(context, info, region.end - 1);
+            }
+            for (region, no_map) in info.reserved[..info.reserved_count]
+                .iter()
+                .zip(&info.reserved_no_map[..info.reserved_count])
+            {
+                let start = region.start & !4095;
+                let end = region
+                    .end
+                    .checked_add(4095)
+                    .expect("reservation page rounding overflow")
+                    & !4095;
+                for address in [Some(start), Some(end - 1), start.checked_sub(1), Some(end)]
+                    .iter()
+                    .flatten()
+                    .copied()
+                {
+                    expect_ram_mapping(context, info, address);
+                }
+                if *no_map {
+                    expect_ram_mapping(context, info, start + (end - start) / 2);
+                }
+            }
+            for region in [Some(boot::kernel_region()), Some(info.dtb), info.initrd]
+                .into_iter()
+                .flatten()
+            {
+                for address in [region.start, region.end - 1] {
+                    let (physical, _) = translation(arch::phys_to_virt(address))
+                        .expect("live boot object direct map missing");
+                    context.expect_eq(physical, address);
+                }
             }
             let uart = info.interrupts.uart.start;
             let (physical, flags) =

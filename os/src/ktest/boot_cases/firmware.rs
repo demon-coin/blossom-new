@@ -58,25 +58,30 @@ impl Fixture for Dtb {
 impl Dtb {
     /// 在真实 chosen 中定位 bootargs；缺失时先插入空属性，供同一替换路径填写边界值。
     fn prepare_bootargs(&mut self) -> (usize, usize) {
+        self.prepare_property("/chosen", "bootargs")
+    }
+
+    /// 在独占的真实节点中定位属性；缺失时插入空值，属性名保存在同一字符串块。
+    fn prepare_property(&mut self, path: &str, name: &str) -> (usize, usize) {
         let offset = {
             let tree = fdt::Fdt::new(&self.bytes[..self.length]).expect("actual DTB invalid");
-            let chosen = tree.find_node("/chosen").expect("actual chosen absent");
-            if let Some(property) = chosen.property("bootargs") {
+            let node = tree.find_node(path).expect("actual DTB node absent");
+            if let Some(property) = node.property(name) {
                 return (
                     (property.value.as_ptr() as usize)
                         .checked_sub(self.bytes.as_ptr() as usize)
-                        .expect("DTB bootargs pointer outside copy"),
+                        .expect("DTB property pointer outside copy"),
                     property.value.len(),
                 );
             }
-            let first = chosen
+            let first = node
                 .properties()
                 .next()
-                .expect("actual chosen properties absent");
+                .expect("actual DTB node properties absent");
             (first.value.as_ptr() as usize)
                 .checked_sub(self.bytes.as_ptr() as usize)
                 .and_then(|n| n.checked_sub(12))
-                .expect("DTB chosen property offset overflow")
+                .expect("DTB property offset overflow")
         };
         let word = |field: usize| {
             let end = field.checked_add(4).expect("DTB header offset overflow");
@@ -105,12 +110,15 @@ impl Dtb {
         assert!(structure_end <= strings && strings_end <= self.length);
 
         // 仅支持保留表、结构、字符串依次排列的真实副本；末尾填充可容纳新增属性名。
-        let name = b"bootargs\0";
+        let name_length = name
+            .len()
+            .checked_add(1)
+            .expect("DTB property name overflow");
         let name_start = strings_end
             .checked_add(12)
             .expect("DTB property name offset overflow");
         let name_end = name_start
-            .checked_add(name.len())
+            .checked_add(name_length)
             .expect("DTB property name overflow");
         let total = self
             .length
@@ -129,7 +137,7 @@ impl Dtb {
             (
                 32,
                 strings_size
-                    .checked_add(name.len())
+                    .checked_add(name_length)
                     .expect("DTB strings size overflow"),
             ),
             (
@@ -162,7 +170,8 @@ impl Dtb {
             )
         });
         self.bytes.copy_within(offset..self.length, value);
-        self.bytes[name_start..name_end].copy_from_slice(name);
+        self.bytes[name_start..name_end - 1].copy_from_slice(name.as_bytes());
+        self.bytes[name_end - 1] = 0;
         for (field, end, word) in fields {
             self.bytes[field..end].copy_from_slice(&word.to_be_bytes());
         }
@@ -237,6 +246,29 @@ impl Dtb {
             self.bytes[field..end].copy_from_slice(&value.to_be_bytes());
         }
         self.length = total;
+    }
+
+    /// 用正式属性替换路径设置一个值，不保留跨结构移动的节点或属性借用。
+    fn put_property(&mut self, path: &str, name: &str, value: &[u8]) {
+        let (offset, length) = self.prepare_property(path, name);
+        self.replace_property(offset, length, value);
+    }
+
+    /// 用 NOP 移除独占副本中的现有属性，保持其它节点和属性的物理布局。
+    fn remove_property(&mut self, path: &str, name: &str) {
+        let range = {
+            let tree = fdt::Fdt::new(&self.bytes[..self.length]).expect("actual DTB invalid");
+            let node = tree.find_node(path).expect("actual DTB node absent");
+            node.property(name).map(|property| {
+                let value = property.value.as_ptr() as usize - self.bytes.as_ptr() as usize;
+                value - 12..(value + property.value.len() + 3) & !3
+            })
+        };
+        if let Some(range) = range {
+            for token in self.bytes[range].chunks_exact_mut(4) {
+                token.copy_from_slice(&4u32.to_be_bytes());
+            }
+        }
     }
 }
 
@@ -367,7 +399,11 @@ pub(crate) mod cases {
         }
         assert!(parsed.reserved[..parsed.reserved_count]
             .iter()
-            .all(|r| live.reserved[..live.reserved_count].contains(r)));
+            .zip(&parsed.reserved_no_map[..parsed.reserved_count])
+            .all(|(region, no_map)| live.reserved[..live.reserved_count]
+                .iter()
+                .zip(&live.reserved_no_map[..live.reserved_count])
+                .any(|(actual, actual_no_map)| region == actual && no_map == actual_no_map)));
         for region in &live.memory[..live.memory_count] {
             assert!(region.start < region.end);
             context.diagnostic(format_args!(
@@ -375,10 +411,13 @@ pub(crate) mod cases {
                 region.start, region.end
             ));
         }
-        for region in &live.reserved[..live.reserved_count] {
+        for (region, no_map) in live.reserved[..live.reserved_count]
+            .iter()
+            .zip(&live.reserved_no_map[..live.reserved_count])
+        {
             context.diagnostic(format_args!(
-                "RESERVED start={:#x} end={:#x}",
-                region.start, region.end
+                "RESERVED start={:#x} end={:#x} no_map={}",
+                region.start, region.end, no_map
             ));
         }
         context.diagnostic(format_args!(
@@ -572,9 +611,11 @@ pub(crate) mod cases {
         }
     }
 
-    /// 独占快照连续登记真实 RAM 子区间，容量错误不得改变已发表的前128条记录。
+    /// 普通和 no-map 共用同一容量；失败不得提交区间、属性或计数中的任何一项。
     #[test]
-    fn reservation_capacity(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+    #[case("ordinary_first", false)]
+    #[case("no_map_first", true)]
+    fn reservation_capacity(context: &mut TestContext<'_>, fixture: &mut Dtb, first_no_map: bool) {
         let live = boot::info();
         let actual = parse(&fixture.bytes[..fixture.length], fixture.actual, live.bsp_hardware_id);
         let expected = parse(&fixture.bytes[..fixture.length], fixture.expected, live.bsp_hardware_id);
@@ -587,20 +628,31 @@ pub(crate) mod cases {
             let start = ram.start.checked_add(index.checked_mul(4096).expect("reservation offset overflow"))
                 .expect("reservation address overflow");
             let region = boot::Region { start, end: start.checked_add(4096).expect("reservation end overflow") };
-            actual.reserve(region).expect("legal reservation rejected");
+            let no_map = (index & 1 == 0) == first_no_map;
+            if no_map {
+                actual.reserve_no_map(region).expect("legal no-map reservation rejected");
+            } else {
+                actual.reserve(region).expect("legal reservation rejected");
+            }
             expected.reserved[index] = region;
+            expected.reserved_no_map[index] = no_map;
             context.expect_eq(actual.reserved_count, index + 1);
         }
         expected.reserved_count = boot::MAX_RESERVED_REGIONS;
         context.expect_eq(&actual.reserved[..], &expected.reserved[..]);
+        context.expect_eq(&actual.reserved_no_map[..], &expected.reserved_no_map[..]);
         let start = ram.start.checked_add(boot::MAX_RESERVED_REGIONS.checked_mul(4096)
             .expect("last reservation offset overflow")).expect("last reservation address overflow");
-        assert!(actual.reserve(boot::Region {
+        let overflow = boot::Region {
             start, end: start.checked_add(4096).expect("last reservation end overflow"),
-        }).is_err());
+        };
+        assert!(actual.reserve(overflow).is_err());
+        assert!(actual.reserve_no_map(overflow).is_err());
         context.expect_eq(actual.reserved_count, expected.reserved_count);
         context.expect_eq(&actual.reserved[..], &expected.reserved[..]);
+        context.expect_eq(&actual.reserved_no_map[..], &expected.reserved_no_map[..]);
     }
+
     $($qemu_rtc)*
 
     /// 所有不完整前缀都必须由生产边界验证拒绝。
@@ -726,6 +778,176 @@ pub(crate) mod cases {
 }
     };
 }
+/// RV 直映扣洞和活动对象边界使用同一独占固件副本验证。
+#[cfg(target_arch = "riscv64")]
+#[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
+pub(crate) mod no_map {
+    use super::*;
+
+    /// 无序、重叠、相邻及跨 bank 的 no-map 按整页并集扣除，普通保留不缩减直映。
+    #[test]
+    fn no_map_union(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let info = parse(
+            &fixture.bytes[..fixture.length],
+            fixture.actual,
+            boot::info().bsp_hardware_id,
+        );
+        let base = platform::LINK_LAYOUT.ram_phys_base as usize;
+        info.reserved_count = 0;
+        info.reserve(boot::Region {
+            start: base,
+            end: base + 0x28000,
+        })
+        .unwrap();
+        for (start, end) in [
+            (0x21001, 0x22fff),
+            (0x5001, 0x8000),
+            (0x1f001, 0x21001),
+            (0x7000, 0xa001),
+            (0xb000, 0xc000),
+            (0xf001, 0x21000),
+            (0xfffff, 0x102001),
+        ] {
+            info.reserve_no_map(boot::Region {
+                start: base + start,
+                end: base + end,
+            })
+            .unwrap();
+        }
+        let mut actual = [boot::Region::default(); 3];
+        let mut count = 0;
+        for (start, end) in [(0, 0x10000), (0x20000, 0x28000), (0x100000, 0x102000)] {
+            for region in arch::direct_map_regions(
+                info,
+                boot::Region {
+                    start: base + start,
+                    end: base + end,
+                },
+            ) {
+                assert!(count < actual.len(), "unexpected direct-map fragment");
+                actual[count] = region;
+                count += 1;
+            }
+        }
+        context.expect_eq(count, 3);
+        context.expect_eq(
+            actual,
+            [
+                boot::Region {
+                    start: base,
+                    end: base + 0x5000,
+                },
+                boot::Region {
+                    start: base + 0xc000,
+                    end: base + 0xf000,
+                },
+                boot::Region {
+                    start: base + 0x23000,
+                    end: base + 0x28000,
+                },
+            ],
+        );
+    }
+
+    /// 全容量 RAM 和内部分裂同时经过正式映射表及 L1/L0 预算，不能只按原 bank 数预留。
+    #[test]
+    fn no_map_mapping_capacity(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let info = parse(
+            &fixture.bytes[..fixture.length],
+            fixture.actual,
+            boot::info().bsp_hardware_id,
+        );
+        let base = platform::LINK_LAYOUT.ram_phys_base as usize;
+        info.reserved_count = 0;
+        info.memory_count = boot::MAX_MEMORY_REGIONS;
+        let holes = boot::MAX_RESERVED_REGIONS / boot::MAX_MEMORY_REGIONS;
+        assert_eq!(holes * boot::MAX_MEMORY_REGIONS, boot::MAX_RESERVED_REGIONS);
+        let bank_bytes = (holes + 1) * 0x400000;
+        let stride = bank_bytes.next_power_of_two();
+        for bank in 0..info.memory_count {
+            let start = base + bank * stride;
+            info.memory[bank] = boot::Region {
+                start: start + 4096,
+                end: start + bank_bytes - 4096,
+            };
+            for hole in 1..=holes {
+                let boundary = start + hole * 0x400000;
+                info.reserve_no_map(boot::Region {
+                    start: boundary - 4096,
+                    end: boundary + 4096,
+                })
+                .unwrap();
+            }
+        }
+        let (fragments, tables) = arch::ktest_ram_mapping_budget(info);
+        context.expect_eq(
+            fragments,
+            boot::MAX_MEMORY_REGIONS + boot::MAX_RESERVED_REGIONS,
+        );
+        // 每段两端落在不同 2MiB 槽；独立计算整个直映 VA 范围触及的 L1 数。
+        let first = arch::phys_to_virt(info.memory[0].start) >> 30;
+        let last = arch::phys_to_virt(info.memory[info.memory_count - 1].end - 1) >> 30;
+        context.expect_eq(tables, 1 + last - first + 1 + 2 * fragments);
+    }
+
+    /// 活动对象冲突按页拒绝，完整镜像尾部也受保护；宽泛普通保留与固件 no-map 可以相交。
+    #[test]
+    fn no_map_live_objects(_: &mut TestContext<'_>, fixture: &mut Dtb) {
+        let info = parse(
+            &fixture.bytes[..fixture.length],
+            fixture.actual,
+            boot::info().bsp_hardware_id,
+        );
+        let base = platform::LINK_LAYOUT.ram_phys_base as usize;
+        let kernel = boot::Region {
+            start: base + 0xc000,
+            end: base + 0xe000,
+        };
+        info.dtb = boot::Region {
+            start: base + 0x4001,
+            end: base + 0x5000,
+        };
+        info.initrd = Some(boot::Region {
+            start: base + 0x8000,
+            end: base + 0x9000,
+        });
+        info.reserved_count = 0;
+        info.reserve(boot::Region {
+            start: base,
+            end: base + 0x10000,
+        })
+        .unwrap();
+        info.reserve_no_map(boot::Region {
+            start: base,
+            end: base + 0x1001,
+        })
+        .unwrap();
+        assert!(arch::validate_boot_no_map(info, kernel).is_ok());
+        for target in [kernel, info.dtb, info.initrd.unwrap()] {
+            info.reserved_count = 2;
+            info.reserve_no_map(boot::Region {
+                start: target.end - 1,
+                end: target.end,
+            })
+            .unwrap();
+            assert!(arch::validate_boot_no_map(info, kernel).is_err());
+        }
+        info.reserved_count = 2;
+        info.reserve_no_map(boot::Region {
+            start: base + 0x4000,
+            end: info.dtb.start,
+        })
+        .unwrap();
+        assert!(arch::validate_boot_no_map(info, kernel).is_err());
+        info.reserved_count = 2;
+        info.reserve_no_map(boot::Region {
+            start: kernel.end,
+            end: kernel.end + 1,
+        })
+        .unwrap();
+        assert!(arch::validate_boot_no_map(info, kernel).is_ok());
+    }
+}
 
 #[cfg(blossom_platform = "qemu-virt")]
 firmware_cases! {
@@ -780,3 +1002,146 @@ firmware_cases! {
 
 #[cfg(not(blossom_platform = "qemu-virt"))]
 firmware_cases! {}
+
+/// DMA 属性只改变测试独占的真实 DTB 副本，不要求存在或启动原生设备。
+#[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware", "dma-policy"), timeout_ms = 10000)]
+pub(crate) mod dma_policy {
+    use super::*;
+
+    const PROVIDER: u32 = 0xffff_fffe;
+    const CONSUMER: u32 = 0xffff_fffd;
+
+    /// 无显式声明且父链结束时，RISC-V 和 LA 的调用默认值保持各自含义。
+    #[test]
+    fn architecture_defaults(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        for name in ["dma-coherent", "dma-noncoherent", "interconnect-names"] {
+            fixture.remove_property("/", name);
+        }
+        for default in [false, true] {
+            context.expect_eq(
+                platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/", default),
+                Ok(default),
+            );
+        }
+    }
+
+    /// 最近节点覆盖相反的祖先声明，同节点两属性保持 coherent 优先。
+    #[test]
+    fn closest_explicit_attribute(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        fixture.put_property("/", "dma-coherent", &[]);
+        fixture.remove_property("/chosen", "dma-coherent");
+        fixture.put_property("/chosen", "dma-noncoherent", &[]);
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
+            Ok(false),
+        );
+        fixture.put_property("/", "dma-noncoherent", &[]);
+        fixture.remove_property("/", "dma-coherent");
+        fixture.put_property("/chosen", "dma-coherent", &[]);
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false),
+            Ok(true),
+        );
+        fixture.remove_property("/chosen", "dma-noncoherent");
+        fixture.remove_property("/chosen", "dma-coherent");
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
+            Ok(false),
+        );
+    }
+
+    /// dma-mem 跳到非结构父节点，索引前的空 phandle 不冒充有参数的 provider。
+    #[test]
+    fn selected_dma_parent(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        fixture.put_property("/", "dma-coherent", &[]);
+        fixture.remove_property("/chosen", "dma-coherent");
+        fixture.remove_property("/chosen", "dma-noncoherent");
+        fixture.put_property("/cpus", "phandle", &PROVIDER.to_be_bytes());
+        fixture.put_property("/cpus", "#interconnect-cells", &2u32.to_be_bytes());
+        fixture.remove_property("/cpus", "dma-coherent");
+        fixture.put_property("/cpus", "dma-noncoherent", &[]);
+        fixture.put_property("/chosen", "interconnect-names", b"other\0dma-mem\0");
+        let mut links = [0u8; 16];
+        links[4..8].copy_from_slice(&PROVIDER.to_be_bytes());
+        links[8..12].copy_from_slice(&3u32.to_be_bytes());
+        links[12..].copy_from_slice(&4u32.to_be_bytes());
+        fixture.put_property("/chosen", "interconnects", &links);
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
+            Ok(false),
+        );
+        fixture.remove_property("/cpus", "dma-noncoherent");
+        fixture.put_property("/cpus", "dma-coherent", &[]);
+        fixture.put_property("/", "dma-noncoherent", &[]);
+        fixture.remove_property("/", "dma-coherent");
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false),
+            Ok(true),
+        );
+    }
+
+    /// 已选择的缺失或截断 interconnect 保持错误，不回普通父节点的 coherent 声明。
+    #[test]
+    fn selected_parent_errors(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        fixture.put_property("/", "dma-coherent", &[]);
+        fixture.remove_property("/chosen", "dma-coherent");
+        fixture.remove_property("/chosen", "dma-noncoherent");
+        fixture.put_property("/cpus", "phandle", &PROVIDER.to_be_bytes());
+        fixture.put_property("/cpus", "#interconnect-cells", &2u32.to_be_bytes());
+        fixture.put_property("/chosen", "interconnect-names", b"dma-mem\0");
+        let mut link = [0u8; 12];
+        link[..4].copy_from_slice(&PROVIDER.to_be_bytes());
+        for length in [0, 3, 4, 8] {
+            fixture.put_property("/chosen", "interconnects", &link[..length]);
+            context.expect_eq(
+                platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
+                    .is_err(),
+                true,
+            );
+        }
+        fixture.put_property("/chosen", "interconnects", &0u32.to_be_bytes());
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
+                .is_err(),
+            true,
+        );
+        fixture.put_property("/chosen", "interconnects", &(PROVIDER - 2).to_be_bytes());
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
+                .is_err(),
+            true,
+        );
+        fixture.put_property("/chosen", "interconnects", &link);
+        fixture.put_property("/cpus", "#interconnect-cells", &[2]);
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
+                .is_err(),
+            true,
+        );
+    }
+
+    /// DMA 父环不能无限遍历；设备自身的显式声明不消费无关的错误父链。
+    #[test]
+    fn parent_cycle_and_local_override(context: &mut TestContext<'_>, fixture: &mut Dtb) {
+        for path in ["/chosen", "/cpus"] {
+            fixture.remove_property(path, "dma-coherent");
+            fixture.remove_property(path, "dma-noncoherent");
+            fixture.put_property(path, "#interconnect-cells", &0u32.to_be_bytes());
+            fixture.put_property(path, "interconnect-names", b"dma-mem\0");
+        }
+        fixture.put_property("/chosen", "phandle", &CONSUMER.to_be_bytes());
+        fixture.put_property("/cpus", "phandle", &PROVIDER.to_be_bytes());
+        fixture.put_property("/chosen", "interconnects", &PROVIDER.to_be_bytes());
+        fixture.put_property("/cpus", "interconnects", &CONSUMER.to_be_bytes());
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true)
+                .is_err(),
+            true,
+        );
+        fixture.put_property("/chosen", "dma-noncoherent", &[]);
+        context.expect_eq(
+            platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
+            Ok(false),
+        );
+    }
+}

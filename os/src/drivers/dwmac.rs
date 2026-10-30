@@ -457,7 +457,8 @@ impl Dwmac {
         }
         let interrupt = irq::map_source(resources.interrupt_source).map_err(GmacError::Irq)?;
         // SAFETY: 唯一规范化资源与各 provider 的完整永久映射由本接口调用者保证。
-        unsafe { board_setup::apply_setup(&resources.setup) }.map_err(GmacError::Resource)?;
+        unsafe { board_setup::apply_setup(&resources.setup, Duration::ZERO) }
+            .map_err(GmacError::Resource)?;
         let registers = Registers {
             region: resources.registers,
             generation,
@@ -1027,7 +1028,7 @@ impl Dwmac {
         });
         // SAFETY: 同一 MAC 的真实规范化时钟引用和永久 provider 映射仍由根拥有，
         // 此动作只包含 TX clock，不重复执行复位或 pin 动作；Work 独占链路配置。
-        unsafe { board_setup::apply_setup(&setup) }.map_err(GmacError::Resource)
+        unsafe { board_setup::apply_setup(&setup, Duration::ZERO) }.map_err(GmacError::Resource)
     }
 
     /// 极短 MMIO 与最新 tail 在同锁串行，避免并发 writer 将旧 tail 写回到新边界之前。
