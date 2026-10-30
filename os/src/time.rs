@@ -317,7 +317,21 @@ unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     }
 }
 
-/// BSP 按实际平台采样持久时钟；无可用源时从未校时的 Unix 零点沿单调基准推进。
+/// RTC 只能以有效日历提供墙钟起点；不可用样本保留未校时零点及诊断原因。
+fn rtc_realtime_base(
+    sample: &Result<Option<[u32; 6]>, &'static str>,
+) -> (u64, Option<&'static str>) {
+    match sample {
+        Ok(Some(calendar)) => match calendar_realtime(*calendar) {
+            Some(realtime) => (realtime, None),
+            None => (0, Some("RTC calendar is invalid or out of range")),
+        },
+        Ok(None) => (0, Some("no persistent RTC is available")),
+        Err(error) => (0, Some(*error)),
+    }
+}
+
+/// BSP 按实际平台尝试RTC授时；未取得有效起点时保持未校时状态，不阻止单调计数器注册。
 ///
 /// # Safety
 /// info 必须是已验证的当前机器启动资源；存在的 RTC 及其时钟、复位 provider
@@ -330,20 +344,17 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
         }
         Platform::VisionFive2 | Platform::Ls2k1000la => {
             // SAFETY: 继承 BSP IRQ-off、AP 未释放、真实资源与 provider 永久映射的合同。
-            let calendar =
-                unsafe { arch::board_rtc_calendar(info) }.expect("board RTC sampling failed");
-            match calendar {
-                Some(calendar) => {
-                    calendar_realtime(calendar).expect("RTC calendar is invalid or out of range")
-                }
-                None => {
-                    crate::early_println!(
-                        "RTC platform={:?} source=unset; no trusted persistent clock; realtime starts at Unix epoch 0",
-                        info.platform
-                    );
-                    0
-                }
+            let sample = unsafe { arch::board_rtc_calendar(info) };
+            let (realtime, unavailable) = rtc_realtime_base(&sample);
+            if let Some(reason) = unavailable {
+                crate::early_println!(
+                    "RTC platform={:?} source=unset reason={} sample={:?}; realtime starts at Unix epoch 0",
+                    info.platform,
+                    reason,
+                    sample
+                );
             }
+            realtime
         }
     }
 }
@@ -651,6 +662,13 @@ pub(crate) mod testing {
     /// 对独立字段调用生产日历换算，不访问或改写实际 RTC。
     pub(crate) fn rtc_calendar(year: u32, low: u32) -> Option<u64> {
         super::rtc_calendar(year, low)
+    }
+
+    /// 对独立RTC样本执行生产启动授时规则，不访问硬件或改写已发布的时间基准。
+    pub(crate) fn rtc_realtime_base(
+        sample: Result<Option<[u32; 6]>, &'static str>,
+    ) -> (u64, Option<&'static str>) {
+        super::rtc_realtime_base(&sample)
     }
 
     const ARMED: usize = 1;

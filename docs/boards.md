@@ -180,13 +180,23 @@ cd /test/selftests/fs
 
 ## 7. 运行边界与记录
 
-### 完整 OS DT 的最近一次实板尝试
+### RTC授时边界修复后的完整OS DT实板结果
+
+本代VF2普通debug内核已用同一完整树实际运行成功，ELF SHA256为`f9e09e65387c23c5f451d3e11cb0193c7d39cbc6d3e6152f548bfcc635e07e75`。包装前后292节点/1924属性逐项相等，未裁RTC、CMA、ccache别名或两个enabled GMAC；无initrd，既有`/dev/mmcblk0p1`仍为唯一ReadWrite根。固件核对本代kernel.uImage/DTB全文CRC32为`0407a341`/`861f605e`，与宿主相等，仅一次修后`bootm`。
+
+按Linux将可选RTC授时失败与单调counter初始化分开：真实采样和公历校验保留，无效日期、缺席或读取错误输出诊断并以未授时Unix零起点继续，不写硬件日期、不填构建时间。本代解码样本为`[2000, 0, 0, 0, 40, 4]`，月/日0无效，日志明确`source=unset`；它不是两个原始寄存器dump，不倒填下节旧失败样本，也不证明硬件日期已校准。后续REALTIME为零起点加单调经过时间，不能当可信UTC。
+
+本代内核实际登记`0x70000000..0x90000000`预留，启动四个应用核至`READY cpus=4`、原生SD根、GMAC1 PHY准备及PID1/BusyBox Shell。Shell命令和`true`正常，已有`fs:file_shared`两TAP及`process:affinity`五TAP全部通过，两程序退出0、summary pass2/fail0/error0/status0。`/proc/uptime`由`267.45 1069.10`推进至`271.63 1085.78`，现有`busybox sleep 1`退出0；不把命令间隔写成精确时钟校准。现有userland缺`date`和`uptime`命令，原组合最终127保留，未扩applet，也未宣称日期CLI通过。
+
+最后`sync`返回0，一次`busybox halt`完成PID1退出0、NET停止、ROOTFS同步退休、CPU ack14及本核事件源关闭。当前最后观测是完整正常Halt，串口已交还，本轮TFTP/日志已关闭，不再输入；这不是自然Restart、PowerOff或掉电试验。本代没有重做内核网络数据测试，不转签下文旧ELF的ARP/ICMP/TCP；也未重写SD、固件、saveenv或RTC日期。完整输入身份、逐次命令、原始UART、双ISA定向回归和质量结果见`build/vf2-rtc/{final-evidence.json,package-identity.json,uart.log}`。
+
+### 修前完整OS DT的实板失败
 
 源码 `43389aa1` 的 VF2 普通 debug 内核已用完整输入实际执行一次。ELF SHA256为`2ca3e55d973c71f1dcf7f7506624bdd7ac8ee8a373c2bede0903ea405bea6ddd`；本轮包装前后硬件描述均为292节点/1924属性，CMA动态请求、ccache三段reg及两个enabled GMAC全部保留。正式无initrd `bootm` 前，kernel.uImage与DTB的固件全文CRC32分别为`ab3e5a2d`、`861f605e`，均等于宿主输入。
 
-本次已到`BOOT platform=VisionFive2 cpus=4 bsp=1`、`MEMORY`和`BUDDY`，随后实际停止在`FAIL panic: panicked at src/time.rs:337:49`。该位置为RTC日历转换的`expect`：采样返回了日历，通用公历校验未通过；原串口没有打印六个日期字段，尚不能确定是未校时还是采样/解码问题。
+修前这次运行已到`BOOT platform=VisionFive2 cpus=4 bsp=1`、`MEMORY`和`BUDDY`，随后实际停止在`FAIL panic: panicked at src/time.rs:337:49`。该位置为RTC日历转换的`expect`：采样返回了日历，通用公历校验未通过；该代原串口没有打印六个日期字段，不能确定其未校时或采样/解码根因。
 
-这不是完整启动通过：四个CPU仅已发现，尚未启动AP或到READY，也未执行内核Storage/SD根挂载、GMAC数据、PID1/TTY/Shell及正常Halt。固件使用GMAC1成功TFTP不证明本内核网络。没有关闭RTC节点绕过、校时、改驱动、重写SD或刷固件。原文和输入身份见`build/vf2-full-native/{native-summary.json,uart.log,package-identity.json}`；最后观测为panic而非正常停机，已停止本轮TFTP并交还串口。
+该次不是完整启动通过：四个CPU仅已发现，尚未启动AP或到READY，也未执行内核Storage/SD根挂载、GMAC数据、PID1/TTY/Shell及正常Halt。固件使用GMAC1成功TFTP不证明本内核网络；当时没有关闭RTC节点绕过、校时、改驱动、重写SD或刷固件。原文和输入身份见`build/vf2-full-native/{native-summary.json,uart.log,package-identity.json}`；当次最后观测为panic而非正常停机。上节修后成功另保新源码/ELF和原文，不改写本次Fail。
 
 ### 此前各 ELF 的实板记录
 

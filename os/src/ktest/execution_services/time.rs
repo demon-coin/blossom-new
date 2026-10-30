@@ -849,6 +849,29 @@ impl ServiceFixture {
 pub(crate) mod cases {
     use super::*;
 
+    /// 可选RTC授时失败只留下未校时起点，有效的Unix零点与缺席样本保持可区分。
+    #[test]
+    #[case("valid_epoch", Ok(Some([1970, 1, 1, 0, 0, 0])), 0u64, false)]
+    #[case("valid_leap_day", Ok(Some([2000, 2, 29, 0, 0, 0])), 951_782_400_000_000_000u64, false)]
+    #[case("unavailable", Ok(None), 0u64, true)]
+    #[case("invalid_calendar", Ok(Some([2000, 0, 0, 0, 0, 0])), 0u64, true)]
+    #[case("invalid_leap_day", Ok(Some([2100, 2, 29, 0, 0, 0])), 0u64, true)]
+    #[case("read_failure", Err("RTC calendar did not stabilize"), 0u64, true)]
+    fn rtc_boot_base(
+        _: &mut ::ktest::TestContext<'_>,
+        fixture: &mut ServiceFixture,
+        sample: Result<Option<[u32; 6]>, &'static str>,
+        expected: u64,
+        unset: bool,
+    ) -> ::ktest::TestResult {
+        fixture.fixed(move || {
+            let (actual, unavailable) = clock::testing::rtc_realtime_base(sample);
+            assert_eq!(actual, expected);
+            assert_eq!(unavailable.is_some(), unset);
+            Ok(())
+        })
+    }
+
     /// 生产日历换算覆盖 Unix 起点、闰年、世纪、有效时分秒及纳秒容量边界。
     #[test]
     fn rtc_calendar_boundaries(
