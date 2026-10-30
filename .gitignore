@@ -5,6 +5,7 @@ __pycache__/
 # Rust 构建产物
 **/target/
 os/target-*/
+/os/build/
 
 # 顶层构建与运行产物
 /build/
@@ -17,3 +18,4 @@ os/target-*/
 
 # 运行日志
 os/qemu.log
+/*.log
