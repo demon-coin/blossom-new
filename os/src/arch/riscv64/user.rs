@@ -1,10 +1,10 @@
 //! 每个用户线程独占的整数、浮点现场及本次调用的受信续接。
 
 use crate::arch::{UserAccess, UserTrap};
-use core::{
-    arch::{asm, global_asm},
-    mem::offset_of,
-};
+use core::arch::asm;
+
+mod entry;
+mod signal_return;
 
 #[repr(C, align(16))]
 pub struct UserContext {
@@ -48,8 +48,6 @@ impl UserContext {
     }
 }
 
-global_asm!(include_str!("sigreturn.S"));
-
 extern "C" {
     static rv_user_signal_return_start: u8;
     static rv_user_signal_return_end: u8;
@@ -63,17 +61,6 @@ pub fn signal_return_code() -> &'static [u8] {
     // 返回切片只借内核静态字节，不借用户映射或建立可并发写的用户内容引用。
     unsafe { core::slice::from_raw_parts(start, end - start as usize) }
 }
-
-global_asm!(include_str!("user.S"),
-    gpr = const offset_of!(UserContext, gpr),
-    pc = const offset_of!(UserContext, pc),
-    fpr = const offset_of!(UserContext, fpr),
-    fcsr = const offset_of!(UserContext, fcsr),
-    kernel_sp = const offset_of!(UserContext, kernel_sp),
-    scause = const offset_of!(UserContext, scause),
-    stval = const offset_of!(UserContext, stval),
-    kernel_fault = sym super::rv_kernel_fault,
-    user_tests = const cfg!(feature = "ktest") as usize);
 
 extern "C" {
     /// 保存当前 Rust 调用续接并通过 sret 执行用户现场，trap 后回到同一调用栈。

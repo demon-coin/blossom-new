@@ -1,10 +1,10 @@
 //! PLV3 私有现场；返回同一普通 Task 的 Rust 调用栈。
 
-use core::arch::global_asm;
-use core::mem::offset_of;
-
 use super::{csr_read, handle_hardware_interrupt, irq_enabled};
 use crate::arch::{UserAccess, UserTrap};
+
+mod entry;
+mod signal_return;
 
 /// FP、LSX 与 LASX 共享同一组寄存器，最宽槽同时保证真实 32 字节对齐。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,8 +58,6 @@ impl UserContext {
     }
 }
 
-global_asm!(include_str!("sigreturn.S"));
-
 extern "C" {
     static la_user_signal_return_start: u8;
     static la_user_signal_return_end: u8;
@@ -73,18 +71,6 @@ pub fn signal_return_code() -> &'static [u8] {
     // 返回切片只借内核静态字节，不借用户映射或建立可并发写的用户内容引用。
     unsafe { core::slice::from_raw_parts(start, end - start as usize) }
 }
-
-global_asm!(include_str!("user.S"),
-    gpr = const offset_of!(UserContext, gpr),
-    pc = const offset_of!(UserContext, pc),
-    fpr = const offset_of!(UserContext, fpr),
-    fcsr = const offset_of!(UserContext, fcsr),
-    fcc = const offset_of!(UserContext, fcc),
-    estat = const offset_of!(UserContext, estat),
-    badv = const offset_of!(UserContext, badv),
-    kernel_sp = const offset_of!(UserContext, kernel_sp),
-    execution_tests = const cfg!(feature = "ktest") as usize,
-);
 
 extern "C" {
     /// 保存本次内核续接并执行 PLV3，异常保存完整用户现场后返回原续接。

@@ -1,3 +1,15 @@
+//! 共享硬件向量先按 sscratch 分流，再在真实内核栈保存与恢复完整 trap 现场。
+
+use crate::arch::riscv64::{rv_handle_trap, KernelTrapFrame, UserContext};
+use core::{
+    arch::global_asm,
+    mem::{offset_of, size_of},
+};
+
+// 用户入口跨模块长跳转，内核入口保留原栈；两条路径均不能接受编译器序言。
+global_asm!(
+    // sscratch 非零仅指向受信用户现场；内核分支在覆盖临时寄存器前保存全部 GPR 和 CSR。
+    r#"
 .text
 
 .option arch, +d
@@ -55,6 +67,9 @@ rv_trap_entry:
     sd t0, {scause}(sp)
     csrr t0, stval
     sd t0, {stval}(sp)
+"#,
+    // 只在原 FS 非 Off 时保存全部 FPR/FCSR，未保存字段仍由 MaybeUninit 表达。
+    r#"
     ld t0, {sstatus}(sp)
     li t1, 0x6000
     and t0, t0, t1
@@ -94,10 +109,16 @@ rv_trap_entry:
     frcsr t0
     sd t0, {fcsr}(sp)
 1:
+"#,
+    // 关闭 FS 后以完整、独占的 frame 调用普通 Rust 分派。
+    r#"
     li t0, 0x6000
     csrc sstatus, t0
     mv a0, sp
-    call rv_handle_trap
+    call {handle_trap}
+"#,
+    // 按保存的 FS 状态恢复浮点现场，普通内核路径不执行浮点访问。
+    r#"
     ld t0, {sstatus}(sp)
     csrw sstatus, t0
     li t1, 0x6000
@@ -138,6 +159,9 @@ rv_trap_entry:
     ld t0, {fcsr}(sp)
     fscsr t0
 2:
+"#,
+    // 恢复原 PC、状态、全部整数寄存器与 SP，最后执行 sret。
+    r#"
     ld t0, {sepc}(sp)
     csrw sepc, t0
     ld t0, {sstatus}(sp)
@@ -174,3 +198,17 @@ rv_trap_entry:
     ld x31, ({gpr} + 31 * {word})(sp)
     ld sp, ({gpr} + 2 * {word})(sp)
     sret
+"#,
+    frame_size = const size_of::<KernelTrapFrame>(),
+    gpr = const offset_of!(KernelTrapFrame, gpr),
+    user_gpr = const offset_of!(UserContext, gpr),
+    word = const size_of::<usize>(),
+    sepc = const offset_of!(KernelTrapFrame, sepc),
+    sstatus = const offset_of!(KernelTrapFrame, sstatus),
+    scause = const offset_of!(KernelTrapFrame, scause),
+    stval = const offset_of!(KernelTrapFrame, stval),
+    fpr = const offset_of!(KernelTrapFrame, fpr),
+    float_word = const size_of::<u64>(),
+    fcsr = const offset_of!(KernelTrapFrame, fcsr),
+    handle_trap = sym rv_handle_trap,
+);

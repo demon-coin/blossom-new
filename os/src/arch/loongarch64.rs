@@ -3,22 +3,31 @@ use crate::boot::BootInfo;
 use crate::platform::LINK_LAYOUT;
 use crate::sched::context::TaskContext;
 use crate::sync::SpinLock;
-use core::arch::{asm, global_asm};
-use core::mem::{offset_of, size_of, MaybeUninit};
+use core::arch::asm;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
 
 pub mod ale;
 mod counter;
+mod entry;
+mod idle;
 mod liointc;
 mod mmu;
+#[cfg(feature = "ktest")]
+mod register_test;
 mod rtc;
 mod signal;
+mod switch;
+mod trap;
 mod uaccess;
 mod user;
 pub use counter::{apply_counter_epoch, establish_counter_epoch};
 pub use rtc::board_rtc_calendar;
+use switch::la_switch_context;
+#[cfg(feature = "ktest")]
+use {register_test::la_test_register_preservation, switch::la_test_task_context_preservation};
 
 pub use mmu::{
     activate_kernel_root, activate_user_root, flush_user_translations, initialize_user_root,
@@ -57,50 +66,12 @@ struct RefillFrame {
     badv: usize,
 }
 
-global_asm!(include_str!("loongarch64/entry.S"),
-    stack_size = const crate::cpu::STACK_SIZE,
-    boot_stack = const offset_of!(crate::cpu::CpuBoot, stack_top),
-    boot_local = const offset_of!(crate::cpu::CpuBoot, local),
-    board_platform = const cfg!(blossom_platform = "ls2k1000la") as usize,
-);
-global_asm!(include_str!("loongarch64/trap.S"),
-    frame_size = const size_of::<KernelTrapFrame>(),
-    gpr = const offset_of!(KernelTrapFrame, gpr),
-    era = const offset_of!(KernelTrapFrame, era),
-    prmd = const offset_of!(KernelTrapFrame, prmd),
-    estat = const offset_of!(KernelTrapFrame, estat),
-    badv = const offset_of!(KernelTrapFrame, badv),
-    euen = const offset_of!(KernelTrapFrame, euen),
-    cpu_base = const offset_of!(KernelTrapFrame, cpu_base),
-    fpr = const offset_of!(KernelTrapFrame, fpr),
-    fcsr = const offset_of!(KernelTrapFrame, fcsr),
-    fcc = const offset_of!(KernelTrapFrame, fcc),
-    refill_size = const size_of::<RefillFrame>(),
-    refill_gpr = const offset_of!(RefillFrame, gpr),
-    refill_era = const offset_of!(RefillFrame, era),
-    refill_prmd = const offset_of!(RefillFrame, prmd),
-    refill_badv = const offset_of!(RefillFrame, badv),
-);
-global_asm!(include_str!("loongarch64/switch.S"),
-    context_ra = const offset_of!(TaskContext, ra),
-    context_sp = const offset_of!(TaskContext, sp),
-    context_saved = const offset_of!(TaskContext, saved),
-    word_size = const size_of::<usize>(),
-    execution_tests = const cfg!(feature = "ktest") as usize,
-);
-
-global_asm!(
-    include_str!("loongarch64/idle.S"),
-    execution_tests = const cfg!(feature = "ktest") as usize,
-);
 extern "C" {
     static __secondary_entry_phys: u8;
     /// 普通内核异常入口，由硬件跳转并按 KernelTrapFrame 布局保存本核现场。
     fn la_kernel_trap();
     /// 物理 refill 入口，使用独立 CSR 现场并在调用 Rust 前恢复高地址 DMW。
     fn la_kernel_refill();
-    /// 按普通函数 ABI 保存旧整数现场并恢复下一执行者，不改写本核 KS0。
-    fn la_switch_context(prev: *mut TaskContext, next: *const TaskContext);
     /// 在启 IE 到 IDLE 的显式窗口内复查提示；窗口中断后退出等待并返回调度器。
     fn la_idle_once_asm(
         kick_pending: *const AtomicUsize,
@@ -848,19 +819,6 @@ extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
     crate::console::fatal(frame.era & !1, frame.gpr[3], frame.era & 1, frame.badv)
 }
 
-#[cfg(feature = "ktest")]
-global_asm!(include_str!("loongarch64/register_test.S"));
-#[cfg(feature = "ktest")]
-extern "C" {
-    /// 在有效本核计数器与异常入口下暂时改写寄存器，等待真实 timer IRQ 后恢复调用现场。
-    fn la_test_register_preservation(
-        counter: *const core::sync::atomic::AtomicUsize,
-        ticks: usize,
-        fcc: usize,
-        fp: usize,
-    ) -> usize;
-}
-
 /// 以一次真实本核 timer IRQ 检查指定 FP 模式与八位 FCC 图样，不遍历其他参数。
 ///
 /// # Safety
@@ -883,12 +841,6 @@ pub(crate) unsafe fn ktest_register_pattern(fp: bool, fcc: u8) -> bool {
         unsafe { la_test_register_preservation(counter, ticks, usize::from(fcc), usize::from(fp)) }
             != 0;
     good && before < counter.load(Ordering::Acquire)
-}
-
-#[cfg(feature = "ktest")]
-extern "C" {
-    /// 保留调用者整数现场，调用真实 yield 并检查恢复现场，期间不读写 KS0。
-    fn la_test_task_context_preservation(yield_fn: usize) -> usize;
 }
 
 /// 在真实普通 Task 中检查 yield 的 callee-saved、栈及返回路径，并恢复调用者现场。

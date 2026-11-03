@@ -1,3 +1,12 @@
+//! 物理引导与高地址续接；临时页表在 BSP 构建后保持不变，供 AP 进入分页。
+
+use crate::cpu::CpuBoot;
+use core::{arch::global_asm, mem::offset_of};
+
+// 固件入口尚无 Rust 栈；清 BSS、构表、启分页的顺序由此片段独占。
+global_asm!(
+    // 物理 BSP 入口先关闭旧中断与分页，保留固件参数并清理 BSS/临时表。
+    r#"
 .section .text.boot,"ax",@progbits
 
 .option push
@@ -39,6 +48,9 @@ __primary_entry_phys:
     addi t4, t4, 8
     addi t3, t3, -1
     bnez t3, 3b
+"#,
+    // 建立临时低地址、RAM/MMIO 直映及镜像映射后，连续切入高地址代码。
+    r#"
     // 临时低映射仅供进入分页的连续取指，永不修改这份 AP 表。
     address t2, __phys_ram_base
     srli t3, t2, 2
@@ -93,6 +105,9 @@ __primary_entry_phys:
     csrw satp, t0
     address t0, rv_primary_high
     jr t0
+"#,
+    // AP 从 HSM 的物理 CpuBoot 取目的核栈与 CpuLocal，再使用不可变 bootstrap 表。
+    r#"
 .global rv_secondary_entry
 rv_secondary_entry:
     csrw sie, zero
@@ -113,6 +128,9 @@ rv_secondary_entry:
 .option pop
 .text
 
+"#,
+    // 高地址 BSP 建立首个 Rust 栈；AP 在访问动态栈前换入已发布的最终 SATP。
+    r#"
 .balign 4
 rv_primary_high:
     .option push
@@ -139,3 +157,8 @@ rv_secondary_high:
     sfence.vma
     mv a0, tp
     tail secondary_main
+"#,
+    boot_stack = const offset_of!(CpuBoot, stack_top),
+    boot_local = const offset_of!(CpuBoot, local),
+    stack_size = const crate::cpu::STACK_SIZE,
+);

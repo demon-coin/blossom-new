@@ -1,20 +1,25 @@
 //! 固定 Sv39/QEMU virt 后端；SBI 只使用 TIME、IPI、HSM、SRST。
 use crate::{
     boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS, MAX_VIRTIO_MMIO},
-    cpu::{CpuBoot, CpuLocal},
+    cpu::CpuLocal,
     platform::LINK_LAYOUT,
     sched::context::TaskContext,
 };
 use core::{
-    arch::{asm, global_asm},
-    mem::{offset_of, size_of, MaybeUninit},
+    arch::asm,
+    mem::{size_of, MaybeUninit},
     ptr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+mod entry;
 mod mmu;
+#[cfg(feature = "ktest")]
+mod registers;
 mod rtc;
 mod signal;
+mod switch;
+mod trap;
 mod uaccess;
 mod user;
 pub use mmu::{
@@ -23,8 +28,13 @@ pub use mmu::{
     user_leaf_entry, user_leaf_mkclean, user_leaf_permissions, user_table_entry,
     SIGNAL_RETURN_PAGE, USER_ADDRESS_END, USER_LEVELS, USER_STACK_TOP,
 };
+#[cfg(feature = "ktest")]
+use registers::rv_register_roundtrip;
 pub use rtc::board_rtc_calendar;
 pub(crate) use signal::SIGNAL_MIN_STACK;
+use switch::rv_switch_context;
+#[cfg(feature = "ktest")]
+use switch::rv_task_context_roundtrip;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
@@ -76,39 +86,6 @@ struct KernelTrapFrame {
     fpr: MaybeUninit<[u64; 32]>,
     fcsr: MaybeUninit<usize>,
 }
-global_asm!(include_str!("riscv64/entry.S"),
-    boot_stack = const offset_of!(CpuBoot, stack_top),
-    boot_local = const offset_of!(CpuBoot, local),
-    stack_size = const crate::cpu::STACK_SIZE);
-global_asm!(include_str!("riscv64/trap.S"),
-    frame_size = const size_of::<KernelTrapFrame>(),
-    gpr = const offset_of!(KernelTrapFrame, gpr),
-    user_gpr = const offset_of!(UserContext, gpr),
-    word = const size_of::<usize>(),
-    sepc = const offset_of!(KernelTrapFrame, sepc),
-    sstatus = const offset_of!(KernelTrapFrame, sstatus),
-    scause = const offset_of!(KernelTrapFrame, scause),
-    stval = const offset_of!(KernelTrapFrame, stval),
-    fpr = const offset_of!(KernelTrapFrame, fpr),
-    float_word = const size_of::<u64>(),
-    fcsr = const offset_of!(KernelTrapFrame, fcsr));
-global_asm!(include_str!("riscv64/switch.S"),
-    context_size = const size_of::<TaskContext>(),
-    context_ra = const offset_of!(TaskContext, ra),
-    context_sp = const offset_of!(TaskContext, sp),
-    context_saved = const offset_of!(TaskContext, saved),
-    word = const size_of::<usize>(),
-    execution_tests = const cfg!(feature = "ktest") as usize,
-    yield_now = sym crate::sched::yield_now);
-
-extern "C" {
-    /// 保存当前普通调用现场并返回到下一执行者的调用现场，不改变目的 CPU 的 tp。
-    ///
-    /// # Safety
-    /// 调用者必须独占有效且不重叠的上下文，IRQ 关闭且 FS 为 Off；
-    /// next 的栈、返回地址与 callee-saved 必须组成有效普通调用现场。
-    fn rv_switch_context(prev: *mut TaskContext, next: *const TaskContext);
-}
 
 /// 在 IRQ 关闭的调度交接段切换整数调用现场，恢复后使用目的 CPU 的 CpuLocal。
 ///
@@ -125,15 +102,6 @@ pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     assert_eq!(status & 0x6000, 0, "task switch requires FS Off");
     // SAFETY: 调用者保证上下文独占、栈/返回地址有效和交接生命周期；上面已检查 IRQ 与 FS。
     unsafe { rv_switch_context(prev, next) };
-}
-
-#[cfg(feature = "ktest")]
-extern "C" {
-    /// 按普通调用 ABI 保存调用者寄存器，跨真实 yield 校验整数现场并恢复调用者。
-    ///
-    /// # Safety
-    /// 必须由能合法 yield 的普通 Task 调用，FS 为 Off，栈满足 16 字节 ABI 对齐。
-    fn rv_task_context_roundtrip() -> usize;
 }
 
 /// 在可调度的普通 Task 中跨真实 yield 检验全部 callee-saved、SP 与返回地址。
@@ -1066,22 +1034,6 @@ fn rv_dispatch_interrupt(cause: usize, pc: usize, sp: usize, bad: usize) {
             crate::console::fatal(pc, sp, cause, bad)
         }
     }
-}
-
-#[cfg(feature = "ktest")]
-global_asm!(include_str!("riscv64/registers.S"));
-#[cfg(feature = "ktest")]
-extern "C" {
-    /// 按整数调用 ABI 临时启用 IRQ，等待本核计数器推进并检验寄存器现场。
-    ///
-    /// # Safety
-    /// counter 必须指向永久、对齐的本核 AtomicUsize，expected 必须由已编程的 timer 推进；
-    /// 必须支持 D 且没有活跃浮点上下文，fp 只能为 0 或 1，trap/栈/CpuLocal 必须已安装。
-    fn rv_register_roundtrip(
-        counter: *const core::sync::atomic::AtomicUsize,
-        expected: usize,
-        fp: usize,
-    ) -> usize;
 }
 
 /// 以一次真实本核 timer IRQ 检查指定 FP 模式的原始寄存器图样；RV 没有 FCC，忽略该参数。

@@ -1,3 +1,12 @@
+//! 用户进入、异常返回及入口故障共用本次 Task 的受信续接帧。
+
+use crate::arch::loongarch64::user::UserContext;
+use core::arch::global_asm;
+use core::mem::offset_of;
+
+global_asm!(
+    // FP、LSX、LASX 共用 32 字节槽；测试宏只访问 CPU 支持的实际宽度。
+    r#"
 .text
 
 # /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
@@ -28,6 +37,9 @@
 .Lprobe_vector_done\@:
 .endm
 
+"#,
+    // 保存 160 字节普通 ABI 续接，KS1 定位私有现场，KS3 保存受信 Task SP。
+    r#"
 # 本次普通 Rust 调用的 160 字节续接帧，保持 16 字节 ABI 对齐。
 .balign 64
 .global la_run_user
@@ -70,6 +82,9 @@ la_run_user:
     la.abs $t0, la_user_trap
     csrwr $t0, 12
     move $sp, $a0
+"#,
+    // 按 CPUCFG 的完整依赖恢复扩展单元、FCSR 与 FCC，不读取未支持的高 lanes。
+    r#"
     # EUEN 只取 CPUCFG2 中具有完整依赖的 FP/LSX/LASX 能力。
     li.w $t0, 2
     cpucfg $t0, $t0
@@ -117,6 +132,9 @@ la_run_user:
     bstrpick.d $t1, $t0, 63, 56
     movgr2cf $fcc7, $t1
 .Lrestore_fp_done:
+"#,
+    // 用户 PC 来自私有现场，PRMD 固定为 PLV3/IE；恢复全部整数后执行 ERTN。
+    r#"
     ld.d $t0, $sp, {pc}
     csrwr $t0, 6
     # 特权和 IRQ 状态只由内核常量构造，用户寄存器不参与 PRMD。
@@ -155,6 +173,9 @@ la_run_user:
     ld.d $sp, $sp, {gpr}+3*8
     ertn
 
+"#,
+    // 页对齐的用户 trap 先区分来源，借 KS2 保留 t0 并在受信现场保存原 SP。
+    r#"
 # EENTRY 低 12 位只读零，用户异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
 .balign 4096
 .global la_user_trap
@@ -207,6 +228,9 @@ la_user_trap:
     st.d $t0, $sp, {estat}
     csrrd $t0, 7
     st.d $t0, $sp, {badv}
+"#,
+    // 按实际 EUEN 保存最宽扩展现场及全部 FCC，标量路径仍使用相同槽间距。
+    r#"
     csrrd $t0, 2
     andi $t1, $t0, 4
     bnez $t1, .Lsave_lasx
@@ -240,6 +264,9 @@ la_user_trap:
     bstrins.d $t0, $t1, 63, 56
     st.d $t0, $sp, {fcc}
 .Lsave_fp_done:
+"#,
+    // 先关闭 EUEN，再取回 Task 续接 SP、内核 tp/r21 与入口 CSR，返回同次 Rust 调用。
+    r#"
     csrwr $zero, 2
     ld.d $sp, $sp, {kernel_sp}
     ld.d $tp, $sp, 8
@@ -274,6 +301,9 @@ la_user_trap:
     addi.d $sp, $sp, 160
     jr $ra
 
+"#,
+    // 入口窗口的内核异常与 refill 不向当前 SP 压栈，改从 KS3 恢复受信续接后报告。
+    r#"
 .Luser_kernel_fault:
     # PLV0 入口故障不使用当前不可信 SP 压帧，独立快照保留真正故障 CSR 和故障 SP。
     move $a1, $sp
@@ -320,6 +350,9 @@ la_user_kernel_refill_fault:
     csrwr $t0, 0
     bl loongarch_user_kernel_fault
 
+"#,
+    // 仅 ktest 提供页内相对寻址消费者与故障入口，复制字节不依赖内核地址。
+    r#"
 .if {execution_tests}
 .section .text.la_user_probe, "ax"
 .balign 4096
@@ -400,3 +433,14 @@ la_user_fault_execute:
     jirl $zero, $a5, 0
 la_user_code_end:
 .endif
+"#,
+    gpr = const offset_of!(UserContext, gpr),
+    pc = const offset_of!(UserContext, pc),
+    fpr = const offset_of!(UserContext, fpr),
+    fcsr = const offset_of!(UserContext, fcsr),
+    fcc = const offset_of!(UserContext, fcc),
+    estat = const offset_of!(UserContext, estat),
+    badv = const offset_of!(UserContext, badv),
+    kernel_sp = const offset_of!(UserContext, kernel_sp),
+    execution_tests = const cfg!(feature = "ktest") as usize,
+);

@@ -1,3 +1,12 @@
+//! 用户进入、陷入与同一 Rust 调用续接；所有入口共享唯一 UserContext 布局。
+
+use crate::arch::riscv64::{rv_kernel_fault, user::UserContext};
+use core::{arch::global_asm, mem::offset_of};
+
+// 切换 SP/TP/GP 的窗口不调用调度器，用户来源与 S 来源异常仍按原协议区分。
+global_asm!(
+    // 当前 Task 栈保留 128 字节 Rust 续接帧，sscratch 只记录受信的私有现场。
+    r#"
 .text
 .option arch, +a, +d
 .balign 4
@@ -25,6 +34,9 @@ rv_run_user:
     sd sp, {kernel_sp}(a0)
     csrw sscratch, a0
     mv sp, a0
+"#,
+    // 恢复全部用户浮点现场，并只构造许可的 sstatus 位，清除跨特权 LR/SC reservation。
+    r#"
     li t0, 0x6000
     csrs sstatus, t0
     fld f0, ({fpr} + 0 * 8)(sp)
@@ -69,6 +81,9 @@ rv_run_user:
     // 用户与内核不共享 LR/SC reservation；此 scratch 槽的值将在 trap 时覆盖。
     addi t0, sp, {stval}
     sc.d zero, zero, (t0)
+"#,
+    // 最后恢复用户整数寄存器与用户 SP，通过 sret 降到用户特权级。
+    r#"
     ld x1, ({gpr} + 1 * 8)(sp)
     ld x3, ({gpr} + 3 * 8)(sp)
     ld x4, ({gpr} + 4 * 8)(sp)
@@ -102,6 +117,9 @@ rv_run_user:
     ld sp, ({gpr} + 2 * 8)(sp)
     sret
 
+"#,
+    // 通用向量已保存 t0；受信现场接收原 SP、其余 GPR 与真实异常 CSR。
+    r#"
 .balign 4
 .global rv_user_trap_entry
 rv_user_trap_entry:
@@ -148,6 +166,9 @@ rv_user_trap_entry:
     csrr t0, sstatus
     andi t0, t0, 0x100
     bnez t0, .Lrv_user_kernel_fault
+"#,
+    // 确认用户来源后保存全部 FPR/FCSR，不能把用户 TLS 当作 CpuLocal。
+    r#"
     fsd f0, ({fpr} + 0 * 8)(sp)
     fsd f1, ({fpr} + 1 * 8)(sp)
     fsd f2, ({fpr} + 2 * 8)(sp)
@@ -182,6 +203,9 @@ rv_user_trap_entry:
     fsd f31, ({fpr} + 31 * 8)(sp)
     frcsr t0
     sd t0, {fcsr}(sp)
+"#,
+    // 从本次 Task 续接恢复受信 GP/TP/状态，清除 scratch 和 kernel_sp 后返回原 Rust 调用。
+    r#"
     ld t0, {kernel_sp}(sp)
     // 受信 TP/GP/状态恢复前保留 context 入口，S 来源故障仍能取得真实内核栈。
     ld gp, 8(t0)
@@ -206,6 +230,9 @@ rv_user_trap_entry:
     ld s11, 112(sp)
     addi sp, sp, 128
     ret
+"#,
+    // 进入或退出窗口的 S 来源故障使用真实续接栈，保留原致命诊断路径。
+    r#"
 
 .Lrv_user_kernel_fault:
     // 入口或退出窗口内的 S 来源异常仍致命，用真实续接栈执行原内核诊断。
@@ -223,6 +250,9 @@ rv_user_trap_entry:
     mv sp, t0
     call {kernel_fault}
 
+"#,
+    // ktest 指令块仅含可整体复制的局部分支，生产构建保持原 .if 排除语义。
+    r#"
 .if {user_tests}
 .pushsection .text.user_probe, "ax", @progbits
 .balign 4
@@ -289,3 +319,14 @@ rv_user_probe_execute:
 rv_user_probe_end:
 .popsection
 .endif
+"#,
+    gpr = const offset_of!(UserContext, gpr),
+    pc = const offset_of!(UserContext, pc),
+    fpr = const offset_of!(UserContext, fpr),
+    fcsr = const offset_of!(UserContext, fcsr),
+    kernel_sp = const offset_of!(UserContext, kernel_sp),
+    scause = const offset_of!(UserContext, scause),
+    stval = const offset_of!(UserContext, stval),
+    kernel_fault = sym rv_kernel_fault,
+    user_tests = const cfg!(feature = "ktest") as usize,
+);

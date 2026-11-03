@@ -1,9 +1,31 @@
-.text
+//! 真实 timer IRQ 的寄存器探针；手工栈帧同时保存原控制状态。
 
-.balign 16
-.global la_test_register_preservation
-.type la_test_register_preservation, @function
-la_test_register_preservation:
+use core::arch::naked_asm;
+use core::sync::atomic::AtomicUsize;
+
+/// 等待本核真实 timer IRQ 并比较整数、SP、KS0 及所选 FP/FCSR/FCC 图样。
+///
+/// # Safety
+/// 必须处于 PLV0，本核异常入口、timer IRQ 源、CpuLocal 和当前 ABI 栈均已建立；
+/// counter 须指向本核永久、自然对齐的 timer 原子计数，ticks 为有效的四字节对齐周期。
+/// 调用期间须固定 CPU、禁止调度，不得持 handler 所需锁或有活跃 FP 上下文；
+/// fp 仅取零或一，非零时硬件须支持标量 FP，fcc 须为八位值。
+/// 返回恢复进入时的 IE/EUEN，但临时 timer deadline 须由调用者在同核 IRQ-off 下交还生产层，
+/// 包括检查失败后的清理；不得跨此裸帧展开。
+#[naked]
+#[no_mangle]
+pub(super) unsafe extern "C" fn la_test_register_preservation(
+    counter: *const AtomicUsize,
+    ticks: usize,
+    fcc: usize,
+    fp: usize,
+) -> usize {
+    // SAFETY: 调用者保证本核异常/timer、永久计数器及 ABI 栈有效，期间不调度；
+    // 手动帧保留原整数、控制和被测 FP 现场，临时 IRQ/FP 开关均在本次调用内恢复。
+    unsafe {
+        naked_asm!(
+            // 192 字节栈帧保留调用者整数、原 EUEN/CRMD、KS0 及真实计数器快照。
+            r#"
     addi.d $sp, $sp, -192
     st.d $ra, $sp, 0
     st.d $s0, $sp, 8
@@ -21,7 +43,10 @@ la_test_register_preservation:
     csrrd $t2, 0x30
     st.d $t2, $sp, 80
     st.d $sp, $sp, 88
-    beqz $a3, .Ltest_no_fp
+"#,
+            // FP 分支暂开标量单元并保存 f0/f24、FCSR 与全部 FCC，再布置独立图样。
+            r#"
+    beqz $a3, 2f
     li.w $t2, 1
     csrwr $t2, 2
     fst.d $f0, $sp, 96
@@ -74,10 +99,13 @@ la_test_register_preservation:
     srli.d $t2, $a2, 7
     andi $t2, $t2, 1
     movgr2cf $fcc7, $t2
-    b .Ltest_arm
-.Ltest_no_fp:
+    b 3f
+2:
     csrwr $zero, 2
-.Ltest_arm:
+"#,
+            // 布置整数图样并安装 timer，临时开 IE 等待真实计数变化后重新关 IE。
+            r#"
+3:
     li.d $t0, 0x123
     li.d $t1, 0x456
     li.d $s0, 0x789
@@ -89,39 +117,42 @@ la_test_register_preservation:
     li.w $t2, 4
     li.w $t3, 4
     csrxchg $t2, $t3, 0
-.Ltest_wait:
+4:
     ld.d $t2, $sp, 40
     ld.d $t2, $t2, 0
     ld.d $t3, $sp, 48
-    beq $t2, $t3, .Ltest_wait
+    beq $t2, $t3, 4b
     li.w $t2, 4
     csrxchg $zero, $t2, 0
+"#,
+            // 检查全部被测整数与扩展现场，未启用 FP 时只核 EUEN 保持关闭。
+            r#"
     li.d $t4, 0x123
-    bne $t0, $t4, .Ltest_bad
+    bne $t0, $t4, 7f
     li.d $t4, 0x456
-    bne $t1, $t4, .Ltest_bad
+    bne $t1, $t4, 7f
     li.d $t4, 0x789
-    bne $s0, $t4, .Ltest_bad
+    bne $s0, $t4, 7f
     li.d $t4, 0xabc
-    bne $s1, $t4, .Ltest_bad
+    bne $s1, $t4, 7f
     li.d $t4, 0xdef
-    bne $a2, $t4, .Ltest_bad
+    bne $a2, $t4, 7f
     ld.d $t4, $sp, 88
-    bne $sp, $t4, .Ltest_bad
+    bne $sp, $t4, 7f
     csrrd $t4, 0x30
     ld.d $t5, $sp, 80
-    bne $t4, $t5, .Ltest_bad
+    bne $t4, $t5, 7f
     ld.d $t4, $sp, 72
-    beqz $t4, .Ltest_check_no_fp
+    beqz $t4, 5f
     movfr2gr.d $t4, $f0
     li.d $t5, 0x3ff123456789abcd
-    bne $t4, $t5, .Ltest_bad
+    bne $t4, $t5, 7f
     movfr2gr.d $t4, $f24
     li.d $t5, 0x400fedcba9876543
-    bne $t4, $t5, .Ltest_bad
+    bne $t4, $t5, 7f
     movfcsr2gr $t4, $fcsr0
     li.w $t5, 0x100
-    bne $t4, $t5, .Ltest_bad
+    bne $t4, $t5, 7f
     move $t4, $zero
     movcf2gr $t5, $fcc0
     slli.d $t5, $t5, 0
@@ -148,19 +179,22 @@ la_test_register_preservation:
     slli.d $t5, $t5, 7
     or $t4, $t4, $t5
     ld.d $t5, $sp, 64
-    bne $t4, $t5, .Ltest_bad
-    b .Ltest_good
-.Ltest_check_no_fp:
+    bne $t4, $t5, 7f
+    b 6f
+5:
     csrrd $t4, 2
-    bnez $t4, .Ltest_bad
-.Ltest_good:
+    bnez $t4, 7f
+6:
     li.w $a0, 1
-    b .Ltest_restore
-.Ltest_bad:
+    b 8f
+7:
     move $a0, $zero
-.Ltest_restore:
+"#,
+            // 按原模式恢复 FP、EUEN、KS0、IE 和调用者整数现场，然后退还手工栈帧。
+            r#"
+8:
     ld.d $t2, $sp, 72
-    beqz $t2, .Ltest_restore_control
+    beqz $t2, 9f
     li.w $t2, 1
     csrwr $t2, 2
     fld.d $f0, $sp, 96
@@ -183,7 +217,7 @@ la_test_register_preservation:
     movgr2cf $fcc6, $t2
     ld.d $t2, $sp, 176
     movgr2cf $fcc7, $t2
-.Ltest_restore_control:
+9:
     ld.d $t2, $sp, 24
     csrwr $t2, 2
     ld.d $t2, $sp, 80
@@ -196,4 +230,7 @@ la_test_register_preservation:
     ld.d $s1, $sp, 16
     addi.d $sp, $sp, 192
     jirl $zero, $ra, 0
-.size la_test_register_preservation, .-la_test_register_preservation
+"#,
+        );
+    }
+}

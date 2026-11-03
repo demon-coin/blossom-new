@@ -3,6 +3,7 @@
 #![feature(asm_experimental_arch)]
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
+#![feature(naked_functions)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(feature = "ktest", feature(panic_can_unwind))]
 

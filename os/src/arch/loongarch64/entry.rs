@@ -1,3 +1,11 @@
+//! 主辅核机器入口；建立 DMW 与受信栈后才进入 Rust。
+
+use core::arch::global_asm;
+use core::mem::offset_of;
+
+global_asm!(
+    // 主核先保留固件参数，再建立缓存与 MMIO 的高地址别名。
+    r#"
 .section .text.entry,"ax",@progbits
 
 .balign 64
@@ -23,6 +31,9 @@ __primary_entry:
     # 高别名取指前先建立 DMW，兼容固件仍处于分页模式的物理入口。
     la.abs $t0, .Lprimary_high
     jirl $zero, $t0, 0
+"#,
+    // 高地址取指后切 PG、清 BSS，并将原四个参数交还主核入口。
+    r#"
 .Lprimary_high:
     # DATF/DATM 取一致缓存：refill 在 DA 下读页表必须看到内核 DMW 写回的叶。
     li.w $t0, 0xb0
@@ -44,6 +55,9 @@ __primary_entry:
     move $a3, $s3
     b primary_main
 
+"#,
+    // 辅核从 mailbox 物理 PC 起步，先建立与主核相同的 DMW。
+    r#"
 .balign 64
 .global __secondary_entry
 __secondary_entry:
@@ -62,6 +76,9 @@ __secondary_entry:
     # mailbox 指向物理 PC；高别名建立以后才切换 CRMD 的分页状态。
     la.abs $t0, .Lsecondary_high
     jirl $zero, $t0, 0
+"#,
+    // 板平台直接读栈与 CpuLocal；QEMU 从永久 CpuBoot 记录读取。
+    r#"
 .Lsecondary_high:
     # DATF/DATM 取一致缓存：refill 在 DA 下读页表必须看到内核 DMW 写回的叶。
     li.w $t0, 0xb0
@@ -80,3 +97,9 @@ __secondary_entry:
     ld.d $a0, $t1, {boot_local}
     .endif
     b secondary_main
+"#,
+    stack_size = const crate::cpu::STACK_SIZE,
+    boot_stack = const offset_of!(crate::cpu::CpuBoot, stack_top),
+    boot_local = const offset_of!(crate::cpu::CpuBoot, local),
+    board_platform = const cfg!(blossom_platform = "ls2k1000la") as usize,
+);

@@ -1,3 +1,12 @@
+//! 内核异常与物理 refill 的硬件入口；两者的 CSR 和 frame 不混用。
+
+use crate::arch::loongarch64::{KernelTrapFrame, RefillFrame};
+use core::arch::global_asm;
+use core::mem::{offset_of, size_of};
+
+global_asm!(
+    // 普通异常先保存全部整数寄存器和原 SP，再记录异常 CSR 与 KS0。
+    r#"
 .text
 
 # EENTRY 低 12 位只读零，异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
@@ -50,6 +59,9 @@ la_kernel_trap:
     st.d $t0, $sp, {euen}
     csrrd $t0, 48
     st.d $t0, $sp, {cpu_base}
+"#,
+    // 只有原 EUEN.FPE 开启时才保存全部标量 FP、FCSR 与八个 FCC。
+    r#"
     ld.d $t0, $sp, {euen}
     andi $t0, $t0, 1
     beqz $t0, .Lla_fp_saved
@@ -103,6 +115,9 @@ la_kernel_trap:
     st.d $t0, $sp, {fcc}+6*8
     movcf2gr $t0, $fcc7
     st.d $t0, $sp, {fcc}+7*8
+"#,
+    // 完整现场建立后调用 Rust，返回时先恢复 EUEN 再恢复条件保存的 FP。
+    r#"
 .Lla_fp_saved:
     move $a0, $sp
     bl loongarch_trap
@@ -161,6 +176,9 @@ la_kernel_trap:
     movgr2cf $fcc6, $t0
     ld.d $t0, $sp, {fcc}+7*8
     movgr2cf $fcc7, $t0
+"#,
+    // 恢复原异常返回状态、KS0 和整数现场，最后以原 SP 执行 ERTN。
+    r#"
 .Lla_fp_restored:
     ld.d $t0, $sp, {era}
     csrwr $t0, 6
@@ -201,6 +219,9 @@ la_kernel_trap:
     ld.d $sp, $sp, {gpr}+3*8
     ertn
 
+"#,
+    // 物理 refill 独立按页对齐；用户路径保留 TLBRSAVE/KS2 并装入完整偶奇叶。
+    r#"
 # TLBRENTRY 低 12 位只读零，重填入口必须按 4KiB 对齐，不能只按 64 字节对齐。
 .balign 4096
 .global la_kernel_refill
@@ -251,6 +272,9 @@ la_kernel_refill:
     tlbfill
     csrrd $t0, 139
     ertn
+"#,
+    // 内核 refill 在 DA 下保存独立 frame，切回高别名和 DMW 后报告致命异常。
+    r#"
 .Lkernel_refill_fatal:
     # refill 自动处于 DA；高地址栈仍以物理掩码可访问。
     addi.d $sp, $sp, -{refill_size}
@@ -302,3 +326,21 @@ la_kernel_refill:
     csrxchg $t0, $t1, 0
     move $a0, $sp
     bl loongarch_refill
+"#,
+    frame_size = const size_of::<KernelTrapFrame>(),
+    gpr = const offset_of!(KernelTrapFrame, gpr),
+    era = const offset_of!(KernelTrapFrame, era),
+    prmd = const offset_of!(KernelTrapFrame, prmd),
+    estat = const offset_of!(KernelTrapFrame, estat),
+    badv = const offset_of!(KernelTrapFrame, badv),
+    euen = const offset_of!(KernelTrapFrame, euen),
+    cpu_base = const offset_of!(KernelTrapFrame, cpu_base),
+    fpr = const offset_of!(KernelTrapFrame, fpr),
+    fcsr = const offset_of!(KernelTrapFrame, fcsr),
+    fcc = const offset_of!(KernelTrapFrame, fcc),
+    refill_size = const size_of::<RefillFrame>(),
+    refill_gpr = const offset_of!(RefillFrame, gpr),
+    refill_era = const offset_of!(RefillFrame, era),
+    refill_prmd = const offset_of!(RefillFrame, prmd),
+    refill_badv = const offset_of!(RefillFrame, badv),
+);
