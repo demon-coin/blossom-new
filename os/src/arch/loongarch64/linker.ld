@@ -10,7 +10,15 @@ SECTIONS {
     . = __direct_base + __kernel_phys_start;
     .text : AT(ADDR(.text) - __direct_base) {
         PROVIDE(__executable_start = .);
-        KEEP(*(.text.entry))
+        KEEP(*(.text.entry.primary))
+        . = ALIGN(64);
+        KEEP(*(.text.entry.secondary))
+        . = ALIGN(4096);
+        KEEP(*(.text.vector.kernel_trap))
+        . = ALIGN(4096);
+        KEEP(*(.text.vector.kernel_refill))
+        . = ALIGN(4096);
+        KEEP(*(.text.vector.user_trap))
         *(.text .text.*)
         PROVIDE(__etext = .);
     } :text

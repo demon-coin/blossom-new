@@ -1,17 +1,24 @@
 //! 用户进入、陷入与同一 Rust 调用续接；所有入口共享唯一 UserContext 布局。
 
 use crate::arch::riscv64::{rv_kernel_fault, user::UserContext};
-use core::{arch::global_asm, mem::offset_of};
+#[cfg(feature = "ktest")]
+use core::arch::global_asm;
+use core::{arch::naked_asm, mem::offset_of};
 
-// 切换 SP/TP/GP 的窗口不调用调度器，用户来源与 S 来源异常仍按原协议区分。
-global_asm!(
-    // 当前 Task 栈保留 128 字节 Rust 续接帧，sscratch 只记录受信的私有现场。
-    r#"
-.text
+/// 保存当前 Task 的真实 Rust 续接，通过 sret 执行用户现场，陷入后返回同一次调用。
+///
+/// # Safety
+/// context 必须由当前普通 Task 独占并位于活动根的内核映射；IRQ 关闭且内核 FS Off。
+/// 用户根、内核映射、context 与当前 Task 栈必须保活到返回，期间不得调用调度器。
+#[naked]
+#[no_mangle]
+pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut UserContext) {
+    // SAFETY: 调用者满足活动根、独占现场和栈寿命；128 字节续接保留完整内核 callee-saved 与状态。
+    unsafe {
+        naked_asm!(
+        r#"
+.option push
 .option arch, +a, +d
-.balign 4
-.global rv_run_user
-rv_run_user:
     // 本次调用的续接始终放在当前 Task 栈；TP/GP 仅在此不调度的汇编区间保活。
     addi sp, sp, -128
     sd ra, 0(sp)
@@ -35,8 +42,8 @@ rv_run_user:
     csrw sscratch, a0
     mv sp, a0
 "#,
-    // 恢复全部用户浮点现场，并只构造许可的 sstatus 位，清除跨特权 LR/SC reservation。
-    r#"
+        // 恢复全部用户浮点现场，并只构造许可的 sstatus 位，清除跨特权 LR/SC reservation。
+        r#"
     li t0, 0x6000
     csrs sstatus, t0
     fld f0, ({fpr} + 0 * 8)(sp)
@@ -82,8 +89,8 @@ rv_run_user:
     addi t0, sp, {stval}
     sc.d zero, zero, (t0)
 "#,
-    // 最后恢复用户整数寄存器与用户 SP，通过 sret 降到用户特权级。
-    r#"
+        // 最后恢复用户整数寄存器与用户 SP，通过 sret 降到用户特权级。
+        r#"
     ld x1, ({gpr} + 1 * 8)(sp)
     ld x3, ({gpr} + 3 * 8)(sp)
     ld x4, ({gpr} + 4 * 8)(sp)
@@ -116,13 +123,33 @@ rv_run_user:
     ld x31, ({gpr} + 31 * 8)(sp)
     ld sp, ({gpr} + 2 * 8)(sp)
     sret
-
+.option pop
 "#,
-    // 通用向量已保存 t0；受信现场接收原 SP、其余 GPR 与真实异常 CSR。
-    r#"
-.balign 4
-.global rv_user_trap_entry
-rv_user_trap_entry:
+        gpr = const offset_of!(UserContext, gpr),
+        pc = const offset_of!(UserContext, pc),
+        fpr = const offset_of!(UserContext, fpr),
+        fcsr = const offset_of!(UserContext, fcsr),
+        kernel_sp = const offset_of!(UserContext, kernel_sp),
+        stval = const offset_of!(UserContext, stval),
+            );
+    }
+}
+
+/// 从公共 trap 向量接收受信 context，保存用户现场后恢复当前 Task 的原 Rust 续接。
+///
+/// # Safety
+/// 只能从公共向量跳入；SP 必须指向本次 rv_run_user 的独占 context，
+/// 用户 t0 已保存且 sscratch 仍持被中断的原 SP。context 中的真实 Task 续接必须存活；
+/// S 来源异常只能沿原 fatal 路径处理，不得当作用户 trap 返回。
+#[naked]
+#[no_mangle]
+pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
+    // SAFETY: 公共向量已按 scratch 合同保存 t0；受信现场和续接在恢复 GP/TP/状态前保持可用。
+    unsafe {
+        naked_asm!(
+        r#"
+.option push
+.option arch, +a, +d
     // 通用入口已保存用户 t0 并换入受信 context；sscratch 暂存被中断的原 SP。
     csrr t0, sscratch
     csrw sscratch, sp
@@ -165,10 +192,10 @@ rv_user_trap_entry:
     sd t0, {stval}(sp)
     csrr t0, sstatus
     andi t0, t0, 0x100
-    bnez t0, .Lrv_user_kernel_fault
+    bnez t0, 2f
 "#,
-    // 确认用户来源后保存全部 FPR/FCSR，不能把用户 TLS 当作 CpuLocal。
-    r#"
+        // 确认用户来源后保存全部 FPR/FCSR，不能把用户 TLS 当作 CpuLocal。
+        r#"
     fsd f0, ({fpr} + 0 * 8)(sp)
     fsd f1, ({fpr} + 1 * 8)(sp)
     fsd f2, ({fpr} + 2 * 8)(sp)
@@ -204,8 +231,8 @@ rv_user_trap_entry:
     frcsr t0
     sd t0, {fcsr}(sp)
 "#,
-    // 从本次 Task 续接恢复受信 GP/TP/状态，清除 scratch 和 kernel_sp 后返回原 Rust 调用。
-    r#"
+        // 从本次 Task 续接恢复受信 GP/TP/状态，清除 scratch 和 kernel_sp 后返回原 Rust 调用。
+        r#"
     ld t0, {kernel_sp}(sp)
     // 受信 TP/GP/状态恢复前保留 context 入口，S 来源故障仍能取得真实内核栈。
     ld gp, 8(t0)
@@ -231,10 +258,10 @@ rv_user_trap_entry:
     addi sp, sp, 128
     ret
 "#,
-    // 进入或退出窗口的 S 来源故障使用真实续接栈，保留原致命诊断路径。
-    r#"
+        // 进入或退出窗口的 S 来源故障使用真实续接栈，保留原致命诊断路径。
+        r#"
 
-.Lrv_user_kernel_fault:
+2:
     // 入口或退出窗口内的 S 来源异常仍致命，用真实续接栈执行原内核诊断。
     ld a0, {pc}(sp)
     ld a1, ({gpr} + 2 * 8)(sp)
@@ -249,11 +276,26 @@ rv_user_trap_entry:
     csrw sscratch, zero
     mv sp, t0
     call {kernel_fault}
-
+.option pop
 "#,
-    // ktest 指令块仅含可整体复制的局部分支，生产构建保持原 .if 排除语义。
+        gpr = const offset_of!(UserContext, gpr),
+        pc = const offset_of!(UserContext, pc),
+        fpr = const offset_of!(UserContext, fpr),
+        fcsr = const offset_of!(UserContext, fcsr),
+        kernel_sp = const offset_of!(UserContext, kernel_sp),
+        scause = const offset_of!(UserContext, scause),
+        stval = const offset_of!(UserContext, stval),
+        kernel_fault = sym rv_kernel_fault,
+            );
+    }
+}
+
+// 固定指令块只含局部分支，可整体复制到用户页；扩展选项不影响其他裸函数。
+#[cfg(feature = "ktest")]
+global_asm!(
     r#"
-.if {user_tests}
+.option push
+.option arch, +a, +d
 .pushsection .text.user_probe, "ax", @progbits
 .balign 4
 .global rv_user_probe_start
@@ -318,15 +360,6 @@ rv_user_probe_execute:
     jr a5
 rv_user_probe_end:
 .popsection
-.endif
+.option pop
 "#,
-    gpr = const offset_of!(UserContext, gpr),
-    pc = const offset_of!(UserContext, pc),
-    fpr = const offset_of!(UserContext, fpr),
-    fcsr = const offset_of!(UserContext, fcsr),
-    kernel_sp = const offset_of!(UserContext, kernel_sp),
-    scause = const offset_of!(UserContext, scause),
-    stval = const offset_of!(UserContext, stval),
-    kernel_fault = sym rv_kernel_fault,
-    user_tests = const cfg!(feature = "ktest") as usize,
 );

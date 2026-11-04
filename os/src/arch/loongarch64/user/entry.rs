@@ -1,49 +1,29 @@
 //! 用户进入、异常返回及入口故障共用本次 Task 的受信续接帧。
 
-use crate::arch::loongarch64::user::UserContext;
+use crate::arch::loongarch64::user::{loongarch_user_kernel_fault, UserContext};
+#[cfg(feature = "ktest")]
 use core::arch::global_asm;
+use core::arch::naked_asm;
 use core::mem::offset_of;
 
-global_asm!(
-    // FP、LSX、LASX 共用 32 字节槽；测试宏只访问 CPU 支持的实际宽度。
-    r#"
-.text
-
+/// 保存当前 Task 的 160 字节 ABI 续接，恢复最宽用户现场并进入 PLV3，异常后回到同一次调用。
+///
+/// # Safety
+/// context 必须是当前 Task 独占、完整初始化且保活的私有现场；Mm、当前栈与目的 CPU 的 KS0 必须有效。
+/// 本核 IRQ 和内核 EUEN 必须关闭，栈满足 16 字节对齐，不得持有跨用户进入的 FP 状态或允许跨裸帧展开。
+#[naked]
+#[no_mangle]
+pub(super) unsafe extern "C" fn la_run_user(_context: *mut UserContext) {
+    // SAFETY: 调用者独占有效 context 和 Task 栈，IRQ/EUEN 已关闭；160 字节续接保活到同次用户异常返回。
+    unsafe {
+        naked_asm!(
+            r#"
 # /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
 .macro LA_FP_REGS insn, prefix
     .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
         \insn $\prefix\()\n, $sp, {fpr}+\n*32
     .endr
 .endm
-
-# /// 用户消费者从独立输入加载实际高 lanes 并写回结果，浮点循环不依赖内核初值。
-.macro LA_PROBE_VECTOR
-    li.w $t0, 2
-    cpucfg $t0, $t0
-    andi $t1, $t0, 0x80
-    bnez $t1, .Lprobe_lasx\@
-    andi $t1, $t0, 0x40
-    beqz $t1, .Lprobe_scalar\@
-    vld $vr31, $a6, 96
-    vst $vr31, $a6, 128
-    b .Lprobe_vector_done\@
-.Lprobe_lasx\@:
-    xvld $xr31, $a6, 96
-    xvst $xr31, $a6, 128
-    b .Lprobe_vector_done\@
-.Lprobe_scalar\@:
-    fld.d $f31, $a6, 96
-    fst.d $f31, $a6, 128
-.Lprobe_vector_done\@:
-.endm
-
-"#,
-    // 保存 160 字节普通 ABI 续接，KS1 定位私有现场，KS3 保存受信 Task SP。
-    r#"
-# 本次普通 Rust 调用的 160 字节续接帧，保持 16 字节 ABI 对齐。
-.balign 64
-.global la_run_user
-la_run_user:
     addi.d $sp, $sp, -160
     st.d $r1, $sp, 0
     st.d $r2, $sp, 8
@@ -79,39 +59,37 @@ la_run_user:
     csrwr $t0, 51
     move $t0, $a0
     csrwr $t0, 49
-    la.abs $t0, la_user_trap
+    la.abs $t0, {user_trap}
     csrwr $t0, 12
     move $sp, $a0
-"#,
-    // 按 CPUCFG 的完整依赖恢复扩展单元、FCSR 与 FCC，不读取未支持的高 lanes。
-    r#"
+
     # EUEN 只取 CPUCFG2 中具有完整依赖的 FP/LSX/LASX 能力。
     li.w $t0, 2
     cpucfg $t0, $t0
     andi $t1, $t0, 1
-    beqz $t1, .Lrestore_euen
+    beqz $t1, 2f
     andi $t2, $t0, 0x40
-    beqz $t2, .Lrestore_euen
+    beqz $t2, 2f
     ori $t1, $t1, 2
     andi $t2, $t0, 0x80
-    beqz $t2, .Lrestore_euen
+    beqz $t2, 2f
     ori $t1, $t1, 4
-.Lrestore_euen:
+2:
     csrwr $t1, 2
     csrrd $t0, 2
     andi $t1, $t0, 4
-    bnez $t1, .Lrestore_lasx
+    bnez $t1, 4f
     andi $t1, $t0, 2
-    bnez $t1, .Lrestore_lsx
-    beqz $t0, .Lrestore_fp_done
+    bnez $t1, 3f
+    beqz $t0, 6f
     LA_FP_REGS fld.d, f
-    b .Lrestore_fp_control
-.Lrestore_lsx:
+    b 5f
+3:
     LA_FP_REGS vld, vr
-    b .Lrestore_fp_control
-.Lrestore_lasx:
+    b 5f
+4:
     LA_FP_REGS xvld, xr
-.Lrestore_fp_control:
+5:
     ld.d $t0, $sp, {fcsr}
     movgr2fcsr $fcsr0, $t0
     ld.d $t0, $sp, {fcc}
@@ -131,10 +109,8 @@ la_run_user:
     movgr2cf $fcc6, $t1
     bstrpick.d $t1, $t0, 63, 56
     movgr2cf $fcc7, $t1
-.Lrestore_fp_done:
-"#,
-    // 用户 PC 来自私有现场，PRMD 固定为 PLV3/IE；恢复全部整数后执行 ERTN。
-    r#"
+6:
+
     ld.d $t0, $sp, {pc}
     csrwr $t0, 6
     # 特权和 IRQ 状态只由内核常量构造，用户寄存器不参与 PRMD。
@@ -173,20 +149,46 @@ la_run_user:
     ld.d $sp, $sp, {gpr}+3*8
     ertn
 
+
+.purgem LA_FP_REGS
 "#,
-    // 页对齐的用户 trap 先区分来源，借 KS2 保留 t0 并在受信现场保存原 SP。
-    r#"
-# EENTRY 低 12 位只读零，用户异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
-.balign 4096
-.global la_user_trap
-la_user_trap:
+            gpr = const offset_of!(UserContext, gpr),
+            pc = const offset_of!(UserContext, pc),
+            fpr = const offset_of!(UserContext, fpr),
+            fcsr = const offset_of!(UserContext, fcsr),
+            fcc = const offset_of!(UserContext, fcc),
+            kernel_sp = const offset_of!(UserContext, kernel_sp),
+            user_trap = sym la_user_trap,
+        );
+    }
+}
+
+/// 在用户异常中保存完整 GPR、最宽 FP/FCSR/FCC，并恢复当前 Task 的原内核续接与入口 CSR。
+///
+/// # Safety
+/// 仅由已安装的 EENTRY 进入；KS1 必须定位独占 UserContext，KS3 必须保留本次调用的受信 Task 续接。
+/// 用户来源不得用用户 SP 建帧；PLV0 入口故障只能在恢复 KS3 栈后进入 Rust fatal，KS0 始终属于目的 CPU。
+#[naked]
+#[no_mangle]
+#[link_section = ".text.vector.user_trap"]
+pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
+    // SAFETY: KS1/KS3 由本次用户调用建立并保活；用户寄存器只写入私有现场，恢复受信栈后才回到内核调用。
+    unsafe {
+        naked_asm!(
+            r#"
+# /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
+.macro LA_FP_REGS insn, prefix
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        \insn $\prefix\()\n, $sp, {fpr}+\n*32
+    .endr
+.endm
     # KS0 永久保留 CpuLocal；KS2 只在入口暂存用户 t0。
     csrwr $t0, 50
     csrrd $t0, 1
     andi $t0, $t0, 3
-    bnez $t0, .Luser_source
-    b .Luser_kernel_fault
-.Luser_source:
+    bnez $t0, 2f
+    b 7f
+2:
     csrwr $sp, 49
     st.d $r0, $sp, {gpr}+0*8
     st.d $r1, $sp, {gpr}+1*8
@@ -228,23 +230,21 @@ la_user_trap:
     st.d $t0, $sp, {estat}
     csrrd $t0, 7
     st.d $t0, $sp, {badv}
-"#,
-    // 按实际 EUEN 保存最宽扩展现场及全部 FCC，标量路径仍使用相同槽间距。
-    r#"
+
     csrrd $t0, 2
     andi $t1, $t0, 4
-    bnez $t1, .Lsave_lasx
+    bnez $t1, 4f
     andi $t1, $t0, 2
-    bnez $t1, .Lsave_lsx
-    beqz $t0, .Lsave_fp_done
+    bnez $t1, 3f
+    beqz $t0, 6f
     LA_FP_REGS fst.d, f
-    b .Lsave_fp_control
-.Lsave_lsx:
+    b 5f
+3:
     LA_FP_REGS vst, vr
-    b .Lsave_fp_control
-.Lsave_lasx:
+    b 5f
+4:
     LA_FP_REGS xvst, xr
-.Lsave_fp_control:
+5:
     movfcsr2gr $t0, $fcsr0
     st.d $t0, $sp, {fcsr}
     movcf2gr $t0, $fcc0
@@ -263,10 +263,8 @@ la_user_trap:
     movcf2gr $t1, $fcc7
     bstrins.d $t0, $t1, 63, 56
     st.d $t0, $sp, {fcc}
-.Lsave_fp_done:
-"#,
-    // 先关闭 EUEN，再取回 Task 续接 SP、内核 tp/r21 与入口 CSR，返回同次 Rust 调用。
-    r#"
+6:
+
     csrwr $zero, 2
     ld.d $sp, $sp, {kernel_sp}
     ld.d $tp, $sp, 8
@@ -301,20 +299,44 @@ la_user_trap:
     addi.d $sp, $sp, 160
     jr $ra
 
-"#,
-    // 入口窗口的内核异常与 refill 不向当前 SP 压栈，改从 KS3 恢复受信续接后报告。
-    r#"
-.Luser_kernel_fault:
+
+7:
     # PLV0 入口故障不使用当前不可信 SP 压帧，独立快照保留真正故障 CSR 和故障 SP。
     move $a1, $sp
     csrrd $a0, 6
     csrrd $a2, 5
     csrrd $a3, 7
     move $a4, $zero
-    b .Luser_kernel_fault_restore
+    b {fault_restore}
 
-.global la_user_kernel_refill_fault
-la_user_kernel_refill_fault:
+
+.purgem LA_FP_REGS
+"#,
+            gpr = const offset_of!(UserContext, gpr),
+            pc = const offset_of!(UserContext, pc),
+            fpr = const offset_of!(UserContext, fpr),
+            fcsr = const offset_of!(UserContext, fcsr),
+            fcc = const offset_of!(UserContext, fcc),
+            estat = const offset_of!(UserContext, estat),
+            badv = const offset_of!(UserContext, badv),
+            kernel_sp = const offset_of!(UserContext, kernel_sp),
+            fault_restore = sym la_user_kernel_fault_restore,
+        );
+    }
+}
+
+/// 接收用户入口窗口的内核 refill，在 DA 下快照专属 CSR，先跳高别名再恢复 DMW。
+///
+/// # Safety
+/// 只能由 refill 入口在确认 EENTRY 为用户向量后跳入；KS3 必须是本次调用仍保活的受信续接，当前 SP 不能用于压帧。
+/// TLBRERA/TLBRBADV 必须仍是原故障现场，普通 Rust 调用只能发生在高地址和受信栈恢复之后。
+#[naked]
+#[no_mangle]
+pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_kernel_refill_fault() -> ! {
+    // SAFETY: refill 前驱已确认用户入口窗口且保活 KS3；此段不使用当前 SP 压帧，先完成 DA 到高别名的转换。
+    unsafe {
+        naked_asm!(
+            r#"
     # refill 保留专属 CSR 语义；DA 下只跳转高地址别名，再恢复 PLV0 DMW。
     move $a1, $sp
     csrrd $a0, 138
@@ -323,13 +345,37 @@ la_user_kernel_refill_fault:
     slli.d $a0, $a0, 1
     csrrd $a3, 137
     li.w $a4, 1
-    la.abs $t0, .Luser_kernel_refill_high
+    la.abs $t0, 2f
     jirl $zero, $t0, 0
-.Luser_kernel_refill_high:
+2:
     li.w $t0, 0x10
     li.w $t1, 0x18
     csrxchg $t0, $t1, 0
-.Luser_kernel_fault_restore:
+    b {fault_restore}
+"#,
+            fault_restore = sym la_user_kernel_fault_restore,
+        );
+    }
+}
+
+/// 从 KS3 恢复受信 Task 栈和入口内核状态，保留 a0–a4 的原故障 pc/sp/cause/bad/refill 值交给 fatal。
+///
+/// # Safety
+/// 只能由两个入口故障分支跳入；DMW 必须已可用，KS3 指向本次有效 160 字节续接帧，a0–a4 已快照原故障。
+/// 不返回原用户现场，不得将故障 SP 当作 Rust 栈；目的 CPU 的 KS0 不得被覆盖。
+#[naked]
+#[no_mangle]
+unsafe extern "C" fn la_user_kernel_fault_restore(
+    _pc: usize,
+    _sp: usize,
+    _cause: usize,
+    _bad: usize,
+    _is_refill: usize,
+) -> ! {
+    // SAFETY: 两个故障分支已恢复 DMW 并快照 a0–a4；KS3 仍指向有效续接，恢复内核状态后才能跳入 fatal。
+    unsafe {
+        naked_asm!(
+            r#"
     csrrd $sp, 51
     ld.d $tp, $sp, 8
     ld.d $r21, $sp, 16
@@ -348,12 +394,37 @@ la_user_kernel_refill_fault:
     csrwr $t0, 51
     ld.d $t0, $sp, 152
     csrwr $t0, 0
-    bl loongarch_user_kernel_fault
-
+    bl {handler}
 "#,
-    // 仅 ktest 提供页内相对寻址消费者与故障入口，复制字节不依赖内核地址。
+            handler = sym loongarch_user_kernel_fault,
+        );
+    }
+}
+
+#[cfg(feature = "ktest")]
+global_asm!(
     r#"
-.if {execution_tests}
+# /// 用户消费者从独立输入加载实际高 lanes 并写回结果，浮点循环不依赖内核初值。
+.macro LA_PROBE_VECTOR
+    li.w $t0, 2
+    cpucfg $t0, $t0
+    andi $t1, $t0, 0x80
+    bnez $t1, .Lprobe_lasx\@
+    andi $t1, $t0, 0x40
+    beqz $t1, .Lprobe_scalar\@
+    vld $vr31, $a6, 96
+    vst $vr31, $a6, 128
+    b .Lprobe_vector_done\@
+.Lprobe_lasx\@:
+    xvld $xr31, $a6, 96
+    xvst $xr31, $a6, 128
+    b .Lprobe_vector_done\@
+.Lprobe_scalar\@:
+    fld.d $f31, $a6, 96
+    fst.d $f31, $a6, 128
+.Lprobe_vector_done\@:
+.endm
+
 .section .text.la_user_probe, "ax"
 .balign 4096
 .global la_user_code_start
@@ -432,15 +503,6 @@ la_user_fault_write:
 la_user_fault_execute:
     jirl $zero, $a5, 0
 la_user_code_end:
-.endif
+.purgem LA_PROBE_VECTOR
 "#,
-    gpr = const offset_of!(UserContext, gpr),
-    pc = const offset_of!(UserContext, pc),
-    fpr = const offset_of!(UserContext, fpr),
-    fcsr = const offset_of!(UserContext, fcsr),
-    fcc = const offset_of!(UserContext, fcc),
-    estat = const offset_of!(UserContext, estat),
-    badv = const offset_of!(UserContext, badv),
-    kernel_sp = const offset_of!(UserContext, kernel_sp),
-    execution_tests = const cfg!(feature = "ktest") as usize,
 );

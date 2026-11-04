@@ -1,10 +1,16 @@
 //! 每个用户线程独占的整数、浮点现场及本次调用的受信续接。
 
-use crate::arch::{UserAccess, UserTrap};
+use crate::arch::{
+    riscv64::{irq_enabled, rv_dispatch_interrupt},
+    UserAccess, UserTrap,
+};
 use core::arch::asm;
 
 mod entry;
 mod signal_return;
+
+use crate::arch::riscv64::user::entry::rv_run_user;
+pub(in crate::arch::riscv64) use crate::arch::riscv64::user::entry::rv_user_trap_entry;
 
 #[repr(C, align(16))]
 pub struct UserContext {
@@ -62,14 +68,6 @@ pub fn signal_return_code() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, end - start as usize) }
 }
 
-extern "C" {
-    /// 保存当前 Rust 调用续接并通过 sret 执行用户现场，trap 后回到同一调用栈。
-    ///
-    /// # Safety
-    /// context 须独占且位于当前根的内核映射中；IRQ 关闭，FS Off，用户根及内核高半存活。
-    fn rv_run_user(context: *mut UserContext);
-}
-
 /// 在当前普通 Task 中执行用户现场，返回已完成硬件分派的小 trap 快照且不推进 PC。
 ///
 /// # Safety
@@ -77,7 +75,7 @@ extern "C" {
 /// 调用前 IRQ 关闭且没有活跃内核 FP；不得在中断域或持普通锁时调用。
 /// MM 与完整页表必须保活到返回，只有返回到 Rust 且退出 HardIrqGuard 后才允许调度。
 pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
-    assert!(!super::irq_enabled());
+    assert!(!irq_enabled());
     let status: usize;
     // SAFETY: 本核处于 S-mode，仅读取状态以拒绝覆盖活跃的内核 FP 现场。
     unsafe {
@@ -94,7 +92,7 @@ pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
         rv_run_user(context);
     }
     if context.scause & (1usize << 63) != 0 {
-        super::rv_dispatch_interrupt(context.scause, context.pc, context.gpr[2], context.stval);
+        rv_dispatch_interrupt(context.scause, context.pc, context.gpr[2], context.stval);
         return UserTrap::Interrupt;
     }
     match context.scause {

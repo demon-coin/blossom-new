@@ -1,18 +1,28 @@
 //! 内核异常与物理 refill 的硬件入口；两者的 CSR 和 frame 不混用。
 
-use crate::arch::loongarch64::{KernelTrapFrame, RefillFrame};
-use core::arch::global_asm;
+use crate::arch::loongarch64::user::{la_user_kernel_refill_fault, la_user_trap};
+use crate::arch::loongarch64::{loongarch_refill, loongarch_trap, KernelTrapFrame, RefillFrame};
+use core::arch::naked_asm;
 use core::mem::{offset_of, size_of};
 
-global_asm!(
-    // 普通异常先保存全部整数寄存器和原 SP，再记录异常 CSR 与 KS0。
-    r#"
-.text
+extern "C" {
+    // 永久 invalid 根由同架构 MMU 模块拥有，入口只取得其链接地址。
+    static LA_INVALID_ROOT: u8;
+}
 
-# EENTRY 低 12 位只读零，异常入口必须按 4KiB 对齐，不能只按 64 字节对齐。
-.balign 4096
-.global la_kernel_trap
-la_kernel_trap:
+/// 保存完整内核整数、异常 CSR、KS0 及条件 FP/FCSR/FCC，返回原被打断现场。
+///
+/// # Safety
+/// 仅供 PLV0 的普通异常硬件入口使用；当前栈必须有效、独占且有 KernelTrapFrame 空间，DMW 和本核 KS0 必须保活。
+/// 原 EUEN.FPE 开启时全部标量 FP 可读写；Rust 分派不得跨裸帧展开。
+#[naked]
+#[no_mangle]
+#[link_section = ".text.vector.kernel_trap"]
+pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
+    // SAFETY: 硬件入口保证 PLV0 和有效内核栈；按 KernelTrapFrame 保存完整现场，Rust 分派仅在帧完成后调用。
+    unsafe {
+        naked_asm!(
+                r#"
     addi.d $sp, $sp, -{frame_size}
     st.d $r0, $sp, {gpr}+0*8
     st.d $r1, $sp, {gpr}+1*8
@@ -59,12 +69,10 @@ la_kernel_trap:
     st.d $t0, $sp, {euen}
     csrrd $t0, 48
     st.d $t0, $sp, {cpu_base}
-"#,
-    // 只有原 EUEN.FPE 开启时才保存全部标量 FP、FCSR 与八个 FCC。
-    r#"
+
     ld.d $t0, $sp, {euen}
     andi $t0, $t0, 1
-    beqz $t0, .Lla_fp_saved
+    beqz $t0, 2f
     fst.d $f0, $sp, {fpr}+0*8
     fst.d $f1, $sp, {fpr}+1*8
     fst.d $f2, $sp, {fpr}+2*8
@@ -115,17 +123,15 @@ la_kernel_trap:
     st.d $t0, $sp, {fcc}+6*8
     movcf2gr $t0, $fcc7
     st.d $t0, $sp, {fcc}+7*8
-"#,
-    // 完整现场建立后调用 Rust，返回时先恢复 EUEN 再恢复条件保存的 FP。
-    r#"
-.Lla_fp_saved:
+
+2:
     move $a0, $sp
-    bl loongarch_trap
+    bl {handler}
     ld.d $t0, $sp, {euen}
     csrwr $t0, 2
     ld.d $t0, $sp, {euen}
     andi $t0, $t0, 1
-    beqz $t0, .Lla_fp_restored
+    beqz $t0, 3f
     fld.d $f0, $sp, {fpr}+0*8
     fld.d $f1, $sp, {fpr}+1*8
     fld.d $f2, $sp, {fpr}+2*8
@@ -176,10 +182,8 @@ la_kernel_trap:
     movgr2cf $fcc6, $t0
     ld.d $t0, $sp, {fcc}+7*8
     movgr2cf $fcc7, $t0
-"#,
-    // 恢复原异常返回状态、KS0 和整数现场，最后以原 SP 执行 ERTN。
-    r#"
-.Lla_fp_restored:
+
+3:
     ld.d $t0, $sp, {era}
     csrwr $t0, 6
     ld.d $t0, $sp, {prmd}
@@ -218,42 +222,64 @@ la_kernel_trap:
     ld.d $r31, $sp, {gpr}+31*8
     ld.d $sp, $sp, {gpr}+3*8
     ertn
-
 "#,
-    // 物理 refill 独立按页对齐；用户路径保留 TLBRSAVE/KS2 并装入完整偶奇叶。
-    r#"
-# TLBRENTRY 低 12 位只读零，重填入口必须按 4KiB 对齐，不能只按 64 字节对齐。
-.balign 4096
-.global la_kernel_refill
-la_kernel_refill:
+        frame_size = const size_of::<KernelTrapFrame>(),
+        gpr = const offset_of!(KernelTrapFrame, gpr),
+        era = const offset_of!(KernelTrapFrame, era),
+        prmd = const offset_of!(KernelTrapFrame, prmd),
+        estat = const offset_of!(KernelTrapFrame, estat),
+        badv = const offset_of!(KernelTrapFrame, badv),
+        euen = const offset_of!(KernelTrapFrame, euen),
+        cpu_base = const offset_of!(KernelTrapFrame, cpu_base),
+        fpr = const offset_of!(KernelTrapFrame, fpr),
+        fcsr = const offset_of!(KernelTrapFrame, fcsr),
+        fcc = const offset_of!(KernelTrapFrame, fcc),
+                handler = sym loongarch_trap,
+            );
+    }
+}
+
+/// 在 DA 下区分用户 refill 与内核致命 refill，完整装入偶奇叶或保存独立 CSR 现场。
+///
+/// # Safety
+/// 仅供 TLBRENTRY 物理入口使用，PW 与永久 invalid 链必须已初始化；正常内核来源须有可在 DA 下访问的有效栈。
+/// 用户入口窗口必须保留 KS1/KS3 的受信现场；高地址跳转和 DMW 恢复完成前不得调用普通 Rust。
+#[naked]
+#[no_mangle]
+#[link_section = ".text.vector.kernel_refill"]
+pub(super) unsafe extern "C" fn la_kernel_refill() -> ! {
+    // SAFETY: 已安装的 PW/invalid 链限定页表访问；内核栈或 KS3 由入口契约保活，先恢复高别名和 DMW 再调用 Rust。
+    unsafe {
+        naked_asm!(
+                r#"
     # 用户 refill 把 t0 存入 TLBRSAVE、t1 存入临时 KS2，不触碰用户 SP 或 KS0。
     csrwr $t0, 139
     csrrd $t0, 143
     andi $t0, $t0, 3
     xori $t0, $t0, 3
-    beqz $t0, .Luser_refill
+    beqz $t0, 3f
     # PLV0 的用户入口窗口仍可能持有 context/用户 SP；只在该窗口借 KS3 续接栈。
     # KS2 是非返回的内核 refill 临时槽，原 GPR 在压致命 frame 前恢复。
     csrwr $t1, 50
     csrrd $t0, 12
-    la.abs $t1, la_user_trap
-    bne $t0, $t1, .Lordinary_kernel_refill
-    b la_user_kernel_refill_fault
-.Lordinary_kernel_refill:
+    la.abs $t1, {user_trap}
+    bne $t0, $t1, 2f
+    b {user_refill_fault}
+2:
     csrrd $t1, 50
     csrrd $t0, 139
-    b .Lkernel_refill_fatal
-.Luser_refill:
+    b 6f
+3:
     # 三层只索引低 39 位；超出政策范围的地址只能走永久 invalid 链。
     csrrd $t0, 137
     srli.d $t0, $t0, 39
-    bnez $t0, .Linvalid_user_root
+    bnez $t0, 4f
     csrrd $t0, 25
-    b .Luser_refill_walk
-.Linvalid_user_root:
-    la.abs $t0, LA_INVALID_ROOT
+    b 5f
+4:
+    la.abs $t0, {invalid_root}
     bstrpick.d $t0, $t0, 47, 0
-.Luser_refill_walk:
+5:
     # PWCH DIR2 / PWCL DIR0 / PT 构成固定三级；空目录总指向永久 invalid 页。
     lddir $t0, $t0, 3
     lddir $t0, $t0, 1
@@ -272,10 +298,8 @@ la_kernel_refill:
     tlbfill
     csrrd $t0, 139
     ertn
-"#,
-    // 内核 refill 在 DA 下保存独立 frame，切回高别名和 DMW 后报告致命异常。
-    r#"
-.Lkernel_refill_fatal:
+
+6:
     # refill 自动处于 DA；高地址栈仍以物理掩码可访问。
     addi.d $sp, $sp, -{refill_size}
     st.d $r0, $sp, {refill_gpr}+0*8
@@ -318,29 +342,24 @@ la_kernel_refill:
     csrrd $t0, 137
     st.d $t0, $sp, {refill_badv}
     # TLBRENTRY 是物理入口；DA 下先转高别名再恢复 DMW。
-    la.abs $t0, .Lrefill_high
+    la.abs $t0, 7f
     jirl $zero, $t0, 0
-.Lrefill_high:
+7:
     li.w $t0, 0x10
     li.w $t1, 0x18
     csrxchg $t0, $t1, 0
     move $a0, $sp
-    bl loongarch_refill
+    bl {handler}
 "#,
-    frame_size = const size_of::<KernelTrapFrame>(),
-    gpr = const offset_of!(KernelTrapFrame, gpr),
-    era = const offset_of!(KernelTrapFrame, era),
-    prmd = const offset_of!(KernelTrapFrame, prmd),
-    estat = const offset_of!(KernelTrapFrame, estat),
-    badv = const offset_of!(KernelTrapFrame, badv),
-    euen = const offset_of!(KernelTrapFrame, euen),
-    cpu_base = const offset_of!(KernelTrapFrame, cpu_base),
-    fpr = const offset_of!(KernelTrapFrame, fpr),
-    fcsr = const offset_of!(KernelTrapFrame, fcsr),
-    fcc = const offset_of!(KernelTrapFrame, fcc),
-    refill_size = const size_of::<RefillFrame>(),
-    refill_gpr = const offset_of!(RefillFrame, gpr),
-    refill_era = const offset_of!(RefillFrame, era),
-    refill_prmd = const offset_of!(RefillFrame, prmd),
-    refill_badv = const offset_of!(RefillFrame, badv),
-);
+        refill_size = const size_of::<RefillFrame>(),
+        refill_gpr = const offset_of!(RefillFrame, gpr),
+        refill_era = const offset_of!(RefillFrame, era),
+        refill_prmd = const offset_of!(RefillFrame, prmd),
+        refill_badv = const offset_of!(RefillFrame, badv),
+                user_trap = sym la_user_trap,
+                user_refill_fault = sym la_user_kernel_refill_fault,
+                invalid_root = sym LA_INVALID_ROOT,
+                handler = sym loongarch_refill,
+            );
+    }
+}

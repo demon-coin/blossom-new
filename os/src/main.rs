@@ -85,15 +85,15 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
 /// 使用固件资源准备 CPU、MM、统一时间与中断，再发表内核任务并释放 AP。
 ///
 /// # Safety
-/// 仅由选定机器的 BSP 引导汇编调用一次，IRQ 关闭且 AP 未释放。
-/// 汇编已建立内核/RAM/早期 UART 映射、独占启动栈，并清理普通 BSS。
-/// 原始四参数在 BSS 清理前已保存，DTB 头部及声明全文可读且不覆盖内核。
+/// 仅由选定机器的 BSP 引导入口调用一次，IRQ 关闭且 AP 未释放。
+/// 早期初始化已建立内核/RAM/早期 UART 映射与独占启动栈，并清理普通 BSS。
+/// 原始四参数在内存初始化前已保存，DTB 头部及声明全文可读且不覆盖内核。
 /// 板固件提供的 EFI 系统表及配置表数组须在解析期间可读且不变；
 /// 所选命令行须保活到快照复制结束，相关存储均不得与永久 BootInfo 槽重叠。
 #[no_mangle]
 pub unsafe extern "C" fn primary_main(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> ! {
     // 引导构造帧先真实返回，避免 LTO 把大数组留在 Boot 展开的 64KiB 栈上。
-    // SAFETY: BSP 汇编满足本入口的独占状态、实际映射和固件参数约束。
+    // SAFETY: 机器入口与早期初始化满足本入口的独占状态、实际映射和固件参数约束。
     unsafe { initialize_boot([arg0, arg1, arg2, arg3]) };
     #[cfg(feature = "ktest")]
     let test_command = {

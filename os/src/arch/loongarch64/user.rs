@@ -1,6 +1,10 @@
 //! PLV3 私有现场；返回同一普通 Task 的 Rust 调用栈。
 
-use super::{csr_read, handle_hardware_interrupt, irq_enabled};
+use crate::arch::loongarch64::user::entry::la_run_user;
+pub(in crate::arch::loongarch64) use crate::arch::loongarch64::user::entry::{
+    la_user_kernel_refill_fault, la_user_trap,
+};
+use crate::arch::loongarch64::{csr_read, handle_hardware_interrupt, irq_enabled};
 use crate::arch::{UserAccess, UserTrap};
 
 mod entry;
@@ -70,11 +74,6 @@ pub fn signal_return_code() -> &'static [u8] {
     // SAFETY: 两个链接符号界定同一永久只读片段，end 位于 start 之后，字节内容全部已初始化；
     // 返回切片只借内核静态字节，不借用户映射或建立可并发写的用户内容引用。
     unsafe { core::slice::from_raw_parts(start, end - start as usize) }
-}
-
-extern "C" {
-    /// 保存本次内核续接并执行 PLV3，异常保存完整用户现场后返回原续接。
-    fn la_run_user(context: *mut UserContext);
 }
 
 /// 真实进入 PLV3；中断沿正常硬中断路径完成后返回值快照，不推进用户 PC。

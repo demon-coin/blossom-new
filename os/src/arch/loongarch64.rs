@@ -23,6 +23,7 @@ mod switch;
 mod trap;
 mod uaccess;
 mod user;
+use crate::arch::loongarch64::trap::{la_kernel_refill, la_kernel_trap};
 pub use counter::{apply_counter_epoch, establish_counter_epoch};
 pub use rtc::board_rtc_calendar;
 use switch::la_switch_context;
@@ -68,10 +69,6 @@ struct RefillFrame {
 
 extern "C" {
     static __secondary_entry_phys: u8;
-    /// 普通内核异常入口，由硬件跳转并按 KernelTrapFrame 布局保存本核现场。
-    fn la_kernel_trap();
-    /// 物理 refill 入口，使用独立 CSR 现场并在调用 Rust 前恢复高地址 DMW。
-    fn la_kernel_refill();
     /// 在启 IE 到 IDLE 的显式窗口内复查提示；窗口中断后退出等待并返回调度器。
     fn la_idle_once_asm(
         kick_pending: *const AtomicUsize,

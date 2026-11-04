@@ -1,29 +1,37 @@
 //! 共享硬件向量先按 sscratch 分流，再在真实内核栈保存与恢复完整 trap 现场。
 
-use crate::arch::riscv64::{rv_handle_trap, KernelTrapFrame, UserContext};
+use crate::arch::riscv64::{
+    rv_handle_trap, user::rv_user_trap_entry, KernelTrapFrame, UserContext,
+};
 use core::{
-    arch::global_asm,
+    arch::naked_asm,
     mem::{offset_of, size_of},
 };
 
-// 用户入口跨模块长跳转，内核入口保留原栈；两条路径均不能接受编译器序言。
-global_asm!(
-    // sscratch 非零仅指向受信用户现场；内核分支在覆盖临时寄存器前保存全部 GPR 和 CSR。
-    r#"
-.text
-
+/// 按 sscratch 区分用户与内核来源，在真实内核栈保存现场并返回被中断位置。
+///
+/// # Safety
+/// 只能由 S-mode 硬件 trap 进入；内核来源的 SP 必须有效且按 16 字节对齐。
+/// sscratch 非零时必须指向当前 Task 独占的 UserContext，且其中续接仍存活；
+/// 内核映射、当前 CPU 的 TP 与完整 trap 栈空间必须在分派返回前保持有效。
+#[naked]
+#[no_mangle]
+#[link_section = ".text.trap.entry"]
+pub(in crate::arch::riscv64) unsafe extern "C" fn rv_trap_entry() -> ! {
+    // SAFETY: 硬件与用户入口满足上述 scratch/栈合同；先保存被覆盖寄存器，再调用普通 Rust 分派。
+    unsafe {
+        naked_asm!(
+        r#"
+.option push
 .option arch, +d
-.balign 4
-.global rv_trap_entry
-rv_trap_entry:
     // sscratch 为零时保留原内核栈；用户执行时只接受内核预置的私有现场指针。
     csrrw sp, sscratch, sp
-    beqz sp, .Lrv_kernel_trap
+    beqz sp, 2f
     // 不依赖外部入口位于 JAL 的 ±1MiB 内；先保存用户 t0，再用 PC 相对长跳转。
     sd t0, ({user_gpr} + 5 * {word})(sp)
-    lla t0, rv_user_trap_entry
+    lla t0, {user_trap}
     jr t0
-.Lrv_kernel_trap:
+2:
     csrrw sp, sscratch, sp
     addi sp, sp, -{frame_size}
     sd x1, ({gpr} + 1 * {word})(sp)
@@ -68,12 +76,12 @@ rv_trap_entry:
     csrr t0, stval
     sd t0, {stval}(sp)
 "#,
-    // 只在原 FS 非 Off 时保存全部 FPR/FCSR，未保存字段仍由 MaybeUninit 表达。
-    r#"
+        // 只在原 FS 非 Off 时保存全部 FPR/FCSR，未保存字段仍由 MaybeUninit 表达。
+        r#"
     ld t0, {sstatus}(sp)
     li t1, 0x6000
     and t0, t0, t1
-    beqz t0, 1f
+    beqz t0, 3f
     fsd f0, ({fpr} + 0 * {float_word})(sp)
     fsd f1, ({fpr} + 1 * {float_word})(sp)
     fsd f2, ({fpr} + 2 * {float_word})(sp)
@@ -108,22 +116,22 @@ rv_trap_entry:
     fsd f31, ({fpr} + 31 * {float_word})(sp)
     frcsr t0
     sd t0, {fcsr}(sp)
-1:
+3:
 "#,
-    // 关闭 FS 后以完整、独占的 frame 调用普通 Rust 分派。
-    r#"
+        // 关闭 FS 后以完整、独占的 frame 调用普通 Rust 分派。
+        r#"
     li t0, 0x6000
     csrc sstatus, t0
     mv a0, sp
     call {handle_trap}
 "#,
-    // 按保存的 FS 状态恢复浮点现场，普通内核路径不执行浮点访问。
-    r#"
+        // 按保存的 FS 状态恢复浮点现场，普通内核路径不执行浮点访问。
+        r#"
     ld t0, {sstatus}(sp)
     csrw sstatus, t0
     li t1, 0x6000
     and t0, t0, t1
-    beqz t0, 2f
+    beqz t0, 4f
     fld f0, ({fpr} + 0 * {float_word})(sp)
     fld f1, ({fpr} + 1 * {float_word})(sp)
     fld f2, ({fpr} + 2 * {float_word})(sp)
@@ -158,10 +166,10 @@ rv_trap_entry:
     fld f31, ({fpr} + 31 * {float_word})(sp)
     ld t0, {fcsr}(sp)
     fscsr t0
-2:
+4:
 "#,
-    // 恢复原 PC、状态、全部整数寄存器与 SP，最后执行 sret。
-    r#"
+        // 恢复原 PC、状态、全部整数寄存器与 SP，最后执行 sret。
+        r#"
     ld t0, {sepc}(sp)
     csrw sepc, t0
     ld t0, {sstatus}(sp)
@@ -198,17 +206,21 @@ rv_trap_entry:
     ld x31, ({gpr} + 31 * {word})(sp)
     ld sp, ({gpr} + 2 * {word})(sp)
     sret
+.option pop
 "#,
-    frame_size = const size_of::<KernelTrapFrame>(),
-    gpr = const offset_of!(KernelTrapFrame, gpr),
-    user_gpr = const offset_of!(UserContext, gpr),
-    word = const size_of::<usize>(),
-    sepc = const offset_of!(KernelTrapFrame, sepc),
-    sstatus = const offset_of!(KernelTrapFrame, sstatus),
-    scause = const offset_of!(KernelTrapFrame, scause),
-    stval = const offset_of!(KernelTrapFrame, stval),
-    fpr = const offset_of!(KernelTrapFrame, fpr),
-    float_word = const size_of::<u64>(),
-    fcsr = const offset_of!(KernelTrapFrame, fcsr),
-    handle_trap = sym rv_handle_trap,
-);
+        frame_size = const size_of::<KernelTrapFrame>(),
+        gpr = const offset_of!(KernelTrapFrame, gpr),
+        user_gpr = const offset_of!(UserContext, gpr),
+        word = const size_of::<usize>(),
+        sepc = const offset_of!(KernelTrapFrame, sepc),
+        sstatus = const offset_of!(KernelTrapFrame, sstatus),
+        scause = const offset_of!(KernelTrapFrame, scause),
+        stval = const offset_of!(KernelTrapFrame, stval),
+        fpr = const offset_of!(KernelTrapFrame, fpr),
+        float_word = const size_of::<u64>(),
+        fcsr = const offset_of!(KernelTrapFrame, fcsr),
+        handle_trap = sym rv_handle_trap,
+        user_trap = sym rv_user_trap_entry,
+            );
+    }
+}

@@ -35,6 +35,7 @@ pub(crate) use signal::SIGNAL_MIN_STACK;
 use switch::rv_switch_context;
 #[cfg(feature = "ktest")]
 use switch::rv_task_context_roundtrip;
+use trap::rv_trap_entry;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 #[cfg(feature = "ktest")]
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
@@ -45,7 +46,6 @@ pub const NAME: &str = "riscv64";
 extern "C" {
     static __kernel_phys_end: u8;
     static __secondary_entry_phys: u8;
-    fn rv_trap_entry();
 }
 // medany 的 PC 相对取址不能直接到达物理/直映绝对符号；从本地 literal 读取地址值。
 macro_rules! address {

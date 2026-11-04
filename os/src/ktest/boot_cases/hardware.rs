@@ -24,8 +24,8 @@ pub(super) fn wait(mut predicate: impl FnMut() -> bool, reason: &'static str) ->
     Ok(())
 }
 
+/// 读取实际 SATP 并确认 Sv39 模式，再查询当前最终页表。
 #[cfg(target_arch = "riscv64")]
-/// 从真实 SATP 根沿 Sv39 遍历，任何下一层表都必须属于永久保留的内核 RAM。
 fn translation(address: usize) -> Option<(usize, usize)> {
     let satp: usize;
     // SAFETY: S-mode 读取当前 SATP，不改写翻译状态。
@@ -33,7 +33,12 @@ fn translation(address: usize) -> Option<(usize, usize)> {
         core::arch::asm!("csrr {value}, satp", value = out(reg) satp, options(nomem, nostack));
     }
     assert_eq!(satp >> 60, 8, "final SATP is not Sv39");
-    let mut physical = (satp & ((1usize << 44) - 1)) << 12;
+    translation_from((satp & ((1usize << 44) - 1)) << 12, address)
+}
+
+/// 只读遍历指定 Sv39 根，当前表与 bootstrap 表都必须属于永久内核保留 RAM。
+#[cfg(target_arch = "riscv64")]
+fn translation_from(mut physical: usize, address: usize) -> Option<(usize, usize)> {
     for level in (0..3).rev() {
         let kernel = boot::kernel_region();
         assert!(
@@ -128,6 +133,23 @@ pub(crate) mod mapping {
             "final-address pc={:#x} sp={:#x} kernel={:#x}..{:#x}",
             code, stack, kernel.start, kernel.end
         ));
+    }
+
+    /// 清零只改写半开区间；空区间和两端的有效数据必须保持。
+    #[test]
+    fn boot_clear_interval() {
+        const SENTINEL: usize = 0x9d37_51ab_c462_e806;
+        let mut words = [SENTINEL; 10];
+        let start = core::ptr::addr_of_mut!(words).cast::<usize>() as usize;
+        let word_size = core::mem::size_of::<usize>();
+        // SAFETY: 空区间端点指向本例独占且对齐的数组，不改写任何对象。
+        unsafe { arch::boot_clear_words(start, start) };
+        assert!(words.iter().all(|&value| value == SENTINEL));
+        // SAFETY: 内部八个机器字完全落在本例独占数组中，不覆盖两端数据或调用保存区。
+        unsafe { arch::boot_clear_words(start + word_size, start + 9 * word_size) };
+        assert_eq!(words[0], SENTINEL);
+        assert_eq!(words[9], SENTINEL);
+        assert!(words[1..9].iter().all(|&value| value == 0));
     }
 
     /// 低 RAM 别名已撤销；no-map 页与相邻普通保留页的最终映射按真实属性核对。
@@ -231,6 +253,55 @@ pub(crate) mod rv_mapping {
         assert!(unsafe { arch::ktest_register_pattern(fp, 0) });
         context.expect_eq(counter.load(Ordering::Acquire), before + 1);
         assert!(!arch::irq_enabled());
+    }
+
+    /// 从 BSP 实际保留的 bootstrap 根检查全部直映和镜像叶，不读取叶所映射的数据。
+    #[test]
+    fn bootstrap_mappings(context: &mut TestContext<'_>) {
+        extern "C" {
+            static RV_BOOT_ROOT: u8;
+        }
+        const GIB: usize = 1 << 30;
+        const IMAGE_LEAF: usize = 1 << 21;
+        let layout = crate::platform::LINK_LAYOUT;
+        let root = arch::virt_to_phys(core::ptr::addr_of!(RV_BOOT_ROOT) as usize);
+        let ram = layout.ram_phys_base as usize;
+        for offset in [0, GIB - 1] {
+            context.expect_eq(
+                translation_from(root, ram + offset),
+                Some((ram + offset, 0xcf)),
+            );
+            context.expect_eq(
+                translation_from(root, layout.mmio_virt_base as usize + offset),
+                Some((offset, 0xc7)),
+            );
+        }
+        for leaf in 0..64 {
+            for within in [0, GIB - 1] {
+                let offset = leaf * GIB + within;
+                context.expect_eq(
+                    translation_from(root, layout.direct_map_virt_base as usize + offset),
+                    Some((ram + offset, 0xcf)),
+                );
+            }
+        }
+        for leaf in 0..512 {
+            for within in [0, IMAGE_LEAF - 1] {
+                let offset = leaf * IMAGE_LEAF + within;
+                context.expect_eq(
+                    translation_from(root, layout.kernel_link_virt as usize + offset),
+                    Some((layout.kernel_load_phys as usize + offset, 0xcf)),
+                );
+            }
+        }
+        for address in [
+            0,
+            GIB - 1,
+            layout.direct_map_virt_base as usize + 64 * GIB,
+            layout.kernel_link_virt as usize + GIB,
+        ] {
+            context.expect_eq(translation_from(root, address), None);
+        }
     }
 }
 
