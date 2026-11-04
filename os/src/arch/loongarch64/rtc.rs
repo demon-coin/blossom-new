@@ -2,6 +2,9 @@
 
 use crate::arch::{dma_barrier, mmio_address};
 use crate::boot::BootInfo;
+use crate::time::toy::*;
+
+const MAX_CALENDAR_SAMPLES: usize = 4;
 
 /// BSP 独占 RTC 时取得年月日时分秒，有限重采样避免跨年混合两组日历。
 ///
@@ -13,37 +16,41 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     if region.start == region.end {
         return Ok(None);
     }
-    if region.start & 3 != 0 || region.end - region.start < 0x44 {
+    if region.start & (core::mem::align_of::<u32>() - 1) != 0
+        || region.end - region.start < RTC_CTRL_REG + core::mem::size_of::<u32>()
+    {
         return Err("TOY RTC resource window is invalid");
     }
     let base = mmio_address(region.start);
     // SAFETY: 调用契约保证真实 RTC 资源和永久映射，上面的检查覆盖全部 u32 寄存器；
     // BSP 独占控制寄存器，TOY enable 不写日历，不生成默认时间。
     unsafe {
-        let control = (base + 0x40) as *mut u32;
-        control.write_volatile(control.read_volatile() | (1 << 11));
+        let control = (base + RTC_CTRL_REG) as *mut u32;
+        control.write_volatile(control.read_volatile() | TOY_ENABLE);
     }
     dma_barrier();
-    for _ in 0..4 {
+    for _ in 0..MAX_CALENDAR_SAMPLES {
         // SAFETY: year/read0 寄存器均在已验证且对齐的资源内，只有 BSP 访问；
         // 每组 volatile 读之间设备屏障保证硬件采样顺序，年变化时放弃该组。
         let (year, low, after) = unsafe {
-            let year = ((base + 0x30) as *const u32).read_volatile();
+            let year = ((base + TOY_READ1_REG) as *const u32).read_volatile();
             dma_barrier();
-            let low = ((base + 0x2c) as *const u32).read_volatile();
+            let low = ((base + TOY_READ0_REG) as *const u32).read_volatile();
             dma_barrier();
-            let after = ((base + 0x30) as *const u32).read_volatile();
+            let after = ((base + TOY_READ1_REG) as *const u32).read_volatile();
             (year, low, after)
         };
         if year == after {
-            let year = year.checked_add(1900).ok_or("TOY RTC year overflows")?;
+            let year = year
+                .checked_add(TOY_YEAR_BASE)
+                .ok_or("TOY RTC year overflows")?;
             return Ok(Some([
                 year,
-                (low >> 26) & 63,
-                (low >> 21) & 31,
-                (low >> 16) & 31,
-                (low >> 10) & 63,
-                (low >> 4) & 63,
+                (low >> TOY_MONTH_SHIFT) & TOY_MONTH_MASK,
+                (low >> TOY_DAY_SHIFT) & TOY_DAY_MASK,
+                (low >> TOY_HOUR_SHIFT) & TOY_HOUR_MASK,
+                (low >> TOY_MINUTE_SHIFT) & TOY_MINUTE_MASK,
+                (low >> TOY_SECOND_SHIFT) & TOY_SECOND_MASK,
             ]));
         }
     }

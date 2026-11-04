@@ -12,6 +12,7 @@ pub const AF_INET6: u16 = 10;
 pub const INET_ADDRESS_LEN: usize = 16;
 pub const INET6_ADDRESS_LEN: usize = 28;
 pub const MAX_ADDRESS_LEN: usize = INET6_ADDRESS_LEN;
+pub(crate) const ADDRESS_FAMILY_LEN: usize = core::mem::size_of::<u16>();
 
 /// 打开对象的地址族不随 mapped 报文使用的实际 IP 协议改变。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,7 +102,7 @@ pub enum SocketAddress {
 impl SocketAddress {
     /// 解码已经复制的完整 sockaddr；UNIX 仅接受匿名两字节名称。
     pub fn decode(bytes: &[u8]) -> Result<Self, FsError> {
-        if bytes.len() < 2 {
+        if bytes.len() < ADDRESS_FAMILY_LEN {
             return Err(FsError::InvalidOperation);
         }
         match u16::from_ne_bytes([bytes[0], bytes[1]]) {
@@ -132,7 +133,7 @@ impl SocketAddress {
                     scope_id: u32::from_ne_bytes(bytes[24..28].try_into().unwrap()),
                 })
             }
-            AF_UNIX if bytes.len() == 2 => Ok(Self::UnixUnnamed),
+            AF_UNIX if bytes.len() == ADDRESS_FAMILY_LEN => Ok(Self::UnixUnnamed),
             AF_UNIX => Err(FsError::Unsupported),
             _ => Err(FsError::AddressFamilyNotSupported),
         }
@@ -236,8 +237,8 @@ impl SocketAddress {
     pub fn encode(self, target: &mut [u8]) -> usize {
         let mut bytes = [0u8; MAX_ADDRESS_LEN];
         let (family, length) = match self {
-            Self::Unspecified => (AF_UNSPEC, 2),
-            Self::UnixUnnamed => (AF_UNIX, 2),
+            Self::Unspecified => (AF_UNSPEC, ADDRESS_FAMILY_LEN),
+            Self::UnixUnnamed => (AF_UNIX, ADDRESS_FAMILY_LEN),
             Self::Inet(endpoint) => {
                 let IpAddress::Ipv4(address) = endpoint.address else {
                     panic!("IPv4 ABI has IPv6 endpoint");

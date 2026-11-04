@@ -289,12 +289,13 @@ impl Notifications {
     }
 }
 
+/// 验证自然对齐的 futex 字宽及完整用户范围，零 bitset 不登记等待。
 fn validate(address: usize, mask: u32) -> Result<(), FutexError> {
-    if address & 3 != 0 || mask == 0 {
+    if address & (core::mem::size_of::<u32>() - 1) != 0 || mask == 0 {
         return Err(FutexError::InvalidArgument);
     }
     if address
-        .checked_add(4)
+        .checked_add(core::mem::size_of::<u32>())
         .is_none_or(|end| arch::USER_ADDRESS_END < end)
     {
         return Err(FutexError::Vm(VmError::InvalidRange));

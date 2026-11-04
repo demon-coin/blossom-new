@@ -49,7 +49,7 @@ fn reserved_metadata_bio(
             volume.view().absolute_byte(
                 block * volume.geometry().block_size as u64,
                 volume.geometry().block_size,
-            )? / 512,
+            )? / crate::block::SECTOR_BYTES,
             memory,
             0,
             None,

@@ -11,10 +11,9 @@ use crate::block::backend::{virtio_limits, Backend, SlotControl, WorkTarget};
 use virtio_drivers::Hal;
 
 use crate::block::bio::{BioArc, BioInner};
-#[cfg(feature = "ktest")]
-use crate::block::SECTOR_BYTES;
 use crate::block::{
     AccessMode, Bio, BlkOperation, BlockError, DiskIdentity, FsClaim, QueueLimits, MAX_BATCH,
+    SECTOR_BYTES,
 };
 use crate::cache::MetadataPages;
 use crate::drivers::virtio::VirtioDevice;
@@ -632,7 +631,7 @@ impl Disk {
                         || (bio.inner.operation() != BlkOperation::Flush
                             && !claim
                                 .view()
-                                .contains_bytes(bio.inner.sector() * 512, bio.inner.len()))
+                                .contains_bytes(bio.inner.sector() * SECTOR_BYTES, bio.inner.len()))
                 })
             {
                 Some(BlockError::InvalidRange)
@@ -644,7 +643,8 @@ impl Disk {
                             &q,
                             (
                                 bio.inner.sector(),
-                                bio.inner.sector() + (bio.inner.len() / 512) as u64,
+                                bio.inner.sector()
+                                    + (bio.inner.len() / SECTOR_BYTES as usize) as u64,
                             ),
                         ),
                     })
@@ -855,7 +855,7 @@ impl Disk {
             let native = !matches!(&target, WorkTarget::Ram(_));
             let result = match target {
                 WorkTarget::Ram(region) => {
-                    let start = region.start + (resources.sector * 512) as usize;
+                    let start = region.start + (resources.sector * SECTOR_BYTES) as usize;
                     // SAFETY: RAM 范围独占且不与 payload 重叠，正式限额已核完整物理范围；
                     // child 保来源到复制结束，此唯一 Work 不并行复制同一 RAM 通道。
                     unsafe {
@@ -1589,7 +1589,7 @@ impl PreparingSlot<'_> {
                     {
                         q.slot_writes[usize::from(tag)] = Some((
                             resources.sector,
-                            resources.sector + (resources.bytes / 512) as u64,
+                            resources.sector + (resources.bytes / SECTOR_BYTES as usize) as u64,
                         ));
                     }
                 }

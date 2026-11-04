@@ -8,6 +8,15 @@ use gpt_disk_types::{BlockSize, GptHeader, GptHeaderRevision, Lba, MasterBootRec
 
 use crate::block::{BlockError, BlockView, SECTOR_BYTES};
 
+pub(crate) const LETTERED_DISK_COUNT: u8 = b'z' - b'a' + 1;
+const MBR_SIGNATURE: [u8; 2] = [0x55, 0xaa];
+const MBR_GPT_PROTECTIVE: u8 = 0xee;
+const DOS_EXTENDED_PARTITION: u8 = 0x05;
+const WIN98_EXTENDED_PARTITION: u8 = 0x0f;
+const LINUX_EXTENDED_PARTITION: u8 = 0x85;
+const GPT_PRIMARY_HEADER_LBA: u64 = 1;
+const GPT_FIRST_ENTRY_LBA: u64 = GPT_PRIMARY_HEADER_LBA + 1;
+
 /// 物理设备命名域；RAM 不占用 VirtIO 的既有顺序编号。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceName {
@@ -80,10 +89,10 @@ impl fmt::Display for DeviceSelector {
     /// 生成可直接用于 bootargs 的规范完整设备名。
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.device {
-            DeviceName::Virtio(index) if index < 26 => {
+            DeviceName::Virtio(index) if index < LETTERED_DISK_COUNT => {
                 write!(output, "/dev/vd{}", char::from(b'a' + index))?
             }
-            DeviceName::Scsi(index) if index < 26 => {
+            DeviceName::Scsi(index) if index < LETTERED_DISK_COUNT => {
                 write!(output, "/dev/sd{}", char::from(b'a' + index))?
             }
             DeviceName::Ram => output.write_str("/dev/ram0")?,
@@ -245,7 +254,7 @@ where
     }
     let capacity = io.num_blocks().map_err(BlockError::from)?;
     let block_bytes = block_size.to_usize().ok_or(BlockError::InvalidRange)?;
-    let mut inline = [0_u8; 512];
+    let mut inline = [0_u8; core::mem::size_of::<MasterBootRecord>()];
     let mut storage = Vec::new();
     let block = if block_bytes == inline.len() {
         inline.as_mut_slice()
@@ -260,13 +269,13 @@ where
     // SAFETY: MasterBootRecord 是库声明的 512B POD，所有位模式有效且没有引用或析构；
     // block 包含已初始化的完整对象字节，read_unaligned 不要求其起始地址对齐。
     let mbr = unsafe { core::ptr::read_unaligned(block.as_ptr().cast::<MasterBootRecord>()) };
-    if mbr.signature != [0x55, 0xaa] {
+    if mbr.signature != MBR_SIGNATURE {
         return Ok(Vec::new());
     }
     if mbr
         .partitions
         .iter()
-        .any(|partition| partition.os_indicator == 0xee)
+        .any(|partition| partition.os_indicator == MBR_GPT_PROTECTIVE)
     {
         let mut disk = GptDisk::new(io).map_err(disk_error)?;
         return discover_gpt(&mut disk, capacity, block_size, block);
@@ -282,13 +291,16 @@ fn discover_mbr(
 ) -> Result<Vec<Partition>, BlockError> {
     let mut partitions = Vec::new();
     partitions
-        .try_reserve_exact(4)
+        .try_reserve_exact(mbr.partitions.len())
         .map_err(|_| BlockError::NoMemory)?;
     for (index, entry) in mbr.partitions.iter().enumerate() {
         if entry.os_indicator == 0 {
             continue;
         }
-        if matches!(entry.os_indicator, 0x05 | 0x0f | 0x85) {
+        if matches!(
+            entry.os_indicator,
+            DOS_EXTENDED_PARTITION | WIN98_EXTENDED_PARTITION | LINUX_EXTENDED_PARTITION
+        ) {
             return Err(BlockError::Unsupported);
         }
         partitions.push(Partition::new(
@@ -325,7 +337,10 @@ where
         .0
         .checked_add(blocks)
         .ok_or(BlockError::InvalidRange)?;
-    if layout.num_entries == 0 || layout.start_lba.0 < 2 || header.first_usable_lba.to_u64() < end {
+    if layout.num_entries == 0
+        || layout.start_lba.0 < GPT_FIRST_ENTRY_LBA
+        || header.first_usable_lba.to_u64() < end
+    {
         return Err(BlockError::InvalidRange);
     }
     let bytes = layout
@@ -397,8 +412,8 @@ fn validate_header(header: &GptHeader, capacity: u64, block: &[u8]) -> Result<()
     let first = header.first_usable_lba.to_u64();
     let last = header.last_usable_lba.to_u64();
     let alternate = header.alternate_lba.to_u64();
-    if header.my_lba.to_u64() != 1
-        || first < 2
+    if header.my_lba.to_u64() != GPT_PRIMARY_HEADER_LBA
+        || first < GPT_FIRST_ENTRY_LBA
         || last < first
         || alternate <= last
         || alternate.checked_add(1) != Some(capacity)
@@ -412,10 +427,12 @@ fn validate_header(header: &GptHeader, capacity: u64, block: &[u8]) -> Result<()
 /// 调用者已核 92 <= size <= block.len()，不复制整个头或重新实现 CRC 算法。
 fn extended_header_crc(block: &[u8], size: usize) -> u32 {
     const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&gpt_disk_types::Crc32::ALGORITHM);
+    const CHECKSUM_OFFSET: usize = 16;
+    const CHECKSUM_BYTES: usize = core::mem::size_of::<u32>();
     let mut digest = CRC.digest();
-    digest.update(&block[..16]);
-    digest.update(&[0_u8; 4]);
-    digest.update(&block[20..size]);
+    digest.update(&block[..CHECKSUM_OFFSET]);
+    digest.update(&[0_u8; CHECKSUM_BYTES]);
+    digest.update(&block[CHECKSUM_OFFSET + CHECKSUM_BYTES..size]);
     digest.finalize()
 }
 

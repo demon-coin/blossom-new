@@ -40,6 +40,9 @@ use crate::mm::dma::MappedPages;
 pub const SECTOR_BYTES: u64 = 512;
 pub(super) const MAX_BATCH: usize = 8;
 
+/// 单命令后端的软件完成槽数，独立于硬件通道深度和 Bio 批量大小。
+pub(crate) const NATIVE_TAG_COUNT: u16 = 8;
+
 /// 块请求语义不携带具体设备协议的操作码。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlkOperation {

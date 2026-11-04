@@ -9,6 +9,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 const MAX_ACTIONS: usize = 8;
+const MAX_CLAIMS_PER_ENTRY: usize = 64;
 static SOURCE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// 当前外部控制器 domain 内已经核对范围的源身份。
@@ -324,7 +325,7 @@ pub unsafe fn register(
 
 /// 有界消费本核真实 claim；每源每次 claim 只计一次，同线所有准入 action 都运行。
 pub fn handle_external() {
-    for _ in 0..64 {
+    for _ in 0..MAX_CLAIMS_PER_ENTRY {
         let Some(source) = arch::external_claim() else {
             break;
         };

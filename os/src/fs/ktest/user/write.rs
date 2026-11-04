@@ -1,7 +1,7 @@
 //! 可写文件测试的共同拥有、真实同步与六类行为 suite 锚点。
 
 use crate::arch::UserAccess;
-use crate::block::{Bio, BioAllocator, BlkOperation, IoResult};
+use crate::block::{Bio, BioAllocator, BlkOperation, IoResult, SECTOR_BYTES};
 use crate::cache::FileUnmapPhase;
 use crate::fs::ext4::{codec, BlockMapping, InodeData};
 use crate::fs::file::{open_path_with_flags, FileIoContext, WriteBuffer};
@@ -132,7 +132,7 @@ impl WriteOwner {
         checked(
             context,
             inode.update_metadata(checked(context, inode.disk_volume())?.claim(), |metadata| {
-                metadata.mode |= 0o2000;
+                metadata.mode |= crate::fs::types::S_ISGID;
                 metadata.gid = 1001;
             }),
         )?;
@@ -994,9 +994,11 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
     let data = checked(context, volume.load_inode(inode.number(), None))?;
     let mut tree = Tree::default();
     tree.blocks
-        .try_reserve_exact((data.blocks * 512 / volume.geometry().block_size as u64) as usize)
+        .try_reserve_exact(
+            (data.blocks * SECTOR_BYTES / volume.geometry().block_size as u64) as usize,
+        )
         .map_err(|_| TestError("write tree observations OOM"))?;
-    if data.flags & 0x80000 != 0 {
+    if data.flags & codec::EXTENTS != 0 {
         let header = checked(context, codec::extent_header(&data.block, None))?;
         tree.depth = header.depth;
         checked(
@@ -1107,9 +1109,9 @@ fn prepare_unlinked_original_writeback(
     let mut content = folio.lock_content();
     inode.mapping().mkclean(0, &folio, &mut content);
     let dirty = folio.dirty_sectors();
-    let block_mask = ((1u16 << (block_size / 512)) - 1) as u8;
+    let block_mask = ((1u16 << (block_size / SECTOR_BYTES as usize)) - 1) as u8;
     for offset in (0..PAGE_SIZE).step_by(block_size) {
-        if dirty & (block_mask << (offset / 512)) == 0 {
+        if dirty & (block_mask << (offset / SECTOR_BYTES as usize)) == 0 {
             continue;
         }
         let target = targets[offset / block_size].ok_or(FsError::Corrupt)?;

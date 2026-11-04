@@ -2,6 +2,9 @@
 
 use core::{arch::asm, mem::size_of};
 
+/// 两种受支持架构的普通函数调用栈均按 16 字节对齐。
+pub(crate) const STACK_ALIGNMENT: usize = 16;
+
 /// 在最早初始化阶段写入一个机器字，不引入依赖高地址映射的普通辅助调用。
 ///
 /// # Safety

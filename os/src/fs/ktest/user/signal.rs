@@ -70,10 +70,12 @@ impl UserOwner {
                 && u64::from_le_bytes(marker_bytes) == 0x51a2
                 && sched::test_state(&executor) == State::Blocked
         })?;
-        self.graph().send_kernel(pid, 14).map_err(|error| {
-            context.diagnostic(format_args!("user-file-signal-send error={:?}", error));
-            TestError("user file signal request failed")
-        })?;
+        self.graph()
+            .send_kernel(pid, crate::task::signal::SIGALRM)
+            .map_err(|error| {
+                context.diagnostic(format_args!("user-file-signal-send error={:?}", error));
+                TestError("user file signal request failed")
+            })?;
         context.expect_eq(sched::test_state(&executor), State::Blocked);
         let signals = user
             .signals()
@@ -170,7 +172,11 @@ impl UserOwner {
             // SAFETY: call的同步完成Release/Acquire保活栈参数，调用者返回前不访问这些字段。
             let request = unsafe { &mut *argument.cast::<RemoteKill>() };
             request.sender = cpu::current().id;
-            request.result = Some(request.graph.send_kernel(request.pid, 9));
+            request.result = Some(
+                request
+                    .graph
+                    .send_kernel(request.pid, crate::task::signal::SIGKILL),
+            );
         }
         let mut kill = RemoteKill {
             graph: Arc::clone(self.graph()),
@@ -306,7 +312,7 @@ impl UserOwner {
             return Err(TestError("suspend child exited before signal checkpoint"));
         }
         self.graph()
-            .send_kernel(pid, 19)
+            .send_kernel(pid, crate::task::signal::SIGSTOP)
             .map_err(|_| TestError("suspend child stop request failed"))?;
         let selector = WaitSelector::Pid(
             self.graph()
@@ -354,7 +360,7 @@ impl UserOwner {
             stopped.status
         ));
         self.graph()
-            .send_kernel(pid, 18)
+            .send_kernel(pid, crate::task::signal::SIGCONT)
             .map_err(|_| TestError("suspend child continue request failed"))?;
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);

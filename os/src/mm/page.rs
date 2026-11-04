@@ -8,12 +8,13 @@ use core::sync::atomic::AtomicUsize;
 
 use crate::boot::MAX_MEMORY_REGIONS;
 use crate::mm::anon::AnonState;
-use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SIZE, RANGE_CAPACITY};
+use crate::mm::bootmem::{BootMemory, BootStats, PageRange, PAGE_SHIFT, RANGE_CAPACITY};
 use crate::mm::folio::FolioState;
-use crate::mm::OwnedPages;
+use crate::mm::{OwnedPages, PAGE_SIZE};
 use crate::sync::{SpinLock, SpinLockGuard};
 
-const PAGES_PER_SECTION: usize = (128 * 1024 * 1024) / PAGE_SIZE;
+const SECTION_SIZE_BITS: usize = 27;
+const PAGES_PER_SECTION: usize = 1 << (SECTION_SIZE_BITS - PAGE_SHIFT);
 type Section<'a> = Option<&'a [PageDesc]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

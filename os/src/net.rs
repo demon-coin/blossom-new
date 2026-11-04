@@ -32,7 +32,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::TcpControl;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Address, Ipv4Cidr,
-    Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr,
+    Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr, ETHERNET_HEADER_LEN,
 };
 use spin::Once;
 
@@ -44,10 +44,12 @@ use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
 use crate::net::core::TcpCore;
 pub(crate) use crate::net::lifecycle::EgressWait;
 use crate::net::lifecycle::{EgressWaiting, RetiredEndpoint, RetiredEndpoints};
-use crate::net::packet::{return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket};
+use crate::net::packet::{
+    return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket, MAX_IP_PACKET_LEN,
+};
 use crate::net::route::{
     unicast, DefaultRouteRequest, EthernetConfig, InterfaceId, InterfaceSnapshot, Route,
-    RouteSnapshot,
+    RouteSnapshot, IPV4_ADDRESS_BITS,
 };
 use crate::net::stats::InterfaceStats;
 use crate::net::table::{BindLease, NetTables, TcpTuple};
@@ -55,16 +57,22 @@ use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::{UnixEndpoint, UnixPair};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
-use crate::time;
+use crate::time::{self, NSEC_PER_USEC};
 use crate::timer::{Timer, TimerKind};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 
 pub const LOOPBACK_CAPACITY: usize = 32;
-pub const LOOPBACK_MTU: usize = 65535;
+pub const LOOPBACK_MTU: usize = MAX_IP_PACKET_LEN;
 pub(crate) const SOMAXCONN: usize = 4096;
 pub(crate) const PROTOCOL_BUDGET: usize = 16;
-const ETHERNET_FRAME_CAPACITY: usize = 1514;
-const INTERFACE_WORKSPACE_CAPACITY: usize = 65536;
+const ETHERNET_IP_MTU: usize = 1500;
+pub(crate) const ETHERNET_FRAME_CAPACITY: usize = ETHERNET_IP_MTU + ETHERNET_HEADER_LEN;
+const INTERFACE_WORKSPACE_CAPACITY: usize = 64 * 1024;
+const LOOPBACK_IPV4_PREFIX_LEN: u8 = 8;
+const IPV4_POINT_TO_POINT_PREFIX_LEN: u8 = IPV4_ADDRESS_BITS - 1;
+const ROOT_WORK_ITEMS: usize = 2;
+pub(crate) const INTERFACE_COUNT: usize = 2;
+const ROUTE_SNAPSHOT_CAPACITY: usize = INTERFACE_COUNT + 1;
 
 /// 每份预备帧独占自己的编码存储，领取期间不得再交出该槽的 TxToken。
 struct FrameSlot {
@@ -220,10 +228,16 @@ impl InterfaceState {
         if medium == Medium::Ip {
             iface.update_ip_addrs(|addresses| {
                 addresses
-                    .push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::LOCALHOST, 8)))
+                    .push(IpCidr::Ipv4(Ipv4Cidr::new(
+                        Ipv4Address::LOCALHOST,
+                        LOOPBACK_IPV4_PREFIX_LEN,
+                    )))
                     .expect("loopback IPv4 capacity exhausted");
                 addresses
-                    .push(IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128)))
+                    .push(IpCidr::Ipv6(Ipv6Cidr::new(
+                        Ipv6Address::LOCALHOST,
+                        u128::BITS as u8,
+                    )))
                     .expect("loopback IPv6 capacity exhausted");
             });
         }
@@ -638,7 +652,7 @@ impl NetStack {
         })
         .map_err(|_| FsError::NoMemory)?;
         let queue = WorkQueue::try_new(WorkQueueConfig {
-            max_active: cpu::count() + 2,
+            max_active: cpu::count() + ROOT_WORK_ITEMS,
             ordered: false,
             reclaim: false,
         })
@@ -841,7 +855,7 @@ impl NetStack {
     }
 
     /// 最多两个真实接口的副本，不让格式化者持有库状态。
-    pub fn interface_snapshots(&self) -> [Option<InterfaceSnapshot>; 2] {
+    pub fn interface_snapshots(&self) -> [Option<InterfaceSnapshot>; INTERFACE_COUNT] {
         [
             self.interface_snapshot(InterfaceId::Loopback).ok(),
             self.interface_snapshot(InterfaceId::Ethernet).ok(),
@@ -849,8 +863,8 @@ impl NetStack {
     }
 
     /// 直连从库 CIDR 生成，默认从同一 Routes 生成，最多三条 IPv4 路由。
-    pub fn route_snapshots(&self) -> [Option<RouteSnapshot>; 3] {
-        let mut snapshots = [None; 3];
+    pub fn route_snapshots(&self) -> [Option<RouteSnapshot>; ROUTE_SNAPSHOT_CAPACITY] {
+        let mut snapshots = [None; ROUTE_SNAPSHOT_CAPACITY];
         for (index, id) in [InterfaceId::Loopback, InterfaceId::Ethernet]
             .iter()
             .copied()
@@ -873,7 +887,7 @@ impl NetStack {
                 });
             }
             if id == InterfaceId::Ethernet {
-                snapshots[2] = state.default_gateway().map(|gateway| RouteSnapshot {
+                snapshots[INTERFACE_COUNT] = state.default_gateway().map(|gateway| RouteSnapshot {
                     interface: id,
                     destination: [0; 4],
                     prefix_len: 0,
@@ -896,7 +910,7 @@ impl NetStack {
                     if address != Ipv4Address::LOCALHOST.octets() {
                         return Err(FsError::InvalidOperation);
                     }
-                    8
+                    LOOPBACK_IPV4_PREFIX_LEN
                 }
                 InterfaceId::Ethernet => {
                     if !unicast(address) {
@@ -919,7 +933,9 @@ impl NetStack {
             let _admission = self.admission()?;
             let mut interface = self.interface(id).ok_or(FsError::NoDevice)?.lock();
             let state = interface.as_mut().ok_or(FsError::NotConnected)?;
-            if 32 < prefix_len || (id == InterfaceId::Loopback && prefix_len != 8) {
+            if IPV4_ADDRESS_BITS < prefix_len
+                || (id == InterfaceId::Loopback && prefix_len != LOOPBACK_IPV4_PREFIX_LEN)
+            {
                 return Err(FsError::InvalidOperation);
             }
             let cidr = state.ipv4().ok_or(FsError::AddressNotAvailable)?;
@@ -976,7 +992,9 @@ impl NetStack {
                 if !cidr.contains_addr(&Ipv4Address::from(gateway)) {
                     return Err(FsError::NetworkUnreachable);
                 }
-                if cidr.prefix_len() < 31 && (gateway == network || host == !mask) {
+                if cidr.prefix_len() < IPV4_POINT_TO_POINT_PREFIX_LEN
+                    && (gateway == network || host == !mask)
+                {
                     return Err(FsError::InvalidOperation);
                 }
                 if existing.is_some() {
@@ -1600,7 +1618,7 @@ impl NetStack {
     /// 只选择已有空帧和空 fragmenter 的原槽，不移动等待中的队列项。
     fn select_egress(
         &self,
-        blocked: [bool; 2],
+        blocked: [bool; INTERFACE_COUNT],
         stalled: &[Option<IpAddress>],
     ) -> Option<(usize, InterfaceId)> {
         let ready = [
@@ -1814,7 +1832,7 @@ impl NetStack {
             return;
         }
         self.maintain_interfaces();
-        let mut blocked = [false; 2];
+        let mut blocked = [false; INTERFACE_COUNT];
         let mut stalled = [None; LOOPBACK_CAPACITY];
         let mut tx_full = false;
         let mut consumed = 0;
@@ -1938,7 +1956,7 @@ impl NetStack {
     /// 预算尾包含已编码的输入应答；真实 TX 满仍只等 completion，不因待发帧忙重排。
     fn actionable_egress(
         &self,
-        blocked: [bool; 2],
+        blocked: [bool; INTERFACE_COUNT],
         tx_full: bool,
         stalled: &[Option<IpAddress>],
     ) -> bool {
@@ -2029,7 +2047,7 @@ impl NetStack {
                 let micros =
                     u64::try_from(deadline.total_micros()).expect("negative interface deadline");
                 let nanos = micros
-                    .checked_mul(1000)
+                    .checked_mul(NSEC_PER_USEC)
                     .expect("interface deadline overflow");
                 timer
                     .arm(time::MonotonicInstant::from_nanos(nanos))
@@ -2220,7 +2238,7 @@ fn prepare_ingress_storage() -> Result<Vec<u8>, FsError> {
 /// 库微秒与生产 monotonic 纳秒共享基准，不另建协议时钟。
 fn interface_now() -> Instant {
     Instant::from_micros(
-        i64::try_from(time::now().as_nanos() / 1000).expect("interface clock exhausted"),
+        i64::try_from(time::now().as_nanos() / NSEC_PER_USEC).expect("interface clock exhausted"),
     )
 }
 
@@ -2234,12 +2252,17 @@ fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Ins
 
 /// 正常静态 IPv4 初次赋址采用 A/B/C 类前缀；调用者已核单播边界。
 fn classful_prefix(address: [u8; 4]) -> u8 {
-    if address[0] < 128 {
-        8
-    } else if address[0] < 192 {
-        16
+    const CLASS_B_FIRST_OCTET: u8 = 128;
+    const CLASS_C_FIRST_OCTET: u8 = 192;
+    const CLASS_A_PREFIX_LEN: u8 = 0xff00_0000u32.leading_ones() as u8;
+    const CLASS_B_PREFIX_LEN: u8 = 0xffff_0000u32.leading_ones() as u8;
+    const CLASS_C_PREFIX_LEN: u8 = 0xffff_ff00u32.leading_ones() as u8;
+    if address[0] < CLASS_B_FIRST_OCTET {
+        CLASS_A_PREFIX_LEN
+    } else if address[0] < CLASS_C_FIRST_OCTET {
+        CLASS_B_PREFIX_LEN
     } else {
-        24
+        CLASS_C_PREFIX_LEN
     }
 }
 
@@ -2248,7 +2271,7 @@ fn ipv4_mask(prefix_len: u8) -> u32 {
     if prefix_len == 0 {
         0
     } else {
-        u32::MAX << (32 - prefix_len)
+        u32::MAX << (IPV4_ADDRESS_BITS - prefix_len)
     }
 }
 

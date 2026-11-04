@@ -60,7 +60,7 @@ ktest_register_roundtrip_asm:
     sd sp, 224(sp)
     sd a0, 232(sp)
     sd zero, 240(sp)
-    li t1, 0x6000
+    li t1, {sr_fs}
     and t2, t0, t1
     bnez t2, .Lktest_rv_exit
     csrs sstatus, t1
@@ -104,7 +104,7 @@ ktest_register_roundtrip_asm:
     fmv.d.x fs10, t0
     li t0, 0x3ff000000000010b
     fmv.d.x fs11, t0
-    li t0, 0x6000
+    li t0, {sr_fs}
     csrc sstatus, t0
     li s0, 0x510
     li s1, 0x511
@@ -121,9 +121,9 @@ ktest_register_roundtrip_asm:
     ld t0, 232(sp)
     jalr ra, t0, 0
     csrr t0, sstatus
-    csrci sstatus, 2
+    csrci sstatus, {sr_sie}
     beqz a0, .Lktest_rv_restore
-    li t1, 0x6002
+    li t1, {sr_fs_sie}
     and t0, t0, t1
     bnez t0, .Lktest_rv_restore
     ld t0, 224(sp)
@@ -154,7 +154,7 @@ ktest_register_roundtrip_asm:
     bne s10, t0, .Lktest_rv_restore
     li t0, 0x51b
     bne s11, t0, .Lktest_rv_restore
-    li t0, 0x6000
+    li t0, {sr_fs}
     csrs sstatus, t0
     frcsr t0
     li t1, 0x61
@@ -198,7 +198,7 @@ ktest_register_roundtrip_asm:
     li t0, 1
     sd t0, 240(sp)
 .Lktest_rv_restore:
-    li t0, 0x6000
+    li t0, {sr_fs}
     csrs sstatus, t0
     fld fs0, 128(sp)
     fld fs1, 136(sp)
@@ -214,7 +214,7 @@ ktest_register_roundtrip_asm:
     fld fs11, 216(sp)
     ld t0, 120(sp)
     fscsr t0
-    li t0, 0x6000
+    li t0, {sr_fs}
     csrc sstatus, t0
 .Lktest_rv_exit:
     ld a0, 240(sp)
@@ -236,7 +236,10 @@ ktest_register_roundtrip_asm:
     ret
 .size ktest_register_roundtrip_asm, .-ktest_register_roundtrip_asm
 .option pop
-"#
+"#,
+    sr_fs = const crate::arch::SR_FS,
+    sr_sie = const crate::arch::SR_SIE,
+    sr_fs_sie = const crate::arch::SR_FS | crate::arch::SR_SIE,
 );
 
 #[cfg(target_arch = "loongarch64")]
@@ -260,18 +263,18 @@ ktest_register_roundtrip_asm:
     st.d $s7, $sp, 72
     st.d $s8, $sp, 80
     st.d $tp, $sp, 88
-    csrrd $t0, 0x30
+    csrrd $t0, {csr_ks0}
     st.d $t0, $sp, 96
-    csrrd $t0, 2
+    csrrd $t0, {csr_euen}
     st.d $sp, $sp, 184
     st.d $a0, $sp, 192
     st.d $zero, $sp, 200
     st.d $r21, $sp, 208
-    andi $t1, $t0, 1
+    andi $t1, $t0, {euen_fp}
     bnez $t1, .Lktest_la_exit
-    li.w $t0, 1
-    li.w $t1, 1
-    csrxchg $t0, $t1, 2
+    li.w $t0, {euen_fp}
+    li.w $t1, {euen_fp}
+    csrxchg $t0, $t1, {csr_euen}
     movfcsr2gr $t0, $fcsr0
     st.d $t0, $sp, 112
     fst.d $fs0, $sp, 120
@@ -300,8 +303,8 @@ ktest_register_roundtrip_asm:
     movgr2fr.d $fs6, $t0
     li.d $t0, 0x3ff0000000000107
     movgr2fr.d $fs7, $t0
-    li.w $t1, 1
-    csrxchg $zero, $t1, 2
+    li.w $t1, {euen_fp}
+    csrxchg $zero, $t1, {csr_euen}
     li.d $fp, 0x50f
     li.d $s0, 0x510
     li.d $s1, 0x511
@@ -314,20 +317,20 @@ ktest_register_roundtrip_asm:
     li.d $s8, 0x518
     ld.d $t0, $sp, 192
     jirl $ra, $t0, 0
-    csrrd $t2, 0
-    li.w $t3, 4
-    csrxchg $zero, $t3, 0
+    csrrd $t2, {csr_crmd}
+    li.w $t3, {crmd_ie}
+    csrxchg $zero, $t3, {csr_crmd}
     beqz $a0, .Lktest_la_restore
-    csrrd $t0, 2
-    andi $t0, $t0, 1
+    csrrd $t0, {csr_euen}
+    andi $t0, $t0, {euen_fp}
     bnez $t0, .Lktest_la_restore
-    andi $t2, $t2, 4
+    andi $t2, $t2, {crmd_ie}
     bnez $t2, .Lktest_la_restore
     ld.d $t0, $sp, 184
     bne $sp, $t0, .Lktest_la_restore
     ld.d $t0, $sp, 88
     bne $tp, $t0, .Lktest_la_restore
-    csrrd $t0, 0x30
+    csrrd $t0, {csr_ks0}
     ld.d $t1, $sp, 96
     bne $t0, $t1, .Lktest_la_restore
     ld.d $t0, $sp, 208
@@ -352,9 +355,9 @@ ktest_register_roundtrip_asm:
     bne $s7, $t0, .Lktest_la_restore
     li.d $t0, 0x518
     bne $s8, $t0, .Lktest_la_restore
-    li.w $t0, 1
-    li.w $t1, 1
-    csrxchg $t0, $t1, 2
+    li.w $t0, {euen_fp}
+    li.w $t1, {euen_fp}
+    csrxchg $t0, $t1, {csr_euen}
     movfcsr2gr $t0, $fcsr0
     li.w $t1, 0x100
     bne $t0, $t1, .Lktest_la_restore
@@ -385,9 +388,9 @@ ktest_register_roundtrip_asm:
     li.w $t0, 1
     st.d $t0, $sp, 200
 .Lktest_la_restore:
-    li.w $t0, 1
-    li.w $t1, 1
-    csrxchg $t0, $t1, 2
+    li.w $t0, {euen_fp}
+    li.w $t1, {euen_fp}
+    csrxchg $t0, $t1, {csr_euen}
     fld.d $fs0, $sp, 120
     fld.d $fs1, $sp, 128
     fld.d $fs2, $sp, 136
@@ -398,13 +401,13 @@ ktest_register_roundtrip_asm:
     fld.d $fs7, $sp, 176
     ld.d $t0, $sp, 112
     movgr2fcsr $fcsr0, $t0
-    li.w $t1, 1
-    csrxchg $zero, $t1, 2
+    li.w $t1, {euen_fp}
+    csrxchg $zero, $t1, {csr_euen}
 .Lktest_la_exit:
     ld.d $a0, $sp, 200
     ld.d $tp, $sp, 88
     ld.d $t0, $sp, 96
-    csrwr $t0, 0x30
+    csrwr $t0, {csr_ks0}
     ld.d $r21, $sp, 208
     ld.d $fp, $sp, 8
     ld.d $s0, $sp, 16
@@ -420,5 +423,10 @@ ktest_register_roundtrip_asm:
     addi.d $sp, $sp, 224
     jr $ra
 .size ktest_register_roundtrip_asm, .-ktest_register_roundtrip_asm
-"#
+"#,
+    csr_euen = const crate::arch::CSR_EUEN,
+    euen_fp = const crate::arch::EUEN_FP,
+    csr_crmd = const crate::arch::CSR_CRMD,
+    crmd_ie = const crate::arch::CRMD_IE,
+    csr_ks0 = const crate::arch::CSR_KS0,
 );

@@ -290,7 +290,7 @@ impl UserOwner {
             if mode == b"k" {
                 let pid = self.running.as_ref().unwrap().pid;
                 self.graph()
-                    .send_kernel(pid, 9)
+                    .send_kernel(pid, crate::task::signal::SIGKILL)
                     .map_err(|_| TestError("vfork父取消信号发送失败"))?;
                 let event = self.wait(context)?;
                 context.expect_eq(event.status, 9);

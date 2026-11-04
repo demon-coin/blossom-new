@@ -19,7 +19,11 @@ impl UserOwner {
         self.prepare_tty(context, 4)?;
         checked(
             context,
-            tty::set_termios(Termios::default(), 2, FileIoContext::Kernel),
+            tty::set_termios(
+                Termios::default(),
+                tty::termios::TCSAFLUSH,
+                FileIoContext::Kernel,
+            ),
         )?;
         let image = self.load_named(context, PROGRAM, mode)?;
         let mm = image.mm.clone();

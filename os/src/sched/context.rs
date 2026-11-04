@@ -24,7 +24,11 @@ impl TaskContext {
 
     /// 从独占栈顶开始执行入口，后续切换按普通 ABI 保存现场。
     pub(crate) fn initial(stack_top: usize) -> Self {
-        assert_eq!(stack_top & 15, 0, "task stack is not aligned");
+        assert_eq!(
+            stack_top & (crate::arch::STACK_ALIGNMENT - 1),
+            0,
+            "task stack is not aligned"
+        );
         Self {
             ra: crate::sched::task_trampoline as usize,
             sp: stack_top,

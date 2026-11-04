@@ -9,7 +9,7 @@ use crate::task::process::ProcessError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(isize)]
-pub(super) enum Errno {
+pub(crate) enum Errno {
     NotPermitted = 1,
     NotFound = 2,
     NoProcess = 3,

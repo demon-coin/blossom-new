@@ -2,7 +2,11 @@
 
 use crate::arch::{
     boot_clear_words, boot_store_word,
-    riscv64::{PageTable, RV_FINAL_SATP},
+    riscv64::{
+        PageTable, KERNEL_DATA_FLAGS, PAGE_SHIFT, PGDIR_SHIFT, PHYSICAL_TO_PTE_SHIFT, PMD_SIZE,
+        PTE_EXEC, PTE_VALID, PT_ENTRIES, PT_INDEX_MASK, RV_FINAL_SATP, SATP_MODE_SHIFT,
+        SATP_MODE_SV39, SR_SIE,
+    },
 };
 use crate::cpu::{CpuBoot, BOOT_STACK, STACK_SIZE};
 use crate::platform::LINK_LAYOUT;
@@ -42,22 +46,20 @@ unsafe extern "C" fn rv_initialize_boot_memory(
 ) -> usize {
     // 物理代码不能物化高地址的布局结构体；每个字段在编译期折叠为整数。
     const RAM: usize = LINK_LAYOUT.ram_phys_base as usize;
-    const DIRECT_SLOT: usize = ((LINK_LAYOUT.direct_map_virt_base >> 30) & 511) as usize;
-    const MMIO_SLOT: usize = ((LINK_LAYOUT.mmio_virt_base >> 30) & 511) as usize;
-    const KERNEL_SLOT: usize = ((LINK_LAYOUT.kernel_link_virt >> 30) & 511) as usize;
+    const DIRECT_SLOT: usize =
+        ((LINK_LAYOUT.direct_map_virt_base >> PGDIR_SHIFT) & PT_INDEX_MASK as u64) as usize;
+    const MMIO_SLOT: usize =
+        ((LINK_LAYOUT.mmio_virt_base >> PGDIR_SHIFT) & PT_INDEX_MASK as u64) as usize;
+    const KERNEL_SLOT: usize =
+        ((LINK_LAYOUT.kernel_link_virt >> PGDIR_SHIFT) & PT_INDEX_MASK as u64) as usize;
     const IMAGE: usize = LINK_LAYOUT.kernel_load_phys as usize;
     const TABLE_BYTES: usize = size_of::<PageTable>();
     const WORD_BYTES: usize = size_of::<usize>();
-    const TABLE_ENTRIES: usize = TABLE_BYTES / WORD_BYTES;
     const DIRECT_LEAVES: usize = 64;
-    const GIB_LEAF_BYTES: usize = 1 << 30;
-    const IMAGE_LEAF_BYTES: usize = 1 << 21;
-    const PHYSICAL_TO_PTE_SHIFT: usize = 2;
-    const TABLE_VALID: usize = 1;
+    const GIB_LEAF_BYTES: usize = 1 << PGDIR_SHIFT;
     // 临时 RAM 叶保持 V/R/W/X/A/D；MMIO 叶只去掉 X，不改变原硬件属性。
-    const RAM_LEAF_FLAGS: usize = 0xcf;
-    const MMIO_LEAF_FLAGS: usize = 0xc7;
-    const SATP_SV39: usize = 8 << 60;
+    const RAM_LEAF_FLAGS: usize = KERNEL_DATA_FLAGS | PTE_EXEC | PTE_VALID;
+    const MMIO_LEAF_FLAGS: usize = KERNEL_DATA_FLAGS | PTE_VALID;
 
     // SAFETY: 调用者提供独占、对齐且互不重叠的 BSS 与两张完整物理页表，活动栈在区间外。
     unsafe {
@@ -70,7 +72,7 @@ unsafe extern "C" fn rv_initialize_boot_memory(
     // SAFETY: 固定 RAM 布局的低映射索引在 root 内，页表尚未交给硬件或 AP。
     unsafe {
         boot_store_word(
-            root.wrapping_add((RAM >> 30).wrapping_mul(WORD_BYTES)),
+            root.wrapping_add((RAM >> PGDIR_SHIFT).wrapping_mul(WORD_BYTES)),
             ram_leaf,
         )
     };
@@ -91,18 +93,18 @@ unsafe extern "C" fn rv_initialize_boot_memory(
         );
         boot_store_word(
             root.wrapping_add(KERNEL_SLOT.wrapping_mul(WORD_BYTES)),
-            (image >> PHYSICAL_TO_PTE_SHIFT) | TABLE_VALID,
+            (image >> PHYSICAL_TO_PTE_SHIFT) | PTE_VALID,
         );
     }
     index = 0;
-    while index < TABLE_ENTRIES {
+    while index < PT_ENTRIES {
         let leaf = ((IMAGE >> PHYSICAL_TO_PTE_SHIFT) | RAM_LEAF_FLAGS)
-            .wrapping_add(index.wrapping_mul(IMAGE_LEAF_BYTES >> PHYSICAL_TO_PTE_SHIFT));
+            .wrapping_add(index.wrapping_mul(PMD_SIZE >> PHYSICAL_TO_PTE_SHIFT));
         // SAFETY: index 严格小于 512，每次完整字存储均在 BSP 独占的 image 页内。
         unsafe { boot_store_word(image.wrapping_add(index.wrapping_mul(WORD_BYTES)), leaf) };
         index = index.wrapping_add(1);
     }
-    SATP_SV39 | (root >> 12)
+    SATP_MODE_SV39 | (root >> PAGE_SHIFT)
 }
 
 /// 从固件物理入口建立 BSP 栈，调用物理初始化后连续切换到高地址。
@@ -125,7 +127,7 @@ unsafe extern "C" fn __primary_entry_phys(
             ".option push",
             ".option norelax",
             "csrw sie, zero",
-            "csrci sstatus, 2",
+            "csrci sstatus, {sie}",
             "csrw satp, zero",
             "csrw sscratch, zero",
             "mv s0, a0",
@@ -167,6 +169,7 @@ unsafe extern "C" fn __primary_entry_phys(
             high = sym rv_primary_high,
             initialize_phys = sym __bootstrap_init_phys,
             stack_size = const STACK_SIZE,
+            sie = const SR_SIE,
         );
     }
 }
@@ -186,15 +189,15 @@ unsafe extern "C" fn rv_secondary_entry(_hardware_id: usize, _record: *const Cpu
             ".option push",
             ".option norelax",
             "csrw sie, zero",
-            "csrci sstatus, 2",
+            "csrci sstatus, {sie}",
             "csrw sscratch, zero",
             "ld sp, {boot_stack}(a1)",
             "ld tp, {boot_local}(a1)",
             "lla t0, 2f",
             "ld t0, 0(t0)",
-            "srli t0, t0, 12",
-            "li t1, 8",
-            "slli t1, t1, 60",
+            "srli t0, t0, {page_shift}",
+            "li t1, {satp_mode}",
+            "slli t1, t1, {satp_mode_shift}",
             "or t0, t0, t1",
             "sfence.vma",
             "csrw satp, t0",
@@ -210,6 +213,10 @@ unsafe extern "C" fn rv_secondary_entry(_hardware_id: usize, _record: *const Cpu
             boot_local = const offset_of!(CpuBoot, local),
             root = sym __bootstrap_root_phys,
             high = sym rv_secondary_high,
+            sie = const SR_SIE,
+            page_shift = const PAGE_SHIFT,
+            satp_mode = const SATP_MODE_SV39 >> SATP_MODE_SHIFT,
+            satp_mode_shift = const SATP_MODE_SHIFT,
         );
     }
 }

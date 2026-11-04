@@ -15,7 +15,45 @@ mod pending;
 use crate::wait::{WaitId, WaitMode, Waker};
 
 pub(crate) const SIGNAL_COUNT: usize = 64;
-pub(crate) const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
+pub(crate) const SIGHUP: u8 = 1;
+pub(crate) const SIGINT: u8 = 2;
+pub(crate) const SIGQUIT: u8 = 3;
+pub(crate) const SIGILL: u8 = 4;
+pub(crate) const SIGTRAP: u8 = 5;
+pub(crate) const SIGABRT: u8 = 6;
+pub(crate) const SIGBUS: u8 = 7;
+pub(crate) const SIGFPE: u8 = 8;
+pub(crate) const SIGKILL: u8 = 9;
+pub(crate) const SIGUSR1: u8 = 10;
+pub(crate) const SIGSEGV: u8 = 11;
+pub(crate) const SIGPIPE: u8 = 13;
+pub(crate) const SIGALRM: u8 = 14;
+pub(crate) const SIGCHLD: u8 = 17;
+pub(crate) const SIGCONT: u8 = 18;
+pub(crate) const SIGSTOP: u8 = 19;
+pub(crate) const SIGTSTP: u8 = 20;
+pub(crate) const SIGTTIN: u8 = 21;
+pub(crate) const SIGTTOU: u8 = 22;
+pub(crate) const SIGURG: u8 = 23;
+pub(crate) const SIGVTALRM: u8 = 26;
+pub(crate) const SIGPROF: u8 = 27;
+pub(crate) const SIGWINCH: u8 = 28;
+pub(crate) const SIGSYS: u8 = 31;
+pub(crate) const SIGRTMIN: u8 = 32;
+pub(crate) const SIGINFO_BYTES: usize = 128;
+pub(crate) const SIGSET_BYTES: usize = core::mem::size_of::<u64>();
+const SI_KERNEL: i32 = 128;
+pub(crate) const SIG_DFL: usize = 0;
+pub(crate) const SIG_IGN: usize = 1;
+const SA_NOCLDSTOP: usize = 1;
+pub(crate) const CLD_EXITED: i32 = 1;
+pub(crate) const CLD_KILLED: i32 = 2;
+pub(crate) const CLD_DUMPED: i32 = 3;
+pub(crate) const CLD_STOPPED: i32 = 5;
+pub(crate) const CLD_CONTINUED: i32 = 6;
+pub(crate) const SI_TKILL: i32 = -6;
+const SA_SIGINFO: usize = 4;
+pub(crate) const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 pub(crate) const SA_ONSTACK: usize = 0x0800_0000;
 pub(crate) const SA_RESTART: usize = 0x1000_0000;
 pub(crate) const SA_NODEFER: usize = 0x4000_0000;
@@ -24,8 +62,9 @@ pub(crate) const SS_ONSTACK: u32 = 1;
 pub(crate) const SS_DISABLE: u32 = 2;
 const SA_NOCLDWAIT: usize = 2;
 const ACTION_FLAGS: usize =
-    1 | SA_NOCLDWAIT | 4 | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
-const STOP_MASK: u64 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
+    SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+const STOP_MASK: u64 =
+    (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
 
 /// 两目标的动作对象没有restorer字段；内核保存用户handler地址但不解引用它。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +130,7 @@ impl SignalInfo {
         Self {
             signum,
             errno: 0,
-            code: 128,
+            code: SI_KERNEL,
             payload: SignalPayload::Sender {
                 pid: 0,
                 uid: 0,
@@ -102,7 +141,7 @@ impl SignalInfo {
 
     /// 编码64位两目标共同的128字节siginfo，所有padding与未使用union字节清零。
     pub(crate) fn encode(&self, bytes: &mut [u8]) {
-        assert_eq!(bytes.len(), 128);
+        assert_eq!(bytes.len(), SIGINFO_BYTES);
         bytes.fill(0);
         bytes[0..4].copy_from_slice(&(self.signum as i32).to_le_bytes());
         bytes[4..8].copy_from_slice(&self.errno.to_le_bytes());
@@ -328,7 +367,7 @@ impl SignalGroup {
 
     /// IRQ普通定时信号无分配，发送与通知在siglock两侧，调用者不得已持siglock。
     pub(crate) fn send_timer(&self, signum: u8) {
-        assert!(matches!(signum, 14 | 26 | 27));
+        assert!(matches!(signum, SIGALRM | SIGVTALRM | SIGPROF));
         self.send(SignalInfo::kernel(signum))
             .expect("ordinary timer signal failed");
     }
@@ -421,21 +460,21 @@ impl SignalGroup {
         account: Option<&ThreadGroup>,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<bool, SignalError> {
-        if self.system_init && matches!(info.signum, 9 | 19) {
+        if self.system_init && matches!(info.signum, SIGKILL | SIGSTOP) {
             return Ok(false);
         }
         let mut group = self.state.lock();
-        if group.members == 0 || (group.exit.is_some() && info.signum != 18) {
+        if group.members == 0 || (group.exit.is_some() && info.signum != SIGCONT) {
             return Ok(false);
         }
-        let continued = info.signum == 18 && group.stop_reported;
+        let continued = info.signum == SIGCONT && group.stop_reported;
         let discard = match info.signum {
-            18 => STOP_MASK,
-            19..=22 => 1 << 17,
+            SIGCONT => STOP_MASK,
+            SIGSTOP..=SIGTTOU => 1 << (SIGCONT - 1),
             _ => 0,
         };
         group.pending.discard(discard);
-        if info.signum == 18 {
+        if info.signum == SIGCONT {
             group.stop_signal = None;
             group.stop_reported = false;
             group.stopped = 0;
@@ -445,7 +484,7 @@ impl SignalGroup {
         for thread in threads {
             let mut private = thread.state.lock();
             private.pending.discard(discard);
-            if info.signum == 18 {
+            if info.signum == SIGCONT {
                 private.stopped = false;
             }
             if target.is_none()
@@ -459,8 +498,8 @@ impl SignalGroup {
         if group.exit.is_some() {
             return Ok(continued);
         }
-        if info.signum == 9 {
-            group.exit.get_or_insert(9);
+        if info.signum == SIGKILL {
+            group.exit.get_or_insert(SIGKILL as i32);
             group.stop_signal = None;
         } else if blocked || !ignored(action, info.signum, self.system_init) {
             match target {
@@ -468,9 +507,9 @@ impl SignalGroup {
                 None => group.pending.push(info, prepared, account)?,
             }
             if eligible
-                && action.handler == 0
+                && action.handler == SIG_DFL
                 && !ignored(action, info.signum, self.system_init)
-                && !matches!(info.signum, 19..=22)
+                && !matches!(info.signum, SIGSTOP..=SIGTTOU)
             {
                 group.exit.get_or_insert(info.signum as i32);
                 group.stop_signal = None;
@@ -485,15 +524,15 @@ impl SignalGroup {
         info: SignalInfo,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> bool {
-        assert!(info.signum == 17 && matches!(info.code, 1..=3));
+        assert!(info.signum == SIGCHLD && matches!(info.code, CLD_EXITED..=CLD_DUMPED));
         let binding = self.sighand.lock();
         let actions = binding.actions.lock();
-        let action = actions[16];
-        let autoreap = action.handler == 1 || action.flags & SA_NOCLDWAIT != 0;
-        if action.handler != 1 {
+        let action = actions[SIGCHLD as usize - 1];
+        let autoreap = action.handler == SIG_IGN || action.flags & SA_NOCLDWAIT != 0;
+        if action.handler != SIG_IGN {
             match self.deliver_locked(
                 info,
-                1 << 16,
+                1 << (SIGCHLD - 1),
                 action,
                 None,
                 &mut PreparedSignal::kernel(),
@@ -514,7 +553,10 @@ impl SignalGroup {
         action: Option<SignalAction>,
         threads: impl Iterator<Item = &'a Arc<ThreadSignals>>,
     ) -> Result<SignalAction, SignalError> {
-        if signal == 0 || SIGNAL_COUNT < signal || (action.is_some() && matches!(signal, 9 | 19)) {
+        if signal == 0
+            || SIGNAL_COUNT < signal
+            || (action.is_some() && (signal == SIGKILL as usize || signal == SIGSTOP as usize))
+        {
             return Err(SignalError::InvalidSignal);
         }
         let binding = self.sighand.lock();
@@ -565,7 +607,8 @@ impl SignalGroup {
         let suppress = {
             let binding = self.sighand.lock();
             let actions = binding.actions.lock();
-            matches!(info.code, 5 | 6) && actions[16].flags & 1 != 0
+            matches!(info.code, CLD_STOPPED | CLD_CONTINUED)
+                && actions[SIGCHLD as usize - 1].flags & SA_NOCLDSTOP != 0
         };
         if !suppress {
             match self.send(info) {
@@ -633,7 +676,10 @@ impl ThreadSignals {
 
     /// 同步用户fault保存地址与原trap事实，内核强制信号走同一优先领取责任。
     pub(crate) fn force_fault(&self, info: SignalInfo) {
-        assert!(matches!(info.signum, 4 | 5 | 7 | 8 | 11 | 31));
+        assert!(matches!(
+            info.signum,
+            SIGILL | SIGTRAP | SIGBUS | SIGFPE | SIGSEGV | SIGSYS
+        ));
         assert!(matches!(info.payload, SignalPayload::Fault { .. }));
         self.force(info);
     }
@@ -647,7 +693,7 @@ impl ThreadSignals {
             let mut private = self.state.lock();
             let bit = 1 << (info.signum - 1);
             let action = &mut actions[info.signum as usize - 1];
-            if private.mask & bit != 0 || action.handler == 1 {
+            if private.mask & bit != 0 || action.handler == SIG_IGN {
                 *action = SignalAction::DEFAULT;
             }
             private.mask &= !bit;
@@ -795,14 +841,14 @@ impl ThreadSignals {
                 retired.add(removed)
             };
             let mut action = actions[info.signum as usize - 1];
-            if forced && action.handler == 1 {
+            if forced && action.handler == SIG_IGN {
                 action = SignalAction::DEFAULT;
             }
             if ignored(action, info.signum, !forced && self.group.system_init) {
                 continue;
             }
-            if action.handler == 0 {
-                if matches!(info.signum, 19..=22) {
+            if action.handler == SIG_DFL {
+                if matches!(info.signum, SIGSTOP..=SIGTTOU) {
                     group.stop_signal = Some(info.signum);
                     return Some(SignalSelection::Stop);
                 }
@@ -811,7 +857,7 @@ impl ThreadSignals {
                 return Some(SignalSelection::Exit(status));
             }
             if action.flags & SA_RESETHAND != 0 {
-                actions[info.signum as usize - 1].handler = 0;
+                actions[info.signum as usize - 1].handler = SIG_DFL;
             }
             let restore_mask = private.mask;
             private.mask |= action.mask;
@@ -970,9 +1016,9 @@ fn signal_bit(signum: u8) -> Result<u64, SignalError> {
 
 /// 系统首根忽略普通默认处置和KILL/STOP；forced同步故障调用时不传此角色。
 fn ignored(action: SignalAction, signum: u8, system_init: bool) -> bool {
-    (system_init && (action.handler == 0 || matches!(signum, 9 | 19)))
-        || action.handler == 1
-        || (action.handler == 0 && matches!(signum, 17 | 18 | 23 | 28))
+    (system_init && (action.handler == SIG_DFL || matches!(signum, SIGKILL | SIGSTOP)))
+        || action.handler == SIG_IGN
+        || (action.handler == SIG_DFL && matches!(signum, SIGCHLD | SIGCONT | SIGURG | SIGWINCH))
 }
 
 /// 实际活成员全部确认时记录停止完成，成员退出不能制造空组停止事件。
@@ -1002,7 +1048,7 @@ fn interruption(
         return true;
     }
     let pending = private.pending.bits | group.pending.bits;
-    if !system_init && pending & (1 << 8) != 0 {
+    if !system_init && pending & (1 << (SIGKILL - 1)) != 0 {
         return true;
     }
     if mode == WaitMode::Killable {

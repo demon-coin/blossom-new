@@ -1,7 +1,11 @@
 //! tmpfs 挂载选项只计算额度和初始根权限，不修改文件系统状态。
 
+use crate::fs::types::S_IALLUGO;
 use crate::fs::FsError;
 use crate::mm::PAGE_SIZE;
+
+/// inode 与名字的额度估算单位，仅用于限制可表示的 inode 数。
+const BOGO_INODE_SIZE: usize = 1024;
 
 /// 未出现的额度保留为 None，供初始默认与重配分别消费。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,7 +53,7 @@ impl TmpfsOptions {
                     let maximum = if name == b"nr_blocks" {
                         isize::MAX as u64
                     } else {
-                        (usize::MAX / 1024) as u64
+                        (usize::MAX / BOGO_INODE_SIZE) as u64
                     };
                     if !rest.is_empty() || maximum < amount {
                         return Err(FsError::InvalidOperation);
@@ -65,7 +69,7 @@ impl TmpfsOptions {
                     if (!rest.is_empty() && rest != b"\n") || (u32::MAX as u64) < mode {
                         return Err(FsError::InvalidOperation);
                     }
-                    options.mode = Some((mode & 0o7777) as u16);
+                    options.mode = Some((mode & u64::from(S_IALLUGO)) as u16);
                 }
                 _ => return Err(FsError::InvalidOperation),
             }
@@ -78,7 +82,7 @@ impl TmpfsOptions {
         (
             self.blocks.unwrap_or(ram_pages / 2),
             self.inodes
-                .unwrap_or((ram_pages / 2).min(usize::MAX / 1024)),
+                .unwrap_or((ram_pages / 2).min(usize::MAX / BOGO_INODE_SIZE)),
         )
     }
 }

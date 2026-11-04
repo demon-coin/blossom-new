@@ -1,5 +1,7 @@
 //! 各核 `rdtime` 补偿寄存器 `CNTC` 的统一零点。
 
+use crate::arch::loongarch64::register;
+
 use super::{csr_read, csr_write, read_counter};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -9,7 +11,7 @@ static COUNTER_EPOCH_READY: AtomicBool = AtomicBool::new(false);
 
 /// 读取计数器补偿寄存器；`rdtime` 的读数等于原始计数加上该补偿。
 fn counter_compensation() -> u64 {
-    csr_read::<0x43>() as u64
+    csr_read::<{ register::CSR_CNTC }>() as u64
 }
 
 /// 写入本核计数器补偿，使补偿后的读数与统一零点对齐。
@@ -18,7 +20,7 @@ fn counter_compensation() -> u64 {
 /// 仅 PLV0 启动段可调用，且该核不得已有时间采样依赖旧补偿。
 unsafe fn write_counter_compensation(value: u64) {
     // SAFETY: 调用者保证 PLV0 且本核尚无依赖旧补偿的时间采样。
-    unsafe { csr_write::<0x43>(value as usize) };
+    unsafe { csr_write::<{ register::CSR_CNTC }>(value as usize) };
 }
 
 /// BSP 在开放 AP 与时间服务前建立统一计数器零点。
@@ -51,5 +53,5 @@ pub unsafe fn apply_counter_epoch() {
 
 /// 读取最近一次异常保存的指令字；仅用于同步异常的现场诊断。
 pub fn bad_instruction() -> usize {
-    csr_read::<0x8>()
+    csr_read::<{ register::CSR_BADI }>()
 }

@@ -1,8 +1,14 @@
 //! 内核异常与物理 refill 的硬件入口；两者的 CSR 和 frame 不混用。
 
+use crate::arch::loongarch64::mmu::{PHYSICAL_BITS, PT_INDEX_BITS, USER_ADDRESS_BITS};
+use crate::arch::loongarch64::register as reg;
 use crate::arch::loongarch64::user::{la_user_kernel_refill_fault, la_user_trap};
 use crate::arch::loongarch64::{loongarch_refill, loongarch_trap, KernelTrapFrame, RefillFrame};
+use crate::mm::PAGE_SHIFT;
 use core::arch::naked_asm;
+
+const LDDIR_ROOT: usize = 3;
+const LDDIR_MIDDLE: usize = 1;
 use core::mem::{offset_of, size_of};
 
 extern "C" {
@@ -57,21 +63,21 @@ pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
     st.d $r31, $sp, {gpr}+31*8
     addi.d $t0, $sp, {frame_size}
     st.d $t0, $sp, {gpr}+3*8
-    csrrd $t0, 6
+    csrrd $t0, {csr_era}
     st.d $t0, $sp, {era}
-    csrrd $t0, 1
+    csrrd $t0, {csr_prmd}
     st.d $t0, $sp, {prmd}
-    csrrd $t0, 5
+    csrrd $t0, {csr_estat}
     st.d $t0, $sp, {estat}
-    csrrd $t0, 7
+    csrrd $t0, {csr_badv}
     st.d $t0, $sp, {badv}
-    csrrd $t0, 2
+    csrrd $t0, {csr_euen}
     st.d $t0, $sp, {euen}
-    csrrd $t0, 48
+    csrrd $t0, {csr_ks0}
     st.d $t0, $sp, {cpu_base}
 
     ld.d $t0, $sp, {euen}
-    andi $t0, $t0, 1
+    andi $t0, $t0, {reg_euen_fp}
     beqz $t0, 2f
     fst.d $f0, $sp, {fpr}+0*8
     fst.d $f1, $sp, {fpr}+1*8
@@ -128,9 +134,9 @@ pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
     move $a0, $sp
     bl {handler}
     ld.d $t0, $sp, {euen}
-    csrwr $t0, 2
+    csrwr $t0, {csr_euen}
     ld.d $t0, $sp, {euen}
-    andi $t0, $t0, 1
+    andi $t0, $t0, {reg_euen_fp}
     beqz $t0, 3f
     fld.d $f0, $sp, {fpr}+0*8
     fld.d $f1, $sp, {fpr}+1*8
@@ -185,11 +191,11 @@ pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
 
 3:
     ld.d $t0, $sp, {era}
-    csrwr $t0, 6
+    csrwr $t0, {csr_era}
     ld.d $t0, $sp, {prmd}
-    csrwr $t0, 1
+    csrwr $t0, {csr_prmd}
     ld.d $t0, $sp, {cpu_base}
-    csrwr $t0, 48
+    csrwr $t0, {csr_ks0}
     ld.d $r1, $sp, {gpr}+1*8
     ld.d $r2, $sp, {gpr}+2*8
     ld.d $r4, $sp, {gpr}+4*8
@@ -235,6 +241,13 @@ pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
         fcsr = const offset_of!(KernelTrapFrame, fcsr),
         fcc = const offset_of!(KernelTrapFrame, fcc),
                 handler = sym loongarch_trap,
+            csr_badv = const reg::CSR_BADV,
+            csr_era = const reg::CSR_ERA,
+            csr_estat = const reg::CSR_ESTAT,
+            csr_euen = const reg::CSR_EUEN,
+            csr_ks0 = const reg::CSR_KS0,
+            csr_prmd = const reg::CSR_PRMD,
+            reg_euen_fp = const reg::EUEN_FP,
             );
     }
 }
@@ -253,50 +266,50 @@ pub(super) unsafe extern "C" fn la_kernel_refill() -> ! {
         naked_asm!(
                 r#"
     # 用户 refill 把 t0 存入 TLBRSAVE、t1 存入临时 KS2，不触碰用户 SP 或 KS0。
-    csrwr $t0, 139
-    csrrd $t0, 143
-    andi $t0, $t0, 3
-    xori $t0, $t0, 3
+    csrwr $t0, {csr_tlbrsave}
+    csrrd $t0, {csr_tlbrprmd}
+    andi $t0, $t0, {reg_prmd_pplv}
+    xori $t0, $t0, {reg_plv_user}
     beqz $t0, 3f
     # PLV0 的用户入口窗口仍可能持有 context/用户 SP；只在该窗口借 KS3 续接栈。
     # KS2 是非返回的内核 refill 临时槽，原 GPR 在压致命 frame 前恢复。
-    csrwr $t1, 50
-    csrrd $t0, 12
+    csrwr $t1, {csr_ks2}
+    csrrd $t0, {csr_eentry}
     la.abs $t1, {user_trap}
     bne $t0, $t1, 2f
     b {user_refill_fault}
 2:
-    csrrd $t1, 50
-    csrrd $t0, 139
+    csrrd $t1, {csr_ks2}
+    csrrd $t0, {csr_tlbrsave}
     b 6f
 3:
     # 三层只索引低 39 位；超出政策范围的地址只能走永久 invalid 链。
-    csrrd $t0, 137
-    srli.d $t0, $t0, 39
+    csrrd $t0, {csr_tlbrbadv}
+    srli.d $t0, $t0, {user_address_bits}
     bnez $t0, 4f
-    csrrd $t0, 25
+    csrrd $t0, {csr_pgdl}
     b 5f
 4:
     la.abs $t0, {invalid_root}
-    bstrpick.d $t0, $t0, 47, 0
+    bstrpick.d $t0, $t0, {physical_last_bit}, 0
 5:
     # PWCH DIR2 / PWCL DIR0 / PT 构成固定三级；空目录总指向永久 invalid 页。
-    lddir $t0, $t0, 3
-    lddir $t0, $t0, 1
+    lddir $t0, $t0, {lddir_root}
+    lddir $t0, $t0, {lddir_middle}
     # QEMU 9.2.1 的 LDPTE 会截断高权限位；固定 4KiB 叶以完整 64 位装入偶奇 CSR。
     # KS2 只暂存 t1，真正用户 trap 会重新保存 t0；TLBREHI 保留本次 VPPN 和既有 PS12。
-    csrwr $t1, 50
-    csrrd $t1, 137
-    bstrpick.d $t1, $t1, 20, 13
-    slli.d $t1, $t1, 4
+    csrwr $t1, {csr_ks2}
+    csrrd $t1, {csr_tlbrbadv}
+    bstrpick.d $t1, $t1, {pair_index_last}, {pair_index_first}
+    slli.d $t1, $t1, {pair_stride_shift}
     add.d $t0, $t0, $t1
     ld.d $t1, $t0, 8
-    csrwr $t1, 141
+    csrwr $t1, {csr_tlbrelo1}
     ld.d $t0, $t0, 0
-    csrwr $t0, 140
-    csrrd $t1, 50
+    csrwr $t0, {csr_tlbrelo0}
+    csrrd $t1, {csr_ks2}
     tlbfill
-    csrrd $t0, 139
+    csrrd $t0, {csr_tlbrsave}
     ertn
 
 6:
@@ -335,19 +348,19 @@ pub(super) unsafe extern "C" fn la_kernel_refill() -> ! {
     st.d $r31, $sp, {refill_gpr}+31*8
     addi.d $t0, $sp, {refill_size}
     st.d $t0, $sp, {refill_gpr}+3*8
-    csrrd $t0, 138
+    csrrd $t0, {csr_tlbrera}
     st.d $t0, $sp, {refill_era}
-    csrrd $t0, 143
+    csrrd $t0, {csr_tlbrprmd}
     st.d $t0, $sp, {refill_prmd}
-    csrrd $t0, 137
+    csrrd $t0, {csr_tlbrbadv}
     st.d $t0, $sp, {refill_badv}
     # TLBRENTRY 是物理入口；DA 下先转高别名再恢复 DMW。
     la.abs $t0, 7f
     jirl $zero, $t0, 0
 7:
-    li.w $t0, 0x10
-    li.w $t1, 0x18
-    csrxchg $t0, $t1, 0
+    li.w $t0, {reg_crmd_pg}
+    li.w $t1, {reg_crmd_address_mode}
+    csrxchg $t0, $t1, {csr_crmd}
     move $a0, $sp
     bl {handler}
 "#,
@@ -359,7 +372,28 @@ pub(super) unsafe extern "C" fn la_kernel_refill() -> ! {
                 user_trap = sym la_user_trap,
                 user_refill_fault = sym la_user_kernel_refill_fault,
                 invalid_root = sym LA_INVALID_ROOT,
+                user_address_bits = const USER_ADDRESS_BITS,
+                physical_last_bit = const PHYSICAL_BITS - 1,
+                lddir_root = const LDDIR_ROOT,
+                lddir_middle = const LDDIR_MIDDLE,
+                pair_index_last = const PAGE_SHIFT + PT_INDEX_BITS - 1,
+                pair_index_first = const PAGE_SHIFT + 1,
+                pair_stride_shift = const core::mem::size_of::<[usize; 2]>().trailing_zeros(),
                 handler = sym loongarch_refill,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_eentry = const reg::CSR_EENTRY,
+            csr_ks2 = const reg::CSR_KS2,
+            csr_pgdl = const reg::CSR_PGDL,
+            csr_tlbrbadv = const reg::CSR_TLBRBADV,
+            csr_tlbrelo0 = const reg::CSR_TLBRELO0,
+            csr_tlbrelo1 = const reg::CSR_TLBRELO1,
+            csr_tlbrera = const reg::CSR_TLBRERA,
+            csr_tlbrprmd = const reg::CSR_TLBRPRMD,
+            csr_tlbrsave = const reg::CSR_TLBRSAVE,
+            reg_crmd_address_mode = const reg::CRMD_ADDRESS_MODE,
+            reg_crmd_pg = const reg::CRMD_PG,
+            reg_plv_user = const reg::PLV_USER,
+            reg_prmd_pplv = const reg::PRMD_PPLV,
             );
     }
 }

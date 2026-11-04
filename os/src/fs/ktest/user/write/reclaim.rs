@@ -642,8 +642,17 @@ pub(super) mod cases {
             context,
             // SAFETY: 唯一清零原页没有外部 CPU 别名，Read 的整个映射移交给同一真实 Bio；
             // 无回调，只有完整完成并领取原 memory 后才借用设备写入的字节。
-            unsafe { Bio::try_new(disk, BlkOperation::Read, byte / 512, memory, 0, None) }
-                .map_err(FsError::from),
+            unsafe {
+                Bio::try_new(
+                    disk,
+                    BlkOperation::Read,
+                    byte / crate::block::SECTOR_BYTES,
+                    memory,
+                    0,
+                    None,
+                )
+            }
+            .map_err(FsError::from),
         )?;
         let completion = bio.completion();
         claim.submit_bio(bio);
@@ -669,7 +678,7 @@ pub(super) mod cases {
     /// 从当前真实根挑选外部节点；不把 inline 根或普通数据块冒充冷 metadata。
     fn external_root_nodes(inode: &InodeRef, traditional: bool) -> Result<[u64; 4], FsError> {
         inode.with_map_read(|metadata, root| {
-            if (metadata.flags & 0x80000 == 0) != traditional {
+            if (metadata.flags & codec::EXTENTS == 0) != traditional {
                 return Err(FsError::InvalidOperation);
             }
             let mut nodes = [0; 4];

@@ -7,10 +7,13 @@ use core::time::Duration;
 
 use crate::arch;
 use crate::block::disk::{Disk, DiskRef, QueuePhase, QueueState};
-use crate::block::{AccessMode, BlockError, BlockView};
+use crate::block::{AccessMode, BlockError, BlockView, SECTOR_BYTES};
 use crate::cache::MetadataPages;
 use crate::wait::{WaitNode, Waiter};
 use crate::{sched, time, timer};
+
+const RESET_TIMEOUT: Duration = Duration::from_secs(2);
+const RESET_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// 文件系统占用共享同一个真实磁盘及模式，克隆不增加队列占用数。
 #[derive(Clone)]
@@ -190,7 +193,7 @@ impl Disk {
             }
         }
         let deadline = time::now()
-            .checked_add(Duration::from_secs(2))
+            .checked_add(RESET_TIMEOUT)
             .expect("block reset deadline overflows monotonic time");
         loop {
             if deadline <= time::now() {
@@ -233,7 +236,7 @@ impl Disk {
                 self.quiescent.wake_all();
                 return Ok(());
             }
-            timer::sleep(Duration::from_millis(1));
+            timer::sleep(RESET_POLL_INTERVAL);
         }
     }
 
@@ -423,7 +426,10 @@ fn raw_write_conflicts(queue: &QueueState, span: (u64, u64)) -> bool {
         let bio = unsafe { &*node };
         if overlaps(
             span,
-            (bio.sector(), bio.sector() + (bio.len() / 512) as u64),
+            (
+                bio.sector(),
+                bio.sector() + (bio.len() / SECTOR_BYTES as usize) as u64,
+            ),
         ) {
             return true;
         }

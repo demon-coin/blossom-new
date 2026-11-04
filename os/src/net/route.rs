@@ -4,6 +4,12 @@ use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Cidr};
 
 use crate::fs::FsError;
 
+pub(crate) const IPV4_ADDRESS_BITS: u8 = u32::BITS as u8;
+pub(crate) const RTF_UP: u16 = 0x1;
+pub(crate) const RTF_GATEWAY: u16 = 0x2;
+const IPV4_LOOPBACK_NETWORK: u8 = 127;
+const IPV4_MULTICAST_FIRST_OCTET: u8 = 224;
+
 /// 同一协议域的两种实际交付介质。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InterfaceId {
@@ -67,7 +73,7 @@ pub struct EthernetConfig {
 impl EthernetConfig {
     /// 在写入库接口前核静态配置边界，不创建第二个路由或地址集合。
     pub fn validate(self) -> Result<(), FsError> {
-        if 32 < self.prefix_len || !unicast(self.address) {
+        if IPV4_ADDRESS_BITS < self.prefix_len || !unicast(self.address) {
             return Err(FsError::InvalidOperation);
         }
         if let Some(gateway) = self.gateway {
@@ -93,5 +99,7 @@ pub struct Route {
 
 /// 当前静态 eth0 控制入口只接受非回环 IPv4 单播值。
 pub(crate) fn unicast(address: [u8; 4]) -> bool {
-    address[0] != 0 && address[0] != 127 && address[0] < 224
+    address[0] != 0
+        && address[0] != IPV4_LOOPBACK_NETWORK
+        && address[0] < IPV4_MULTICAST_FIRST_OCTET
 }

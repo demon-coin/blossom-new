@@ -7,6 +7,18 @@ use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 
 const CAPACITY: usize = 2 * 1024 * 1024;
+const FDT_WORD_BYTES: usize = core::mem::size_of::<u32>();
+const FDT_ALIGN_MASK: usize = FDT_WORD_BYTES - 1;
+const FDT_TOTALSIZE: usize = FDT_WORD_BYTES;
+const FDT_OFF_DT_STRUCT: usize = 2 * FDT_WORD_BYTES;
+const FDT_OFF_DT_STRINGS: usize = 3 * FDT_WORD_BYTES;
+const FDT_OFF_MEM_RSVMAP: usize = 4 * FDT_WORD_BYTES;
+const FDT_SIZE_DT_STRINGS: usize = 8 * FDT_WORD_BYTES;
+const FDT_SIZE_DT_STRUCT: usize = 9 * FDT_WORD_BYTES;
+const FDT_HEADER_BYTES: usize = 10 * FDT_WORD_BYTES;
+const FDT_PROPERTY_BYTES: usize = 3 * FDT_WORD_BYTES;
+const FDT_PROP: usize = 3;
+const FDT_NOP: u32 = 4;
 static COPY_LOCK: SpinLock<()> = SpinLock::new(());
 static mut COPY: [u8; CAPACITY] = [0; CAPACITY];
 static mut ACTUAL: MaybeUninit<boot::BootInfo> = MaybeUninit::uninit();
@@ -80,17 +92,19 @@ impl Dtb {
                 .expect("actual DTB node properties absent");
             (first.value.as_ptr() as usize)
                 .checked_sub(self.bytes.as_ptr() as usize)
-                .and_then(|n| n.checked_sub(12))
+                .and_then(|n| n.checked_sub(FDT_PROPERTY_BYTES))
                 .expect("DTB property offset overflow")
         };
         let word = |field: usize| {
-            let end = field.checked_add(4).expect("DTB header offset overflow");
+            let end = field
+                .checked_add(FDT_WORD_BYTES)
+                .expect("DTB header offset overflow");
             u32::from_be_bytes(self.bytes[..self.length][field..end].try_into().unwrap()) as usize
         };
-        let structure = word(8);
-        let strings = word(12);
-        let strings_size = word(32);
-        let structure_size = word(36);
+        let structure = word(FDT_OFF_DT_STRUCT);
+        let strings = word(FDT_OFF_DT_STRINGS);
+        let strings_size = word(FDT_SIZE_DT_STRINGS);
+        let structure_size = word(FDT_SIZE_DT_STRUCT);
         let structure_end = structure
             .checked_add(structure_size)
             .expect("DTB structure overflow");
@@ -98,14 +112,14 @@ impl Dtb {
             .checked_add(strings_size)
             .expect("DTB strings overflow");
         let value = offset
-            .checked_add(12)
+            .checked_add(FDT_PROPERTY_BYTES)
             .expect("DTB inserted property overflow");
-        assert_eq!(word(4), self.length);
-        assert_eq!(word(offset), 3);
-        assert_eq!(structure & 3, 0);
-        assert_eq!(structure_size & 3, 0);
-        assert_eq!(offset & 3, 0);
-        assert!(40 <= structure && word(16) < structure);
+        assert_eq!(word(FDT_TOTALSIZE), self.length);
+        assert_eq!(word(offset), FDT_PROP);
+        assert_eq!(structure & FDT_ALIGN_MASK, 0);
+        assert_eq!(structure_size & FDT_ALIGN_MASK, 0);
+        assert_eq!(offset & FDT_ALIGN_MASK, 0);
+        assert!(FDT_HEADER_BYTES <= structure && word(FDT_OFF_MEM_RSVMAP) < structure);
         assert!(structure <= offset && value <= structure_end);
         assert!(structure_end <= strings && strings_end <= self.length);
 
@@ -115,53 +129,55 @@ impl Dtb {
             .checked_add(1)
             .expect("DTB property name overflow");
         let name_start = strings_end
-            .checked_add(12)
+            .checked_add(FDT_PROPERTY_BYTES)
             .expect("DTB property name offset overflow");
         let name_end = name_start
             .checked_add(name_length)
             .expect("DTB property name overflow");
         let total = self
             .length
-            .checked_add(12)
+            .checked_add(FDT_PROPERTY_BYTES)
             .expect("DTB insertion overflow")
             .max(name_end);
         assert!(total <= self.bytes.len());
         let fields = [
-            (4, total),
+            (FDT_TOTALSIZE, total),
             (
-                12,
+                FDT_OFF_DT_STRINGS,
                 strings
-                    .checked_add(12)
+                    .checked_add(FDT_PROPERTY_BYTES)
                     .expect("DTB strings offset overflow"),
             ),
             (
-                32,
+                FDT_SIZE_DT_STRINGS,
                 strings_size
                     .checked_add(name_length)
                     .expect("DTB strings size overflow"),
             ),
             (
-                36,
+                FDT_SIZE_DT_STRUCT,
                 structure_size
-                    .checked_add(12)
+                    .checked_add(FDT_PROPERTY_BYTES)
                     .expect("DTB structure size overflow"),
             ),
-            (offset, 3),
+            (offset, FDT_PROP),
             (
                 offset
-                    .checked_add(4)
+                    .checked_add(FDT_WORD_BYTES)
                     .expect("DTB property length offset overflow"),
                 0,
             ),
             (
                 offset
-                    .checked_add(8)
+                    .checked_add(2 * FDT_WORD_BYTES)
                     .expect("DTB property name field overflow"),
                 strings_size,
             ),
         ]
         .map(|(field, word)| {
-            let end = field.checked_add(4).expect("DTB field write overflow");
+            let end = field
+                .checked_add(FDT_WORD_BYTES)
+                .expect("DTB field write overflow");
             assert!(end <= total);
             (
                 field,
@@ -182,33 +198,38 @@ impl Dtb {
     /// 在独占副本内替换现有属性，移动结构尾部及字符串块后同步全部长度字段。
     fn replace_property(&mut self, offset: usize, old_length: usize, value: &[u8]) {
         let word = |field: usize| {
-            let end = field.checked_add(4).expect("DTB header offset overflow");
+            let end = field
+                .checked_add(FDT_WORD_BYTES)
+                .expect("DTB header offset overflow");
             u32::from_be_bytes(self.bytes[field..end].try_into().unwrap()) as usize
         };
-        let structure = word(8);
-        let strings = word(12);
-        let structure_size = word(36);
+        let structure = word(FDT_OFF_DT_STRUCT);
+        let strings = word(FDT_OFF_DT_STRINGS);
+        let structure_size = word(FDT_SIZE_DT_STRUCT);
         let structure_end = structure
             .checked_add(structure_size)
             .expect("DTB structure overflow");
         let header = offset
-            .checked_sub(12)
+            .checked_sub(FDT_PROPERTY_BYTES)
             .expect("DTB property header underflow");
         let length_field = offset
-            .checked_sub(8)
+            .checked_sub(2 * FDT_WORD_BYTES)
             .expect("DTB property length underflow");
-        assert_eq!(word(4), self.length);
-        assert_eq!(word(header), 3);
+        assert_eq!(word(FDT_TOTALSIZE), self.length);
+        assert_eq!(word(header), FDT_PROP);
         assert_eq!(word(length_field), old_length);
         assert!(structure <= header && structure_end <= strings && strings <= self.length);
-        assert!(word(16) < structure);
-        assert_eq!(offset & 3, 0);
-        let old_padded = old_length.checked_add(3).expect("DTB property overflow") & !3;
+        assert!(word(FDT_OFF_MEM_RSVMAP) < structure);
+        assert_eq!(offset & FDT_ALIGN_MASK, 0);
+        let old_padded = old_length
+            .checked_add(FDT_ALIGN_MASK)
+            .expect("DTB property overflow")
+            & !FDT_ALIGN_MASK;
         let new_padded = value
             .len()
-            .checked_add(3)
+            .checked_add(FDT_ALIGN_MASK)
             .expect("DTB replacement overflow")
-            & !3;
+            & !FDT_ALIGN_MASK;
         let old_end = offset
             .checked_add(old_padded)
             .expect("DTB old property overflow");
@@ -227,10 +248,16 @@ impl Dtb {
         assert!(total <= self.bytes.len());
         let value_end = offset.checked_add(value.len()).expect("DTB value overflow");
         let fields = [
-            (4, u32::try_from(total).expect("DTB total exceeds u32")),
-            (12, u32::try_from(strings).expect("DTB strings exceeds u32")),
             (
-                36,
+                FDT_TOTALSIZE,
+                u32::try_from(total).expect("DTB total exceeds u32"),
+            ),
+            (
+                FDT_OFF_DT_STRINGS,
+                u32::try_from(strings).expect("DTB strings exceeds u32"),
+            ),
+            (
+                FDT_SIZE_DT_STRUCT,
                 u32::try_from(structure_size).expect("DTB structure exceeds u32"),
             ),
             (
@@ -242,7 +269,9 @@ impl Dtb {
         self.bytes[offset..value_end].copy_from_slice(value);
         self.bytes[value_end..new_end].fill(0);
         for (field, value) in fields {
-            let end = field.checked_add(4).expect("DTB header write overflow");
+            let end = field
+                .checked_add(FDT_WORD_BYTES)
+                .expect("DTB header write overflow");
             self.bytes[field..end].copy_from_slice(&value.to_be_bytes());
         }
         self.length = total;
@@ -261,12 +290,13 @@ impl Dtb {
             let node = tree.find_node(path).expect("actual DTB node absent");
             node.property(name).map(|property| {
                 let value = property.value.as_ptr() as usize - self.bytes.as_ptr() as usize;
-                value - 12..(value + property.value.len() + 3) & !3
+                value - FDT_PROPERTY_BYTES
+                    ..(value + property.value.len() + FDT_ALIGN_MASK) & !FDT_ALIGN_MASK
             })
         };
         if let Some(range) = range {
-            for token in self.bytes[range].chunks_exact_mut(4) {
-                token.copy_from_slice(&4u32.to_be_bytes());
+            for token in self.bytes[range].chunks_exact_mut(FDT_WORD_BYTES) {
+                token.copy_from_slice(&FDT_NOP.to_be_bytes());
             }
         }
     }

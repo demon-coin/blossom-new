@@ -10,7 +10,7 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 
-use crate::block::{AccessMode, FsClaim, IoResult, MetadataIoContext};
+use crate::block::{AccessMode, FsClaim, IoResult, MetadataIoContext, SECTOR_BYTES};
 use crate::cache::{BufferRef, FileMapping, PreparedFile};
 use crate::fs::dentry::{Dentry, DentryCache, DentryRef};
 use crate::fs::ext4::{
@@ -19,7 +19,10 @@ use crate::fs::ext4::{
 };
 use crate::fs::memfs::{MemoryFs, MemoryPageCharge, MemorySpecial};
 use crate::fs::readahead::{self, ReadaheadState};
-use crate::fs::types::{DirectoryCursor, DirectoryEntry, InodeKind, InodeTime};
+use crate::fs::types::{
+    DirectoryCursor, DirectoryEntry, InodeKind, InodeTime, NAME_MAX, S_IALLUGO, S_IFDIR, S_IFLNK,
+    S_IFREG, S_IRWXUGO, S_ISGID, S_IXGRP,
+};
 use crate::fs::writeback;
 use crate::fs::{background, FsError, ReadBuffer, WriteBuffer};
 use crate::mm::folio::FolioContent;
@@ -31,6 +34,9 @@ use crate::task::ReclaimScope;
 use crate::time;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
+
+/// 内存目录的每项记账尺寸，点项与普通名字使用同一单位。
+const MEMORY_DIRENT_BYTES: u64 = 20;
 
 #[cfg(feature = "ktest")]
 type LoadHook = Arc<dyn Fn(&InodeRef) + Send + Sync>;
@@ -906,7 +912,10 @@ impl PreparedSymlink {
         inode: &InodeData,
         target: &[u8],
     ) -> Result<Self, FsError> {
-        if target.len() < 60 || PAGE_SIZE < target.len() || target.is_empty() || target.contains(&0)
+        if target.len() < codec::INODE_BLOCK_BYTES
+            || PAGE_SIZE < target.len()
+            || target.is_empty()
+            || target.contains(&0)
         {
             return Err(if PAGE_SIZE < target.len() {
                 FsError::NameTooLong
@@ -944,7 +953,7 @@ impl PreparedSymlink {
             blocks: inode.blocks,
             publishing: false,
         };
-        let sectors = (block_size / 512) as u64;
+        let sectors = (block_size / SECTOR_BYTES as usize) as u64;
         let added = prepared
             .mappings
             .as_ref()
@@ -1317,7 +1326,7 @@ impl InodeCache {
             return Ok((cache, root));
         }
         let candidate_cache = DentryCache::try_new(capacity)?;
-        let root_inode = self.iget(volume, 2)?;
+        let root_inode = self.iget(volume, codec::ROOT_INODE)?;
         let candidate_root = DentryRef::try_root(root_inode.clone())?;
         self.domain
             .publish_dentry_namespace(candidate_cache, &root_inode, candidate_root)
@@ -1325,7 +1334,7 @@ impl InodeCache {
 
     /// 从 canonical inode 槽弱登记中复用卷根，候选在索引锁外准备。
     pub(crate) fn root_dentry(&self, volume: &Arc<Ext4Volume>) -> Result<DentryRef, FsError> {
-        let inode = self.iget(volume, 2)?;
+        let inode = self.iget(volume, codec::ROOT_INODE)?;
         if let Some(root) = self.domain.canonical_root(&inode) {
             return Ok(root);
         }
@@ -1491,7 +1500,7 @@ impl InodeCache {
                 directory_flags = Some(edit.flags());
                 prepared.directory = Some(edit);
             }
-            NewInodeContent::Symlink(target) if target.len() < 60 => {
+            NewInodeContent::Symlink(target) if target.len() < codec::INODE_BLOCK_BYTES => {
                 root.fill(0);
                 root[..target.len()].copy_from_slice(target);
                 size = target.len() as u64;
@@ -1509,12 +1518,12 @@ impl InodeCache {
             next.flags &= !codec::EXTENTS;
         }
         if let Some(flags) = directory_flags {
-            let permitted = codec::INDEX | 0x40000;
+            let permitted = codec::INDEX | codec::HUGE_FILE;
             if flags & !permitted != initial.flags & !permitted {
                 return Err(FsError::InvalidOperation);
             }
             let (_, huge) = codec::blocks_encoding(volume.geometry(), next.blocks)?;
-            next.flags = (flags & !0x40000) | if huge { 0x40000 } else { 0 };
+            next.flags = (flags & !codec::HUGE_FILE) | if huge { codec::HUGE_FILE } else { 0 };
         }
         volume.initialize_unpublished_inode(
             prepared
@@ -2838,7 +2847,8 @@ impl Inode {
             && metadata.kind == InodeKind::Regular
             && self.memory_special().is_none()
         {
-            metadata.blocks = self.mapping.len() as u64 * (PAGE_SIZE / 512) as u64;
+            metadata.blocks =
+                self.mapping.len() as u64 * (PAGE_SIZE / SECTOR_BYTES as usize) as u64;
         }
         Ok(metadata)
     }
@@ -2944,12 +2954,12 @@ impl InodeWriteGuard<'_> {
         if uid != 0 && uid != old.uid {
             return Err(FsError::NotPermitted);
         }
-        let mut permissions = mode & 0o7777;
+        let mut permissions = mode & S_IALLUGO;
         if uid != 0 && gid != old.gid {
-            permissions &= !0o2000;
+            permissions &= !S_ISGID;
         }
         let mut prepared = self.prepare_ctime(now_ns)?;
-        prepared.next.mode = (old.mode & !0o7777) | permissions;
+        prepared.next.mode = (old.mode & !S_IALLUGO) | permissions;
         Ok(prepared)
     }
 
@@ -2968,7 +2978,7 @@ impl InodeWriteGuard<'_> {
             if atime
                 .into_iter()
                 .chain(mtime)
-                .any(|time| 1_000_000_000 <= time.nanoseconds)
+                .any(|time| (time::NSEC_PER_SEC as u32) <= time.nanoseconds)
             {
                 return Err(FsError::InvalidOperation);
             }
@@ -2977,12 +2987,21 @@ impl InodeWriteGuard<'_> {
             next.ctime = now;
         } else {
             if let Some(time) = atime {
-                next.atime = codec::prepare_inode_time(time, 140, old.extra_isize)?;
+                next.atime = codec::prepare_inode_time(
+                    time,
+                    codec::INODE_ATIME_EXTRA_OFFSET,
+                    old.extra_isize,
+                )?;
             }
             if let Some(time) = mtime {
-                next.mtime = codec::prepare_inode_time(time, 136, old.extra_isize)?;
+                next.mtime = codec::prepare_inode_time(
+                    time,
+                    codec::INODE_MTIME_EXTRA_OFFSET,
+                    old.extra_isize,
+                )?;
             }
-            next.ctime = codec::prepare_inode_time(now, 132, old.extra_isize)?;
+            next.ctime =
+                codec::prepare_inode_time(now, codec::INODE_CTIME_EXTRA_OFFSET, old.extra_isize)?;
         }
         prepare_inode_metadata(self.inode, self.state, old, next)
     }
@@ -3315,7 +3334,7 @@ impl DirectoryWriteGuard<'_> {
         }
         let result = (|| {
             let flags = edit.flags();
-            let permitted = codec::INDEX | 0x40000;
+            let permitted = codec::INDEX | codec::HUGE_FILE;
             if flags & !permitted != old.flags & !permitted {
                 return Err(FsError::InvalidOperation);
             }
@@ -3327,7 +3346,7 @@ impl DirectoryWriteGuard<'_> {
             next.mtime = mtime;
             next.ctime = ctime;
             let (_, huge) = codec::blocks_encoding(volume.geometry(), next.blocks)?;
-            next.flags = (flags & !0x40000) | if huge { 0x40000 } else { 0 };
+            next.flags = (flags & !codec::HUGE_FILE) | if huge { codec::HUGE_FILE } else { 0 };
             let mapping = volume.prepare_inode_mapping(&old, &old_root, &next, &root)?;
             Ok::<_, FsError>((next, mapping))
         })();
@@ -3396,7 +3415,9 @@ fn initial_inode_metadata(
         return Err(FsError::FileTooLarge);
     }
     let (mtime, ctime) = codec::prepare_inode_write_times(now_ns, initial.extra_isize)?;
-    let atime = if 144 <= 128 + initial.extra_isize {
+    let atime = if codec::INODE_ATIME_EXTRA_OFFSET + core::mem::size_of::<u32>()
+        <= codec::GOOD_OLD_INODE_BYTES + initial.extra_isize
+    {
         mtime
     } else {
         InodeTime {
@@ -3411,8 +3432,10 @@ fn initial_inode_metadata(
     metadata.atime = atime;
     metadata.mtime = mtime;
     metadata.ctime = ctime;
-    metadata.flags = (initial.flags & !0x40000) | if huge { 0x40000 } else { 0 };
-    metadata.fast_symlink = metadata.kind == InodeKind::Symlink && blocks == 0 && size < 60;
+    metadata.flags = (initial.flags & !codec::HUGE_FILE) | if huge { codec::HUGE_FILE } else { 0 };
+    metadata.fast_symlink = metadata.kind == InodeKind::Symlink
+        && blocks == 0
+        && size < codec::INODE_BLOCK_BYTES as u64;
     Ok(metadata)
 }
 
@@ -3730,10 +3753,10 @@ fn write_result(start: u64, accepted: usize, error: FsError) -> Result<(u64, usi
 /// 有限最大文件位置由实际布局决定，传统树容量与 extent 的 32 位逻辑块号分别计算。
 fn write_limit(g: &crate::fs::ext4::Geometry, flags: u32) -> u64 {
     let blocks = if flags & crate::fs::ext4::codec::EXTENTS != 0 {
-        1u64 << 32
+        codec::EXTENT_LOGICAL_BLOCKS
     } else {
         let n = (g.block_size / 4) as u64;
-        12 + n + n * n + n * n * n
+        codec::DIRECT_BLOCKS as u64 + n + n * n + n * n * n
     };
     (blocks * g.block_size as u64).min(i64::MAX as u64)
 }
@@ -3748,7 +3771,7 @@ fn write_metadata(
     removed: u64,
     now: u64,
 ) -> Result<InodeMetadata, FsError> {
-    let sectors = (g.block_size / 512) as u64;
+    let sectors = (g.block_size / SECTOR_BYTES as usize) as u64;
     let blocks = old
         .blocks
         .checked_add(added * sectors)
@@ -3765,7 +3788,7 @@ fn write_metadata(
             .ok_or(FsError::FileTooLarge)?,
     );
     next.blocks = blocks;
-    next.flags = (old.flags & !0x40000) | if huge { 0x40000 } else { 0 };
+    next.flags = (old.flags & !codec::HUGE_FILE) | if huge { codec::HUGE_FILE } else { 0 };
     next.mtime = mtime;
     next.ctime = ctime;
     Ok(next)
@@ -3815,7 +3838,11 @@ impl InodeMetadata {
             number: 0,
             kind,
             mode,
-            size: if kind == InodeKind::Directory { 40 } else { 0 },
+            size: if kind == InodeKind::Directory {
+                2 * MEMORY_DIRENT_BYTES
+            } else {
+                0
+            },
             uid,
             gid,
             links,
@@ -3992,11 +4019,11 @@ impl InodeRef {
                 )
             }
         };
-        let setgid = parent.mode & 0o2000 != 0;
+        let setgid = parent.mode & S_ISGID != 0;
         let kind_mode = match kind {
-            InodeKind::Directory => 0x4000,
-            InodeKind::Symlink => 0xa000,
-            InodeKind::Regular => 0x8000,
+            InodeKind::Directory => S_IFDIR,
+            InodeKind::Symlink => S_IFLNK,
+            InodeKind::Regular => S_IFREG,
             InodeKind::Character
             | InodeKind::Block
             | InodeKind::Fifo
@@ -4005,21 +4032,21 @@ impl InodeRef {
         };
         let mut mode = kind_mode
             | if kind == InodeKind::Symlink {
-                0o777
+                S_IRWXUGO
             } else {
-                requested_mode & 0o7777
+                requested_mode & S_IALLUGO
             };
         if kind == InodeKind::Directory && setgid {
-            mode |= 0o2000;
+            mode |= S_ISGID;
         } else if kind != InodeKind::Directory
             && setgid
-            && mode & 0o2010 == 0o2010
+            && mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP)
             && gid != parent.gid
         {
-            mode &= !0o2000;
+            mode &= !S_ISGID;
         }
         if kind != InodeKind::Symlink {
-            mode &= !(umask & 0o777);
+            mode &= !(umask & S_IRWXUGO);
         }
         let gid = if setgid { parent.gid } else { gid };
         let mut initial = InodeMetadata::memory(kind, mode, uid, gid, 0, now_ns);
@@ -4267,8 +4294,8 @@ impl InodeRef {
 /// 将内存时间拆成共同秒/纳秒表示，不受 ext4 记录宽度约束。
 fn memory_time(now_ns: u64) -> InodeTime {
     InodeTime {
-        seconds: (now_ns / 1_000_000_000) as i64,
-        nanoseconds: (now_ns % 1_000_000_000) as u32,
+        seconds: (now_ns / time::NSEC_PER_SEC) as i64,
+        nanoseconds: (now_ns % time::NSEC_PER_SEC) as u32,
     }
 }
 
@@ -4463,7 +4490,7 @@ impl DirectoryWriteGuard<'_> {
             next.links = memory_link_count(next.links, links_delta)?;
             next.size = (directory.entries.len() as u64)
                 .checked_add(2)
-                .and_then(|entries| entries.checked_mul(20))
+                .and_then(|entries| entries.checked_mul(MEMORY_DIRENT_BYTES))
                 .ok_or(FsError::NoSpace)?;
             next.mtime = memory_time(now_ns);
             next.ctime = next.mtime;
@@ -4544,7 +4571,7 @@ fn validate_memory_name(name: &[u8]) -> Result<(), FsError> {
     {
         return Err(FsError::InvalidName);
     }
-    if 255 < name.len() {
+    if NAME_MAX < name.len() {
         return Err(FsError::NameTooLong);
     }
     Ok(())

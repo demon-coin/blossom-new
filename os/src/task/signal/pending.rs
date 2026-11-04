@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use core::ptr;
 
-use super::{signal_bit, SignalError, SignalInfo, SIGNAL_COUNT};
+use super::{signal_bit, SignalError, SignalInfo, SIGNAL_COUNT, SIGRTMIN};
 use crate::task::process::{Resource, SignalCharge, ThreadGroup};
 
 pub(super) struct QueuedSignal {
@@ -141,7 +141,7 @@ impl Pending {
         target: Option<&ThreadGroup>,
     ) -> Result<(), SignalError> {
         let bit = signal_bit(info.signum)?;
-        if info.signum < 32 && self.bits & bit != 0 {
+        if info.signum < SIGRTMIN && self.bits & bit != 0 {
             return Ok(());
         }
         let index = info.signum as usize - 1;

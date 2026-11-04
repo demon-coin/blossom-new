@@ -3,6 +3,13 @@
 use alloc::vec::Vec;
 use core::ptr;
 use virtio_drivers::transport::pci::bus::PciError;
+use virtio_drivers::transport::{mmio::MmioVersion, DeviceType};
+
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_MMIO_VERSION: usize = 0x04;
+const VIRTIO_MMIO_DEVICE_ID: usize = 0x08;
+const VIRTIO_MMIO_VENDOR_ID: usize = 0x0c;
+const VIRTIO_MMIO_IDENTITY_SIZE: usize = VIRTIO_MMIO_VENDOR_ID + core::mem::size_of::<u32>();
 
 use crate::{
     arch,
@@ -85,7 +92,9 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
         .map_err(|_| ProbeError::NoMemory)?;
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
         let base = mmio_region_address(resource.registers)?;
-        if resource.registers.end - resource.registers.start < 16 || base & 3 != 0 {
+        if resource.registers.end - resource.registers.start < VIRTIO_MMIO_IDENTITY_SIZE
+            || base & 3 != 0
+        {
             return Err(ProbeError::Resource("VirtIO MMIO header window is invalid"));
         }
         // SAFETY: BootInfo 仅发布已验证的启用 VirtIO-MMIO 区间，AP 前已安装 PTE
@@ -93,24 +102,26 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
         let (magic, version, device_id, vendor_id) = unsafe {
             (
                 ptr::read_volatile(base as *const u32),
-                ptr::read_volatile((base + 4) as *const u32),
-                ptr::read_volatile((base + 8) as *const u32),
-                ptr::read_volatile((base + 12) as *const u32),
+                ptr::read_volatile((base + VIRTIO_MMIO_VERSION) as *const u32),
+                ptr::read_volatile((base + VIRTIO_MMIO_DEVICE_ID) as *const u32),
+                ptr::read_volatile((base + VIRTIO_MMIO_VENDOR_ID) as *const u32),
             )
         };
-        if magic != 0x7472_6976 || !matches!(version, 1 | 2) {
+        if magic != VIRTIO_MMIO_MAGIC
+            || (version != MmioVersion::Legacy as u32 && version != MmioVersion::Modern as u32)
+        {
             return Err(ProbeError::Resource(
                 "VirtIO MMIO identity or version is invalid",
             ));
         }
-        if device_id == 2 {
+        if device_id == DeviceType::Block as u32 {
             mmio_blocks.push(MmioBlockCandidate {
                 registers: resource.registers,
                 version,
                 vendor_id,
                 interrupt: irq::map_source(resource.interrupt_source)?,
             });
-        } else if device_id == 1 {
+        } else if device_id == DeviceType::Network as u32 {
             mmio_networks.push(MmioNetCandidate {
                 registers: resource.registers,
                 version,

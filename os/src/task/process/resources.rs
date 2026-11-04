@@ -40,7 +40,7 @@ impl Limits {
         };
         Self([
             ResourceLimit {
-                current: 8 * 1024 * 1024,
+                current: crate::task::exec::DEFAULT_STACK_BYTES,
                 maximum: u64::MAX,
             },
             infinity,

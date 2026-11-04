@@ -1,5 +1,6 @@
 //! 已保活正常 RAM 的原始字节访问；用户权限由 MM 逐页检查，地址使用 PLV0 缓存 DMW。
 
+use crate::arch::loongarch64::register as reg;
 use core::arch::asm;
 
 /// 原始复制已驻留的正常 RAM 字节，不分配、不睡眠，不构造共享内容引用或并发快照。
@@ -74,7 +75,8 @@ pub unsafe fn load_user_u32(src: *const u32) -> u32 {
     unsafe {
         asm!(
             "ld.wu {value}, {src}, 0",
-            "dbar 0x14",
+            "dbar {hint}",
+            hint = const reg::DBAR_ACQUIRE,
             src = in(reg) src,
             value = out(reg) value,
             options(nostack),
@@ -94,8 +96,9 @@ pub unsafe fn store_user_u32(dst: *mut u32, value: u32) {
     // st.w 是单次自然对齐原子写入，默认内存副作用同时提供编译器 Release 边界。
     unsafe {
         asm!(
-            "dbar 0x12",
+            "dbar {hint}",
             "st.w {value}, {dst}, 0",
+            hint = const reg::DBAR_RELEASE,
             dst = in(reg) dst,
             value = in(reg) value as usize,
             options(nostack),

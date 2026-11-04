@@ -10,6 +10,10 @@ use crate::mm::buddy::{self, Block, BATCH_CAPACITY};
 use crate::sync::{IrqSaveGuard, SpinLock};
 
 const NONE: usize = usize::MAX;
+// managed 的约千分之一先限到 1 MiB，再按 high/batch 比例缩小。
+const MANAGED_BATCH_SHIFT: usize = 10;
+const MAX_BATCH_BYTES: usize = 1 << 20;
+const HIGH_BATCH_RATIO: usize = 4;
 
 struct Pageset {
     head: usize,
@@ -25,7 +29,7 @@ impl Pageset {
             head: NONE,
             count: 0,
             batch,
-            high: 4 * batch,
+            high: HIGH_BATCH_RATIO * batch,
         }
     }
 
@@ -92,7 +96,9 @@ static PAGESETS: [Once<SpinLock<Pageset>>; MAX_CPUS] = [const { Once::new() }; M
 
 /// 由初始 managed 页数推导固定小批量，不维护依赖 vmstat 的自适应参数。
 fn batch_size(managed: usize) -> usize {
-    let raw = ((managed >> 10).min(256) / 4).clamp(1, 8);
+    let raw = ((managed >> MANAGED_BATCH_SHIFT).min(MAX_BATCH_BYTES / PAGE_SIZE)
+        / HIGH_BATCH_RATIO)
+        .clamp(1, BATCH_CAPACITY);
     let rounded = 1usize << (usize::BITS - 1 - (raw + raw / 2).leading_zeros());
     (rounded - 1).max(1)
 }

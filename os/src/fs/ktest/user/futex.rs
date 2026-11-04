@@ -101,7 +101,7 @@ impl UserOwner {
                 Self::futex_phase(&mm, &root, 2)?;
                 let child_pid = child.identity().expect("futex child has no identity").tid();
                 self.graph()
-                    .send_kernel(child_pid, 10)
+                    .send_kernel(child_pid, crate::task::signal::SIGUSR1)
                     .map_err(|_| TestError("futex isolation signal request failed"))?;
                 mm.store_user_u32(FUTEX_CONTROL + 12, 2)
                     .map_err(|_| TestError("futex isolation signal release failed"))?;
@@ -140,7 +140,7 @@ impl UserOwner {
                     .expect("restart child has no identity")
                     .tid();
                 self.graph()
-                    .send_kernel(child_pid, 10)
+                    .send_kernel(child_pid, crate::task::signal::SIGUSR1)
                     .map_err(|_| TestError("futex restart signal request failed"))?;
                 until("futex restart handler did not execute", || {
                     mm.load_user_u32(FUTEX_CONTROL + 32) == Ok(1) || child.mm().is_none()
@@ -161,7 +161,7 @@ impl UserOwner {
                     .expect("deadline child has no identity")
                     .tid();
                 self.graph()
-                    .send_kernel(child_pid, 19)
+                    .send_kernel(child_pid, crate::task::signal::SIGSTOP)
                     .map_err(|_| TestError("futex deadline stop request failed"))?;
                 let parent = root
                     .identity()
@@ -207,7 +207,7 @@ impl UserOwner {
                     deadline.as_nanos(), crate::time::now().as_nanos(), stopped.status
                 ));
                 self.graph()
-                    .send_kernel(child_pid, 18)
+                    .send_kernel(child_pid, crate::task::signal::SIGCONT)
                     .map_err(|_| TestError("futex deadline continue request failed"))?;
                 mm.store_user_u32(FUTEX_CONTROL + 12, 2)
                     .map_err(|_| TestError("futex deadline continue release failed"))?;
@@ -268,7 +268,7 @@ impl UserOwner {
                             .expect("requeue child has no identity")
                             .tid();
                         self.graph()
-                            .send_kernel(waiting_pid, 10)
+                            .send_kernel(waiting_pid, crate::task::signal::SIGUSR1)
                             .map_err(|_| TestError("futex requeue cancellation signal failed"))?;
                     } else {
                         until("requeued futex deadline was not reached", || {

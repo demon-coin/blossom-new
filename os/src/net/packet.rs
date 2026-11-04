@@ -6,12 +6,23 @@ use core::fmt;
 use core::mem;
 use smoltcp::iface::{IpPayload, Packet};
 use smoltcp::socket::tcp::Socket as RawTcpSocket;
-use smoltcp::wire::{IpAddress, IpProtocol, IpRepr, TcpControl, TcpRepr, UdpRepr};
+use smoltcp::wire::{
+    IpAddress, IpProtocol, IpRepr, TcpControl, TcpRepr, UdpRepr, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
+    UDP_HEADER_LEN,
+};
 
 use crate::fs::FsError;
 use crate::net::address::InetEndpoint;
 use crate::net::table::BindLease;
 use crate::sync::SpinLock;
+
+// 当前网络域把完整 IP 报文限制为十六位总长，IPv6 同样扣除固定头，不启用 jumbogram。
+pub(crate) const MAX_IP_PACKET_LEN: usize = u16::MAX as usize;
+pub(crate) const MAX_IPV4_UDP_PAYLOAD_LEN: usize =
+    MAX_IP_PACKET_LEN - IPV4_HEADER_LEN - UDP_HEADER_LEN;
+pub(crate) const IPV6_UDP_HEADER_LEN: usize = IPV6_HEADER_LEN + UDP_HEADER_LEN;
+pub(crate) const MAX_IPV6_UDP_PAYLOAD_LEN: usize = MAX_IP_PACKET_LEN - IPV6_UDP_HEADER_LEN;
+const DEFAULT_HOP_LIMIT: u8 = 64;
 
 /// 每接口的一份捕获后备独立保活，loan 不引用网络域或端点。
 pub(crate) type CaptureStorage = Arc<SpinLock<Vec<u8>>>;
@@ -61,7 +72,7 @@ impl OwnedPacket {
             .header_len()
             .checked_add(tcp.buffer_len())
             .ok_or(FsError::MessageTooLarge)?;
-        if ip_mtu < length || (u16::MAX as usize) < length {
+        if ip_mtu < length || MAX_IP_PACKET_LEN < length {
             return Err(FsError::MessageTooLarge);
         }
         let mut storage = Vec::new();
@@ -94,14 +105,14 @@ impl OwnedPacket {
             destination.address,
             IpProtocol::Udp,
             payload_len,
-            64,
+            DEFAULT_HOP_LIMIT,
         );
         let length = ip
             .header_len()
             .checked_add(payload_len)
             .ok_or(FsError::MessageTooLarge)?;
         // IPv4 大报文由接口原 fragmenter 处理；当前 IPv6 只支持路径内完整报文。
-        if (u16::MAX as usize) < length || (matches!(ip, IpRepr::Ipv6(_)) && mtu < length) {
+        if MAX_IP_PACKET_LEN < length || (matches!(ip, IpRepr::Ipv6(_)) && mtu < length) {
             return Err(FsError::MessageTooLarge);
         }
         let mut storage = Vec::new();

@@ -5,11 +5,37 @@ use core::ptr;
 
 use crate::{
     arch,
-    drivers::dwmac::{Generation, GmacError, BUFFER_LEN, RING_LEN},
+    drivers::dwmac::{Generation, GmacError, BUFFER_LEN, FRAME_MAX, FRAME_MIN, RING_LEN},
     mm::dma::{CoherentDma, DmaDirection, DmaDomain},
 };
 
 const OWN: u32 = 1 << 31;
+const ERROR_SUMMARY: u32 = 1 << 15;
+const DWMAC4_RX_CONTEXT: u32 = 1 << 30;
+const DWMAC4_RX_FIRST: u32 = 1 << 29;
+const DWMAC4_RX_LAST: u32 = 1 << 28;
+const DWMAC4_RX_LENGTH_MASK: u32 = 0x7fff;
+const DWMAC1000_RX_FIRST: u32 = 1 << 9;
+const DWMAC1000_RX_LAST: u32 = 1 << 8;
+const DWMAC1000_RX_LENGTH_SHIFT: u32 = 16;
+const DWMAC1000_RX_LENGTH_MASK: u32 = 0x3fff;
+const DWMAC4_RX_INTERRUPT: u32 = 1 << 30;
+const DWMAC4_RX_BUFFER1_VALID: u32 = 1 << 24;
+const DWMAC1000_RX_END_RING: u32 = 1 << 15;
+const DWMAC4_TX_INTERRUPT: u32 = 1 << 31;
+const DWMAC4_TX_FIRST: u32 = 1 << 29;
+const DWMAC4_TX_LAST: u32 = 1 << 28;
+const DWMAC1000_TX_INTERRUPT: u32 = 1 << 30;
+const DWMAC1000_TX_LAST: u32 = 1 << 29;
+const DWMAC1000_TX_FIRST: u32 = 1 << 28;
+const DWMAC1000_TX_END_RING: u32 = 1 << 21;
+const DESCRIPTOR_WORD_BYTES: usize = core::mem::size_of::<u32>();
+const DWMAC4_DESCRIPTOR_BYTES: usize = 4 * DESCRIPTOR_WORD_BYTES;
+const DWMAC1000_DESCRIPTOR_WORDS: usize = 8;
+const DWMAC1000_DESCRIPTOR_BYTES: usize = DWMAC1000_DESCRIPTOR_WORDS * DESCRIPTOR_WORD_BYTES;
+const JH7110_AXI_BEAT_BYTES: usize = core::mem::size_of::<u64>();
+pub(super) const ISOLATED_DESCRIPTOR_BYTES: usize = 64;
+const ETHERNET_FCS_BYTES: usize = 4;
 
 /// 描述符内容没有 Rust 引用；原页由外层设备拥有到确认停止。
 pub(super) struct Ring {
@@ -85,10 +111,14 @@ impl Ring {
     }
 
     /// 在本槽设备访问已结束后写完整控制字，再同步单独的行。
-    fn publish(&self, index: usize, words: [u32; 8]) -> Result<(), GmacError> {
+    fn publish(
+        &self,
+        index: usize,
+        words: [u32; DWMAC1000_DESCRIPTOR_WORDS],
+    ) -> Result<(), GmacError> {
         assert!(index < RING_LEN);
         let status = status_word(self.generation);
-        for word in 0..self.stride / 4 {
+        for word in 0..self.stride / DESCRIPTOR_WORD_BYTES {
             if word != status {
                 self.write(index, word, words.get(word).copied().unwrap_or(0));
             }
@@ -109,8 +139,8 @@ impl Ring {
 
     /// volatile 只读一个对齐控制字，不形成覆盖异步 DMA 的共享引用。
     fn read(&self, index: usize, word: usize) -> u32 {
-        let offset = index * self.stride + word * 4;
-        assert!(offset + 4 <= RING_LEN * self.stride);
+        let offset = index * self.stride + word * DESCRIPTOR_WORD_BYTES;
+        assert!(offset + DESCRIPTOR_WORD_BYTES <= RING_LEN * self.stride);
         // SAFETY: 固定控制页覆盖完整环，偏移对齐且已检查；拥有者不在设备停止前归页。
         u32::from_le(unsafe {
             ptr::read_volatile(self.memory.region().cpu.as_ptr().add(offset).cast::<u32>())
@@ -119,8 +149,8 @@ impl Ring {
 
     /// CPU-owned 槽的裸写由外层队列状态串行，设备仍拥有的邻居不受影响。
     fn write(&self, index: usize, word: usize, value: u32) {
-        let offset = index * self.stride + word * 4;
-        assert!(offset + 4 <= RING_LEN * self.stride);
+        let offset = index * self.stride + word * DESCRIPTOR_WORD_BYTES;
+        assert!(offset + DESCRIPTOR_WORD_BYTES <= RING_LEN * self.stride);
         // SAFETY: 原页永久直映、偏移四字节对齐；私有调用者只修改未交权的独立槽。
         unsafe {
             ptr::write_volatile(
@@ -134,9 +164,9 @@ impl Ring {
 /// 硬件格式长度与 cacheline 隔离分别决定槽长。
 const fn descriptor_stride(generation: Generation, coherent: bool) -> usize {
     match generation {
-        Generation::Dwmac4 => 64,
-        Generation::Dwmac1000 if coherent => 32,
-        Generation::Dwmac1000 => 64,
+        Generation::Dwmac4 => ISOLATED_DESCRIPTOR_BYTES,
+        Generation::Dwmac1000 if coherent => DWMAC1000_DESCRIPTOR_BYTES,
+        Generation::Dwmac1000 => ISOLATED_DESCRIPTOR_BYTES,
     }
 }
 
@@ -144,8 +174,10 @@ const fn descriptor_stride(generation: Generation, coherent: bool) -> usize {
 const fn descriptor_skip(generation: Generation, coherent: bool) -> u32 {
     let stride = descriptor_stride(generation, coherent);
     match generation {
-        Generation::Dwmac4 => ((stride - 16) / 8) as u32,
-        Generation::Dwmac1000 => ((stride - 32) / 4) as u32,
+        Generation::Dwmac4 => ((stride - DWMAC4_DESCRIPTOR_BYTES) / JH7110_AXI_BEAT_BYTES) as u32,
+        Generation::Dwmac1000 => {
+            ((stride - DWMAC1000_DESCRIPTOR_BYTES) / DESCRIPTOR_WORD_BYTES) as u32
+        }
     }
 }
 
@@ -164,37 +196,49 @@ pub(super) const fn device_owned(status: u32) -> bool {
 
 /// 验证硬件包含 FCS 的帧长，返回不含 FCS 的 Ethernet 长度。
 pub(super) const fn received(generation: Generation, status: u32) -> Option<usize> {
-    if matches!(generation, Generation::Dwmac4) && status & (1 << 30) != 0 {
+    if matches!(generation, Generation::Dwmac4) && status & DWMAC4_RX_CONTEXT != 0 {
         return None;
     }
     let (first, last, length) = match generation {
-        Generation::Dwmac4 => (1 << 29, 1 << 28, (status & 0x7fff) as usize),
-        Generation::Dwmac1000 => (1 << 9, 1 << 8, ((status >> 16) & 0x3fff) as usize),
+        Generation::Dwmac4 => (
+            DWMAC4_RX_FIRST,
+            DWMAC4_RX_LAST,
+            (status & DWMAC4_RX_LENGTH_MASK) as usize,
+        ),
+        Generation::Dwmac1000 => (
+            DWMAC1000_RX_FIRST,
+            DWMAC1000_RX_LAST,
+            ((status >> DWMAC1000_RX_LENGTH_SHIFT) & DWMAC1000_RX_LENGTH_MASK) as usize,
+        ),
     };
-    if status & (OWN | (1 << 15)) != 0 || status & (first | last) != first | last {
+    if status & (OWN | ERROR_SUMMARY) != 0 || status & (first | last) != first | last {
         return None;
     }
     // 两代均关闭自动 FCS stripping，所有长度都按同一实际 DMA 字节范围解释。
-    if length < 18 || 1518 < length {
+    if length < FRAME_MIN + ETHERNET_FCS_BYTES || FRAME_MAX + ETHERNET_FCS_BYTES < length {
         None
     } else {
-        Some(length - 4)
+        Some(length - ETHERNET_FCS_BYTES)
     }
 }
 
 /// TX 错误摘要只在 OWN 已清除后解释，不用写回长度计算发送字节。
 pub(super) const fn transmit_error(status: u32) -> bool {
-    status & (1 << 15) != 0
+    status & ERROR_SUMMARY != 0
 }
 
 /// RX 每帧仅使用 buffer1，末槽的增强 ring-end 位保留在旧代第二字。
-const fn rx_descriptor(generation: Generation, last: bool, address: u64) -> [u32; 8] {
+const fn rx_descriptor(
+    generation: Generation,
+    last: bool,
+    address: u64,
+) -> [u32; DWMAC1000_DESCRIPTOR_WORDS] {
     match generation {
         Generation::Dwmac4 => [
             address as u32,
-            (address >> 32) as u32,
+            (address >> u32::BITS) as u32,
             0,
-            OWN | (1 << 30) | (1 << 24),
+            OWN | DWMAC4_RX_INTERRUPT | DWMAC4_RX_BUFFER1_VALID,
             0,
             0,
             0,
@@ -202,7 +246,7 @@ const fn rx_descriptor(generation: Generation, last: bool, address: u64) -> [u32
         ],
         Generation::Dwmac1000 => [
             OWN,
-            BUFFER_LEN as u32 | if last { 1 << 15 } else { 0 },
+            BUFFER_LEN as u32 | if last { DWMAC1000_RX_END_RING } else { 0 },
             address as u32,
             0,
             0,
@@ -219,20 +263,23 @@ const fn tx_descriptor(
     last: bool,
     address: u64,
     length: usize,
-) -> [u32; 8] {
+) -> [u32; DWMAC1000_DESCRIPTOR_WORDS] {
     match generation {
         Generation::Dwmac4 => [
             address as u32,
-            (address >> 32) as u32,
-            (1 << 31) | length as u32,
-            OWN | (1 << 29) | (1 << 28) | length as u32,
+            (address >> u32::BITS) as u32,
+            DWMAC4_TX_INTERRUPT | length as u32,
+            OWN | DWMAC4_TX_FIRST | DWMAC4_TX_LAST | length as u32,
             0,
             0,
             0,
             0,
         ],
         Generation::Dwmac1000 => [
-            OWN | (1 << 30) | (1 << 29) | (1 << 28) | if last { 1 << 21 } else { 0 },
+            OWN | DWMAC1000_TX_INTERRUPT
+                | DWMAC1000_TX_LAST
+                | DWMAC1000_TX_FIRST
+                | if last { DWMAC1000_TX_END_RING } else { 0 },
             length as u32,
             address as u32,
             0,

@@ -197,8 +197,12 @@ impl SerialTtyOwner {
         }
         crate::fs::tty::drain(FileIoContext::Kernel)
             .map_err(|_| TestError("tty drain failed at receive handoff"))?;
-        crate::fs::tty::set_termios(Termios::default(), 2, FileIoContext::Kernel)
-            .map_err(|_| TestError("tty default termios failed at receive handoff"))?;
+        crate::fs::tty::set_termios(
+            Termios::default(),
+            crate::fs::tty::termios::TCSAFLUSH,
+            FileIoContext::Kernel,
+        )
+        .map_err(|_| TestError("tty default termios failed at receive handoff"))?;
         crate::fs::tty::flush_work();
         Ok(())
     }

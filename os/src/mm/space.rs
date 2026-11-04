@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::mem::size_of;
 use core::ops::Range;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::{self, UserAccess};
 use crate::cache::FileRangeData;
 use crate::cpu;
-use crate::fs::{ExecAccess, FileRef, FsError, InodeKind, InodeRef};
+use crate::fs::{ExecAccess, FileRef, FsError, InodeKind, InodeRef, O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::mm::anon::SharedAnon;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::mm::user_table::{
@@ -519,9 +520,9 @@ pub(crate) struct FutexRead<'a> {
 impl FutexRead<'_> {
     /// 从同一稳定读侧解析当前 VMA 的具体 futex 身份。
     pub(crate) fn key(&self, address: usize, private: bool) -> Result<FutexKey, FutexAccessError> {
-        if address & 3 != 0
+        if address & (size_of::<u32>() - 1) != 0
             || address
-                .checked_add(4)
+                .checked_add(size_of::<u32>())
                 .is_none_or(|end| arch::USER_ADDRESS_END < end)
         {
             return Err(VmError::InvalidRange.into());
@@ -1928,14 +1929,14 @@ fn check_file(
     permissions: PagePermissions,
     maximum: PagePermissions,
 ) -> Result<(), VmError> {
-    if file.flags() & 3 == 1 {
+    if file.flags() & O_ACCMODE == O_WRONLY {
         return Err(VmError::File(FsError::BadFd));
     }
     if offset & (PAGE_SIZE as u64 - 1) != 0 || offset.checked_add(length as u64).is_none() {
         return Err(VmError::InvalidRange);
     }
     if !private && (permissions.write || maximum.write) {
-        if file.flags() & 3 != 2 {
+        if file.flags() & O_ACCMODE != O_RDWR {
             return Err(VmError::Permission);
         }
         file.path()

@@ -147,13 +147,14 @@ fn fp_control() -> usize {
     // SAFETY: 当前为内核 S-mode；读 sstatus 不访问 FP，不修改 IRQ 或任何寄存器状态。
     unsafe {
         core::arch::asm!("csrr {value}, sstatus", value = out(reg) value, options(nomem, nostack));
-        value & 0x6000
+        value & crate::arch::SR_FS
     }
     #[cfg(target_arch = "loongarch64")]
     // SAFETY: 当前为 PLV0；仅读 EUEN.FPE，不访问 FCSR/FP，不修改控制状态。
     unsafe {
-        core::arch::asm!("csrrd {value}, 0x2", value = out(reg) value, options(nomem, nostack));
-        value & 1
+        core::arch::asm!("csrrd {value}, {euen}", value = out(reg) value,
+            euen = const crate::arch::CSR_EUEN, options(nomem, nostack));
+        value & crate::arch::EUEN_FP
     }
 }
 

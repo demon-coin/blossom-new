@@ -8,7 +8,7 @@ use virtio_drivers::BufferDirection;
 
 use crate::block::{
     AccessMode, Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, BlockView, Disk,
-    DiskRef, EndIo, FsClaim, IoResult,
+    DiskRef, EndIo, FsClaim, IoResult, NATIVE_TAG_COUNT,
 };
 use crate::boot::Region;
 use crate::cache::MetadataCache;
@@ -211,7 +211,7 @@ impl Ram {
             end: backing.phys_addr() + backing.len(),
         };
         let queue = WorkQueue::try_new(WorkQueueConfig {
-            max_active: 9,
+            max_active: usize::from(NATIVE_TAG_COUNT) + 1,
             ordered: false,
             reclaim: true,
         })

@@ -68,13 +68,13 @@ impl Geometry {
         if group == 0 {
             return true;
         }
-        if self.features_compat & 0x200 != 0 {
+        if self.features_compat & codec::FEATURE_COMPAT_SPARSE_SUPER2 != 0 {
             return self
                 .backup_groups
                 .iter()
                 .any(|&backup| u64::from(backup) == group);
         }
-        if self.features_ro_compat & 1 == 0 || group == 1 {
+        if self.features_ro_compat & codec::FEATURE_RO_COMPAT_SPARSE_SUPER == 0 || group == 1 {
             return true;
         }
         [3u64, 5, 7].into_iter().any(|base| {
@@ -200,15 +200,25 @@ impl Ext4Volume {
             .ok_or(FsError::Corrupt)?;
         // 主超级块在 1024 字节处；读设备对齐的整页后仅解码其固定范围。
         let superblock = metadata.get(0, PAGE_SIZE, None)?;
-        let geometry = superblock
-            .with_read(|data| codec::decode_super(codec::bytes(data, 1024, 1024)?, capacity))??;
+        let geometry = superblock.with_read(|data| {
+            codec::decode_super(
+                codec::bytes(data, codec::SUPERBLOCK_OFFSET, codec::SUPERBLOCK_BYTES)?,
+                capacity,
+            )
+        })??;
         drop(superblock);
         let logical = view.limits().logical_block_size as usize;
         if geometry.block_size % logical != 0 {
             return Err(FsError::Unsupported);
         }
         // 未识别的 RO-compatible 格式可以读取，不能授予当前后端写能力。
-        let supported_ro = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | codec::METADATA_CSUM;
+        let supported_ro = codec::FEATURE_RO_COMPAT_SPARSE_SUPER
+            | codec::FEATURE_RO_COMPAT_LARGE_FILE
+            | codec::FEATURE_RO_COMPAT_HUGE_FILE
+            | codec::FEATURE_RO_COMPAT_GDT_CSUM
+            | codec::FEATURE_RO_COMPAT_DIR_NLINK
+            | codec::FEATURE_RO_COMPAT_EXTRA_ISIZE
+            | codec::METADATA_CSUM;
         if mode == AccessMode::ReadWrite && geometry.features_ro_compat & !supported_ro != 0 {
             return Err(FsError::Unsupported);
         }
@@ -423,10 +433,10 @@ impl Ext4Volume {
         // 主超级块位于页零的固定窗口，普通 metadata_block 的数据块校验不接受此保留块。
         let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
         superblock.with_read(|bytes| {
-            let record = codec::bytes(bytes, 1024, 1024)?;
+            let record = codec::bytes(bytes, codec::SUPERBLOCK_OFFSET, codec::SUPERBLOCK_BYTES)?;
             let mut free = u64::from(codec::le32(record, 12)?);
             let mut reserved = u64::from(codec::le32(record, 8)?);
-            if g.features_incompat & 0x80 != 0 {
+            if g.features_incompat & codec::FEATURE_INCOMPAT_64BIT != 0 {
                 free |= u64::from(codec::le32(record, 344)?) << 32;
                 reserved |= u64::from(codec::le32(record, 340)?) << 32;
             }
@@ -435,7 +445,7 @@ impl Ext4Volume {
                 return Err(FsError::Corrupt);
             }
             Ok(FilesystemStat {
-                fs_type: 0xef53,
+                fs_type: u64::from(codec::SUPER_MAGIC),
                 block_size: g.block_size as u64,
                 blocks: g.blocks_count,
                 free,
@@ -579,7 +589,7 @@ impl Ext4Volume {
         &self,
         index: u64,
         file_size: u64,
-        targets: &[Option<u64>; PAGE_SIZE / 512],
+        targets: &[Option<u64>; PAGE_SIZE / SECTOR_BYTES as usize],
         mut read: FolioRead,
     ) -> Result<(), FsError> {
         let start = match index.checked_mul(PAGE_SIZE as u64) {
@@ -770,9 +780,11 @@ impl Ext4Volume {
         expected.blocks = next.blocks;
         expected.flags = next.flags;
         expected.fast_symlink = next.fast_symlink;
-        let fast_symlink = next.kind == InodeKind::Symlink && next.blocks == 0 && next.size < 60;
+        let fast_symlink = next.kind == InodeKind::Symlink
+            && next.blocks == 0
+            && next.size < codec::INODE_BLOCK_BYTES as u64;
         let inode_layout_flags =
-            0x40000 | codec::INDEX | if fast_symlink { codec::EXTENTS } else { 0 };
+            codec::HUGE_FILE | codec::INDEX | if fast_symlink { codec::EXTENTS } else { 0 };
         if expected != *next
             || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
             || (fast_symlink && next.flags & codec::EXTENTS != 0)
@@ -977,7 +989,7 @@ impl Ext4Volume {
         expected.mtime = next.mtime;
         expected.ctime = next.ctime;
         expected.flags = next.flags;
-        let inode_layout_flags = 0x40000 | codec::INDEX;
+        let inode_layout_flags = codec::HUGE_FILE | codec::INDEX;
         if expected != *next || next.flags & !inode_layout_flags != old.flags & !inode_layout_flags
         {
             return Err(FsError::InvalidOperation);

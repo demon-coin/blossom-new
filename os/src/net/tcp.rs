@@ -16,7 +16,7 @@ use crate::net::address::{AddressFamily, InetEndpoint};
 use crate::net::core::{ProtocolDeadline, TcpCore};
 use crate::net::lifecycle::{EgressWait, RetirementLink};
 use crate::net::packet::OwnedPacket;
-use crate::net::socket::SocketTimeouts;
+use crate::net::socket::{SocketTimeouts, SHUT_RD, SHUT_RDWR, SHUT_WR};
 use crate::net::table::{BindLease, TcpTuple, TransportProtocol};
 use crate::net::{
     EndpointSlot, IoProgress, NetStack, NetStackRef, LOOPBACK_CAPACITY, PROTOCOL_BUDGET, SOMAXCONN,
@@ -411,7 +411,7 @@ impl TcpEndpoint {
 
     /// 关闭指定方向；发送关闭沿 raw FIN，接收方向仍能在 SHUT_WR 后独立推进。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
-        if 2 < how {
+        if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
         }
         let mut core = self.lock();
@@ -419,10 +419,10 @@ impl TcpEndpoint {
         if !metadata.connected || core.state() == State::Closed {
             return Err(FsError::NotConnected);
         }
-        if how == 0 || how == 2 {
+        if how == SHUT_RD || how == SHUT_RDWR {
             metadata.read_closed = true;
         }
-        if how == 1 || how == 2 {
+        if how == SHUT_WR || how == SHUT_RDWR {
             metadata.write_closed = true;
             core.close();
         }
@@ -1169,7 +1169,7 @@ fn observed_state_change(previous: Option<State>, core: &TcpCore) -> Option<u64>
     if previous == current {
         return None;
     }
-    Some((trace_state_code(previous) << 8) | trace_state_code(current))
+    Some((trace_state_code(previous) << u8::BITS) | trace_state_code(current))
 }
 
 /// 固定事件文本使用独立于库枚举布局的协议状态码。

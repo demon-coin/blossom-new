@@ -6,7 +6,10 @@ use super::termios::{
     ONOCR, OPOST, PARMRK, TAB3, TABDLY, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT,
     VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VTIME, VWERASE,
 };
-use crate::console::RxSample;
+use crate::console::{
+    RxSample, DATA_READY, UART_LSR_BREAK, UART_LSR_FRAME, UART_LSR_OVERRUN, UART_LSR_PARITY,
+};
+use crate::task::signal::{SIGINT, SIGQUIT, SIGTSTP};
 
 /// 输入队列固定 4096 字节。
 pub const INPUT_CAPACITY: usize = 4096;
@@ -16,17 +19,6 @@ pub const OUTPUT_CAPACITY: usize = 4096;
 pub const ECHO_CAPACITY: usize = 4104;
 /// 读写 uaccess 片段固定 512 字节。
 pub const SEGMENT_BYTES: usize = 512;
-
-/// LSR 数据就绪位。
-const LSR_DATA_READY: u8 = 0x01;
-/// LSR 溢出错误位。
-const LSR_OVERRUN: u8 = 0x02;
-/// LSR 校验错误位。
-const LSR_PARITY: u8 = 0x04;
-/// LSR 帧错误位。
-const LSR_FRAME: u8 = 0x08;
-/// LSR 中断位。
-const LSR_BREAK: u8 = 0x10;
 
 /// 回车字节。
 const CARRIAGE_RETURN: u8 = b'\r';
@@ -38,6 +30,10 @@ const BACKSPACE: u8 = 0x08;
 const BELL: u8 = 0x07;
 /// 禁用控制字符。
 const DISABLED_CHAR: u8 = 0;
+const TAB_WIDTH: usize = 8;
+const TAB_COLUMN_MASK: usize = TAB_WIDTH - 1;
+const ECHO_TAB_AFTER_TAB: u8 = 0x80;
+const ECHO_EXPANSION_BUDGET: usize = 64;
 
 /// 回显操作：输出一个原始字节。
 const ECHO_BYTE: u8 = 0;
@@ -531,16 +527,16 @@ impl NttyState {
     /// 处理一个采样，只记录输入效果；实际组信号必须在全部业务锁外发送。
     pub fn receive_sample(&mut self, sample: RxSample) -> ReceiveOutcome {
         let termios = self.termios;
-        if sample.status & LSR_BREAK != 0 {
+        if sample.status & UART_LSR_BREAK != 0 {
             return self.receive_break(termios);
         }
-        if sample.status & (LSR_PARITY | LSR_FRAME) != 0 {
+        if sample.status & (UART_LSR_PARITY | UART_LSR_FRAME) != 0 {
             return ReceiveOutcome::changes(self.receive_parity_error(termios, sample.byte));
         }
-        if sample.status & LSR_OVERRUN != 0 {
+        if sample.status & UART_LSR_OVERRUN != 0 {
             self.overrun += 1;
         }
-        if sample.status & LSR_DATA_READY == 0 {
+        if sample.status & DATA_READY == 0 {
             return ReceiveOutcome::default();
         }
         self.receive_byte(termios, sample.byte)
@@ -558,7 +554,7 @@ impl NttyState {
             return ReceiveOutcome {
                 read_changed: true,
                 write_changed: true,
-                signal: Some(2),
+                signal: Some(SIGINT),
             };
         }
         let changed = if termios.iflag & PARMRK != 0 {
@@ -645,11 +641,11 @@ impl NttyState {
         }
         if termios.lflag & ISIG != 0 && byte != DISABLED_CHAR {
             let signal = if byte == termios.cc[VINTR] {
-                Some(2)
+                Some(SIGINT)
             } else if byte == termios.cc[VQUIT] {
-                Some(3)
+                Some(SIGQUIT)
             } else if byte == termios.cc[VSUSP] {
-                Some(20)
+                Some(SIGTSTP)
             } else {
                 None
             };
@@ -1022,7 +1018,8 @@ impl NttyState {
                     count += 1;
                 }
             }
-            let packed = (count & 7) as u8 | if after_tab { 0x80 } else { 0 };
+            let packed =
+                (count & TAB_COLUMN_MASK) as u8 | if after_tab { ECHO_TAB_AFTER_TAB } else { 0 };
             let _ = self.echo.push(ECHO_ERASE_TAB, packed);
             return true;
         }
@@ -1118,11 +1115,11 @@ impl NttyState {
                     self.echo.pop();
                 }
                 ECHO_ERASE_TAB => {
-                    let mut count = usize::from(item.value & 7);
-                    if item.value & 0x80 == 0 {
+                    let mut count = usize::from(item.value & TAB_COLUMN_MASK as u8);
+                    if item.value & ECHO_TAB_AFTER_TAB == 0 {
                         count += self.canon_column;
                     }
-                    let backs = 8 - (count & 7);
+                    let backs = TAB_WIDTH - (count & TAB_COLUMN_MASK);
                     if self.output.space() < backs {
                         return true;
                     }
@@ -1135,7 +1132,7 @@ impl NttyState {
                     self.echo.pop();
                 }
                 ECHO_ERASE_LINE => {
-                    let mut budget = 64;
+                    let mut budget = ECHO_EXPANSION_BUDGET;
                     while self.canon_column < self.column && 0 < budget {
                         if self.output.space() < 3 {
                             return true;
@@ -1152,7 +1149,7 @@ impl NttyState {
                     self.echo.pop();
                 }
                 ECHO_REPRINT => {
-                    let mut budget = 64;
+                    let mut budget = ECHO_EXPANSION_BUDGET;
                     loop {
                         let (byte, done) = match self.pending_reprint.as_ref() {
                             Some(p) if p.done < p.len => (p.bytes[p.done], p.done),
@@ -1210,7 +1207,7 @@ impl NttyState {
         match byte {
             LINE_FEED if termios.oflag & ONLCR != 0 => 2,
             CARRIAGE_RETURN if termios.oflag & ONOCR != 0 && self.column == 0 => 0,
-            b'\t' if termios.oflag & TABDLY == TAB3 => 8 - (self.column & 7),
+            b'\t' if termios.oflag & TABDLY == TAB3 => TAB_WIDTH - (self.column & TAB_COLUMN_MASK),
             _ => 1,
         }
     }
@@ -1269,7 +1266,7 @@ impl NttyState {
                 self.output.push(CARRIAGE_RETURN)
             }
             b'\t' if termios.oflag & TABDLY == TAB3 => {
-                let spaces = 8 - (self.column & 7);
+                let spaces = TAB_WIDTH - (self.column & TAB_COLUMN_MASK);
                 for _ in 0..spaces {
                     let _ = self.output.push(b' ');
                 }
@@ -1277,7 +1274,7 @@ impl NttyState {
                 true
             }
             b'\t' => {
-                self.column += 8 - (self.column & 7);
+                self.column += TAB_WIDTH - (self.column & TAB_COLUMN_MASK);
                 self.output.push(b'\t')
             }
             BACKSPACE => {

@@ -14,7 +14,8 @@ use crate::fs::readahead::ReadaheadSnapshot;
 use crate::fs::readahead::ReadaheadState;
 use crate::fs::{
     background, writeback, DirectoryCursor, DirectoryEntry, FsError, InodeKind, InodeRef,
-    InodeTime, Path, Pollable, Vfs, WriteAccess,
+    InodeTime, Path, Pollable, Vfs, WriteAccess, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFREG, S_IFSOCK,
 };
 use crate::fs::{devfs, kmsg, ktrace, procfs};
 use crate::mm::space::{Mm, VmError};
@@ -32,21 +33,25 @@ pub enum FileIoContext<'a> {
     User(&'a UserThread),
 }
 
-const O_ACCMODE: u32 = 0o3;
-const O_WRONLY: u32 = 0o1;
-const O_CREAT: u32 = 0o100;
-const O_EXCL: u32 = 0o200;
-const O_TRUNC: u32 = 0o1000;
-const O_APPEND: u32 = 0o2000;
-const O_NONBLOCK: u32 = 0o4000;
-pub(crate) const O_DSYNC: u32 = 0x1000;
-pub(crate) const O_SYNC: u32 = 0x101000;
+pub(crate) const O_ACCMODE: u32 = 0o3;
+pub(crate) const O_RDONLY: u32 = 0o0;
+pub(crate) const O_WRONLY: u32 = 0o1;
+pub(crate) const O_RDWR: u32 = 0o2;
+pub(crate) const O_CREAT: u32 = 0o100;
+pub(crate) const O_EXCL: u32 = 0o200;
+pub(crate) const O_TRUNC: u32 = 0o1000;
+pub(crate) const O_APPEND: u32 = 0o2000;
+pub(crate) const O_NONBLOCK: u32 = 0o4000;
+pub(crate) const O_DSYNC: u32 = 0o10000;
+const __O_SYNC: u32 = 0o4000000;
+pub(crate) const O_SYNC: u32 = __O_SYNC | O_DSYNC;
+pub(crate) const O_LARGEFILE: u32 = 0o100000;
 pub(crate) const O_DIRECTORY: u32 = 0o200000;
 pub(crate) const O_NOFOLLOW: u32 = 0o400000;
-const O_CLOEXEC: u32 = 0o2000000;
+pub(crate) const O_CLOEXEC: u32 = 0o2000000;
 pub(crate) const O_NOCTTY: u32 = 0o400;
 const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
-const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | 0o100000 | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
+const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
 
 /// 已从目标 iovec ABI 解码的地址与长度；不借用用户字节。
 #[repr(C)]
@@ -1170,15 +1175,15 @@ pub fn stat_path(path: &Path) -> Result<FileStat, FsError> {
     Ok(FileStat {
         inode: inode.number(),
         kind: data.kind,
-        mode: (data.mode & 0o7777)
+        mode: (data.mode & S_IALLUGO)
             | match data.kind {
-                InodeKind::Regular => 0o100000,
-                InodeKind::Directory => 0o040000,
-                InodeKind::Symlink => 0o120000,
-                InodeKind::Character => 0o020000,
-                InodeKind::Block => 0o060000,
-                InodeKind::Fifo => 0o010000,
-                InodeKind::Socket => 0o140000,
+                InodeKind::Regular => S_IFREG,
+                InodeKind::Directory => S_IFDIR,
+                InodeKind::Symlink => S_IFLNK,
+                InodeKind::Character => S_IFCHR,
+                InodeKind::Block => S_IFBLK,
+                InodeKind::Fifo => S_IFIFO,
+                InodeKind::Socket => S_IFSOCK,
                 InodeKind::Other => unreachable!(),
             },
         size: data.size,

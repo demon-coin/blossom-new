@@ -7,30 +7,57 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::fs::epoll::WatchHead;
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, Pollable};
 use crate::fs::{DirectoryEntry, FileStat, FsError, InodeKind, InodeRef, InodeTime, Path};
-use crate::fs::{FileIoContext, FileLike, ReadBuffer, SeekFrom, WriteBuffer};
-use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
-use crate::net::packet::zeroed_bytes;
+use crate::fs::{
+    FileIoContext, FileLike, ReadBuffer, SeekFrom, WriteBuffer, O_CLOEXEC, O_NONBLOCK, O_RDWR,
+    S_IFSOCK, S_IRWXUGO,
+};
+use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress, AF_UNIX};
+use crate::net::packet::{zeroed_bytes, MAX_IPV4_UDP_PAYLOAD_LEN};
 use crate::net::tcp::TcpEndpoint;
 use crate::net::udp::UdpEndpoint;
 use crate::net::unix::UnixEndpoint;
 use crate::net::{IoProgress, MessageResult, NetStackRef, UnixSocketType};
+use crate::task::signal::SIGPIPE;
 use crate::time::{self, MonotonicInstant};
 use crate::wait::WaitResult;
 use core::time::Duration;
 use smoltcp::socket::tcp::CongestionControl;
 
 pub const TCP_BUFFER_LEN: usize = 128 * 1024;
-const O_RDWR: u32 = 2;
-const O_NONBLOCK: u32 = 0o4000;
-const O_CLOEXEC: u32 = 0o2000000;
-const MSG_PEEK: u32 = 0x2;
-const MSG_TRUNC: u32 = 0x20;
-const MSG_DONTWAIT: u32 = 0x40;
-const MSG_NOSIGNAL: u32 = 0x4000;
-const STREAM_PREFIX_LEN: usize = 4096;
-const MAX_DATAGRAM_LEN: usize = 65507;
+pub(crate) const SOCK_STREAM: u32 = 1;
+pub(crate) const SOCK_DGRAM: u32 = 2;
+pub(crate) const SOCK_SEQPACKET: u32 = 5;
+pub(crate) const SOCK_TYPE_MASK: u32 = 0xf;
+pub(crate) const SOCK_MAX: u32 = 11;
+pub(crate) const SOCK_NONBLOCK: u32 = O_NONBLOCK;
+pub(crate) const SOCK_CLOEXEC: u32 = O_CLOEXEC;
+pub(crate) const SHUT_RD: u32 = 0;
+pub(crate) const SHUT_WR: u32 = 1;
+pub(crate) const SHUT_RDWR: u32 = 2;
+pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
+pub(crate) const IPPROTO_IPV6: i32 = 41;
+pub(crate) const IPPROTO_MAX: i32 = 263;
+pub(crate) const SOL_SOCKET: i32 = 1;
+pub(crate) const SO_REUSEADDR: i32 = 2;
+pub(crate) const SO_TYPE: i32 = 3;
+pub(crate) const SO_ERROR: i32 = 4;
+pub(crate) const SO_KEEPALIVE: i32 = 9;
+pub(crate) const SO_SNDBUF: i32 = 7;
+pub(crate) const SO_RCVBUF: i32 = 8;
+pub(crate) const SO_RCVTIMEO: i32 = 20;
+pub(crate) const SO_SNDTIMEO: i32 = 21;
+pub(crate) const SO_ACCEPTCONN: i32 = 30;
+pub(crate) const SO_PROTOCOL: i32 = 38;
+pub(crate) const SO_DOMAIN: i32 = 39;
+pub(crate) const MSG_PEEK: u32 = 0x2;
+pub(crate) const MSG_TRUNC: u32 = 0x20;
+pub(crate) const MSG_DONTWAIT: u32 = 0x40;
+pub(crate) const MSG_NOSIGNAL: u32 = 0x4000;
+pub(crate) const STREAM_PREFIX_LEN: usize = 4096;
 const BUFFER_HINT_MAX: u32 = 65536;
 const BUFFER_BUDGET_MIN: usize = 1024;
+const BUFFER_BUDGET_MULTIPLIER: usize = 2;
 
 /// 端点的两向等待配置使用纳秒；无限与立即返回分别由 None 和 Some(0) 表示。
 #[derive(Clone, Copy, Default)]
@@ -216,8 +243,8 @@ impl SocketFile {
     /// 返回本打开实例的真实流或报文类型。
     pub fn socket_type(&self) -> u32 {
         match &self.endpoint {
-            Endpoint::Udp(_) => 2,
-            Endpoint::Tcp(_) => 1,
+            Endpoint::Udp(_) => SOCK_DGRAM,
+            Endpoint::Tcp(_) => SOCK_STREAM,
             Endpoint::Unix(endpoint) => endpoint.socket_type() as u32,
         }
     }
@@ -234,7 +261,7 @@ impl SocketFile {
     /// 返回实际地址域，匿名 pair 保持 AF_UNIX。
     pub fn domain(&self) -> u16 {
         match &self.endpoint {
-            Endpoint::Unix(_) => 1,
+            Endpoint::Unix(_) => AF_UNIX,
             Endpoint::Tcp(endpoint) => endpoint.family().number(),
             Endpoint::Udp(endpoint) => endpoint.family().number(),
         }
@@ -270,8 +297,8 @@ impl SocketFile {
     /// 返回实际协议编号，匿名 UNIX stream 使用默认协议零。
     pub fn protocol(&self) -> i32 {
         match &self.endpoint {
-            Endpoint::Tcp(_) => 6,
-            Endpoint::Udp(_) => 17,
+            Endpoint::Tcp(_) => IPPROTO_TCP,
+            Endpoint::Udp(_) => IPPROTO_UDP,
             Endpoint::Unix(_) => 0,
         }
     }
@@ -563,7 +590,7 @@ impl SocketFile {
                 Err(FsError::BrokenPipe) => {
                     if flags & MSG_NOSIGNAL == 0 {
                         if let FileIoContext::User(user) = caller {
-                            user.send_kernel_signal(13);
+                            user.send_kernel_signal(SIGPIPE);
                         }
                     }
                     return Err(FsError::BrokenPipe);
@@ -595,7 +622,7 @@ impl SocketFile {
         deadline: Result<Option<MonotonicInstant>, FsError>,
     ) -> Result<usize, FsError> {
         let length = source.len() - source.copied();
-        if MAX_DATAGRAM_LEN < length {
+        if MAX_IPV4_UDP_PAYLOAD_LEN < length {
             return Err(FsError::MessageTooLarge);
         }
         let mut payload = zeroed_bytes(length)?;
@@ -663,7 +690,7 @@ impl SocketFile {
                 Err(FsError::BrokenPipe) => {
                     if flags & MSG_NOSIGNAL == 0 {
                         if let FileIoContext::User(user) = caller {
-                            user.send_kernel_signal(13);
+                            user.send_kernel_signal(SIGPIPE);
                         }
                     }
                     return Err(FsError::BrokenPipe);
@@ -756,7 +783,7 @@ impl SocketFile {
 
     /// signed int 按 unsigned 提示限幅倍增，实际预算不超过原物理后备。
     fn buffer_budget(hint: i32, capacity: usize) -> usize {
-        ((hint as u32).min(BUFFER_HINT_MAX) as usize * 2)
+        ((hint as u32).min(BUFFER_HINT_MAX) as usize * BUFFER_BUDGET_MULTIPLIER)
             .max(BUFFER_BUDGET_MIN)
             .min(capacity)
     }
@@ -952,7 +979,7 @@ impl SocketFile {
         FileStat {
             inode: self.id(),
             kind: InodeKind::Socket,
-            mode: 0o140777,
+            mode: S_IFSOCK | S_IRWXUGO,
             size: 0,
             uid: self.uid,
             gid: self.gid,

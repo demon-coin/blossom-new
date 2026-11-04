@@ -1,6 +1,6 @@
 //! 真实 timer IRQ 在生产页分配的锁外清零窗口重入，同票远端操作在调用返回前完成。
 
-use crate::mm::ktest::smp::{SmpFixture, State};
+use crate::mm::ktest::smp::{SmpFixture, State, WORK};
 use crate::{
     arch, cpu,
     mm::{self, buddy, pcp, OwnedPages},
@@ -259,7 +259,7 @@ mod reentry {
                 assert_eq!(control.ticket.load(Ordering::Acquire), ticket);
                 state.release_object(id - 1);
                 control.remote_frees.fetch_add(1, Ordering::Relaxed);
-                let pages = state.pages[id * 32].lock().take().unwrap();
+                let pages = state.pages[id * WORK].lock().take().unwrap();
                 drop(pages);
                 assert!(0 < pcp::cpu_cached_pages(id));
                 mm::drain_all_pages();
@@ -276,7 +276,7 @@ mod reentry {
             for id in 1..=participants {
                 state.allocate_object(id - 1);
                 let pages = mm::alloc_pages(0, false).unwrap();
-                *state.pages[id * 32].lock() = Some(pages);
+                *state.pages[id * WORK].lock() = Some(pages);
             }
             control.owner.store(
                 crate::task::current_task_id().unwrap().as_usize(),

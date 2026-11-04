@@ -10,7 +10,9 @@ use super::disk::QueuePhase;
 use super::{
     Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo, IoResult,
 };
-use crate::drivers::virtio::VirtioDevice;
+use crate::drivers::virtio::{
+    VirtioDevice, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN, VIRTIO_VENDOR_ID,
+};
 use crate::mm::dma::MappedPages;
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, JoinHandle, PreparedTask, State, Task};
@@ -109,10 +111,13 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
 /// 唯一 attached 块设备必须来自本例声明的独占 scratch，不能猜第一根盘并原始写入。
 fn scratch() -> Result<VirtioDevice, TestError> {
     let inventory = drivers::discover().map_err(|_| TestError("scratch discovery failed"))?;
-    let mut pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let mut pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     if inventory.mmio_blocks.len() + pci.clone().count() != 1 {
         return Err(TestError(
             "stop fixture requires exactly one attached scratch disk",

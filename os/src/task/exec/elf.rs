@@ -347,7 +347,7 @@ pub(super) fn map_images(
 /// 只有段起止及文件尾所在页能改变来源；计划空间随段数增长，不随跨度增长。
 fn mapping_plan<'a>(loads: &[LoadSegment<'a>]) -> Result<Vec<Mapping<'a>>, ExecError> {
     let mut boundaries = Vec::new();
-    let capacity = loads.len().checked_mul(6).ok_or(ExecError::NoMemory)?;
+    let capacity = loads.len().checked_mul(3 * 2).ok_or(ExecError::NoMemory)?;
     boundaries
         .try_reserve_exact(capacity)
         .map_err(|_| ExecError::NoMemory)?;
@@ -418,7 +418,7 @@ fn page_plan<'a>(loads: &[LoadSegment<'a>], base: usize) -> Option<(u32, Source<
         let segment = load.segment;
         if segment.start < end && base < segment.end {
             present = true;
-            flags |= segment.flags & 7;
+            flags |= segment.flags & (PF_R | PF_W | PF_X);
         }
     }
     if !present {

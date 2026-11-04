@@ -4,7 +4,9 @@ use alloc::sync::Arc;
 
 use crate::boot::{self, Platform};
 use crate::drivers::dwmac::{Dwmac, GmacError};
-use crate::drivers::virtio::VirtioInitError;
+use crate::drivers::virtio::{
+    VirtioInitError, VIRTIO_PCI_NET_LEGACY, VIRTIO_PCI_NET_MODERN, VIRTIO_VENDOR_ID,
+};
 use crate::drivers::virtio_net::VirtioNet;
 use crate::drivers::{DeviceInventory, ProbeError};
 use crate::fs::FsError;
@@ -32,7 +34,11 @@ impl NetDevice {
             Platform::QemuVirt => {
                 !inventory.mmio_networks.is_empty()
                     || inventory.pci.devices().iter().any(|device| {
-                        device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1000 | 0x1041)
+                        device.vendor_id == VIRTIO_VENDOR_ID
+                            && matches!(
+                                device.device_id,
+                                VIRTIO_PCI_NET_LEGACY | VIRTIO_PCI_NET_MODERN
+                            )
                     })
             }
             Platform::VisionFive2 | Platform::Ls2k1000la => boot::info().board.gmac.is_some(),

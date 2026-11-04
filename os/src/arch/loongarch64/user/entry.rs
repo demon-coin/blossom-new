@@ -1,10 +1,21 @@
 //! 用户进入、异常返回及入口故障共用本次 Task 的受信续接帧。
 
+use crate::arch::loongarch64::register as reg;
 use crate::arch::loongarch64::user::{loongarch_user_kernel_fault, UserContext};
 #[cfg(feature = "ktest")]
 use core::arch::global_asm;
 use core::arch::naked_asm;
-use core::mem::offset_of;
+use core::mem::{offset_of, size_of};
+
+const CONTINUATION_GPRS: usize = 13;
+const CONTINUATION_KS3: usize = CONTINUATION_GPRS * core::mem::size_of::<usize>();
+const CONTINUATION_EENTRY: usize = CONTINUATION_KS3 + core::mem::size_of::<usize>();
+const CONTINUATION_PRMD: usize = CONTINUATION_EENTRY + core::mem::size_of::<usize>();
+const CONTINUATION_ERA: usize = CONTINUATION_PRMD + core::mem::size_of::<usize>();
+const CONTINUATION_KS1: usize = CONTINUATION_ERA + core::mem::size_of::<usize>();
+const CONTINUATION_KS2: usize = CONTINUATION_KS1 + core::mem::size_of::<usize>();
+const CONTINUATION_CRMD: usize = CONTINUATION_KS2 + core::mem::size_of::<usize>();
+const CONTINUATION_SIZE: usize = CONTINUATION_CRMD + core::mem::size_of::<usize>();
 
 /// 保存当前 Task 的 160 字节 ABI 续接，恢复最宽用户现场并进入 PLV3，异常后回到同一次调用。
 ///
@@ -21,10 +32,10 @@ pub(super) unsafe extern "C" fn la_run_user(_context: *mut UserContext) {
 # /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
 .macro LA_FP_REGS insn, prefix
     .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-        \insn $\prefix\()\n, $sp, {fpr}+\n*32
+        \insn $\prefix\()\n, $sp, {fpr}+\n*{fp_stride}
     .endr
 .endm
-    addi.d $sp, $sp, -160
+    addi.d $sp, $sp, -{continuation_size}
     st.d $r1, $sp, 0
     st.d $r2, $sp, 8
     st.d $r21, $sp, 16
@@ -38,48 +49,48 @@ pub(super) unsafe extern "C" fn la_run_user(_context: *mut UserContext) {
     st.d $r29, $sp, 80
     st.d $r30, $sp, 88
     st.d $r31, $sp, 96
-    csrrd $t0, 51
-    st.d $t0, $sp, 104
-    csrrd $t0, 12
-    st.d $t0, $sp, 112
-    csrrd $t0, 1
-    st.d $t0, $sp, 120
-    csrrd $t0, 6
-    st.d $t0, $sp, 128
-    csrrd $t0, 49
-    st.d $t0, $sp, 136
-    csrrd $t0, 50
-    st.d $t0, $sp, 144
-    csrrd $t0, 0
-    st.d $t0, $sp, 152
+    csrrd $t0, {csr_ks3}
+    st.d $t0, $sp, {continuation_ks3}
+    csrrd $t0, {csr_eentry}
+    st.d $t0, $sp, {continuation_eentry}
+    csrrd $t0, {csr_prmd}
+    st.d $t0, $sp, {continuation_prmd}
+    csrrd $t0, {csr_era}
+    st.d $t0, $sp, {continuation_era}
+    csrrd $t0, {csr_ks1}
+    st.d $t0, $sp, {continuation_ks1}
+    csrrd $t0, {csr_ks2}
+    st.d $t0, $sp, {continuation_ks2}
+    csrrd $t0, {csr_crmd}
+    st.d $t0, $sp, {continuation_crmd}
     move $t0, $sp
     st.d $t0, $a0, {kernel_sp}
     # KS3 保持受信 Task 续接 SP，覆盖入口及退出期间所有 context/用户 SP 窗口。
     move $t0, $sp
-    csrwr $t0, 51
+    csrwr $t0, {csr_ks3}
     move $t0, $a0
-    csrwr $t0, 49
+    csrwr $t0, {csr_ks1}
     la.abs $t0, {user_trap}
-    csrwr $t0, 12
+    csrwr $t0, {csr_eentry}
     move $sp, $a0
 
     # EUEN 只取 CPUCFG2 中具有完整依赖的 FP/LSX/LASX 能力。
-    li.w $t0, 2
+    li.w $t0, {reg_cpucfg_features}
     cpucfg $t0, $t0
-    andi $t1, $t0, 1
+    andi $t1, $t0, {reg_cpucfg_fp}
     beqz $t1, 2f
-    andi $t2, $t0, 0x40
+    andi $t2, $t0, {reg_cpucfg_lsx}
     beqz $t2, 2f
-    ori $t1, $t1, 2
-    andi $t2, $t0, 0x80
+    ori $t1, $t1, {reg_euen_lsx}
+    andi $t2, $t0, {reg_cpucfg_lasx}
     beqz $t2, 2f
-    ori $t1, $t1, 4
+    ori $t1, $t1, {reg_euen_lasx}
 2:
-    csrwr $t1, 2
-    csrrd $t0, 2
-    andi $t1, $t0, 4
+    csrwr $t1, {csr_euen}
+    csrrd $t0, {csr_euen}
+    andi $t1, $t0, {reg_euen_lasx}
     bnez $t1, 4f
-    andi $t1, $t0, 2
+    andi $t1, $t0, {reg_euen_lsx}
     bnez $t1, 3f
     beqz $t0, 6f
     LA_FP_REGS fld.d, f
@@ -112,10 +123,10 @@ pub(super) unsafe extern "C" fn la_run_user(_context: *mut UserContext) {
 6:
 
     ld.d $t0, $sp, {pc}
-    csrwr $t0, 6
+    csrwr $t0, {csr_era}
     # 特权和 IRQ 状态只由内核常量构造，用户寄存器不参与 PRMD。
-    li.w $t0, 7
-    csrwr $t0, 1
+    li.w $t0, {reg_prmd_user}
+    csrwr $t0, {csr_prmd}
     ld.d $r1, $sp, {gpr}+1*8
     ld.d $r2, $sp, {gpr}+2*8
     ld.d $r4, $sp, {gpr}+4*8
@@ -159,6 +170,30 @@ pub(super) unsafe extern "C" fn la_run_user(_context: *mut UserContext) {
             fcc = const offset_of!(UserContext, fcc),
             kernel_sp = const offset_of!(UserContext, kernel_sp),
             user_trap = sym la_user_trap,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_eentry = const reg::CSR_EENTRY,
+            csr_era = const reg::CSR_ERA,
+            csr_euen = const reg::CSR_EUEN,
+            csr_ks1 = const reg::CSR_KS1,
+            csr_ks2 = const reg::CSR_KS2,
+            csr_ks3 = const reg::CSR_KS3,
+            csr_prmd = const reg::CSR_PRMD,
+            reg_cpucfg_features = const reg::CPUCFG_FEATURES,
+            reg_cpucfg_fp = const reg::CPUCFG_FP,
+            reg_cpucfg_lasx = const reg::CPUCFG_LASX,
+            reg_cpucfg_lsx = const reg::CPUCFG_LSX,
+            reg_euen_lasx = const reg::EUEN_LASX,
+            reg_euen_lsx = const reg::EUEN_LSX,
+            reg_prmd_user = const reg::PRMD_USER,
+            continuation_crmd = const CONTINUATION_CRMD,
+            continuation_eentry = const CONTINUATION_EENTRY,
+            continuation_era = const CONTINUATION_ERA,
+            continuation_ks1 = const CONTINUATION_KS1,
+            continuation_ks2 = const CONTINUATION_KS2,
+            continuation_ks3 = const CONTINUATION_KS3,
+            continuation_prmd = const CONTINUATION_PRMD,
+            continuation_size = const CONTINUATION_SIZE,
+            fp_stride = const size_of::<crate::arch::loongarch64::user::FpRegister>(),
         );
     }
 }
@@ -179,17 +214,17 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
 # /// 按共享最宽槽访问整组寄存器，标量和 LSX 只触及实际支持的低 lanes。
 .macro LA_FP_REGS insn, prefix
     .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-        \insn $\prefix\()\n, $sp, {fpr}+\n*32
+        \insn $\prefix\()\n, $sp, {fpr}+\n*{fp_stride}
     .endr
 .endm
     # KS0 永久保留 CpuLocal；KS2 只在入口暂存用户 t0。
-    csrwr $t0, 50
-    csrrd $t0, 1
-    andi $t0, $t0, 3
+    csrwr $t0, {csr_ks2}
+    csrrd $t0, {csr_prmd}
+    andi $t0, $t0, {reg_prmd_pplv}
     bnez $t0, 2f
     b 7f
 2:
-    csrwr $sp, 49
+    csrwr $sp, {csr_ks1}
     st.d $r0, $sp, {gpr}+0*8
     st.d $r1, $sp, {gpr}+1*8
     st.d $r2, $sp, {gpr}+2*8
@@ -220,21 +255,21 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
     st.d $r29, $sp, {gpr}+29*8
     st.d $r30, $sp, {gpr}+30*8
     st.d $r31, $sp, {gpr}+31*8
-    csrrd $t0, 50
+    csrrd $t0, {csr_ks2}
     st.d $t0, $sp, {gpr}+12*8
-    csrrd $t0, 49
+    csrrd $t0, {csr_ks1}
     st.d $t0, $sp, {gpr}+3*8
-    csrrd $t0, 6
+    csrrd $t0, {csr_era}
     st.d $t0, $sp, {pc}
-    csrrd $t0, 5
+    csrrd $t0, {csr_estat}
     st.d $t0, $sp, {estat}
-    csrrd $t0, 7
+    csrrd $t0, {csr_badv}
     st.d $t0, $sp, {badv}
 
-    csrrd $t0, 2
-    andi $t1, $t0, 4
+    csrrd $t0, {csr_euen}
+    andi $t1, $t0, {reg_euen_lasx}
     bnez $t1, 4f
-    andi $t1, $t0, 2
+    andi $t1, $t0, {reg_euen_lsx}
     bnez $t1, 3f
     beqz $t0, 6f
     LA_FP_REGS fst.d, f
@@ -265,24 +300,24 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
     st.d $t0, $sp, {fcc}
 6:
 
-    csrwr $zero, 2
+    csrwr $zero, {csr_euen}
     ld.d $sp, $sp, {kernel_sp}
     ld.d $tp, $sp, 8
     ld.d $r21, $sp, 16
-    ld.d $t0, $sp, 112
-    csrwr $t0, 12
-    ld.d $t0, $sp, 104
-    csrwr $t0, 51
-    ld.d $t0, $sp, 120
-    csrwr $t0, 1
-    ld.d $t0, $sp, 128
-    csrwr $t0, 6
-    ld.d $t0, $sp, 136
-    csrwr $t0, 49
-    ld.d $t0, $sp, 144
-    csrwr $t0, 50
-    ld.d $t0, $sp, 152
-    csrwr $t0, 0
+    ld.d $t0, $sp, {continuation_eentry}
+    csrwr $t0, {csr_eentry}
+    ld.d $t0, $sp, {continuation_ks3}
+    csrwr $t0, {csr_ks3}
+    ld.d $t0, $sp, {continuation_prmd}
+    csrwr $t0, {csr_prmd}
+    ld.d $t0, $sp, {continuation_era}
+    csrwr $t0, {csr_era}
+    ld.d $t0, $sp, {continuation_ks1}
+    csrwr $t0, {csr_ks1}
+    ld.d $t0, $sp, {continuation_ks2}
+    csrwr $t0, {csr_ks2}
+    ld.d $t0, $sp, {continuation_crmd}
+    csrwr $t0, {csr_crmd}
     ld.d $r1, $sp, 0
     ld.d $r2, $sp, 8
     ld.d $r21, $sp, 16
@@ -296,16 +331,16 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
     ld.d $r29, $sp, 80
     ld.d $r30, $sp, 88
     ld.d $r31, $sp, 96
-    addi.d $sp, $sp, 160
+    addi.d $sp, $sp, {continuation_size}
     jr $ra
 
 
 7:
     # PLV0 入口故障不使用当前不可信 SP 压帧，独立快照保留真正故障 CSR 和故障 SP。
     move $a1, $sp
-    csrrd $a0, 6
-    csrrd $a2, 5
-    csrrd $a3, 7
+    csrrd $a0, {csr_era}
+    csrrd $a2, {csr_estat}
+    csrrd $a3, {csr_badv}
     move $a4, $zero
     b {fault_restore}
 
@@ -321,6 +356,28 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_trap() -> ! {
             badv = const offset_of!(UserContext, badv),
             kernel_sp = const offset_of!(UserContext, kernel_sp),
             fault_restore = sym la_user_kernel_fault_restore,
+            csr_badv = const reg::CSR_BADV,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_eentry = const reg::CSR_EENTRY,
+            csr_era = const reg::CSR_ERA,
+            csr_estat = const reg::CSR_ESTAT,
+            csr_euen = const reg::CSR_EUEN,
+            csr_ks1 = const reg::CSR_KS1,
+            csr_ks2 = const reg::CSR_KS2,
+            csr_ks3 = const reg::CSR_KS3,
+            csr_prmd = const reg::CSR_PRMD,
+            reg_euen_lasx = const reg::EUEN_LASX,
+            reg_euen_lsx = const reg::EUEN_LSX,
+            reg_prmd_pplv = const reg::PRMD_PPLV,
+            continuation_crmd = const CONTINUATION_CRMD,
+            continuation_eentry = const CONTINUATION_EENTRY,
+            continuation_era = const CONTINUATION_ERA,
+            continuation_ks1 = const CONTINUATION_KS1,
+            continuation_ks2 = const CONTINUATION_KS2,
+            continuation_ks3 = const CONTINUATION_KS3,
+            continuation_prmd = const CONTINUATION_PRMD,
+            continuation_size = const CONTINUATION_SIZE,
+            fp_stride = const size_of::<crate::arch::loongarch64::user::FpRegister>(),
         );
     }
 }
@@ -339,21 +396,27 @@ pub(in crate::arch::loongarch64) unsafe extern "C" fn la_user_kernel_refill_faul
             r#"
     # refill 保留专属 CSR 语义；DA 下只跳转高地址别名，再恢复 PLV0 DMW。
     move $a1, $sp
-    csrrd $a0, 138
-    andi $a2, $a0, 1
+    csrrd $a0, {csr_tlbrera}
+    andi $a2, $a0, {reg_tlbrera_is_tlbr}
     srli.d $a0, $a0, 1
     slli.d $a0, $a0, 1
-    csrrd $a3, 137
+    csrrd $a3, {csr_tlbrbadv}
     li.w $a4, 1
     la.abs $t0, 2f
     jirl $zero, $t0, 0
 2:
-    li.w $t0, 0x10
-    li.w $t1, 0x18
-    csrxchg $t0, $t1, 0
+    li.w $t0, {reg_crmd_pg}
+    li.w $t1, {reg_crmd_address_mode}
+    csrxchg $t0, $t1, {csr_crmd}
     b {fault_restore}
 "#,
             fault_restore = sym la_user_kernel_fault_restore,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_tlbrbadv = const reg::CSR_TLBRBADV,
+            csr_tlbrera = const reg::CSR_TLBRERA,
+            reg_crmd_address_mode = const reg::CRMD_ADDRESS_MODE,
+            reg_crmd_pg = const reg::CRMD_PG,
+            reg_tlbrera_is_tlbr = const reg::TLBRERA_IS_TLBR,
         );
     }
 }
@@ -376,27 +439,42 @@ unsafe extern "C" fn la_user_kernel_fault_restore(
     unsafe {
         naked_asm!(
             r#"
-    csrrd $sp, 51
+    csrrd $sp, {csr_ks3}
     ld.d $tp, $sp, 8
     ld.d $r21, $sp, 16
-    csrwr $zero, 2
-    ld.d $t0, $sp, 112
-    csrwr $t0, 12
-    ld.d $t0, $sp, 120
-    csrwr $t0, 1
-    ld.d $t0, $sp, 128
-    csrwr $t0, 6
-    ld.d $t0, $sp, 136
-    csrwr $t0, 49
-    ld.d $t0, $sp, 144
-    csrwr $t0, 50
-    ld.d $t0, $sp, 104
-    csrwr $t0, 51
-    ld.d $t0, $sp, 152
-    csrwr $t0, 0
+    csrwr $zero, {csr_euen}
+    ld.d $t0, $sp, {continuation_eentry}
+    csrwr $t0, {csr_eentry}
+    ld.d $t0, $sp, {continuation_prmd}
+    csrwr $t0, {csr_prmd}
+    ld.d $t0, $sp, {continuation_era}
+    csrwr $t0, {csr_era}
+    ld.d $t0, $sp, {continuation_ks1}
+    csrwr $t0, {csr_ks1}
+    ld.d $t0, $sp, {continuation_ks2}
+    csrwr $t0, {csr_ks2}
+    ld.d $t0, $sp, {continuation_ks3}
+    csrwr $t0, {csr_ks3}
+    ld.d $t0, $sp, {continuation_crmd}
+    csrwr $t0, {csr_crmd}
     bl {handler}
 "#,
             handler = sym loongarch_user_kernel_fault,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_eentry = const reg::CSR_EENTRY,
+            csr_era = const reg::CSR_ERA,
+            csr_euen = const reg::CSR_EUEN,
+            csr_ks1 = const reg::CSR_KS1,
+            csr_ks2 = const reg::CSR_KS2,
+            csr_ks3 = const reg::CSR_KS3,
+            csr_prmd = const reg::CSR_PRMD,
+            continuation_crmd = const CONTINUATION_CRMD,
+            continuation_eentry = const CONTINUATION_EENTRY,
+            continuation_era = const CONTINUATION_ERA,
+            continuation_ks1 = const CONTINUATION_KS1,
+            continuation_ks2 = const CONTINUATION_KS2,
+            continuation_ks3 = const CONTINUATION_KS3,
+            continuation_prmd = const CONTINUATION_PRMD,
         );
     }
 }

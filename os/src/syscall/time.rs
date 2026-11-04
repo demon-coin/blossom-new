@@ -5,16 +5,22 @@ use core::convert::{TryFrom, TryInto};
 use crate::accounting;
 use crate::syscall::error::{self, Errno, SysResult};
 use crate::syscall::{Outcome, Request, Restart};
-use crate::task::time::{CpuTime, ItimerValue, USER_HZ};
+use crate::task::time::{CpuTime, ItimerValue, ITIMER_PROF, ITIMER_REAL, USER_HZ};
 use crate::task::UserThread;
-use crate::time::{self, MonotonicInstant};
+use crate::time::{self, MonotonicInstant, NSEC_PER_SEC, NSEC_PER_USEC, USEC_PER_SEC};
 use crate::timer;
 use crate::wait::WaitResult;
 
-const NSEC_PER_SEC: u64 = 1_000_000_000;
-const NSEC_PER_USEC: u64 = 1_000;
-const USEC_PER_SEC: u64 = 1_000_000;
 const TIMER_ABSTIME: usize = 1;
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+const CLOCK_REALTIME_COARSE: i32 = 5;
+const CLOCK_MONOTONIC_COARSE: i32 = 6;
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_CHILDREN: i32 = -1;
+const RUSAGE_THREAD: i32 = 1;
 
 /// 分派真实时间调用，错误只在普通返回处编码，内部重启保持控制结果。
 pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
@@ -80,7 +86,7 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
     let raw = request.arguments;
     let parsed = (|| {
         let (clock, absolute, address, remaining) = if request.number == 101 {
-            (1, false, raw[0], raw[1])
+            (CLOCK_MONOTONIC, false, raw[0], raw[1])
         } else {
             validate_clock(raw[0])?;
             if raw[1] & !TIMER_ABSTIME != 0 {
@@ -88,14 +94,14 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
             }
             (raw[0] as i32, raw[1] == TIMER_ABSTIME, raw[2], raw[3])
         };
-        if clock != 0 && clock != 1 {
+        if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
             return Err(Errno::Unsupported);
         }
         let mm = user.mm().expect("sleep has no MM");
         let mut bytes = [0; 16];
         error::copyin(&mm, &mut bytes, address)?;
         let ns = decode_time(&bytes, NSEC_PER_SEC, 1)?;
-        let deadline = if absolute && clock == 0 {
+        let deadline = if absolute && clock == CLOCK_REALTIME {
             time::realtime_deadline(ns)
         } else if absolute {
             MonotonicInstant::from_nanos(ns)
@@ -125,7 +131,15 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
 /// 只公开 RTC 日历、原 counter 时间域及真实 CPU 账支持的具体 clock IDs。
 fn validate_clock(raw: usize) -> Result<i32, Errno> {
     let clock = raw as i32;
-    if matches!(clock, 0 | 1 | 2 | 3 | 5 | 6) {
+    if matches!(
+        clock,
+        CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+    ) {
         Ok(clock)
     } else {
         Err(Errno::InvalidArgument)
@@ -135,15 +149,15 @@ fn validate_clock(raw: usize) -> Result<i32, Errno> {
 /// 日历沿启动 RTC 与单调经过时间推进，coarse 查询可交付更细的实际样本。
 fn read_clock(user: &UserThread, raw: usize) -> Result<u64, Errno> {
     match validate_clock(raw)? {
-        0 | 5 => Ok(time::realtime()),
-        1 | 6 => Ok(time::now().as_nanos()),
-        2 => Ok(user
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => Ok(time::realtime()),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE => Ok(time::now().as_nanos()),
+        CLOCK_PROCESS_CPUTIME_ID => Ok(user
             .user_time()
             .expect("process clock has no time")
             .group()
             .snapshot()
             .total()),
-        3 => Ok(user
+        CLOCK_THREAD_CPUTIME_ID => Ok(user
             .user_time()
             .expect("thread clock has no time")
             .snapshot()
@@ -166,7 +180,7 @@ fn clock_getres(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[1] != 0 {
         let frequency = crate::boot::info().counter_frequency;
         assert!(0 < frequency, "clock resolution has no counter frequency");
-        let resolution = if matches!(clock, 5 | 6) {
+        let resolution = if matches!(clock, CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE) {
             timer::TICK_NS
         } else {
             NSEC_PER_SEC / frequency + u64::from(NSEC_PER_SEC % frequency != 0)
@@ -192,7 +206,7 @@ fn gettimeofday(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// itimer selector 是 ABI int，只接受三个真实 timer。
 fn which(raw: usize) -> Result<usize, Errno> {
     let which = raw as i32;
-    if (0..=2).contains(&which) {
+    if (ITIMER_REAL as i32..=ITIMER_PROF as i32).contains(&which) {
         Ok(which as usize)
     } else {
         Err(Errno::InvalidArgument)
@@ -263,9 +277,9 @@ fn times(user: &UserThread, address: usize) -> SysResult {
 fn getrusage(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let time = user.user_time().expect("getrusage has no time");
     let value: CpuTime = match raw[0] as i32 {
-        0 => time.group().snapshot(),
-        -1 => time.group().children(),
-        1 => time.snapshot(),
+        RUSAGE_SELF => time.group().snapshot(),
+        RUSAGE_CHILDREN => time.group().children(),
+        RUSAGE_THREAD => time.snapshot(),
         _ => return Err(Errno::InvalidArgument),
     };
     let mut bytes = [0; 144];

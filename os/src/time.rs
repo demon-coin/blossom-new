@@ -15,9 +15,33 @@ use crate::boot::{BootInfo, Platform, Region};
 use crate::cpu;
 use crate::sync::SpinLock;
 
-const NSEC_PER_SEC: u64 = 1_000_000_000;
+pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
+pub(crate) const NSEC_PER_MSEC: u64 = NSEC_PER_SEC / 1_000;
+pub(crate) const NSEC_PER_USEC: u64 = NSEC_PER_MSEC / 1_000;
+pub(crate) const USEC_PER_SEC: u64 = NSEC_PER_SEC / NSEC_PER_USEC;
 const CONVERSION_SECONDS: u64 = 3600;
 const QUANTUM: Duration = Duration::from_millis(10);
+
+/// TOY 只读日历字段与控制位，供共同时间层和板级 RTC 采样使用。
+#[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
+pub(crate) mod toy {
+    pub(crate) const TOY_READ0_REG: usize = 0x2c;
+    pub(crate) const TOY_READ1_REG: usize = 0x30;
+    pub(crate) const RTC_CTRL_REG: usize = 0x40;
+    pub(crate) const TOY_ENABLE: u32 = 1 << 11;
+    pub(crate) const TOY_32KHZ_ENABLE: u32 = 1 << 8;
+    pub(crate) const TOY_YEAR_BASE: u32 = 1900;
+    pub(crate) const TOY_MONTH_SHIFT: u32 = 26;
+    pub(crate) const TOY_MONTH_MASK: u32 = (1 << 6) - 1;
+    pub(crate) const TOY_DAY_SHIFT: u32 = 21;
+    pub(crate) const TOY_DAY_MASK: u32 = (1 << 5) - 1;
+    pub(crate) const TOY_HOUR_SHIFT: u32 = 16;
+    pub(crate) const TOY_HOUR_MASK: u32 = (1 << 5) - 1;
+    pub(crate) const TOY_MINUTE_SHIFT: u32 = 10;
+    pub(crate) const TOY_MINUTE_MASK: u32 = (1 << 6) - 1;
+    pub(crate) const TOY_SECOND_SHIFT: u32 = 4;
+    pub(crate) const TOY_SECOND_MASK: u32 = (1 << 6) - 1;
+}
 
 /// 自时间源注册起累计的单调纳秒，不表示日历时间。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,7 +92,7 @@ impl Scale {
             "invalid counter mask"
         );
         let required_cycles = frequency * CONVERSION_SECONDS;
-        let (mult, shift) = (0..=32)
+        let (mult, shift) = (0..=u32::BITS)
             .rev()
             .find_map(|shift| {
                 let mult = ((NSEC_PER_SEC << shift) + frequency / 2) / frequency;
@@ -299,9 +323,9 @@ static REALTIME_BASE: Once<u64> = Once::new();
 /// offset 必须对应可读寄存器，调用者独占设备采样协议。
 unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     assert!(
-        offset % 4 == 0
+        offset % core::mem::size_of::<u32>() == 0
             && offset
-                .checked_add(4)
+                .checked_add(core::mem::size_of::<u32>())
                 .is_some_and(|end| end <= region.end - region.start),
         "RTC register exceeds its resource window"
     );
@@ -367,37 +391,40 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
 unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     #[cfg(target_arch = "riscv64")]
     {
+        const TIME_LOW: usize = 0;
+        const TIME_HIGH: usize = TIME_LOW + core::mem::size_of::<u32>();
         // TIME_LOW 锁存同一采样的高字；必须先读低字再读取该高字。
         // SAFETY: 初始化调用者独占实际 Goldfish RTC；两个偏移均为可读寄存器，
         // rtc_register 验证宽度并在两次访问间执行设备屏障。
         unsafe {
-            let low = rtc_register(info.rtc, 0);
-            let high = rtc_register(info.rtc, 4);
-            (u64::from(high) << 32) | u64::from(low)
+            let low = rtc_register(info.rtc, TIME_LOW);
+            let high = rtc_register(info.rtc, TIME_HIGH);
+            (u64::from(high) << u32::BITS) | u64::from(low)
         }
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        const TOY_ENABLE: u32 = (1 << 11) | (1 << 8);
+        use crate::time::toy::{RTC_CTRL_REG, TOY_READ0_REG, TOY_READ1_REG};
+        const TOY_ENABLE_MASK: u32 = toy::TOY_ENABLE | toy::TOY_32KHZ_ENABLE;
         // SAFETY: BSP 独占 LS7A TOY；控制字只增加计数和晶振使能位，
         // 不改日历或 alarm，窗口已由平台验证，强序 DMW 与设备屏障排序读改写。
         unsafe {
-            let control = rtc_register(info.rtc, 0x40);
+            let control = rtc_register(info.rtc, RTC_CTRL_REG);
             let address = arch::mmio_address(info.rtc.start)
-                .checked_add(0x40)
+                .checked_add(RTC_CTRL_REG)
                 .expect("RTC control address overflows");
-            core::ptr::write_volatile(address as *mut u32, control | TOY_ENABLE);
+            core::ptr::write_volatile(address as *mut u32, control | TOY_ENABLE_MASK);
             arch::dma_barrier();
             assert_eq!(
-                rtc_register(info.rtc, 0x40) & TOY_ENABLE,
-                TOY_ENABLE,
+                rtc_register(info.rtc, RTC_CTRL_REG) & TOY_ENABLE_MASK,
+                TOY_ENABLE_MASK,
                 "RTC TOY could not be enabled"
             );
             // 年寄存器不锁存低字；跨年时整组重新采样，避免合成两年的日历。
             loop {
-                let year = rtc_register(info.rtc, 0x30);
-                let low = rtc_register(info.rtc, 0x2c);
-                if year == rtc_register(info.rtc, 0x30) {
+                let year = rtc_register(info.rtc, TOY_READ1_REG);
+                let low = rtc_register(info.rtc, TOY_READ0_REG);
+                if year == rtc_register(info.rtc, TOY_READ1_REG) {
                     return rtc_calendar(year, low)
                         .expect("RTC calendar is invalid or out of range");
                 }
@@ -410,19 +437,28 @@ unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
 #[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
 fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
     calendar_realtime([
-        toy_year.checked_add(1900)?,
-        (low >> 26) & 0x3f,
-        (low >> 21) & 0x1f,
-        (low >> 16) & 0x1f,
-        (low >> 10) & 0x3f,
-        (low >> 4) & 0x3f,
+        toy_year.checked_add(toy::TOY_YEAR_BASE)?,
+        (low >> toy::TOY_MONTH_SHIFT) & toy::TOY_MONTH_MASK,
+        (low >> toy::TOY_DAY_SHIFT) & toy::TOY_DAY_MASK,
+        (low >> toy::TOY_HOUR_SHIFT) & toy::TOY_HOUR_MASK,
+        (low >> toy::TOY_MINUTE_SHIFT) & toy::TOY_MINUTE_MASK,
+        (low >> toy::TOY_SECOND_SHIFT) & toy::TOY_SECOND_MASK,
     ])
 }
 
 /// 将绝对公历年月日时分秒转换为 Unix 纳秒，拒绝无效日期和容量之外的样本。
 fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
+    const HOURS_PER_DAY: i64 = 24;
+    const MINUTES_PER_HOUR: i64 = 60;
+    const SECONDS_PER_MINUTE: i64 = 60;
+    // 三月起算的公历天数公式在 Unix epoch 的偏移。
+    const UNIX_EPOCH_DAY_OFFSET: i64 = 719_499;
     let [year, month, day, hour, minute, second] = calendar.map(i64::from);
-    if !(1..=12).contains(&month) || 24 <= hour || 60 <= minute || 60 <= second {
+    if !(1..=12).contains(&month)
+        || HOURS_PER_DAY <= hour
+        || MINUTES_PER_HOUR <= minute
+        || SECONDS_PER_MINUTE <= second
+    {
         return None;
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -449,8 +485,10 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     } else {
         (year, month - 2)
     };
-    let days = year / 4 - year / 100 + year / 400 + 367 * month / 12 + day + year * 365 - 719499;
-    let seconds = ((days * 24 + hour) * 60 + minute) * 60 + second;
+    let days = year / 4 - year / 100 + year / 400 + 367 * month / 12 + day + year * 365
+        - UNIX_EPOCH_DAY_OFFSET;
+    let seconds =
+        ((days * HOURS_PER_DAY + hour) * MINUTES_PER_HOUR + minute) * SECONDS_PER_MINUTE + second;
     u64::try_from(seconds).ok()?.checked_mul(NSEC_PER_SEC)
 }
 
@@ -675,6 +713,7 @@ pub(crate) mod testing {
     const PAUSED: usize = 2;
     const PUBLISHED: usize = 3;
     const REJECTED: usize = 4;
+    const PAUSE_TIMEOUT_SECONDS: u64 = 5;
     static OVERLAP_PHASE: AtomicUsize = AtomicUsize::new(0);
     static OVERLAP_READER: AtomicUsize = AtomicUsize::new(0);
     static OVERLAP_WRITER: AtomicUsize = AtomicUsize::new(0);
@@ -797,7 +836,7 @@ pub(crate) mod testing {
             "clockevent program pause requires IRQ-off"
         );
         let limit = arch::counter_frequency()
-            .checked_mul(5)
+            .checked_mul(PAUSE_TIMEOUT_SECONDS)
             .expect("clockevent program raw timeout overflows");
         let start = arch::read_counter();
         while state.load(Ordering::Acquire) == PAUSED {
@@ -927,7 +966,7 @@ pub(crate) mod testing {
         }
         assert_ordinary_task();
         let limit = arch::counter_frequency()
-            .checked_mul(5)
+            .checked_mul(PAUSE_TIMEOUT_SECONDS)
             .expect("snapshot raw timeout overflows");
         let start = arch::read_counter();
         if OVERLAP_PHASE

@@ -9,11 +9,27 @@ pub const MAX_BOOTARGS_BYTES: usize = 4096;
 pub const MAX_MEMORY_REGIONS: usize = 32;
 pub const MAX_RESERVED_REGIONS: usize = 128;
 pub const MAX_VIRTIO_MMIO: usize = 8;
+pub(crate) const MAX_DEVICE_CLOCKS: usize = 8;
+pub(crate) const MAX_DEVICE_RESETS: usize = 3;
+pub(crate) const MAX_DEVICE_PINS: usize = 16;
+pub(crate) const MAX_PCI_RANGES: usize = 4;
+
+// PCI OF phys.hi 的地址空间编码与 BDF 字段；MEM32/MEM64 共享内存地址域。
+pub(crate) const PCI_SPACE_CODE_MASK: u32 = 0x0300_0000;
+pub(crate) const PCI_SPACE_IO: u32 = 0x0100_0000;
+pub(crate) const PCI_SPACE_MEM32: u32 = 0x0200_0000;
+pub(crate) const PCI_SPACE_MEM64: u32 = 0x0300_0000;
+pub(crate) const PCI_BUS_SHIFT: u32 = 16;
+pub(crate) const PCI_DEVICE_SHIFT: u32 = 11;
+pub(crate) const PCI_FUNCTION_SHIFT: u32 = 8;
+pub(crate) const PCI_DEVICE_COUNT: u8 = 32;
+pub(crate) const PCI_FUNCTION_COUNT: u8 = 8;
+pub(crate) const PCI_INTX_PIN_COUNT: u8 = 4;
 /// 所选控制器的 source 表容量，PLIC 包含保留的零号源。
 pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(blossom_platform = "visionfive2") {
-    137
+    136 + 1
 } else if cfg!(target_arch = "riscv64") {
-    96
+    95 + 1
 } else {
     64
 };
@@ -107,9 +123,9 @@ pub struct ClockResource {
 /// 所选设备使用的有界时钟表，顺序保持 clock-names 的绑定顺序。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceClocks {
-    pub entries: [ClockResource; 8],
+    pub entries: [ClockResource; MAX_DEVICE_CLOCKS],
     pub count: usize,
-    pub assigned: [ClockResource; 8],
+    pub assigned: [ClockResource; MAX_DEVICE_CLOCKS],
     pub assigned_count: usize,
 }
 
@@ -138,9 +154,9 @@ pub struct GpioInputResource {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceSetup {
     pub clocks: DeviceClocks,
-    pub resets: [ResourceReference; 3],
+    pub resets: [ResourceReference; MAX_DEVICE_RESETS],
     pub reset_count: usize,
-    pub pins: [PinResource; 16],
+    pub pins: [PinResource; MAX_DEVICE_PINS],
     pub pin_count: usize,
 }
 
@@ -297,7 +313,7 @@ pub struct PciResources {
     pub configuration: Region,
     pub kind: PciConfiguration,
     pub configuration_extended: Region,
-    pub ranges: [PciRange; 4],
+    pub ranges: [PciRange; MAX_PCI_RANGES],
     pub range_count: usize,
     pub bus_start: u32,
     pub bus_end: u32,
@@ -317,21 +333,25 @@ impl PciResources {
     ) -> Result<u32, &'static str> {
         if (bus as u32) < self.bus_start
             || self.bus_end < bus as u32
-            || 32 <= device
-            || 8 <= function
-            || !(1..=4).contains(&pin)
+            || PCI_DEVICE_COUNT <= device
+            || PCI_FUNCTION_COUNT <= function
+            || !(1..=PCI_INTX_PIN_COUNT).contains(&pin)
         {
             return Err("PCI INTx BDF or pin is out of range");
         }
         let child = [
-            ((bus as u32) << 16) | ((device as u32) << 11) | ((function as u32) << 8),
+            ((bus as u32) << PCI_BUS_SHIFT)
+                | ((device as u32) << PCI_DEVICE_SHIFT)
+                | ((function as u32) << PCI_FUNCTION_SHIFT),
             0,
             0,
             pin as u32,
         ];
         self.intx_routes[..self.intx_route_count]
             .iter()
-            .find(|route| (0..4).all(|i| ((route.child[i] ^ child[i]) & self.intx_mask[i]) == 0))
+            .find(|route| {
+                (0..child.len()).all(|i| ((route.child[i] ^ child[i]) & self.intx_mask[i]) == 0)
+            })
             .map(|route| route.source)
             .ok_or("PCI INTx has no host interrupt-map route")
     }

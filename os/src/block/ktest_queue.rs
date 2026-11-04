@@ -12,7 +12,10 @@ use super::{
     AccessMode, Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo,
     FsClaim, IoResult,
 };
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioIdentity, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN,
+    VIRTIO_VENDOR_ID,
+};
 use crate::drivers::DeviceInventory;
 use crate::mm::dma::MappedPages;
 use crate::sync::{Completion, SpinLock};
@@ -148,10 +151,13 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
 
 /// 每例借 suite 一次发现库存取得独占设备，上一例已真实 stop/join。
 fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice>, TestError> {
-    let pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     if inventory.mmio_blocks.len() + pci.clone().count() != count {
         return Err(TestError(
             "queue fixture attached device count differs from declared resources",

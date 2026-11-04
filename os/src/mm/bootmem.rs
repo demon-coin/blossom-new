@@ -2,7 +2,8 @@
 
 use crate::boot::{Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS};
 
-pub(crate) const PAGE_SIZE: usize = 4096;
+pub(crate) const PAGE_SHIFT: usize = 12;
+pub(crate) const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 // root 索引一次，每段 RAM 至多一次描述符 backing。
 const MAX_METADATA_ALLOCATIONS: usize = 1 + MAX_MEMORY_REGIONS;
 pub(crate) const RANGE_CAPACITY: usize =

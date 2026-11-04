@@ -12,6 +12,9 @@ use crate::timer::{ArmError, Timer, TimerKind};
 
 use super::{QueueError, RemovedTicket, Work, WorkQueue, STATE_LOCK};
 
+// 一次更新至多撤旧 pending、旧 timer 和未采用的候选 timer 三份强引用。
+const RELEASE_CAPACITY: usize = 3;
+
 /// 关闭与无法表示的延迟均不破坏先前已接受的下一轮。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelayedError {
@@ -50,7 +53,7 @@ unsafe impl Sync for DelayedWork {}
 
 /// 锁下只收集拥有票，离开 STATE_LOCK 后再归还引用和移出的 Work 票。
 struct Releases {
-    raw: [*const DelayedWork; 3],
+    raw: [*const DelayedWork; RELEASE_CAPACITY],
     count: usize,
     work: Option<RemovedTicket>,
 }
@@ -59,7 +62,7 @@ impl Releases {
     /// 准备足以容纳一次更新的旧 pending、撤销 timer 和候选 timer 三份引用。
     fn new() -> Self {
         Self {
-            raw: [ptr::null(); 3],
+            raw: [ptr::null(); RELEASE_CAPACITY],
             count: 0,
             work: None,
         }
@@ -436,6 +439,11 @@ pub(crate) mod testing {
         AfterTransfer,
     }
 
+    const ARMED: usize = 1;
+    const PAUSED: usize = 2;
+    const RELEASED: usize = 3;
+    const PAUSE_TIMEOUT_SECONDS: u64 = 5;
+
     static PAUSE_OWNER: AtomicUsize = AtomicUsize::new(0);
     static PAUSE_POINT: AtomicUsize = AtomicUsize::new(0);
     static PAUSE_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -470,20 +478,20 @@ pub(crate) mod testing {
         );
         PAUSE_OWNER.store(owner.owned_raw as usize, Ordering::Relaxed);
         PAUSE_POINT.store(point as usize, Ordering::Relaxed);
-        PAUSE_STATE.store(1, Ordering::Release);
+        PAUSE_STATE.store(ARMED, Ordering::Release);
     }
 
     /// 观察真实 coarse callback 已进入无锁窗口，不修改任何生产生命周期状态。
     pub(crate) fn arrived() -> bool {
-        PAUSE_STATE.load(Ordering::Acquire) == 2
+        PAUSE_STATE.load(Ordering::Acquire) == PAUSED
     }
 
     /// 控制者确认真实同步调用未早返后，以原 2→3 握手放行 callback。
     /// Thread 控制者不得持状态锁或 callback 退出所需锁；与取消由同一 fixture 串行。
     pub(crate) fn release() {
         assert_eq!(
-            PAUSE_STATE.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
-            Ok(2),
+            PAUSE_STATE.compare_exchange(PAUSED, RELEASED, Ordering::AcqRel, Ordering::Acquire),
+            Ok(PAUSED),
             "delayed callback was not paused"
         );
     }
@@ -498,9 +506,9 @@ pub(crate) mod testing {
         loop {
             let state = PAUSE_STATE.load(Ordering::Acquire);
             let next = match state {
-                0 | 3 => return,
-                1 => 0,
-                2 => 3,
+                0 | RELEASED => return,
+                ARMED => 0,
+                PAUSED => RELEASED,
                 _ => unreachable!("invalid delayed pause state"),
             };
             if PAUSE_STATE
@@ -515,23 +523,23 @@ pub(crate) mod testing {
     /// 在真实 timer 上下文票保活下有限等待另一 CPU 控制者，不睡 BH 或持元数据锁。
     /// 只有原到达者清除停点身份；控制者取消时只做 CAS，避免清除下一次武装的身份。
     pub(super) fn pause(raw: *const DelayedWork, point: PausePoint) {
-        if PAUSE_STATE.load(Ordering::Acquire) != 1
+        if PAUSE_STATE.load(Ordering::Acquire) != ARMED
             || PAUSE_OWNER.load(Ordering::Relaxed) != raw as usize
             || PAUSE_POINT.load(Ordering::Relaxed) != point as usize
         {
             return;
         }
         if PAUSE_STATE
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
         let start = crate::arch::read_counter();
         let limit = crate::arch::counter_frequency()
-            .checked_mul(5)
+            .checked_mul(PAUSE_TIMEOUT_SECONDS)
             .expect("delayed pause timeout overflow");
-        while PAUSE_STATE.load(Ordering::Acquire) == 2 {
+        while PAUSE_STATE.load(Ordering::Acquire) == PAUSED {
             assert!(
                 crate::arch::read_counter().wrapping_sub(start) < limit,
                 "delayed callback pause timed out"

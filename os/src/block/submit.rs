@@ -61,6 +61,9 @@ struct GenerationPlan {
     splits: usize,
 }
 
+#[cfg(feature = "ktest")]
+const READ_BATCH_CAPTURE_PAGES: usize = 32;
+
 /// 最近一波原页读的真实接受事实；地址只复制数值，不延长页、inode 或 claim 的寿命。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
@@ -74,8 +77,8 @@ pub(crate) struct ReadBatchSnapshot {
     pub first_sector: u64,
     /// 只保存本波前三十二个原映射中已完整接受的页，数组有效长度由本字段给出。
     pub captured_pages: usize,
-    pub phys_addrs: [usize; 32],
-    pub dma_addrs: [u64; 32],
+    pub phys_addrs: [usize; READ_BATCH_CAPTURE_PAGES],
+    pub dma_addrs: [u64; READ_BATCH_CAPTURE_PAGES],
 }
 
 #[cfg(feature = "ktest")]
@@ -102,8 +105,8 @@ impl ReadBatchObservation {
                 accepted_bytes: 0,
                 first_sector: bios.first().map_or(0, |bio| bio.inner.sector()),
                 captured_pages: 0,
-                phys_addrs: [0; 32],
-                dma_addrs: [0; 32],
+                phys_addrs: [0; READ_BATCH_CAPTURE_PAGES],
+                dma_addrs: [0; READ_BATCH_CAPTURE_PAGES],
             },
             parents: [const { None }; MAX_BATCH],
         };

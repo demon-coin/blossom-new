@@ -4,7 +4,7 @@ use crate::syscall::error::{self, Errno};
 use crate::syscall::{time, Outcome, Request, Restart};
 use crate::task::futex::{self, WaitOutcome};
 use crate::task::UserThread;
-use crate::time::{self as clock, MonotonicInstant};
+use crate::time::{self as clock, MonotonicInstant, NSEC_PER_SEC};
 
 const WAIT: u32 = 0;
 const WAKE: u32 = 1;
@@ -130,7 +130,7 @@ fn parse_deadline(
     let mm = user.mm().expect("futex timeout has no MM");
     let mut bytes = [0; 16];
     error::copyin(&mm, &mut bytes, address)?;
-    let ns = time::decode_time(&bytes, 1_000_000_000, 1)?;
+    let ns = time::decode_time(&bytes, NSEC_PER_SEC, 1)?;
     let deadline = if operation & COMMAND_MASK == WAIT {
         MonotonicInstant::from_nanos(
             clock::now()

@@ -5,29 +5,43 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use crate::arch;
-use crate::fs::epoll::{EpollEvent, EpollFile};
+use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD as ADD, EPOLL_CTL_MOD as MOD};
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable};
 use crate::fs::{DescriptorFlags, FileRef, FileTable, FsError};
 use crate::mm::space::Mm;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::nofile;
 use crate::syscall::{time as time_abi, Outcome, Request, Restart};
+use crate::task::signal::SIGSET_BYTES;
 use crate::task::UserThread;
-use crate::time::{self, Duration, MonotonicInstant};
+use crate::time::{self, Duration, MonotonicInstant, NSEC_PER_MSEC, NSEC_PER_SEC};
 use crate::wait::WaitMode;
 
 const POLLFD_SIZE: usize = 8;
 const INLINE_POLL_BYTES: usize = 128 * POLLFD_SIZE;
 const EVENT_SIZE: usize = 16;
-const CLOEXEC: u32 = 0x80000;
-const ADD: u32 = 1;
-const MOD: u32 = 3;
-const NSEC_PER_SEC: u64 = 1_000_000_000;
-const DEFAULT_POLL: PollMask = PollMask(0x145);
-const READ_SET: PollMask = PollMask(0xf9);
-const WRITE_SET: PollMask = PollMask(0x32c);
-const EXCEPT_SET: PollMask = PollMask(0x22);
-const ALWAYS_POLL: PollMask = PollMask(0x38);
+const CLOEXEC: u32 = crate::fs::O_CLOEXEC;
+const DEFAULT_POLL: PollMask = PollMask(
+    PollMask::POLLIN.0 | PollMask::POLLOUT.0 | PollMask::POLLRDNORM.0 | PollMask::POLLWRNORM.0,
+);
+const READ_SET: PollMask = PollMask(
+    PollMask::POLLIN.0
+        | PollMask::POLLRDNORM.0
+        | PollMask::POLLRDBAND.0
+        | PollMask::POLLHUP.0
+        | PollMask::POLLERR.0
+        | PollMask::POLLNVAL.0,
+);
+const WRITE_SET: PollMask = PollMask(
+    PollMask::POLLOUT.0
+        | PollMask::POLLWRNORM.0
+        | PollMask::POLLWRBAND.0
+        | PollMask::POLLERR.0
+        | PollMask::POLLNVAL.0,
+);
+const EXCEPT_SET: PollMask = PollMask(PollMask::POLLPRI.0 | PollMask::POLLNVAL.0);
+const ALWAYS_POLL: PollMask =
+    PollMask(PollMask::POLLERR.0 | PollMask::POLLHUP.0 | PollMask::POLLNVAL.0);
 
 #[derive(Clone, Copy)]
 struct Timeout {
@@ -203,7 +217,7 @@ fn core_pselect(
     }
     let runtime = user.runtime().expect("pselect6 has no runtime");
     let nfds = (n as usize).min(runtime.files.allocated_slots());
-    let span = nfds.div_ceil(64) * 8;
+    let span = nfds.div_ceil(u64::BITS as usize) * core::mem::size_of::<u64>();
     let mut input = core::array::from_fn(|_| Vec::new());
     let mut output = core::array::from_fn(|_| Vec::new());
     for set in input.iter_mut().chain(output.iter_mut()) {
@@ -434,7 +448,7 @@ fn epoll_pwait(user: &UserThread, request: Request) -> Outcome {
     let deadline = if timeout < 0 {
         None
     } else {
-        match absolute_after(timeout as u64 * 1_000_000) {
+        match absolute_after(timeout as u64 * NSEC_PER_MSEC) {
             Ok(deadline) => Some(deadline),
             Err(error) => return Outcome::Return(error.result()),
         }
@@ -531,10 +545,10 @@ fn install_mask(user: &UserThread, mm: &Mm, address: usize, size: usize) -> Resu
     if address == 0 {
         return Ok(());
     }
-    if size != 8 {
+    if size != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
-    let mut bytes = [0u8; 8];
+    let mut bytes = [0u8; SIGSET_BYTES];
     copyin(mm, &mut bytes, address)?;
     let signals = user.signals().expect("temporary mask has no signals");
     user.save_mask(signals.replace_mask(u64::from_le_bytes(bytes)));

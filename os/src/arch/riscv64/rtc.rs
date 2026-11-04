@@ -2,6 +2,37 @@
 
 use crate::arch::{dma_barrier, mmio_address};
 use crate::boot::{BootInfo, Region};
+use crate::drivers::board_setup::{
+    AON_RESET_ASSERT, AON_RESET_STATUS, CLOCK_MUX_SHIFT, DIV_MASK, ENABLE, MUX_MASK,
+};
+
+const AONCLK_RTC_APB: u32 = 10;
+const AONCLK_RTC_INTERNAL: u32 = 11;
+const AONCLK_RTC_32K: u32 = 12;
+const AONCLK_RTC_CAL: u32 = 13;
+const AONRST_RTC_APB: u32 = 5;
+const AONRST_RTC_CAL: u32 = 7;
+const CRG_REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+const RTC_INTERNAL_CLOCK: usize = AONCLK_RTC_INTERNAL as usize * CRG_REGISTER_BYTES;
+const RTC_32K_CLOCK: usize = AONCLK_RTC_32K as usize * CRG_REGISTER_BYTES;
+const RTC_32K_PARENT_INTERNAL: u32 = 1;
+const RESET_POLL_ATTEMPTS: usize = 100_000;
+const CALENDAR_READ_ATTEMPTS: usize = 4;
+const RTC_CONTROL: usize = 0;
+const RTC_TIME: usize = 0x3c;
+const RTC_DATE: usize = 0x40;
+const RTC_CALENDAR_CONTROL: u32 = (1 << 0) | (1 << 3);
+const RTC_YEAR_BASE: u32 = 2000;
+const RTC_YEAR_SHIFT: u32 = 11;
+const RTC_YEAR_MASK: u32 = (1 << 8) - 1;
+const RTC_MONTH_SHIFT: u32 = 6;
+const RTC_MONTH_MASK: u32 = (1 << 5) - 1;
+const RTC_DAY_MASK: u32 = (1 << RTC_MONTH_SHIFT) - 1;
+const RTC_MINUTE_SHIFT: u32 = 7;
+const RTC_HOUR_SHIFT: u32 = 2 * RTC_MINUTE_SHIFT;
+const RTC_HOUR_MASK: u32 = (1 << 7) - 1;
+const RTC_MINUTE_MASK: u32 = (1 << RTC_MINUTE_SHIFT) - 1;
+const RTC_SECOND_MASK: u32 = (1 << RTC_MINUTE_SHIFT) - 1;
 
 /// 读取已映射、完整对齐的设备寄存器，调用者已验证资源来源。
 fn read(region: Region, offset: usize) -> u32 {
@@ -45,25 +76,28 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     for clock in &setup.clocks.entries[..setup.clocks.count] {
         let reference = clock.reference;
         match reference.id {
-            10 | 13 => {
-                let offset = reference.id as usize * 4;
+            AONCLK_RTC_APB | AONCLK_RTC_CAL => {
+                let offset = reference.id as usize * CRG_REGISTER_BYTES;
                 write(
                     reference.provider,
                     offset,
-                    read(reference.provider, offset) | (1 << 31),
+                    read(reference.provider, offset) | ENABLE,
                 );
             }
-            11 => {
-                if read(reference.provider, 44) & 0x00ff_ffff == 0 {
+            AONCLK_RTC_INTERNAL => {
+                if read(reference.provider, RTC_INTERNAL_CLOCK) & DIV_MASK == 0 {
                     return Err("RTC internal clock divider is zero");
                 }
             }
-            12 => {
-                let parent = (read(reference.provider, 48) >> 24) & 15;
-                if 1 < parent {
+            AONCLK_RTC_32K => {
+                let parent = (read(reference.provider, RTC_32K_CLOCK) >> CLOCK_MUX_SHIFT)
+                    & (MUX_MASK >> CLOCK_MUX_SHIFT);
+                if RTC_32K_PARENT_INTERNAL < parent {
                     return Err("RTC 32K clock parent is invalid");
                 }
-                if parent == 1 && read(reference.provider, 44) & 0x00ff_ffff == 0 {
+                if parent == RTC_32K_PARENT_INTERNAL
+                    && read(reference.provider, RTC_INTERNAL_CLOCK) & DIV_MASK == 0
+                {
                     return Err("RTC selected internal clock divider is zero");
                 }
             }
@@ -71,20 +105,20 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
         }
     }
     for reset in &setup.resets[..setup.reset_count] {
-        if !(5..=7).contains(&reset.id) {
+        if !(AONRST_RTC_APB..=AONRST_RTC_CAL).contains(&reset.id) {
             return Err("RTC reset is outside the AON binding");
         }
         write(
             reset.provider,
-            0x38,
-            read(reset.provider, 0x38) & !(1 << reset.id),
+            AON_RESET_ASSERT,
+            read(reset.provider, AON_RESET_ASSERT) & !(1 << reset.id),
         );
     }
     let mut ready = false;
-    for _ in 0..100_000 {
+    for _ in 0..RESET_POLL_ATTEMPTS {
         if setup.resets[..setup.reset_count]
             .iter()
-            .all(|reset| read(reset.provider, 0x3c) & (1 << reset.id) != 0)
+            .all(|reset| read(reset.provider, AON_RESET_STATUS) & (1 << reset.id) != 0)
         {
             ready = true;
             break;
@@ -94,20 +128,20 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     if !ready {
         return Err("RTC AON reset deassertion timed out");
     }
-    let config = read(info.rtc, 0);
-    write(info.rtc, 0, config | 1 | (1 << 3));
-    for _ in 0..4 {
-        let before = read(info.rtc, 0x3c);
-        let date = read(info.rtc, 0x40);
-        let after = read(info.rtc, 0x3c);
+    let config = read(info.rtc, RTC_CONTROL);
+    write(info.rtc, RTC_CONTROL, config | RTC_CALENDAR_CONTROL);
+    for _ in 0..CALENDAR_READ_ATTEMPTS {
+        let before = read(info.rtc, RTC_TIME);
+        let date = read(info.rtc, RTC_DATE);
+        let after = read(info.rtc, RTC_TIME);
         if before == after {
             return Ok(Some([
-                2000 + bcd((date >> 11) & 255)?,
-                bcd((date >> 6) & 31)?,
-                bcd(date & 63)?,
-                bcd((before >> 14) & 127)?,
-                bcd((before >> 7) & 127)?,
-                bcd(before & 127)?,
+                RTC_YEAR_BASE + bcd((date >> RTC_YEAR_SHIFT) & RTC_YEAR_MASK)?,
+                bcd((date >> RTC_MONTH_SHIFT) & RTC_MONTH_MASK)?,
+                bcd(date & RTC_DAY_MASK)?,
+                bcd((before >> RTC_HOUR_SHIFT) & RTC_HOUR_MASK)?,
+                bcd((before >> RTC_MINUTE_SHIFT) & RTC_MINUTE_MASK)?,
+                bcd(before & RTC_SECOND_MASK)?,
             ]));
         }
     }

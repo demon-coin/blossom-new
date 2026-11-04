@@ -19,17 +19,22 @@ use crate::fs::memfs::MemorySpecial;
 use crate::fs::poll::{
     PollContext, PollMask, PollNotify, PollRegistration, PollTable, PollWaitHead, Pollable,
 };
-use crate::fs::{DirectoryEntry, FsError, InodeRef, Path};
+use crate::fs::{
+    DirectoryEntry, FsError, InodeRef, Path, O_ACCMODE, O_DIRECTORY, O_NOCTTY, O_NONBLOCK, O_WRONLY,
+};
 use crate::sync::{SleepMutex, SpinLock};
 use crate::task::process::{Pid, TaskGraph, TerminalControl};
-use crate::task::signal::SignalError;
+use crate::task::signal::{SignalError, SIGCONT, SIGHUP, SIGTTIN, SIGTTOU, SIGWINCH};
 use crate::task::UserThread;
 use crate::time::{self, MonotonicInstant};
 use crate::wait::WaitResult;
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 
 use ntty::{NttyState, SEGMENT_BYTES};
-use termios::{Termios, VMIN, VTIME};
+use termios::{
+    Termios, TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON, TCSADRAIN, TCSAFLUSH,
+    TCSANOW, VMIN, VTIME,
+};
 
 /// TCGETS 命令。
 const TCGETS: u32 = 0x5401;
@@ -53,14 +58,12 @@ const TIOCGWINSZ: u32 = 0x5413;
 const TIOCSWINSZ: u32 = 0x5414;
 const TIOCNOTTY: u32 = 0x5422;
 const TIOCGSID: u32 = 0x5429;
-/// O_NOCTTY 只禁止 serial 自动取得控制关系。
-const O_NOCTTY: u32 = 0o400;
-/// O_NONBLOCK 状态位。
-const O_NONBLOCK: u32 = 0o4000;
 /// 工作每轮最多消费的软件采样数。
 const WORK_RX_BUDGET: usize = 64;
 /// 写出片段固定 512 字节。
 const WRITE_SEGMENT: usize = 512;
+const POLL_SOURCES: usize = 2;
+const VTIME_MILLIS: u64 = 100;
 
 /// 常驻端点。
 pub(crate) struct Endpoint {
@@ -414,7 +417,7 @@ impl TtyFile {
         if self.hungup() {
             return Ok(false);
         }
-        check_access(caller, 21)?;
+        check_access(caller, SIGTTIN)?;
         Ok(true)
     }
 
@@ -425,7 +428,7 @@ impl TtyFile {
         }
         let tostop = endpoint().state.lock().termios.lflag & termios::TOSTOP != 0;
         if !self.console && tostop {
-            check_access(caller, 22)?;
+            check_access(caller, SIGTTOU)?;
         }
         Ok(())
     }
@@ -433,7 +436,7 @@ impl TtyFile {
     fn prepare_wait(&self) -> Result<(Arc<PollContext>, PollTable), FsError> {
         let context = PollContext::try_new()?;
         let sink: Arc<dyn PollNotify> = context.clone();
-        let mut table = PollTable::new(sink, 2)?;
+        let mut table = PollTable::new(sink, POLL_SOURCES)?;
         self.poll(Some(&mut table))?;
         Ok((context, table))
     }
@@ -516,7 +519,7 @@ pub fn open(
         MemorySpecial::TtySerial | MemorySpecial::ControllingTty => false,
         _ => return Err(FsError::InvalidOperation),
     };
-    if flags & 0o200000 != 0 {
+    if flags & O_DIRECTORY != 0 {
         return Err(FsError::NotDirectory);
     }
     let watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
@@ -564,7 +567,8 @@ pub fn open(
         termios::serial_config(state.termios, state.divisor, true, true)
             .ok_or(FsError::InvalidOperation)?
     };
-    if special == MemorySpecial::TtySerial && flags & O_NOCTTY == 0 && flags & 3 != 1 {
+    if special == MemorySpecial::TtySerial && flags & O_NOCTTY == 0 && flags & O_ACCMODE != O_WRONLY
+    {
         if let Some(identity) = &identity {
             identity.graph().acquire_tty(identity, endpoint(), true)?;
         }
@@ -661,7 +665,7 @@ impl FileLike for TtyFile {
             TCSETS | TCSETSW | TCSETSF | TCXONC | TCFLSH | TIOCSPGRP
         ) || command == TCSBRK && argument != 0;
         if changes {
-            check_access(caller, 22).map_err(|error| match (command, error) {
+            check_access(caller, SIGTTOU).map_err(|error| match (command, error) {
                 (TIOCSPGRP, FsError::DeviceIo) => FsError::NotTty,
                 (_, error) => error,
             })?;
@@ -677,9 +681,9 @@ impl FileLike for TtyFile {
         };
         match command {
             TCGETS => ioctl_get(user, argument),
-            TCSETS => ioctl_set(self, user, argument, 0, caller),
-            TCSETSW => ioctl_set(self, user, argument, 1, caller),
-            TCSETSF => ioctl_set(self, user, argument, 2, caller),
+            TCSETS => ioctl_set(self, user, argument, TCSANOW, caller),
+            TCSETSW => ioctl_set(self, user, argument, TCSADRAIN, caller),
+            TCSETSF => ioctl_set(self, user, argument, TCSAFLUSH, caller),
             TCSBRK => {
                 if argument == 0 {
                     return Err(FsError::InvalidOperation);
@@ -939,7 +943,7 @@ fn acquire_writer(interruptible: bool, file: Option<&TtyFile>) -> Result<WriterG
     }
     let context = PollContext::try_new()?;
     let sink: Arc<dyn PollNotify> = context.clone();
-    let mut table = PollTable::new(sink, 2)?;
+    let mut table = PollTable::new(sink, POLL_SOURCES)?;
     table.register(&endpoint().read_head)?;
     table.register(&endpoint().write_head)?;
     loop {
@@ -1167,7 +1171,7 @@ fn noncanonical_timeout(
     let start = target.copied();
     let interruptible = matches!(caller, FileIoContext::User(_));
     let deadline = time::now()
-        .checked_add(Duration::from_millis(u64::from(time) * 100))
+        .checked_add(Duration::from_millis(u64::from(time) * VTIME_MILLIS))
         .ok_or(FsError::InvalidOperation)?;
     let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
     let mut segment = [0u8; SEGMENT_BYTES];
@@ -1240,7 +1244,7 @@ fn noncanonical_min_timeout(
             RawDeliver::Delivered(Ok(_)) => {
                 deadline = Some(
                     time::now()
-                        .checked_add(Duration::from_millis(u64::from(time) * 100))
+                        .checked_add(Duration::from_millis(u64::from(time) * VTIME_MILLIS))
                         .ok_or(FsError::InvalidOperation)?,
                 );
                 if minimum <= target.copied() - start {
@@ -1328,7 +1332,7 @@ pub fn set_termios(
     action: u32,
     caller: FileIoContext<'_>,
 ) -> Result<(), FsError> {
-    check_access(caller, 22)?;
+    check_access(caller, SIGTTOU)?;
     apply_termios(termios, action, caller, None)
 }
 
@@ -1339,11 +1343,11 @@ fn apply_termios(
     caller: FileIoContext<'_>,
     file: Option<&TtyFile>,
 ) -> Result<(), FsError> {
-    if 2 < action {
+    if TCSAFLUSH < action {
         return Err(FsError::InvalidOperation);
     }
     termios.validate()?;
-    if action == 0 {
+    if action == TCSANOW {
         return commit_termios(termios, action, None, file);
     }
     drain_output(caller, file)?;
@@ -1419,7 +1423,7 @@ fn commit_termios(
             state.dtr = true;
             state.rts = true;
         }
-        if action == 2 {
+        if action == TCSAFLUSH {
             flush_input_locked(&mut state);
         }
         if termios.lflag & termios::FLUSHO != 0 {
@@ -1456,9 +1460,9 @@ fn endpoint_flush(selector: u32, file: Option<&TtyFile>) -> Result<(), FsError> 
         check_hangup(file)?;
         let mut state = endpoint().state.lock();
         match selector {
-            0 => flush_input_locked(&mut state),
-            1 => state.flush_output(),
-            2 => {
+            TCIFLUSH => flush_input_locked(&mut state),
+            TCOFLUSH => state.flush_output(),
+            TCIOFLUSH => {
                 flush_input_locked(&mut state);
                 state.flush_output();
             }
@@ -1477,7 +1481,7 @@ fn endpoint_flush(selector: u32, file: Option<&TtyFile>) -> Result<(), FsError> 
 /// raw flow 已完成一次后台检查，实际提交在 copy 下重查永久状态。
 fn endpoint_flow(action: u32, file: Option<&TtyFile>) -> Result<usize, FsError> {
     match action {
-        0 => {
+        TCOOFF => {
             let _copy = endpoint().copy.lock();
             check_hangup(file)?;
             let mut state = endpoint().state.lock();
@@ -1485,7 +1489,7 @@ fn endpoint_flow(action: u32, file: Option<&TtyFile>) -> Result<usize, FsError> 
             state.stopped = true;
             Ok(0)
         }
-        1 => {
+        TCOON => {
             {
                 let _copy = endpoint().copy.lock();
                 check_hangup(file)?;
@@ -1499,10 +1503,10 @@ fn endpoint_flow(action: u32, file: Option<&TtyFile>) -> Result<usize, FsError> 
                 .notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
             Ok(0)
         }
-        2 | 3 => {
+        TCIOFF | TCION => {
             let byte = {
                 let state = endpoint().state.lock();
-                if action == 2 {
+                if action == TCIOFF {
                     state.termios.cc[termios::VSTOP]
                 } else {
                     state.termios.cc[termios::VSTART]
@@ -1531,7 +1535,7 @@ pub fn flow(action: u32) -> Result<(), FsError> {
 
 /// typed drain 在边界检查后台访问，实际输出等待与 raw ioctl 共用。
 pub fn drain(caller: FileIoContext<'_>) -> Result<(), FsError> {
-    check_access(caller, 22)?;
+    check_access(caller, SIGTTOU)?;
     drain_output(caller, None)
 }
 
@@ -1556,7 +1560,7 @@ fn drain_output(caller: FileIoContext<'_>, file: Option<&TtyFile>) -> Result<(),
         } else {
             let context = PollContext::try_new()?;
             let sink: Arc<dyn PollNotify> = context.clone();
-            let mut table = PollTable::new(sink, 2)?;
+            let mut table = PollTable::new(sink, POLL_SOURCES)?;
             table.register(&endpoint().read_head)?;
             table.register(&endpoint().write_head)?;
             waiting = Some((context, table));
@@ -1620,8 +1624,8 @@ fn send_foreground(graph: &Weak<TaskGraph>, foreground: &Arc<Pid>, signum: u8) {
 
 /// 解除控制关系后按原稳定目标发送 HUP、CONT，不把解除误作物理挂断。
 fn notify_disassociated(control: TerminalControl) {
-    send_foreground(&control.graph, &control.foreground, 1);
-    send_foreground(&control.graph, &control.foreground, 18);
+    send_foreground(&control.graph, &control.foreground, SIGHUP);
+    send_foreground(&control.graph, &control.foreground, SIGCONT);
 }
 
 /// 最后 session leader 退出只退休原会话和当时打开，后继 open 有独立状态。
@@ -1754,7 +1758,7 @@ fn ioctl_winsize(file: &TtyFile, user: &UserThread, argument: usize) -> Result<u
     let foreground = foreground_snapshot();
     drop(copy);
     if let Some((graph, foreground)) = foreground {
-        send_foreground(&graph, &foreground, 28);
+        send_foreground(&graph, &foreground, SIGWINCH);
     }
     Ok(0)
 }

@@ -3,7 +3,10 @@
 mod uart;
 
 use super::{Bio, BioAllocator, BioCompletion, BlkOperation, Disk, DiskRef, IoResult};
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioIdentity, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN,
+    VIRTIO_VENDOR_ID,
+};
 use crate::drivers::{self, DeviceInventory};
 use crate::mm::dma::MappedPages;
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
@@ -48,10 +51,13 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
 
 /// 只从同一库存按稳定槽/BDF选择两台实例，不读取根盘业务身份或写其内容。
 fn devices(inventory: &DeviceInventory) -> Result<[VirtioDevice; 2], TestError> {
-    let mut pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let mut pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     let pci_count = pci.clone().count();
     if inventory.mmio_blocks.len() + pci_count != 2 {
         return Err(TestError(

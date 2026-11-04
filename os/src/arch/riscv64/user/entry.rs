@@ -1,9 +1,18 @@
 //! 用户进入、陷入与同一 Rust 调用续接；所有入口共享唯一 UserContext 布局。
 
-use crate::arch::riscv64::{rv_kernel_fault, user::UserContext};
+use crate::arch::riscv64::{
+    rv_kernel_fault, user::UserContext, SR_FS_DIRTY, SR_SPIE, SR_SPP, SR_UXL_64,
+};
 #[cfg(feature = "ktest")]
 use core::arch::global_asm;
-use core::{arch::naked_asm, mem::offset_of};
+use core::{
+    arch::naked_asm,
+    mem::{offset_of, size_of},
+};
+
+// 续接按 ra/gp/tp、十二个 callee-saved 和 sstatus 顺序保存。
+const KERNEL_STATUS_OFFSET: usize = (3 + 12) * size_of::<usize>();
+const KERNEL_CONTINUATION_SIZE: usize = KERNEL_STATUS_OFFSET + size_of::<usize>();
 
 /// 保存当前 Task 的真实 Rust 续接，通过 sret 执行用户现场，陷入后返回同一次调用。
 ///
@@ -20,7 +29,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
 .option push
 .option arch, +a, +d
     // 本次调用的续接始终放在当前 Task 栈；TP/GP 仅在此不调度的汇编区间保活。
-    addi sp, sp, -128
+    addi sp, sp, -{continuation_size}
     sd ra, 0(sp)
     sd gp, 8(sp)
     sd tp, 16(sp)
@@ -37,14 +46,14 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
     sd s10, 104(sp)
     sd s11, 112(sp)
     csrr t0, sstatus
-    sd t0, 120(sp)
+    sd t0, {continuation_status}(sp)
     sd sp, {kernel_sp}(a0)
     csrw sscratch, a0
     mv sp, a0
 "#,
         // 恢复全部用户浮点现场，并只构造许可的 sstatus 位，清除跨特权 LR/SC reservation。
         r#"
-    li t0, 0x6000
+    li t0, {fs_dirty}
     csrs sstatus, t0
     fld f0, ({fpr} + 0 * 8)(sp)
     fld f1, ({fpr} + 1 * 8)(sp)
@@ -83,7 +92,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
     ld t0, {pc}(sp)
     csrw sepc, t0
     // 只构造 UXL=64、FS=Dirty、SPIE；禁止 SPP/SUM/MXR/VS 从私有现场回流。
-    li t0, 0x200006020
+    li t0, {user_status}
     csrw sstatus, t0
     // 用户与内核不共享 LR/SC reservation；此 scratch 槽的值将在 trap 时覆盖。
     addi t0, sp, {stval}
@@ -131,6 +140,10 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
         fcsr = const offset_of!(UserContext, fcsr),
         kernel_sp = const offset_of!(UserContext, kernel_sp),
         stval = const offset_of!(UserContext, stval),
+        fs_dirty = const SR_FS_DIRTY,
+        user_status = const SR_UXL_64 | SR_FS_DIRTY | SR_SPIE,
+        continuation_size = const KERNEL_CONTINUATION_SIZE,
+        continuation_status = const KERNEL_STATUS_OFFSET,
             );
     }
 }
@@ -191,7 +204,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     csrr t0, stval
     sd t0, {stval}(sp)
     csrr t0, sstatus
-    andi t0, t0, 0x100
+    andi t0, t0, {spp}
     bnez t0, 2f
 "#,
         // 确认用户来源后保存全部 FPR/FCSR，不能把用户 TLS 当作 CpuLocal。
@@ -237,7 +250,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     // 受信 TP/GP/状态恢复前保留 context 入口，S 来源故障仍能取得真实内核栈。
     ld gp, 8(t0)
     ld tp, 16(t0)
-    ld t1, 120(t0)
+    ld t1, {continuation_status}(t0)
     csrw sstatus, t1
     sd zero, {kernel_sp}(sp)
     csrw sscratch, zero
@@ -255,7 +268,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     ld s9, 96(sp)
     ld s10, 104(sp)
     ld s11, 112(sp)
-    addi sp, sp, 128
+    addi sp, sp, {continuation_size}
     ret
 "#,
         // 进入或退出窗口的 S 来源故障使用真实续接栈，保留原致命诊断路径。
@@ -270,7 +283,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     ld t0, {kernel_sp}(sp)
     ld gp, 8(t0)
     ld tp, 16(t0)
-    ld t1, 120(t0)
+    ld t1, {continuation_status}(t0)
     csrw sstatus, t1
     sd zero, {kernel_sp}(sp)
     csrw sscratch, zero
@@ -285,6 +298,9 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
         kernel_sp = const offset_of!(UserContext, kernel_sp),
         scause = const offset_of!(UserContext, scause),
         stval = const offset_of!(UserContext, stval),
+        spp = const SR_SPP,
+        continuation_size = const KERNEL_CONTINUATION_SIZE,
+        continuation_status = const KERNEL_STATUS_OFFSET,
         kernel_fault = sym rv_kernel_fault,
             );
     }

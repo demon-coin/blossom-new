@@ -10,14 +10,17 @@ use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, Pollable};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
-    ReadBuffer, SeekFrom, WriteBuffer,
+    ReadBuffer, SeekFrom, WriteBuffer, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_TRUNC,
 };
 use crate::klog::{self, Cursor, Level, Record, TEXT_CAPACITY};
 use crate::sync::{SleepMutex, SpinLock};
 use crate::wait::WaitResult;
 
-const O_NONBLOCK: u32 = 0o4000;
 const RECORD_CAPACITY: usize = TEXT_CAPACITY * 4 + 96;
+const LOGLEVEL_ERR: i32 = 3;
+const LOGLEVEL_WARNING: i32 = 4;
+const LOGLEVEL_INFO: i32 = 6;
+const LOGLEVEL_DEBUG: i32 = 7;
 
 /// 独立 open 拥有独立序号，复制描述符共享消费串行锁、状态位与末 watch 责任。
 pub struct KmsgFile {
@@ -42,17 +45,17 @@ impl RecordText {
             len: 0,
         };
         let priority = match record.level {
-            Level::Error => 3,
-            Level::Warn => 4,
-            Level::Info => 6,
-            Level::Debug => 7,
+            Level::Error => LOGLEVEL_ERR,
+            Level::Warn => LOGLEVEL_WARNING,
+            Level::Info => LOGLEVEL_INFO,
+            Level::Debug => LOGLEVEL_DEBUG,
         };
         write!(
             text,
             "{},{},{},-;",
             priority,
             record.seq,
-            record.monotonic_ns / 1000
+            record.monotonic_ns / crate::time::NSEC_PER_USEC
         )
         .expect("kmsg header exceeded fixed capacity");
         const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -91,7 +94,7 @@ impl Write for RecordText {
 
 /// 普通可睡眠任务准备只读实例，失败不发表任何 reader 或 watch 登记。
 pub(crate) fn open(path: Path, flags: u32) -> Result<FileRef, FsError> {
-    if flags & 0o3 != 0 || flags & 0o1000 != 0 {
+    if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
         return Err(FsError::ReadOnly);
     }
     let watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;

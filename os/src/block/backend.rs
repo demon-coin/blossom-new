@@ -1,11 +1,16 @@
 //! 硬件后端只管理协议、提交与真实收权，逻辑父请求由 Disk 统一拥有。
 
-use crate::block::{BlkOperation, BlockError, IoResult, QueueLimits, SECTOR_BYTES};
+use crate::block::{
+    BlkOperation, BlockError, IoResult, QueueLimits, NATIVE_TAG_COUNT, SECTOR_BYTES,
+};
 use crate::boot::Region;
 use crate::boot::{AhciResources, MmcResources};
 use crate::drivers::ahci::Ahci;
 use crate::drivers::sdmmc::Sdmmc;
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity, VirtioInitError};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioIdentity, VirtioInitError, VIRTIO_CONTROL_SEGMENTS, VIRTIO_MAX_QUEUE_DEPTH,
+    VIRTIO_MIN_QUEUE_DEPTH, VIRTIO_STATUS_BYTES,
+};
 use crate::irq::IrqNumber;
 use crate::mm::dma::{DmaDomain, KernelHal, PayloadRange};
 use alloc::collections::VecDeque;
@@ -16,6 +21,9 @@ use core::ptr;
 use virtio_drivers::device::blk::{decode_status, prepare_pdu, BlkInfo, PDU_STRIDE, STATUS_OFFSET};
 use virtio_drivers::transport::{DeviceStatus, InterruptStatus, Notification};
 use virtio_drivers::{DmaRegion, Hal, MappedSegment};
+
+const RAM_MAX_BYTES: usize = 64 * 1024;
+const RAM_MAX_SEGMENTS: usize = 16;
 
 /// 物理身份保留原传输身份，专用保留 RAM 使用其真实物理范围。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,9 +74,9 @@ impl SlotControl {
         }
         let used = used as usize;
         let expected = if operation == BlkOperation::Read {
-            bytes + 1
+            bytes + VIRTIO_STATUS_BYTES
         } else {
-            1
+            VIRTIO_STATUS_BYTES
         };
         if used == expected {
             IoResult {
@@ -77,7 +85,7 @@ impl SlotControl {
             }
         } else if operation == BlkOperation::Read && used < expected {
             IoResult {
-                completed: used.saturating_sub(1),
+                completed: used.saturating_sub(VIRTIO_STATUS_BYTES),
                 error: Some(BlockError::ShortIo),
             }
         } else {
@@ -259,20 +267,20 @@ impl Backend {
 
     /// RAM 的单复制通道与八个回调槽分别限额。
     pub(super) fn ram_limits(region: Region) -> Result<QueueLimits, BlockError> {
-        if region.end <= region.start || (region.end - region.start) % 512 != 0 {
+        if region.end <= region.start || (region.end - region.start) % SECTOR_BYTES as usize != 0 {
             return Err(BlockError::InvalidRange);
         }
         Ok(QueueLimits {
-            capacity_sectors: ((region.end - region.start) / 512) as u64,
-            max_bytes: 64 * 1024,
-            max_segments: 16,
-            max_segment_bytes: 64 * 1024,
-            logical_block_size: 512,
+            capacity_sectors: ((region.end - region.start) / SECTOR_BYTES as usize) as u64,
+            max_bytes: RAM_MAX_BYTES,
+            max_segments: RAM_MAX_SEGMENTS,
+            max_segment_bytes: RAM_MAX_BYTES as u32,
+            logical_block_size: SECTOR_BYTES as u32,
             dma_boundary_mask: u64::MAX,
             readonly: false,
             flush: true,
             queue_depth: 1,
-            tag_count: 8,
+            tag_count: NATIVE_TAG_COUNT,
         })
     }
 
@@ -322,7 +330,10 @@ impl Backend {
     /// 判断本次准备是否有真实提交额度，不将软件槽数当作硬件描述符数。
     pub(super) fn can_submit(&self, segments: usize) -> bool {
         match self {
-            Self::Virtio(v) => segments + 2 <= v.device.driver().available_descriptors(),
+            Self::Virtio(v) => {
+                segments + usize::from(VIRTIO_CONTROL_SEGMENTS)
+                    <= v.device.driver().available_descriptors()
+            }
             Self::Ram { stopped, .. }
             | Self::Sdmmc { stopped, .. }
             | Self::Ahci { stopped, .. } => !*stopped,
@@ -586,7 +597,7 @@ impl Backend {
 fn pending_queue() -> Result<VecDeque<u16>, BlockError> {
     let mut pending = VecDeque::new();
     pending
-        .try_reserve_exact(8)
+        .try_reserve_exact(usize::from(NATIVE_TAG_COUNT))
         .map_err(|_| BlockError::NoMemory)?;
     Ok(pending)
 }
@@ -596,20 +607,20 @@ pub(super) fn virtio_limits(info: BlkInfo) -> Result<QueueLimits, BlockError> {
     if info.capacity_sectors == 0
         || info.capacity_sectors.checked_mul(SECTOR_BYTES).is_none()
         || !info.queue_depth.is_power_of_two()
-        || !(4..=128).contains(&info.queue_depth)
+        || !(VIRTIO_MIN_QUEUE_DEPTH..=VIRTIO_MAX_QUEUE_DEPTH).contains(&info.queue_depth)
         || info.tag_count == 0
         || info.queue_depth < info.tag_count
         || info.max_segments == 0
-        || info.queue_depth - 2 < info.max_segments
+        || info.queue_depth - VIRTIO_CONTROL_SEGMENTS < info.max_segments
         || info.max_segment_bytes == 0
-        || info.logical_block_size < 512
+        || info.logical_block_size < SECTOR_BYTES as u32
         || !info.logical_block_size.is_power_of_two()
     {
         return Err(BlockError::InvalidRange);
     }
     let logical = u64::from(info.logical_block_size);
     let raw = (u64::from(info.max_segment_bytes) * u64::from(info.max_segments))
-        .min(u64::from(u32::MAX) - 1);
+        .min(u64::from(u32::MAX) - VIRTIO_STATUS_BYTES as u64);
     let max_bytes =
         usize::try_from(raw / logical * logical).map_err(|_| BlockError::InvalidRange)?;
     if max_bytes == 0 {

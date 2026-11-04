@@ -1,5 +1,6 @@
 //! 用户映射请求按目标ABI解释一次，再交同一Mm的实际范围与页拥有提交。
 
+use crate::fs::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
 use crate::mm::space::{MmapAddress, MmapRequest, MmapSource};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
@@ -8,6 +9,7 @@ use crate::task::UserThread;
 
 const SHARED: usize = 1;
 const PRIVATE: usize = 2;
+const MAP_SHARING_MASK: usize = SHARED | PRIVATE;
 const FIXED: usize = 0x10;
 const ANONYMOUS: usize = 0x20;
 const DENYWRITE: usize = 0x800;
@@ -19,6 +21,9 @@ const SUPPORTED: usize =
 const MS_ASYNC: usize = 1;
 const MS_INVALIDATE: usize = 2;
 const MS_SYNC: usize = 4;
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
 const ALL: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -30,13 +35,13 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let [address, length, prot, flags, fd, offset] = raw;
     // 栈提示不请求自动增长；历史 DENYWRITE/EXECUTABLE 不改变权限或原执行写占用。
     if flags & !SUPPORTED != 0
-        || !matches!(flags & 3, SHARED | PRIVATE)
+        || !matches!(flags & MAP_SHARING_MASK, SHARED | PRIVATE)
         || offset & (PAGE_SIZE - 1) != 0
     {
         return Err(Errno::InvalidArgument);
     }
     let permissions = permissions(prot)?;
-    let private = flags & 3 == PRIVATE;
+    let private = flags & MAP_SHARING_MASK == PRIVATE;
     let mut maximum = ALL;
     let source = if flags & ANONYMOUS != 0 {
         if private {
@@ -51,15 +56,15 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
             return Err(Errno::BadFd);
         }
         let file = runtime.files.lookup(fd as usize)?;
-        let access = file.flags() & 3;
-        if access == 1 || (!private && permissions.write && access == 0) {
+        let access = file.flags() & O_ACCMODE;
+        if access == O_WRONLY || (!private && permissions.write && access == O_RDONLY) {
             return Err(Errno::Permission);
         }
         let inode = file.mapping_inode().ok_or(Errno::NoDevice)?.clone();
         if !private {
             let path = file.path().ok_or(Errno::NoDevice)?;
             let writable = path.check_writable();
-            maximum.write = access == 2 && writable.is_ok();
+            maximum.write = access == O_RDWR && writable.is_ok();
             if permissions.write {
                 writable?;
             }
@@ -147,18 +152,18 @@ pub(super) fn brk(user: &UserThread, address: usize) -> isize {
 
 /// 写权限在RV硬件上必然包含读，LA保持实际NR/NX能力；未知PROT位明确失败。
 fn permissions(raw: usize) -> Result<PagePermissions, Errno> {
-    if raw & !7 != 0 {
+    if raw & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(Errno::InvalidArgument);
     }
-    let write = raw & 2 != 0;
+    let write = raw & PROT_WRITE != 0;
     #[cfg(target_arch = "riscv64")]
-    let read = raw & 1 != 0 || write;
+    let read = raw & PROT_READ != 0 || write;
     #[cfg(target_arch = "loongarch64")]
-    let read = raw & 1 != 0;
+    let read = raw & PROT_READ != 0;
     Ok(PagePermissions {
         read,
         write,
-        execute: raw & 4 != 0,
+        execute: raw & PROT_EXEC != 0,
     })
 }
 

@@ -19,16 +19,33 @@ use crate::sched;
 use crate::sync::SpinLock;
 use crate::task::signal::{
     PreparedSignal, Sighand, SignalAction, SignalControl, SignalError, SignalGroup, SignalInfo,
-    SignalInheritance, SignalPayload, ThreadSignals,
+    SignalInheritance, SignalPayload, ThreadSignals, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED,
+    CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGHUP, SIGNAL_COUNT, SIGTTIN, SIGTTOU, SI_TKILL,
 };
 use crate::task::time::{GroupTime, USER_HZ};
 use crate::task::{JoinObserver, TaskId, UserThread};
+use crate::time::NSEC_PER_SEC;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
 const TID: usize = 0;
 const TGID: usize = 1;
 const PGID: usize = 2;
 const SID: usize = 3;
+
+pub(crate) const WNOHANG: u32 = 1;
+pub(crate) const WSTOPPED: u32 = 2;
+pub(crate) const WEXITED: u32 = 4;
+pub(crate) const WCONTINUED: u32 = 8;
+pub(crate) const WNOWAIT: u32 = 0x0100_0000;
+pub(crate) const WALL: u32 = 0x4000_0000;
+pub(crate) const WCLONE: u32 = 0x8000_0000;
+pub(crate) const WAIT_SIGNAL_MASK: i32 = 0x7f;
+pub(crate) const WAIT_CORE_DUMP: i32 = 0x80;
+pub(crate) const EXIT_STATUS_MASK: i32 = 0xff;
+pub(crate) const EXIT_STATUS_SHIFT: u32 = 8;
+pub(crate) const WAIT_STOPPED: i32 = 0x7f;
+pub(crate) const WAIT_CONTINUED: i32 = 0xffff;
+pub(crate) const WAIT_STATUS_MASK: i32 = (EXIT_STATUS_MASK << EXIT_STATUS_SHIFT) | EXIT_STATUS_MASK;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessError {
@@ -410,11 +427,14 @@ impl TaskGraph {
 
     /// 只返回实际接受的用户机器动作，kernel取消不伪造关机操作。
     pub(crate) fn shutdown_operation(&self) -> Option<ShutdownOperation> {
+        const HALT: u8 = ShutdownOperation::Halt as u8;
+        const POWER_OFF: u8 = ShutdownOperation::PowerOff as u8;
+        const RESTART: u8 = ShutdownOperation::Restart as u8;
         match self.closing.load(Ordering::Acquire) {
             RUNNING | CANCELLED => None,
-            2 => Some(ShutdownOperation::Halt),
-            3 => Some(ShutdownOperation::PowerOff),
-            4 => Some(ShutdownOperation::Restart),
+            HALT => Some(ShutdownOperation::Halt),
+            POWER_OFF => Some(ShutdownOperation::PowerOff),
+            RESTART => Some(ShutdownOperation::Restart),
             _ => panic!("invalid task graph shutdown state"),
         }
     }
@@ -692,7 +712,8 @@ impl TaskGraph {
                 .expect("unpublished member acknowledged signal control");
             assert!(Arc::ptr_eq(&thread.group, &identity.group));
             let (control, stopped) = thread.signals.acknowledge_control();
-            let event = stopped.map(|signum| child_event(&identity.group, 5, signum as i32));
+            let event =
+                stopped.map(|signum| child_event(&identity.group, CLD_STOPPED, signum as i32));
             if let Some(event) = event {
                 slots[identity.tgid() - 1]
                     .process
@@ -716,9 +737,6 @@ impl TaskGraph {
         selector: &WaitSelector,
         options: u32,
     ) -> Result<Option<ChildEvent>, ProcessError> {
-        const NOWAIT: u32 = 0x0100_0000;
-        const WALL: u32 = 0x4000_0000;
-        const WCLONE: u32 = 0x8000_0000;
         let mut retired = None;
         let event = {
             let mut slots = self.slots.lock();
@@ -741,15 +759,15 @@ impl TaskGraph {
                     }
                     WaitSelector::Any => true,
                 };
-                let clone = process.group.relations.lock().exit_signal != 17;
+                let clone = process.group.relations.lock().exit_signal != SIGCHLD;
                 if !matches || (options & WALL == 0 && clone != (options & WCLONE != 0)) {
                     continue;
                 }
                 eligible = true;
-                if options & 4 != 0 {
+                if options & WEXITED != 0 {
                     if let Some(exit) = process.exit {
                         selected = Some(exit_child_event(&process.group, exit.status));
-                        if options & NOWAIT == 0 {
+                        if options & WNOWAIT == 0 {
                             parent.time.add_reaped_child(&process.group.time);
                             retired = Some(reap_child(&mut slots, index, false));
                         }
@@ -757,11 +775,12 @@ impl TaskGraph {
                     }
                 }
                 let control = process.control_event.filter(|event| {
-                    (event.code == 5 && options & 2 != 0) || (event.code == 6 && options & 8 != 0)
+                    (event.code == CLD_STOPPED && options & WSTOPPED != 0)
+                        || (event.code == CLD_CONTINUED && options & WCONTINUED != 0)
                 });
                 if let Some(event) = control {
                     selected = Some(event);
-                    if options & NOWAIT == 0 {
+                    if options & WNOWAIT == 0 {
                         slots[index]
                             .process
                             .as_mut()
@@ -1019,7 +1038,7 @@ impl TaskGraph {
         pgid: &Arc<Pid>,
         signum: u8,
     ) -> Result<(), SignalError> {
-        if signum == 0 || 64 < signum {
+        if signum == 0 || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
         let result = {
@@ -1037,7 +1056,10 @@ impl TaskGraph {
         tty: &'static tty::Endpoint,
         signum: u8,
     ) -> Result<(), FsError> {
-        assert!(matches!(signum, 21 | 22), "invalid terminal access signal");
+        assert!(
+            matches!(signum, SIGTTIN | SIGTTOU),
+            "invalid terminal access signal"
+        );
         let result = {
             let mut slots = self.slots.lock();
             self.terminal_caller(&slots, caller)?;
@@ -1063,7 +1085,7 @@ impl TaskGraph {
                 relations.pgid.clone()
             };
             if caller.signals.blocked_or_ignored(signum) {
-                return if signum == 22 {
+                return if signum == SIGTTOU {
                     Ok(())
                 } else {
                     Err(FsError::DeviceIo)
@@ -1261,7 +1283,7 @@ impl TaskGraph {
         pid: i32,
         signum: u8,
     ) -> Result<(), SignalError> {
-        if 64 < signum {
+        if SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
         let info = SignalInfo {
@@ -1329,13 +1351,13 @@ impl TaskGraph {
         tgid: Option<usize>,
         signum: u8,
     ) -> Result<(), SignalError> {
-        if tid == 0 || tgid == Some(0) || 64 < signum {
+        if tid == 0 || tgid == Some(0) || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
         let info = SignalInfo {
             signum,
             errno: 0,
-            code: -6,
+            code: SI_TKILL,
             payload: SignalPayload::Sender {
                 pid: sender.tgid(),
                 uid: sender.group.uid,
@@ -1352,10 +1374,10 @@ impl TaskGraph {
         pid: usize,
         info: SignalInfo,
     ) -> Result<(), SignalError> {
-        if pid == 0 || 64 < info.signum {
+        if pid == 0 || SIGNAL_COUNT < info.signum as usize {
             return Err(SignalError::InvalidSignal);
         }
-        if (0 <= info.code || info.code == -6) && sender.tid() != pid {
+        if (0 <= info.code || info.code == SI_TKILL) && sender.tid() != pid {
             return Err(SignalError::Permission);
         }
         let group = self.group_target(pid)?;
@@ -1376,10 +1398,10 @@ impl TaskGraph {
         tgid: usize,
         info: SignalInfo,
     ) -> Result<(), SignalError> {
-        if tid == 0 || tgid == 0 || 64 < info.signum {
+        if tid == 0 || tgid == 0 || SIGNAL_COUNT < info.signum as usize {
             return Err(SignalError::InvalidSignal);
         }
-        if (0 <= info.code || info.code == -6) && sender.tid() != tid {
+        if (0 <= info.code || info.code == SI_TKILL) && sender.tid() != tid {
             return Err(SignalError::Permission);
         }
         self.deliver_thread(sender, tid, Some(tgid), info, true, None)
@@ -1387,7 +1409,7 @@ impl TaskGraph {
 
     /// 内核控制者通过真实组身份发送普通信号，所有kick与uaccess仍在图和siglock之外。
     pub(crate) fn send_kernel(&self, pid: usize, signum: u8) -> Result<(), SignalError> {
-        if signum == 0 || 64 < signum {
+        if signum == 0 || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
         let group = self.group_target(pid)?;
@@ -1400,7 +1422,7 @@ impl TaskGraph {
         identity: &UserIdentity,
         signum: u8,
     ) -> Result<(), SignalError> {
-        if signum == 0 || 64 < signum {
+        if signum == 0 || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
         let info = SignalInfo {
@@ -1466,7 +1488,7 @@ impl TaskGraph {
                     .map(|thread| &thread.signals),
             )?;
             let event = if continued {
-                let event = child_event(group, 6, 18);
+                let event = child_event(group, CLD_CONTINUED, SIGCONT as i32);
                 slots[group.tgid() - 1]
                     .process
                     .as_mut()
@@ -1562,7 +1584,7 @@ impl TaskGraph {
                     .map(|thread| &thread.signals),
             )?;
             let event = if continued {
-                let event = child_event(&group, 6, 18);
+                let event = child_event(&group, CLD_CONTINUED, SIGCONT as i32);
                 slots[group.tgid() - 1]
                     .process
                     .as_mut()
@@ -1850,23 +1872,23 @@ fn detach_role(slots: &mut Numbers, pid: &Arc<Pid>, role: usize) -> Option<Arc<P
 fn signal_permission(sender: &UserIdentity, target: &ThreadGroup, signum: u8) -> bool {
     sender.group.uid == 0
         || sender.group.uid == target.uid
-        || (signum == 18 && sender.group.sid() == target.sid())
+        || (signum == SIGCONT && sender.group.sid() == target.sid())
 }
 
 /// 把普通Linux退出状态转成waitid字段，不把编码后的status误作si_status。
 fn exit_child_event(group: &ThreadGroup, status: i32) -> ChildEvent {
-    let signal = status & 0x7f;
+    let signal = status & WAIT_SIGNAL_MASK;
     child_event(
         group,
         if signal == 0 {
-            1
-        } else if status & 0x80 != 0 {
-            3
+            CLD_EXITED
+        } else if status & WAIT_CORE_DUMP != 0 {
+            CLD_DUMPED
         } else {
-            2
+            CLD_KILLED
         },
         if signal == 0 {
-            (status >> 8) & 0xff
+            (status >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK
         } else {
             signal
         },
@@ -1951,7 +1973,7 @@ fn reap_child(slots: &mut Numbers, index: usize, kernel_join: bool) -> Collected
 /// 控制事件保留原SA_NOCLDSTOP发送路径，不参与退出处置和自动回收事务。
 fn send_parent_event(parent: Option<&ThreadGroup>, event: ChildEvent) {
     if let Some(parent) = parent {
-        parent.signals.send_child(child_signal_info(17, event));
+        parent.signals.send_child(child_signal_info(SIGCHLD, event));
     }
 }
 
@@ -1965,8 +1987,8 @@ fn child_signal_info(signum: u8, event: ChildEvent) -> SignalInfo {
             pid: event.pid,
             uid: event.uid,
             status: event.status,
-            user_ticks: event.user_ns / (1_000_000_000 / USER_HZ),
-            kernel_ticks: event.kernel_ns / (1_000_000_000 / USER_HZ),
+            user_ticks: event.user_ns / (NSEC_PER_SEC / USER_HZ),
+            kernel_ticks: event.kernel_ns / (NSEC_PER_SEC / USER_HZ),
         },
     }
 }
@@ -2085,7 +2107,7 @@ fn deliver_process_group_locked(
                 .filter(|thread| Arc::ptr_eq(&thread.group, group))
                 .map(|thread| &thread.signals),
         )?;
-        let event = continued.then(|| child_event(group, 6, 18));
+        let event = continued.then(|| child_event(group, CLD_CONTINUED, SIGCONT as i32));
         let process = slots[index]
             .process
             .as_mut()
@@ -2118,8 +2140,9 @@ fn notify_new_orphan_locked(slots: &mut Numbers, pgid: &Arc<Pid>, was_orphan: bo
                 && process.group.signals.has_stopped_jobs()
         });
     if stopped {
-        deliver_process_group_locked(slots, pgid, 1).expect("orphan hangup delivery failed");
-        deliver_process_group_locked(slots, pgid, 18).expect("orphan continue delivery failed");
+        deliver_process_group_locked(slots, pgid, SIGHUP).expect("orphan hangup delivery failed");
+        deliver_process_group_locked(slots, pgid, SIGCONT)
+            .expect("orphan continue delivery failed");
     }
 }
 

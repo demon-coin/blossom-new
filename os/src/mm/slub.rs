@@ -18,6 +18,8 @@ pub(crate) const NONE: usize = usize::MAX;
 pub(crate) const CPU_PARTIAL_LIMIT: usize = 2;
 pub(crate) const MIN_PARTIAL: usize = 2;
 const MAX_SLAB_ORDER: usize = 3;
+const MIN_OBJECTS_PER_CPU_SCALE: usize = 4;
+const WASTE_FRACTIONS: [usize; 4] = [16, 8, 4, 2];
 
 #[derive(Clone, Copy)]
 pub(crate) struct Geometry {
@@ -155,10 +157,11 @@ fn order_for(bytes: usize) -> usize {
 fn calculate_geometry(stride: usize) -> Geometry {
     let fls = usize::BITS as usize - cpu::count().leading_zeros() as usize;
     let minimum_order = order_for(stride);
-    let min_objects = (4 * (fls + 1)).min((PAGE_SIZE << MAX_SLAB_ORDER) / stride);
+    let min_objects =
+        (MIN_OBJECTS_PER_CPU_SCALE * (fls + 1)).min((PAGE_SIZE << MAX_SLAB_ORDER) / stride);
     let min_order = order_for(min_objects * stride);
     let mut preferred_order = minimum_order;
-    'fractions: for fraction in [16, 8, 4, 2] {
+    'fractions: for fraction in WASTE_FRACTIONS {
         for order in min_order..=MAX_SLAB_ORDER {
             let bytes = PAGE_SIZE << order;
             if bytes % stride <= bytes / fraction {

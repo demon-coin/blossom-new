@@ -668,7 +668,7 @@ fn find(entries: &[DentryRef], parent: &DentryRef, name: &[u8]) -> Option<Dentry
 
 /// 单组件沿盘上名字长度约束验证，点组件的路径含义由逐组件遍历处理。
 fn validate_name(name: &[u8]) -> Result<(), FsError> {
-    if 255 < name.len() {
+    if crate::fs::types::NAME_MAX < name.len() {
         return Err(FsError::NameTooLong);
     }
     if name.is_empty() || name.contains(&0) || name.contains(&b'/') {

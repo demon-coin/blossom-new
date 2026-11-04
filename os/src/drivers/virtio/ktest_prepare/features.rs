@@ -1,5 +1,6 @@
 //! 现代真实 transport 拒绝遗漏必需 ACCESS_PLATFORM 的组合；不模拟状态读回。
 
+use crate::drivers::virtio::{VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN, VIRTIO_VENDOR_ID};
 use crate::drivers::DeviceInventory;
 use crate::{irq, mm, time, timer};
 use ::ktest::{Fixture, SuiteSlot, TestContext, TestError, TestResult};
@@ -80,7 +81,11 @@ mod hardware {
                 .devices()
                 .iter()
                 .find(|device| {
-                    device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+                    device.vendor_id == VIRTIO_VENDOR_ID
+                        && matches!(
+                            device.device_id,
+                            VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                        )
                 })
                 .and_then(|device| device.interrupt)
                 .ok_or(TestError("feature candidate IRQ missing"))?

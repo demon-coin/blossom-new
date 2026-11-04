@@ -11,11 +11,17 @@ use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
-    ReadBuffer, SeekFrom, Vfs, WriteBuffer,
+    ReadBuffer, SeekFrom, Vfs, WriteBuffer, O_ACCMODE, O_RDONLY, O_TRUNC,
 };
-use crate::net::NetStack;
+use crate::net::route::{IPV4_ADDRESS_BITS, RTF_GATEWAY, RTF_UP};
+use crate::net::{NetStack, INTERFACE_COUNT};
 use crate::sync::SleepMutex;
 use crate::{accounting, cpu, irq, mm, time};
+
+const SNAPSHOT_INITIAL_CAPACITY: usize = 256;
+const BYTES_PER_KIB: usize = 1024;
+const UPTIME_TICKS_PER_SEC: u64 = 100;
+const UPTIME_TICK_NANOS: u64 = time::NSEC_PER_SEC / UPTIME_TICKS_PER_SEC;
 
 /// 每个实际打开实例拥有本次文本和共享游标，重新打开才观察新的系统状态。
 pub struct SnapshotFile {
@@ -36,7 +42,7 @@ impl SnapshotText {
     fn try_new() -> Result<Self, FsError> {
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(256)
+            .try_reserve_exact(SNAPSHOT_INITIAL_CAPACITY)
             .map_err(|_| FsError::NoMemory)?;
         Ok(Self { bytes, error: None })
     }
@@ -97,7 +103,7 @@ pub fn open(
     vfs: &Vfs,
     caller: FileIoContext<'_>,
 ) -> Result<FileRef, FsError> {
-    if flags & 0o3 != 0 || flags & 0o1000 != 0 {
+    if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
         return Err(FsError::ReadOnly);
     }
     let bytes = match special {
@@ -205,7 +211,7 @@ fn interrupts() -> Result<Vec<u8>, FsError> {
 /// 先复制接口和 Root 提供的计数，再锁外格式化；未监测的 FIFO、frame、压缩、组播、碰撞及硬件 TX 错误为零。
 fn net_dev(net: &NetStack) -> Result<Vec<u8>, FsError> {
     let interfaces = net.interface_snapshots();
-    let mut snapshots = [None; 2];
+    let mut snapshots = [None; INTERFACE_COUNT];
     for (slot, interface) in snapshots.iter_mut().zip(interfaces.iter()) {
         if let Some(interface) = interface {
             *slot = Some((interface.id, net.statistics(interface.id)?));
@@ -254,9 +260,14 @@ fn net_route(net: &NetStack) -> Result<Vec<u8>, FsError> {
             let mask = if route.prefix_len == 0 {
                 0
             } else {
-                u32::MAX << (32 - route.prefix_len)
+                u32::MAX << (IPV4_ADDRESS_BITS - route.prefix_len)
             };
-            let flags = u16::from(route.up) | if route.gateway.is_some() { 2 } else { 0 };
+            let flags = if route.up { RTF_UP } else { 0 }
+                | if route.gateway.is_some() {
+                    RTF_GATEWAY
+                } else {
+                    0
+                };
             writeln!(
                 text,
                 "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
@@ -277,7 +288,7 @@ fn meminfo() -> Result<Vec<u8>, FsError> {
     let stats = mm::stats();
     let managed = stats.present_pages - stats.reserved_pages - stats.metadata_pages;
     let free = stats.buddy_free_pages + stats.pcp_cached_pages;
-    let kb_per_page = mm::PAGE_SIZE / 1024;
+    let kb_per_page = mm::PAGE_SIZE / BYTES_PER_KIB;
     let mut text = SnapshotText::try_new()?;
     let result = write!(
         text,
@@ -299,10 +310,10 @@ fn uptime() -> Result<Vec<u8>, FsError> {
     let result = write!(
         text,
         "{}.{:02} {}.{:02}\n",
-        elapsed / 1_000_000_000,
-        elapsed / 10_000_000 % 100,
-        idle / 1_000_000_000,
-        idle / 10_000_000 % 100
+        elapsed / time::NSEC_PER_SEC,
+        elapsed / UPTIME_TICK_NANOS % UPTIME_TICKS_PER_SEC,
+        idle / u128::from(time::NSEC_PER_SEC),
+        idle / u128::from(UPTIME_TICK_NANOS) % u128::from(UPTIME_TICKS_PER_SEC)
     );
     text.finish(result)
 }

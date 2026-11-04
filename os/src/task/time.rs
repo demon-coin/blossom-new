@@ -7,11 +7,15 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Once;
 
 use crate::sync::{SleepMutex, SpinLock};
-use crate::task::signal::SignalGroup;
+use crate::task::signal::{SignalGroup, SIGALRM, SIGPROF, SIGVTALRM};
 use crate::time::{self, MonotonicInstant};
 use crate::timer::{Timer, TimerKind};
 
 pub(crate) const USER_HZ: u64 = 100;
+pub(crate) const ITIMER_REAL: usize = 0;
+pub(crate) const ITIMER_VIRTUAL: usize = 1;
+pub(crate) const ITIMER_PROF: usize = 2;
+const ITIMER_COUNT: usize = ITIMER_PROF + 1;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CpuTime {
@@ -162,7 +166,7 @@ fn next_phase(previous: u64, interval: u64, now: u64) -> Option<u64> {
 }
 
 struct TimerState {
-    timers: [IntervalTimer; 3],
+    timers: [IntervalTimer; ITIMER_COUNT],
     closed: bool,
 }
 
@@ -184,7 +188,7 @@ impl GroupTime {
             children: CpuTotals::new(),
             signals: Arc::downgrade(&signals),
             state: SpinLock::new(TimerState {
-                timers: [IntervalTimer::default(); 3],
+                timers: [IntervalTimer::default(); ITIMER_COUNT],
                 closed: false,
             }),
             real_operation: SleepMutex::new(()),
@@ -238,7 +242,7 @@ impl GroupTime {
 
     /// 原 clock 值与相对期限在同一短锁计算，溢出或已关闭不修改已登记状态。
     pub(crate) fn set_itimer(&self, which: usize, value: ItimerValue) -> Option<ItimerValue> {
-        if which == 0 {
+        if which == ITIMER_REAL {
             return self.set_real(value);
         }
         let mut state = self.state.lock();
@@ -272,12 +276,12 @@ impl GroupTime {
         } else {
             now.checked_add(value.value_ns)?
         };
-        let old = state.timers[0].remaining(now);
-        state.timers[0] = IntervalTimer::default();
+        let old = state.timers[ITIMER_REAL].remaining(now);
+        state.timers[ITIMER_REAL] = IntervalTimer::default();
         drop(state);
         self.real_timer().cancel_sync();
         let mut state = self.state.lock();
-        state.timers[0] = IntervalTimer {
+        state.timers[ITIMER_REAL] = IntervalTimer {
             expires,
             interval: value.interval_ns,
         };
@@ -299,7 +303,7 @@ impl GroupTime {
         let _operation = self.real_operation.lock();
         let mut state = self.state.lock();
         state.closed = true;
-        state.timers = [IntervalTimer::default(); 3];
+        state.timers = [IntervalTimer::default(); ITIMER_COUNT];
         drop(state);
         if self.real_started.swap(false, Ordering::Relaxed) {
             self.real_timer().close_sync();
@@ -309,23 +313,23 @@ impl GroupTime {
     /// CPU 记账后的合法锁外点一次检查两项，不逐周期补排，不持时间锁通知信号。
     pub(crate) fn flush_cpu_timers(&self) {
         let mut state = self.state.lock();
-        let virtual_due = state.timers[1].expire(self.clock(1));
-        let prof_due = state.timers[2].expire(self.clock(2));
+        let virtual_due = state.timers[ITIMER_VIRTUAL].expire(self.clock(ITIMER_VIRTUAL));
+        let prof_due = state.timers[ITIMER_PROF].expire(self.clock(ITIMER_PROF));
         drop(state);
         if virtual_due {
-            self.send(26);
+            self.send(SIGVTALRM);
         }
         if prof_due {
-            self.send(27);
+            self.send(SIGPROF);
         }
     }
 
     /// 各项使用真实单调、用户或用户加内核的具体时间域。
     fn clock(&self, which: usize) -> u64 {
         match which {
-            0 => time::now().as_nanos(),
-            1 => self.snapshot().user_ns,
-            2 => self.snapshot().total(),
+            ITIMER_REAL => time::now().as_nanos(),
+            ITIMER_VIRTUAL => self.snapshot().user_ns,
+            ITIMER_PROF => self.snapshot().total(),
             _ => panic!("invalid interval timer"),
         }
     }
@@ -361,8 +365,8 @@ fn real_expired(timer: Pin<&Timer>) {
     // 以前不释放存储；回调不强持该对象，不形成自身最后 put 或强引用环。
     let group = unsafe { &*(timer.context() as *const GroupTime) };
     let mut state = group.state.lock();
-    let due = state.timers[0].expire(time::now().as_nanos());
-    let expires = state.timers[0].expires;
+    let due = state.timers[ITIMER_REAL].expire(time::now().as_nanos());
+    let expires = state.timers[ITIMER_REAL].expires;
     if due && expires != 0 {
         // SAFETY: 原借用拥有者仍保持稳定存储至同步停止，运行回调可登记独立下一轮；
         // state 锁串行化更新和停止，锁序为时间状态到 timer base，回调入口不持 base。
@@ -371,6 +375,6 @@ fn real_expired(timer: Pin<&Timer>) {
     }
     drop(state);
     if due {
-        group.send(14);
+        group.send(SIGALRM);
     }
 }

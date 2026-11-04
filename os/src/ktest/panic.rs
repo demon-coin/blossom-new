@@ -6,10 +6,12 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::pin::pin;
 use core::ptr;
-use unwinding::abi::UnwindException;
+use unwinding::abi::{UnwindException, UnwindReasonCode};
 use unwinding::panicking::{self, Exception};
 
 const TRUNCATED: &str = " [truncated]";
+const PANIC_MESSAGE_CAPACITY: usize = 512;
+const PANIC_FILE_CAPACITY: usize = 256;
 
 struct PanicText<const N: usize> {
     bytes: [u8; N],
@@ -88,8 +90,8 @@ impl<const N: usize> Write for PanicText<N> {
 
 /// 已被真实展开器归还的 panic 诊断；不保留 PanicInfo 或原格式化参数的借用。
 pub struct PanicRecord {
-    message: PanicText<512>,
-    file: PanicText<256>,
+    message: PanicText<PANIC_MESSAGE_CAPACITY>,
+    file: PanicText<PANIC_FILE_CAPACITY>,
     pub line: u32,
     pub column: u32,
 }
@@ -337,9 +339,9 @@ pub fn raise(info: &PanicInfo<'_>) -> ! {
     }
     let code = panicking::begin_panic(ExceptionToken(boundary));
     // 正常路径从 landing pad 返回 catch；begin_panic 返回表示查找/清理失败，不能恢复主体。
-    match code.0 {
-        5 => crate::ktest::fatal("panic unwind reached end of stack"),
-        3 => crate::ktest::fatal("panic unwind phase1 failed"),
+    match code {
+        UnwindReasonCode::END_OF_STACK => crate::ktest::fatal("panic unwind reached end of stack"),
+        UnwindReasonCode::FATAL_PHASE1_ERROR => crate::ktest::fatal("panic unwind phase1 failed"),
         _ => crate::ktest::fatal("panic unwind phase2 failed"),
     }
 }
@@ -360,11 +362,11 @@ impl FpState {
             // 先开启 FS 才读取 FCSR，不改 SIE 或当前 CPU 的 tp。
             unsafe {
                 core::arch::asm!("csrrs {control}, sstatus, {mask}",
-                    control = out(reg) control, mask = in(reg) 0x6000usize, options(nostack));
+                    control = out(reg) control, mask = in(reg) crate::arch::SR_FS, options(nostack));
                 core::arch::asm!("frcsr {fcsr}", fcsr = out(reg) fcsr, options(nostack));
             }
             Self {
-                control: control & 0x6000,
+                control: control & crate::arch::SR_FS,
                 fcsr,
             }
         }
@@ -372,13 +374,14 @@ impl FpState {
         {
             let control: usize;
             let fcsr: usize;
-            let mut enable = 1usize;
+            let mut enable = crate::arch::EUEN_FP;
             // SAFETY: PLV0 使用掩码只开启 EUEN.FPE；展开不能调度，KS0 不变。
             // FCSR 在 FPE 开启后才读取，不改变其他扩展单元或 IRQ 开关。
             unsafe {
-                core::arch::asm!("csrxchg {enable}, $t0, 0x2",
-                    enable = inout(reg) enable, in("$t0") 1usize, options(nostack));
-                control = enable & 1;
+                core::arch::asm!("csrxchg {enable}, $t0, {euen}",
+                    enable = inout(reg) enable, euen = const crate::arch::CSR_EUEN,
+                    in("$t0") crate::arch::EUEN_FP, options(nostack));
+                control = enable & crate::arch::EUEN_FP;
                 core::arch::asm!("movfcsr2gr {fcsr}, $fcsr0", fcsr = out(reg) fcsr, options(nostack));
             }
             Self { control, fcsr }
@@ -393,14 +396,15 @@ impl FpState {
         unsafe {
             core::arch::asm!("fscsr {fcsr}", fcsr = in(reg) self.fcsr, options(nostack));
             core::arch::asm!("csrc sstatus, {mask}", "csrs sstatus, {control}",
-                mask = in(reg) 0x6000usize, control = in(reg) self.control, options(nostack));
+                mask = in(reg) crate::arch::SR_FS, control = in(reg) self.control, options(nostack));
         }
         #[cfg(target_arch = "loongarch64")]
         // SAFETY: FPE 仍开启，FCSR 先恢复；EUEN 只交换 FPE，KS0 和 IRQ 不变。
         unsafe {
             core::arch::asm!("movgr2fcsr $fcsr0, {fcsr}", fcsr = in(reg) self.fcsr, options(nostack));
-            core::arch::asm!("csrxchg {control}, $t0, 0x2",
-                control = inout(reg) self.control => _, in("$t0") 1usize, options(nostack));
+            core::arch::asm!("csrxchg {control}, $t0, {euen}",
+                control = inout(reg) self.control => _, euen = const crate::arch::CSR_EUEN,
+                in("$t0") crate::arch::EUEN_FP, options(nostack));
         }
     }
 }

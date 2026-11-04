@@ -288,6 +288,8 @@ unsafe fn init_filesystems(
     inventory: &drivers::DeviceInventory,
     selected: fs::system::BootDevices<'_>,
 ) -> Result<task::process::ShutdownOperation, task::ProgramError> {
+    const INODE_CACHE_CAPACITY: usize = 64;
+
     let root = storage
         .lookup(selected.root)
         .ok_or(fs::FsError::MissingRoot)?;
@@ -295,7 +297,8 @@ unsafe fn init_filesystems(
         .extra
         .map(|selector| storage.lookup(selector).ok_or(fs::FsError::MissingRoot))
         .transpose()?;
-    let inodes = Arc::try_new(fs::InodeCache::try_new(64)?).map_err(|_| fs::FsError::NoMemory)?;
+    let inodes = Arc::try_new(fs::InodeCache::try_new(INODE_CACHE_CAPACITY)?)
+        .map_err(|_| fs::FsError::NoMemory)?;
     let inode_eviction = inodes.watch();
     let (vfs, context) =
         fs::system::mount_disks(root, extra, inodes, selected.root_mode, selected.rootdir)?;

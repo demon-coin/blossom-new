@@ -11,8 +11,10 @@ use crate::mm::PAGE_SIZE;
 use super::{ExecError, MAX_PATH_BYTES};
 
 const ARGUMENT_FLOOR: usize = 128 * 1024;
-const ARGUMENT_CEILING: u64 = 6 * 1024 * 1024;
+const ARGUMENT_CEILING: u64 =
+    super::DEFAULT_STACK_BYTES / STACK_LIMIT_FRACTION * (STACK_LIMIT_FRACTION - 1);
 const STRING_LIMIT: usize = 32 * PAGE_SIZE;
+const STACK_LIMIT_FRACTION: u64 = 4;
 
 /// 原始字符串不含 NUL；预算只计文件名、字符串终止符和有效参数指针。
 pub(crate) struct Arguments {
@@ -141,7 +143,8 @@ impl Arguments {
 
     /// 总量按软栈四分之一计算，保留固定下界并截到参数上界。
     fn budget(&self) -> usize {
-        ((self.stack_limit / 4).min(ARGUMENT_CEILING) as usize).max(ARGUMENT_FLOOR)
+        ((self.stack_limit / STACK_LIMIT_FRACTION).min(ARGUMENT_CEILING) as usize)
+            .max(ARGUMENT_FLOOR)
     }
 
     /// 在读取或分配字符串前扣除本项新增指针，同时保留每向量的正 i32 计数域。

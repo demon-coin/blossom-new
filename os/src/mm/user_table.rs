@@ -3,14 +3,13 @@
 
 use crate::arch;
 use crate::mm::reclaim::ReclaimAttempt;
-use crate::mm::{alloc_pages, OwnedPages, PAGE_SIZE};
+use crate::mm::{alloc_pages, OwnedPages, PAGE_SHIFT, PAGE_SIZE};
 use alloc::boxed::Box;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const ENTRIES: usize = PAGE_SIZE / size_of::<usize>();
 const INDEX_BITS: usize = ENTRIES.trailing_zeros() as usize;
-const PAGE_BITS: usize = PAGE_SIZE.trailing_zeros() as usize;
 
 /// 用户叶的访问权限；架构后端决定可表示的权限组合。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,7 +458,7 @@ fn valid_page(va: usize) -> bool {
 
 /// 从页地址取得该级硬件槽索引，架构共用的三层 4KiB 表每页有 512 槽。
 fn slot_index(va: usize, level: usize) -> usize {
-    (va >> (PAGE_BITS + INDEX_BITS * level)) & (ENTRIES - 1)
+    (va >> (PAGE_SHIFT + INDEX_BITS * level)) & (ENTRIES - 1)
 }
 
 /// 用后端实际编解码检查权限及物理地址，避免地址截断或保留权限组合被发表。

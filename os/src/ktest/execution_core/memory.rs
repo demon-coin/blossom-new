@@ -191,7 +191,7 @@ fn pressure(
     assert!(objects.iter().all(Option::is_none));
     for slot in pages.iter_mut() {
         let owned = new_page(0, 0xd4, counts);
-        counts.pressure_pages += owned.len() / 4096;
+        counts.pressure_pages += owned.len() / mm::PAGE_SIZE;
         *slot = Some(owned);
     }
     for (index, slot) in objects.iter_mut().enumerate() {

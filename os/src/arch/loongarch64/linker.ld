@@ -1,6 +1,9 @@
 OUTPUT_ARCH(loongarch)
 ENTRY(__primary_entry)
 INCLUDE platform-layout.ld
+HIDDEN(SECONDARY_ENTRY_ALIGNMENT = 64);
+HIDDEN(BOOT_CLEAR_WORD_BYTES = 8);
+/* FLAGS 在程序头解析阶段求值；这里直接保留 ELF 的 RX、R、RW 权限位。 */
 PHDRS {
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
@@ -11,7 +14,7 @@ SECTIONS {
     .text : AT(ADDR(.text) - __direct_base) {
         PROVIDE(__executable_start = .);
         KEEP(*(.text.entry.primary))
-        . = ALIGN(64);
+        . = ALIGN(SECONDARY_ENTRY_ALIGNMENT);
         KEEP(*(.text.entry.secondary))
         . = ALIGN(4096);
         KEEP(*(.text.vector.kernel_trap))
@@ -42,7 +45,7 @@ SECTIONS {
     .bss (NOLOAD) : AT(ADDR(.bss) - __direct_base) {
         __bss_start = .;
         *(.bss .bss.*) *(.sbss .sbss.*) *(COMMON)
-        . = ALIGN(8);
+        . = ALIGN(BOOT_CLEAR_WORD_BYTES);
         __bss_end = .;
     } :data
     . = ALIGN(4096);

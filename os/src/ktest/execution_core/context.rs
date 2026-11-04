@@ -212,7 +212,7 @@ fn switch_worker(state: Arc<Control>, token: ChildToken, slot: usize) -> Result<
 
 /// 描述符属于原可分配物理范围且没有被 SLUB 接管；不声称该getter表示buddy空闲。
 fn check_stack_pages(base: usize) {
-    for pfn in base / 4096..base / 4096 + STACK_BYTES / 4096 {
+    for pfn in base / mm::PAGE_SIZE..base / mm::PAGE_SIZE + STACK_BYTES / mm::PAGE_SIZE {
         let descriptor = mm::pages()
             .get(pfn)
             .expect("task stack has no page descriptor");

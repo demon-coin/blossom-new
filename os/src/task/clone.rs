@@ -12,6 +12,10 @@ use crate::task::user::{prepare_bound_user, ProgramError};
 use crate::task::{Placement, UserThread};
 use crate::wait::WaitResult;
 
+use crate::task::signal::{SIGCHLD, SIGNAL_COUNT};
+
+const CSIGNAL: usize = 0xff;
+
 const VM: usize = 0x100;
 const FS: usize = 0x200;
 const FILES: usize = 0x400;
@@ -26,7 +30,7 @@ const CHILD_CLEARTID: usize = 0x20_0000;
 // 历史 DETACHED 位不决定成员回收，真实 join 与身份退休仍由原图承担。
 const DETACHED: usize = 0x40_0000;
 const CHILD_SETTID: usize = 0x100_0000;
-const SUPPORTED: usize = 0xff
+const SUPPORTED: usize = CSIGNAL
     | VM
     | FS
     | FILES
@@ -85,10 +89,13 @@ impl CloneArguments {
         let share_vm = flags & VM != 0;
         let share_sighand = flags & SIGHAND != 0;
         let thread = flags & THREAD != 0;
-        if (thread && !share_sighand) || (share_sighand && !share_vm) || 64 < (flags & 0xff) {
+        if (thread && !share_sighand)
+            || (share_sighand && !share_vm)
+            || SIGNAL_COUNT < (flags & CSIGNAL)
+        {
             return Err(CloneError::InvalidFlags);
         }
-        if !thread && !matches!(flags & 0xff, 0 | 17) {
+        if !thread && !matches!((flags & CSIGNAL) as u8, 0 | SIGCHLD) {
             return Err(CloneError::Unsupported);
         }
         #[cfg(target_arch = "riscv64")]
@@ -102,7 +109,7 @@ impl CloneArguments {
             share_sighand,
             thread,
             vfork: flags & VFORK != 0,
-            exit_signal: (flags & 0xff) as u8,
+            exit_signal: (flags & CSIGNAL) as u8,
             stack: raw[1],
             tls: (flags & SETTLS != 0).then_some(tls),
             parent_tid: (flags & PARENT_SETTID != 0).then_some(raw[2]),

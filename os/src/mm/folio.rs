@@ -9,8 +9,8 @@ use core::slice;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::arch;
-use crate::block::{BlockError, IoResult};
-use crate::cache::MetadataCache;
+use crate::block::{BlockError, IoResult, SECTOR_BYTES};
+use crate::cache::{MetadataCache, FILE_BLOCK_BYTES_1K, FILE_BLOCK_BYTES_2K, FILE_BLOCK_BYTES_4K};
 use crate::fs::background::{self, WritebackDomain};
 use crate::fs::memfs::MemoryPageCharge;
 use crate::fs::InodeRef;
@@ -19,7 +19,7 @@ use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
 use crate::sched;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
-const SECTOR_SIZE: usize = 512;
+const SECTOR_SIZE: usize = SECTOR_BYTES as usize;
 const SECTORS_PER_PAGE: usize = PAGE_SIZE / SECTOR_SIZE;
 
 const CONTENT_LOCKED: u8 = 1;
@@ -924,7 +924,12 @@ impl FolioContent<'_> {
         valid_bytes: usize,
         block_size: usize,
     ) -> Result<(), BlockError> {
-        if PAGE_SIZE < valid_bytes || !matches!(block_size, 1024 | 2048 | 4096) {
+        if PAGE_SIZE < valid_bytes
+            || !matches!(
+                block_size,
+                FILE_BLOCK_BYTES_1K | FILE_BLOCK_BYTES_2K | FILE_BLOCK_BYTES_4K
+            )
+        {
             return Err(BlockError::InvalidRange);
         }
         if self.folio.is_memory() {
@@ -986,7 +991,13 @@ impl FolioContent<'_> {
         valid: usize,
         block_size: usize,
     ) -> Result<(), BlockError> {
-        if valid == 0 || PAGE_SIZE <= valid || !matches!(block_size, 1024 | 2048 | 4096) {
+        if valid == 0
+            || PAGE_SIZE <= valid
+            || !matches!(
+                block_size,
+                FILE_BLOCK_BYTES_1K | FILE_BLOCK_BYTES_2K | FILE_BLOCK_BYTES_4K
+            )
+        {
             return Err(BlockError::InvalidRange);
         }
         assert_eq!(

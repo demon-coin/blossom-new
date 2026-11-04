@@ -9,22 +9,24 @@ use crate::fs::pipe::{PipeBuffer, PIPE_BUF};
 use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::SocketAddress;
-use crate::net::socket::SocketTimeouts;
+use crate::net::socket::{
+    SocketTimeouts, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_SEQPACKET, SOCK_STREAM,
+};
 use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef};
 use crate::sync::{SleepMutex, SpinLock};
 
-const STREAM_CAPACITY: usize = 4 * PIPE_BUF;
+const STREAM_PIPE_BUFFERS: usize = 4;
+const STREAM_CAPACITY: usize = STREAM_PIPE_BUFFERS * PIPE_BUF;
 const RECORD_CAPACITY: usize = 32;
-const MSG_TRUNC: u32 = 0x20;
 
 /// 匿名 pair 的真实传输类型，数值与 socket ABI 一致。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum UnixSocketType {
-    Stream = 1,
-    SeqPacket = 5,
+    Stream = SOCK_STREAM,
+    SeqPacket = SOCK_SEQPACKET,
 }
-const SPACE_SHIFT: u32 = 15;
+const SPACE_SHIFT: u32 = usize::BITS - STREAM_CAPACITY.leading_zeros();
 const BYTES_MASK: usize = (1 << SPACE_SHIFT) - 1;
 const SPACE_MASK: usize = BYTES_MASK << SPACE_SHIFT;
 const SENDER_CLOSED: usize = 1 << (2 * SPACE_SHIFT);
@@ -51,7 +53,7 @@ struct DirectionState {
 
 /// 流保留原页 FIFO，记录方向仅在创建时准备有限队列槽。
 enum DirectionBuffer {
-    Stream(PipeBuffer<4>),
+    Stream(PipeBuffer<STREAM_PIPE_BUFFERS>),
     SeqPacket {
         records: VecDeque<Vec<u8>>,
         charge: usize,
@@ -486,14 +488,14 @@ impl UnixEndpoint {
 
     /// 指定方向关闭保留已有 incoming；任一路径均先释放一方向再取得另一方向。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
-        if 2 < how {
+        if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
         }
         self.check_open()?;
-        if how == 0 || how == 2 {
+        if how == SHUT_RD || how == SHUT_RDWR {
             self.pair.close_direction(1 - self.side, false, true, false);
         }
-        if how == 1 || how == 2 {
+        if how == SHUT_WR || how == SHUT_RDWR {
             self.pair.close_direction(self.side, true, false, false);
         }
         Ok(())

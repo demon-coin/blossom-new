@@ -358,7 +358,7 @@ fn abandon_program(
             Arc::clone(&sighand),
             Credentials::ROOT.uid,
             SignalInheritance::EMPTY,
-            17,
+            crate::task::signal::SIGCHLD,
         )
         .map_err(|error| {
             context.diagnostic(format_args!(
@@ -407,7 +407,7 @@ fn abandon_program(
             sighand,
             Credentials::ROOT.uid,
             SignalInheritance::EMPTY,
-            17,
+            crate::task::signal::SIGCHLD,
         )
         .map_err(|error| {
             context.diagnostic(format_args!(
@@ -480,7 +480,7 @@ fn allocation_failure(
             sighand,
             Credentials::ROOT.uid,
             SignalInheritance::EMPTY,
-            17,
+            crate::task::signal::SIGCHLD,
         )
         .map_err(|error| {
             context.diagnostic(format_args!(

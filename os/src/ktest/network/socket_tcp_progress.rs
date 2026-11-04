@@ -13,7 +13,7 @@ pub(crate) mod socket_tcp_progress {
     use crate::ktest::execution_services::{baseline, SuiteBaseline};
     use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
     use crate::net::core::ProtocolDeadline;
-    use crate::net::socket::SocketFile;
+    use crate::net::socket::{SocketFile, SHUT_WR};
     use crate::{cpu, mm, time, timer};
 
     /// 冷 OFD 和全部末弱观察先交给原 fixture，正文失败也由相同拥有结束。
@@ -322,9 +322,9 @@ pub(crate) mod socket_tcp_progress {
             context.expect_eq(&output[..count], &input[..count]);
             position += count;
         }
-        operation(context, client.shutdown(1))?;
+        operation(context, client.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
-        operation(context, server.shutdown(1))?;
+        operation(context, server.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
         drop((server, subject, client, listener));
         retire_cold_tcp(context, fixture)
@@ -677,9 +677,9 @@ pub(crate) mod socket_tcp_progress {
         let mut output = [0u8; 16];
         socket_read_exact(&child, &mut output)?;
         context.expect_eq(&output, b"raw policy child");
-        operation(context, client.shutdown(1))?;
+        operation(context, client.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, child.read(&mut [0u8; 1]))?, 0);
-        operation(context, child.shutdown(1))?;
+        operation(context, child.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
         drop((child, client, listener));
         socket_retired(&fixture.net)?;

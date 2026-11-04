@@ -12,7 +12,9 @@ use core::convert::TryInto;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-const LIMIT: usize = 64;
+const MAX_SELECTED_CASES: usize = 64;
+const COMMAND_CAPACITY: usize = 1024;
+const PEER_ACK_CAPACITY: usize = 64;
 static COMMAND_READ: AtomicBool = AtomicBool::new(false);
 /// 只有一个命令的有界静态 ID，不缓存全目录或名称。
 #[derive(Clone, Copy)]
@@ -20,7 +22,7 @@ pub(crate) struct RunCommand {
     pub(crate) suite: u32,
     pub(crate) seed: u64,
     pub(crate) repeat: u32,
-    cases: [u32; LIMIT],
+    cases: [u32; MAX_SELECTED_CASES],
     count: usize,
     registry: Registry,
 }
@@ -62,7 +64,7 @@ pub(crate) fn early() -> RunCommand {
         mode,
         panic
     ));
-    let mut input = [0u8; 1024];
+    let mut input = [0u8; COMMAND_CAPACITY];
     let mut len = 0;
     loop {
         if len == input.len() {
@@ -144,12 +146,12 @@ fn parse(text: &str, registry: Registry) -> Result<RunCommand, TestError> {
         suite,
         seed,
         repeat,
-        cases: [0; LIMIT],
+        cases: [0; MAX_SELECTED_CASES],
         count: 0,
         registry,
     };
     for item in list.split(',') {
-        if command.count == LIMIT {
+        if command.count == MAX_SELECTED_CASES {
             return Err(TestError("more than 64 selected cases"));
         }
         let id = number(item)?
@@ -194,7 +196,7 @@ fn needs_peer(command: &RunCommand, suite: &SuiteDesc) -> bool {
 
 /// 关闭 RX 的控制者只消费一条有界完整回执，阶段、十进制 ID 和换行必须与当前边界一致。
 fn peer_acknowledgement(id: u32, prefix: &[u8]) -> TestResult {
-    let mut line = [0u8; 64];
+    let mut line = [0u8; PEER_ACK_CAPACITY];
     let mut length = 0;
     loop {
         if length == line.len() {
@@ -437,9 +439,12 @@ pub(crate) fn case_seed(seed: u64, repeat: u32, name: &str) -> u64 {
     let _ = write!(hash, "{}:{}:{}", seed, repeat, name);
     hash.finish()
 }
+const SHA256_BLOCK_BYTES: usize = 64;
+const SHA256_LENGTH_BYTES: usize = core::mem::size_of::<u64>();
+
 struct Sha256 {
     state: [u32; 8],
-    block: [u8; 64],
+    block: [u8; SHA256_BLOCK_BYTES],
     used: usize,
     bytes: u64,
 }
@@ -451,7 +456,7 @@ impl Sha256 {
                 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
                 0x5be0cd19,
             ],
-            block: [0; 64],
+            block: [0; SHA256_BLOCK_BYTES],
             used: 0,
             bytes: 0,
         }
@@ -460,11 +465,11 @@ impl Sha256 {
     fn update(&mut self, mut data: &[u8]) {
         self.bytes = self.bytes.wrapping_add(data.len() as u64);
         while !data.is_empty() {
-            let count = data.len().min(64 - self.used);
+            let count = data.len().min(SHA256_BLOCK_BYTES - self.used);
             self.block[self.used..self.used + count].copy_from_slice(&data[..count]);
             self.used += count;
             data = &data[count..];
-            if self.used == 64 {
+            if self.used == SHA256_BLOCK_BYTES {
                 self.compress();
                 self.used = 0;
             }
@@ -522,7 +527,7 @@ impl Sha256 {
     fn finish(mut self) -> u64 {
         let bits = self.bytes.wrapping_mul(8);
         self.update(&[0x80]);
-        while self.used != 56 {
+        while self.used != SHA256_BLOCK_BYTES - SHA256_LENGTH_BYTES {
             self.update(&[0]);
         }
         self.update(&bits.to_be_bytes());

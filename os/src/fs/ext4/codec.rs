@@ -1,15 +1,103 @@
 //! 磁盘结构仅从有界小端字节解码，校验和与布局共用同一实现。
 
+use crate::block::SECTOR_BYTES;
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
 pub(crate) use crate::fs::ext4::directory::{verify_directory, DirectoryLayout};
 use crate::fs::ext4::{Geometry, InodeData};
 use crate::fs::inode::InodeMetadata;
+use crate::fs::types::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
 use crate::fs::{FsError, InodeKind, InodeTime};
+use crate::time::NSEC_PER_SEC;
 
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
 pub(crate) const EA_INODE: u32 = 0x0020_0000;
 pub(crate) const INDEX: u32 = 0x1000;
 pub(crate) const METADATA_CSUM: u32 = 0x400;
+// inode 标志与超级块 feature 属于不同字段；同名能力不能共用位值。
+pub(crate) const HUGE_FILE: u32 = 0x0004_0000;
+const COMPR: u32 = 0x0000_0004;
+const IMMUTABLE: u32 = 0x0000_0010;
+const APPEND: u32 = 0x0000_0020;
+const ENCRYPT: u32 = 0x0000_0800;
+const VERITY: u32 = 0x0010_0000;
+const INLINE_DATA: u32 = 0x1000_0000;
+const CASEFOLD: u32 = 0x4000_0000;
+
+pub(crate) const FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
+pub(crate) const FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+pub(crate) const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
+const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
+pub(crate) const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
+pub(crate) const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
+const FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+pub(crate) const FEATURE_INCOMPAT_EA_INODE: u32 = 0x0400;
+const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
+pub(crate) const FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
+pub(crate) const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+pub(crate) const FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0004;
+pub(crate) const FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+pub(crate) const FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+pub(crate) const FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+pub(crate) const FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const FEATURE_RO_COMPAT_BIGALLOC: u32 = 0x0200;
+const FEATURE_RO_COMPAT_VERITY: u32 = 0x8000;
+
+pub(crate) const SUPER_MAGIC: u16 = 0xef53;
+pub(crate) const SUPERBLOCK_OFFSET: usize = 1024;
+pub(crate) const SUPERBLOCK_BYTES: usize = 1024;
+pub(crate) const SUPERBLOCK_END: usize = SUPERBLOCK_OFFSET + SUPERBLOCK_BYTES;
+const SUPER_CHECKSUM_OFFSET: usize = SUPERBLOCK_BYTES - core::mem::size_of::<u32>();
+const CRC32C_CHECKSUM: u8 = 1;
+const MIN_BLOCK_BYTES: usize = 1024;
+const MAX_BLOCK_LOG: u32 = 2;
+pub(crate) const MAX_BLOCK_BYTES: usize = MIN_BLOCK_BYTES << MAX_BLOCK_LOG;
+pub(crate) const ROOT_INODE: u64 = 2;
+const FIRST_NON_RESERVED_INODE: u64 = 11;
+pub(crate) const GOOD_OLD_INODE_BYTES: usize = 128;
+pub(crate) const LARGE_INODE_BYTES: usize = 256;
+pub(crate) const INODE_EXTRA_BYTES: usize = 160 - GOOD_OLD_INODE_BYTES;
+const MIN_DESCRIPTOR_BYTES: usize = 32;
+const LARGE_DESCRIPTOR_BYTES: usize = 64;
+pub(crate) const BG_INODE_UNINIT: u16 = 0x0001;
+pub(crate) const BG_BLOCK_UNINIT: u16 = 0x0002;
+
+pub(crate) const DIRECT_BLOCKS: usize = 12;
+pub(crate) const INDIRECT_LEVELS: usize = 3;
+pub(crate) const INODE_BLOCK_BYTES: usize =
+    (DIRECT_BLOCKS + INDIRECT_LEVELS) * core::mem::size_of::<u32>();
+const INODE_BLOCKS_LIMIT: u64 = 1u64 << (u32::BITS + u16::BITS);
+pub(crate) const INODE_CTIME_EXTRA_OFFSET: usize = 132;
+pub(crate) const INODE_MTIME_EXTRA_OFFSET: usize = 136;
+pub(crate) const INODE_ATIME_EXTRA_OFFSET: usize = 140;
+const EPOCH_BITS: u32 = 2;
+const EPOCH_MASK: u32 = (1 << EPOCH_BITS) - 1;
+pub(crate) const EXTENT_MAGIC: u16 = 0xf30a;
+pub(crate) const EXTENT_HEADER_BYTES: usize = 12;
+pub(crate) const EXTENT_ENTRY_BYTES: usize = 12;
+pub(crate) const EXTENT_ROOT_ENTRIES: usize =
+    (INODE_BLOCK_BYTES - EXTENT_HEADER_BYTES) / EXTENT_ENTRY_BYTES;
+pub(crate) const EXTENT_LOGICAL_BLOCKS: u64 = 1u64 << u32::BITS;
+pub(crate) const EXTENT_PHYSICAL_LIMIT: u64 = 1u64 << (u32::BITS + u16::BITS);
+// 树遍历与准备路径使用同一深度上限，路径栈另留一个根节点位置。
+pub(crate) const EXTENT_DEPTH_LIMIT: usize = 32;
+pub(crate) const EXTENT_INIT_MAX_LEN: u16 = 1 << 15;
+pub(crate) const EXTENT_UNWRITTEN_MAX_LEN: u16 = EXTENT_INIT_MAX_LEN - 1;
+pub(crate) const DIR_TAIL_BYTES: usize = 12;
+pub(crate) const FT_DIR_CSUM: u8 = 0xde;
+const XATTR_MAGIC: u32 = 0xea02_0000;
+const XATTR_ENTRY_BYTES: usize = 16;
+pub(crate) const MAX_EA_INODES: usize = MAX_BLOCK_BYTES / XATTR_ENTRY_BYTES;
+
+const FLAGS_SIGNED_HASH: u32 = 0x0001;
+const FLAGS_UNSIGNED_HASH: u32 = 0x0002;
+const DX_HASH_LEGACY: u8 = 0;
+const DX_HASH_HALF_MD4: u8 = 1;
+const DX_HASH_TEA: u8 = 2;
+const DX_HASH_LEGACY_UNSIGNED: u8 = 3;
+const DX_HASH_HALF_MD4_UNSIGNED: u8 = 4;
+pub(crate) const DX_HASH_TEA_UNSIGNED: u8 = 5;
+const DX_HASH_SIPHASH: u8 = 6;
 
 /// 借用明确的字节范围，拒绝短输入与加法溢出。
 pub(crate) fn bytes(data: &[u8], offset: usize, len: usize) -> Result<&[u8], FsError> {
@@ -34,17 +122,23 @@ pub(crate) fn directory_hash(
     hash_version: u8,
     name: &[u8],
 ) -> Result<(u32, u32), FsError> {
-    let version = if hash_version <= 2 && geometry.hash_unsigned {
-        hash_version + 3
+    let version = if hash_version <= DX_HASH_TEA && geometry.hash_unsigned {
+        hash_version + DX_HASH_LEGACY_UNSIGNED
     } else {
         hash_version
     };
     let (mut major, minor) = match version {
-        0 => (legacy_hash(name, false), 0),
-        1 | 4 => half_md4_hash(name, version == 4, geometry.hash_seed),
-        2 | 5 => tea_hash(name, version == 5, geometry.hash_seed),
-        3 => (legacy_hash(name, true), 0),
-        6 => return Err(FsError::Unsupported),
+        DX_HASH_LEGACY => (legacy_hash(name, false), 0),
+        DX_HASH_HALF_MD4 | DX_HASH_HALF_MD4_UNSIGNED => half_md4_hash(
+            name,
+            version == DX_HASH_HALF_MD4_UNSIGNED,
+            geometry.hash_seed,
+        ),
+        DX_HASH_TEA | DX_HASH_TEA_UNSIGNED => {
+            tea_hash(name, version == DX_HASH_TEA_UNSIGNED, geometry.hash_seed)
+        }
+        DX_HASH_LEGACY_UNSIGNED => (legacy_hash(name, true), 0),
+        DX_HASH_SIPHASH => return Err(FsError::Unsupported),
         _ => return Err(FsError::Unsupported),
     };
     major &= !1;
@@ -226,14 +320,14 @@ pub(crate) fn update_directory_checksum(
     }
     let end = geometry
         .block_size
-        .checked_sub(12)
+        .checked_sub(DIR_TAIL_BYTES)
         .ok_or(FsError::Corrupt)?;
     let tail = data
         .get_mut(end..geometry.block_size)
         .ok_or(FsError::Corrupt)?;
     tail.fill(0);
-    put16(data, end + 4, 12);
-    data[end + 7] = 0xde;
+    put16(data, end + 4, DIR_TAIL_BYTES as u16);
+    data[end + 7] = FT_DIR_CSUM;
     let checksum = crc32c(inode.checksum_seed, bytes(data, 0, end)?);
     put32(data, end + 8, checksum);
     Ok(())
@@ -303,47 +397,58 @@ pub(crate) fn ceil_div(value: u64, unit: u64) -> Result<u64, FsError> {
 
 /// 从当前盘面数据建立只读几何；日志状态不参与解码，也不执行日志恢复。
 pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, FsError> {
-    let data = bytes(data, 0, 1024)?;
-    if le16(data, 56)? != 0xef53 {
+    let data = bytes(data, 0, SUPERBLOCK_BYTES)?;
+    if le16(data, 56)? != SUPER_MAGIC {
         return Err(FsError::Corrupt);
     }
     let features_compat = le32(data, 92)?;
     let features_incompat = le32(data, 96)?;
     let features_ro_compat = le32(data, 100)?;
     if features_ro_compat & METADATA_CSUM != 0 {
-        if data[373] != 1 {
+        if data[373] != CRC32C_CHECKSUM {
             return Err(FsError::Unsupported);
         }
-        if crc32c(!0, &data[..1020]) != le32(data, 1020)? {
+        if crc32c(!0, &data[..SUPER_CHECKSUM_OFFSET]) != le32(data, SUPER_CHECKSUM_OFFSET)? {
             return Err(FsError::Checksum);
         }
     }
     // 只读兼容位可忽略未知值，已知扩展读取格式仍须明确拒绝。
-    let supported_incompat = 0x2 | 0x4 | 0x40 | 0x80 | 0x200 | 0x400 | 0x2000 | 0x4000;
+    let supported_incompat = FEATURE_INCOMPAT_FILETYPE
+        | FEATURE_INCOMPAT_RECOVER
+        | FEATURE_INCOMPAT_EXTENTS
+        | FEATURE_INCOMPAT_64BIT
+        | FEATURE_INCOMPAT_FLEX_BG
+        | FEATURE_INCOMPAT_EA_INODE
+        | FEATURE_INCOMPAT_CSUM_SEED
+        | FEATURE_INCOMPAT_LARGEDIR;
     if features_incompat & !supported_incompat != 0
-        || features_ro_compat & (0x4 | 0x200 | 0x8000) != 0
+        || features_ro_compat
+            & (FEATURE_RO_COMPAT_BTREE_DIR | FEATURE_RO_COMPAT_BIGALLOC | FEATURE_RO_COMPAT_VERITY)
+            != 0
     {
         return Err(FsError::Unsupported);
     }
-    if features_incompat & 0x2000 != 0 && features_ro_compat & METADATA_CSUM == 0 {
+    if features_incompat & FEATURE_INCOMPAT_CSUM_SEED != 0
+        && features_ro_compat & METADATA_CSUM == 0
+    {
         return Err(FsError::Corrupt);
     }
     if le32(data, 72)? != 0 || 1 < le32(data, 76)? {
         return Err(FsError::Unsupported);
     }
     let log = le32(data, 24)?;
-    if 2 < log {
+    if MAX_BLOCK_LOG < log {
         return Err(FsError::Unsupported);
     }
-    let block_size = 1024usize << log;
+    let block_size = MIN_BLOCK_BYTES << log;
     if le32(data, 28)? != log || le32(data, 36)? != le32(data, 32)? {
         return Err(FsError::Corrupt);
     }
     let first_data_block = u64::from(le32(data, 20)?);
-    if first_data_block != u64::from(block_size == 1024) {
+    if first_data_block != u64::from(block_size == MIN_BLOCK_BYTES) {
         return Err(FsError::Corrupt);
     }
-    let has64 = features_incompat & 0x80 != 0;
+    let has64 = features_incompat & FEATURE_INCOMPAT_64BIT != 0;
     let blocks_count = u64::from(le32(data, 4)?)
         | if has64 {
             u64::from(le32(data, 336)?) << 32
@@ -354,24 +459,24 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     let blocks_per_group = u64::from(le32(data, 32)?);
     let inodes_per_group = u64::from(le32(data, 40)?);
     let first_inode = if le32(data, 76)? == 0 {
-        11
+        FIRST_NON_RESERVED_INODE
     } else {
         u64::from(le32(data, 84)?)
     };
     let inode_size = if le32(data, 76)? == 0 {
-        128
+        GOOD_OLD_INODE_BYTES
     } else {
         usize::from(le16(data, 88)?)
     };
-    if !matches!(inode_size, 128 | 256) {
+    if !matches!(inode_size, GOOD_OLD_INODE_BYTES | LARGE_INODE_BYTES) {
         return Err(FsError::Unsupported);
     }
     let descriptor_size = if has64 {
         usize::from(le16(data, 254)?)
     } else {
-        32
+        MIN_DESCRIPTOR_BYTES
     };
-    if has64 && descriptor_size != 64 {
+    if has64 && descriptor_size != LARGE_DESCRIPTOR_BYTES {
         return Err(FsError::Unsupported);
     }
     if blocks_count <= first_data_block
@@ -381,7 +486,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         || block_size as u64 * 8 < blocks_per_group
         || block_size as u64 * 8 < inodes_per_group
         || inodes_per_group % (block_size / inode_size) as u64 != 0
-        || first_inode < 11
+        || first_inode < FIRST_NON_RESERVED_INODE
         || inodes_per_group < first_inode
         || blocks_per_group % 8 != 0
         || inodes_per_group % 8 != 0
@@ -412,7 +517,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     }
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(bytes(data, 104, 16)?);
-    let checksum_seed = if features_incompat & 0x2000 != 0 {
+    let checksum_seed = if features_incompat & FEATURE_INCOMPAT_CSUM_SEED != 0 {
         le32(data, 624)?
     } else {
         crc32c(!0, &uuid)
@@ -424,9 +529,10 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         le32(data, 248)?,
     ];
     let hash_flags = le32(data, 352)?;
-    let hash_unsigned = hash_flags & 2 != 0 || hash_flags & 3 == 0;
+    let hash_unsigned = hash_flags & FLAGS_UNSIGNED_HASH != 0
+        || hash_flags & (FLAGS_SIGNED_HASH | FLAGS_UNSIGNED_HASH) == 0;
     let default_hash_version = data[252];
-    if 5 < default_hash_version {
+    if DX_HASH_TEA_UNSIGNED < default_hash_version {
         return Err(FsError::Unsupported);
     }
     let log_groups_per_flex = data[372];
@@ -473,9 +579,9 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
         if crc as u16 != stored {
             return Err(FsError::Checksum);
         }
-    } else if g.features_ro_compat & 0x10 != 0 {
+    } else if g.features_ro_compat & FEATURE_RO_COMPAT_GDT_CSUM != 0 {
         let crc = crc16(crc16(crc16(!0, &g.uuid), &number), &data[..30]);
-        let crc = if g.descriptor_size == 64 {
+        let crc = if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
             crc16(crc, &data[32..])
         } else {
             crc
@@ -484,12 +590,12 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
             return Err(FsError::Checksum);
         }
     }
-    let first = if g.features_incompat & 0x200 != 0 {
+    let first = if g.features_incompat & FEATURE_INCOMPAT_FLEX_BG != 0 {
         g.first_data_block
     } else {
         g.first_data_block + group * g.blocks_per_group
     };
-    let end = if g.features_incompat & 0x200 != 0 {
+    let end = if g.features_incompat & FEATURE_INCOMPAT_FLEX_BG != 0 {
         g.blocks_count
     } else {
         core::cmp::min(first + g.blocks_per_group, g.blocks_count)
@@ -497,7 +603,7 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
     let mut pointers = [0u64; 3];
     for (index, value) in pointers.iter_mut().enumerate() {
         *value = u64::from(le32(data, index * 4)?);
-        if g.descriptor_size == 64 {
+        if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
             *value |= u64::from(le32(data, 32 + index * 4)?) << 32;
         }
         g.validate_blocks(*value, 1)?;
@@ -530,12 +636,12 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if number == 0 || g.inodes_count < number {
         return Err(FsError::Corrupt);
     }
-    let extra_isize = if g.inode_size == 128 {
+    let extra_isize = if g.inode_size == GOOD_OLD_INODE_BYTES {
         0
     } else {
         usize::from(le16(data, 128)?)
     };
-    if g.inode_size < 128 + extra_isize || extra_isize & 3 != 0 {
+    if g.inode_size < GOOD_OLD_INODE_BYTES + extra_isize || extra_isize & 3 != 0 {
         return Err(FsError::Corrupt);
     }
     let generation = le32(data, 100)?;
@@ -549,7 +655,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
             &data[126..128],
         );
         let mut stored = u32::from(le16(data, 124)?);
-        if g.inode_size != 128 {
+        if g.inode_size != GOOD_OLD_INODE_BYTES {
             crc = crc32c(crc, &data[128..130]);
             if 4 <= extra_isize {
                 crc = crc32c(crc32c(crc, &[0, 0]), &data[132..]);
@@ -558,7 +664,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
                 crc = crc32c(crc, &data[130..]);
             }
         }
-        if g.inode_size == 128 || extra_isize < 4 {
+        if g.inode_size == GOOD_OLD_INODE_BYTES || extra_isize < 4 {
             crc &= 0xffff;
         }
         if stored != crc {
@@ -566,31 +672,31 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         }
     }
     let mode = le16(data, 0)?;
-    let kind = match mode & 0xf000 {
-        0x8000 => InodeKind::Regular,
-        0x4000 => InodeKind::Directory,
-        0xa000 => InodeKind::Symlink,
-        0x2000 => InodeKind::Character,
-        0x6000 => InodeKind::Block,
-        0x1000 => InodeKind::Fifo,
-        0xc000 => InodeKind::Socket,
+    let kind = match mode & S_IFMT {
+        S_IFREG => InodeKind::Regular,
+        S_IFDIR => InodeKind::Directory,
+        S_IFLNK => InodeKind::Symlink,
+        S_IFCHR => InodeKind::Character,
+        S_IFBLK => InodeKind::Block,
+        S_IFIFO => InodeKind::Fifo,
+        S_IFSOCK => InodeKind::Socket,
         _ => return Err(FsError::Corrupt),
     };
     let flags = le32(data, 32)?;
-    if flags & (0x4 | 0x800 | 0x100000 | 0x10000000 | 0x40000000) != 0 {
+    if flags & (COMPR | ENCRYPT | VERITY | INLINE_DATA | CASEFOLD) != 0 {
         return Err(FsError::Unsupported);
     }
-    if flags & EXTENTS != 0 && g.features_incompat & 0x40 == 0 {
+    if flags & EXTENTS != 0 && g.features_incompat & FEATURE_INCOMPAT_EXTENTS == 0 {
         return Err(FsError::Corrupt);
     }
-    if flags & EA_INODE != 0 && g.features_incompat & 0x400 == 0 {
+    if flags & EA_INODE != 0 && g.features_incompat & FEATURE_INCOMPAT_EA_INODE == 0 {
         return Err(FsError::Corrupt);
     }
-    if kind == InodeKind::Symlink && flags & (0x10 | 0x20) != 0 {
+    if kind == InodeKind::Symlink && flags & (IMMUTABLE | APPEND) != 0 {
         return Err(FsError::Corrupt);
     }
     let size = u64::from(le32(data, 4)?)
-        | if kind == InodeKind::Regular || g.features_incompat & 0x4000 != 0 {
+        | if kind == InodeKind::Regular || g.features_incompat & FEATURE_INCOMPAT_LARGEDIR != 0 {
             u64::from(le32(data, 108)?) << 32
         } else {
             0
@@ -599,18 +705,18 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         return Err(FsError::Corrupt);
     }
     let mut blocks = u64::from(le32(data, 28)?);
-    if g.features_ro_compat & 8 != 0 {
+    if g.features_ro_compat & FEATURE_RO_COMPAT_HUGE_FILE != 0 {
         blocks |= u64::from(le16(data, 116)?) << 32;
-        if flags & 0x40000 != 0 {
+        if flags & HUGE_FILE != 0 {
             blocks = blocks
-                .checked_mul((g.block_size / 512) as u64)
+                .checked_mul((g.block_size / SECTOR_BYTES as usize) as u64)
                 .ok_or(FsError::Corrupt)?;
         }
-    } else if flags & 0x40000 != 0 {
+    } else if flags & HUGE_FILE != 0 {
         return Err(FsError::Corrupt);
     }
     let file_acl = u64::from(le32(data, 104)?)
-        | if g.features_incompat & 0x80 != 0 {
+        | if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
             u64::from(le16(data, 118)?) << 32
         } else {
             0
@@ -621,15 +727,15 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     let ea_blocks = if file_acl == 0 {
         0
     } else {
-        (g.block_size / 512) as u64
+        (g.block_size / SECTOR_BYTES as usize) as u64
     };
     let fast_symlink = kind == InodeKind::Symlink
         && if flags & EA_INODE == 0 {
             blocks.checked_sub(ea_blocks).ok_or(FsError::Corrupt)? == 0
         } else {
-            0 < size && size < 60
+            0 < size && size < INODE_BLOCK_BYTES as u64
         };
-    if fast_symlink && 60 <= size {
+    if fast_symlink && INODE_BLOCK_BYTES as u64 <= size {
         return Err(FsError::Corrupt);
     }
     let mut block = [0u8; 60];
@@ -645,9 +751,9 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         gid: u32::from(le16(data, 24)?) | u32::from(le16(data, 122)?) << 16,
         links: u32::from(le16(data, 26)?),
         blocks,
-        atime: decode_time(data, 8, 140, extra_isize)?,
-        mtime: decode_time(data, 16, 136, extra_isize)?,
-        ctime: decode_time(data, 12, 132, extra_isize)?,
+        atime: decode_time(data, 8, INODE_ATIME_EXTRA_OFFSET, extra_isize)?,
+        mtime: decode_time(data, 16, INODE_MTIME_EXTRA_OFFSET, extra_isize)?,
+        ctime: decode_time(data, 12, INODE_CTIME_EXTRA_OFFSET, extra_isize)?,
         generation,
         flags,
         block,
@@ -692,14 +798,14 @@ fn decode_time(
     extra_isize: usize,
 ) -> Result<InodeTime, FsError> {
     let seconds = i64::from(le32(data, base)? as i32);
-    let extension = if extra + 4 <= 128 + extra_isize {
+    let extension = if extra + 4 <= GOOD_OLD_INODE_BYTES + extra_isize {
         le32(data, extra)?
     } else {
         0
     };
     Ok(InodeTime {
-        seconds: seconds + (i64::from(extension & 3) << 32),
-        nanoseconds: extension >> 2,
+        seconds: seconds + (i64::from(extension & EPOCH_MASK) << 32),
+        nanoseconds: extension >> EPOCH_BITS,
     })
 }
 
@@ -717,12 +823,12 @@ pub(crate) fn validate_inode_metadata_update(
     fixed.atime = old.atime;
     fixed.mtime = old.mtime;
     fixed.ctime = old.ctime;
-    if fixed != *old || old.mode & 0xf000 != next.mode & 0xf000 || (u16::MAX as u32) < next.links {
+    if fixed != *old || old.mode & S_IFMT != next.mode & S_IFMT || (u16::MAX as u32) < next.links {
         return Err(FsError::InvalidOperation);
     }
-    time_encoding(next.atime, 140, next.extra_isize)?;
-    time_encoding(next.mtime, 136, next.extra_isize)?;
-    time_encoding(next.ctime, 132, next.extra_isize)?;
+    time_encoding(next.atime, INODE_ATIME_EXTRA_OFFSET, next.extra_isize)?;
+    time_encoding(next.mtime, INODE_MTIME_EXTRA_OFFSET, next.extra_isize)?;
+    time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)?;
     Ok(())
 }
 
@@ -732,7 +838,7 @@ fn time_encoding(
     extra: usize,
     extra_isize: usize,
 ) -> Result<(u32, Option<u32>), FsError> {
-    if 1_000_000_000 <= time.nanoseconds {
+    if (NSEC_PER_SEC as u32) <= time.nanoseconds {
         return Err(FsError::InvalidOperation);
     }
     let base = time.seconds as i32;
@@ -741,11 +847,14 @@ fn time_encoding(
         .checked_sub(i64::from(base))
         .ok_or(FsError::InvalidOperation)?
         >> 32;
-    if extra + 4 <= 128 + extra_isize {
-        if !(0..=3).contains(&epoch) {
+    if extra + 4 <= GOOD_OLD_INODE_BYTES + extra_isize {
+        if !(0..=i64::from(EPOCH_MASK)).contains(&epoch) {
             return Err(FsError::InvalidOperation);
         }
-        Ok((base as u32, Some((time.nanoseconds << 2) | epoch as u32)))
+        Ok((
+            base as u32,
+            Some((time.nanoseconds << EPOCH_BITS) | epoch as u32),
+        ))
     } else {
         if epoch != 0 || time.nanoseconds != 0 {
             return Err(FsError::InvalidOperation);
@@ -760,10 +869,10 @@ pub(crate) fn prepare_inode_time(
     extra: usize,
     extra_isize: usize,
 ) -> Result<InodeTime, FsError> {
-    if 1_000_000_000 <= time.nanoseconds {
+    if (NSEC_PER_SEC as u32) <= time.nanoseconds {
         return Err(FsError::InvalidOperation);
     }
-    if 128 + extra_isize < extra + 4 {
+    if GOOD_OLD_INODE_BYTES + extra_isize < extra + 4 {
         time.nanoseconds = 0;
     }
     time_encoding(time, extra, extra_isize)?;
@@ -776,11 +885,11 @@ pub(crate) fn prepare_inode_write_times(
     extra_isize: usize,
 ) -> Result<(InodeTime, InodeTime), FsError> {
     let modified = InodeTime {
-        seconds: (nanoseconds / 1_000_000_000) as i64,
-        nanoseconds: (nanoseconds % 1_000_000_000) as u32,
+        seconds: (nanoseconds / NSEC_PER_SEC) as i64,
+        nanoseconds: (nanoseconds % NSEC_PER_SEC) as u32,
     };
-    let mtime = prepare_inode_time(modified, 136, extra_isize)?;
-    let ctime = prepare_inode_time(modified, 132, extra_isize)?;
+    let mtime = prepare_inode_time(modified, INODE_MTIME_EXTRA_OFFSET, extra_isize)?;
+    let ctime = prepare_inode_time(modified, INODE_CTIME_EXTRA_OFFSET, extra_isize)?;
     Ok((mtime, ctime))
 }
 
@@ -797,18 +906,18 @@ pub(crate) fn patch_inode_metadata(
         return Err(FsError::Corrupt);
     }
     let record = record.get_mut(..g.inode_size).ok_or(FsError::Corrupt)?;
-    let atime = time_encoding(next.atime, 140, next.extra_isize)?;
-    let mtime = time_encoding(next.mtime, 136, next.extra_isize)?;
-    let ctime = time_encoding(next.ctime, 132, next.extra_isize)?;
+    let atime = time_encoding(next.atime, INODE_ATIME_EXTRA_OFFSET, next.extra_isize)?;
+    let mtime = time_encoding(next.mtime, INODE_MTIME_EXTRA_OFFSET, next.extra_isize)?;
+    let ctime = time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)?;
     put16(record, 0, next.mode);
     put16(record, 2, next.uid as u16);
     put16(record, 120, (next.uid >> 16) as u16);
     put16(record, 24, next.gid as u16);
     put16(record, 122, (next.gid >> 16) as u16);
     put16(record, 26, next.links as u16);
-    put_time(record, 8, 140, atime);
-    put_time(record, 16, 136, mtime);
-    put_time(record, 12, 132, ctime);
+    put_time(record, 8, INODE_ATIME_EXTRA_OFFSET, atime);
+    put_time(record, 16, INODE_MTIME_EXTRA_OFFSET, mtime);
+    put_time(record, 12, INODE_CTIME_EXTRA_OFFSET, ctime);
     inode_checksum(g, record, next.checksum_seed, next.extra_isize);
     Ok(())
 }
@@ -838,7 +947,7 @@ pub(crate) fn extent_header(
     data: &[u8],
     expected_depth: Option<u16>,
 ) -> Result<ExtentHeader, FsError> {
-    if le16(data, 0)? != 0xf30a {
+    if le16(data, 0)? != EXTENT_MAGIC {
         return Err(FsError::Corrupt);
     }
     let h = ExtentHeader {
@@ -846,10 +955,10 @@ pub(crate) fn extent_header(
         max: le16(data, 4)?,
         depth: le16(data, 6)?,
     };
-    if 32 < h.depth
+    if EXTENT_DEPTH_LIMIT < usize::from(h.depth)
         || h.max == 0
         || h.max < h.entries
-        || data.len() < 12 + usize::from(h.max) * 12
+        || data.len() < EXTENT_HEADER_BYTES + usize::from(h.max) * EXTENT_ENTRY_BYTES
         || (h.entries == 0 && h.depth != 0)
         || expected_depth.is_some_and(|depth| depth != h.depth)
     {
@@ -863,9 +972,13 @@ pub(crate) fn extent_length(raw: u16) -> Result<(u64, bool), FsError> {
     if raw == 0 {
         return Err(FsError::Corrupt);
     }
-    let unwritten = 32768 < raw;
+    let unwritten = EXTENT_INIT_MAX_LEN < raw;
     Ok((
-        u64::from(if unwritten { raw - 32768 } else { raw }),
+        u64::from(if unwritten {
+            raw - EXTENT_INIT_MAX_LEN
+        } else {
+            raw
+        }),
         unwritten,
     ))
 }
@@ -878,7 +991,7 @@ pub(crate) fn verify_extent_checksum(
     header: ExtentHeader,
 ) -> Result<(), FsError> {
     if g.features_ro_compat & METADATA_CSUM != 0 {
-        let tail = 12 + usize::from(header.max) * 12;
+        let tail = EXTENT_HEADER_BYTES + usize::from(header.max) * EXTENT_ENTRY_BYTES;
         if le32(data, tail)? != crc32c(inode.checksum_seed, bytes(data, 0, tail)?) {
             return Err(FsError::Checksum);
         }
@@ -903,7 +1016,7 @@ pub(crate) fn group_layout(
         g.inodes_per_group * g.inode_size as u64 / g.block_size as u64,
     )?;
     let high = |offset| -> Result<u64, FsError> {
-        Ok(if g.descriptor_size == 64 {
+        Ok(if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
             u64::from(le32(record, offset)?) << 32
         } else {
             0
@@ -931,7 +1044,7 @@ pub(crate) struct GroupState {
 pub(crate) fn group_state(g: &Geometry, record: &[u8]) -> Result<GroupState, FsError> {
     let field = |low, high| -> Result<u32, FsError> {
         Ok(u32::from(le16(record, low)?)
-            | if g.descriptor_size == 64 {
+            | if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
                 u32::from(le16(record, high)?) << 16
             } else {
                 0
@@ -959,7 +1072,7 @@ pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: Gr
         (26, 58, state.inode_checksum),
     ] {
         put16(record, low, value as u16);
-        if g.descriptor_size == 64 {
+        if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
             put16(record, high, (value >> 16) as u16);
         }
     }
@@ -969,9 +1082,9 @@ pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: Gr
         put16(record, 30, 0);
         let sum = crc32c(crc32c(g.checksum_seed, &number), record);
         put16(record, 30, sum as u16);
-    } else if g.features_ro_compat & 0x10 != 0 {
+    } else if g.features_ro_compat & FEATURE_RO_COMPAT_GDT_CSUM != 0 {
         let sum = crc16(crc16(crc16(!0, &g.uuid), &number), &record[..30]);
-        let sum = if g.descriptor_size == 64 {
+        let sum = if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
             crc16(sum, &record[32..])
         } else {
             sum
@@ -988,7 +1101,7 @@ pub(crate) fn bitmap_checksum(g: &Geometry, bitmap: &[u8], inode: bool) -> u32 {
         g.blocks_per_group
     };
     let sum = crc32c(g.checksum_seed, &bitmap[..(bits / 8) as usize]);
-    if g.descriptor_size == 64 {
+    if g.descriptor_size == LARGE_DESCRIPTOR_BYTES {
         sum
     } else {
         sum & 0xffff
@@ -1025,7 +1138,7 @@ pub(crate) fn patch_super_counts(
     now_ns: u64,
 ) {
     let old_blocks = u64::from(le32(record, 12).expect("prepared superblock"))
-        | if g.features_incompat & 0x80 != 0 {
+        | if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
             u64::from(le32(record, 344).expect("prepared superblock")) << 32
         } else {
             0
@@ -1039,16 +1152,20 @@ pub(crate) fn patch_super_counts(
         .expect("free inode count overflow");
     assert!(next_blocks <= g.blocks_count && next_inodes <= g.inodes_count);
     put32(record, 12, next_blocks as u32);
-    if g.features_incompat & 0x80 != 0 {
+    if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
         put32(record, 344, (next_blocks >> 32) as u32);
     }
     put32(record, 16, next_inodes as u32);
     // ABI: s_wtime 与 s_wtime_hi 共同编码 40 位秒数，使用与 inode 时间相同的时钟。
-    let write_seconds = now_ns / 1_000_000_000;
+    let write_seconds = now_ns / NSEC_PER_SEC;
     put32(record, 48, write_seconds as u32);
     record[0x274] = (write_seconds >> 32) as u8;
     if g.features_ro_compat & METADATA_CSUM != 0 {
-        put32(record, 1020, crc32c(!0, &record[..1020]));
+        put32(
+            record,
+            SUPER_CHECKSUM_OFFSET,
+            crc32c(!0, &record[..SUPER_CHECKSUM_OFFSET]),
+        );
     }
 }
 
@@ -1057,14 +1174,14 @@ pub(crate) fn blocks_encoding(g: &Geometry, sectors: u64) -> Result<(u64, bool),
     if sectors <= u32::MAX as u64 {
         return Ok((sectors, false));
     }
-    if g.features_ro_compat & 8 == 0 {
+    if g.features_ro_compat & FEATURE_RO_COMPAT_HUGE_FILE == 0 {
         return Err(FsError::FileTooLarge);
     }
-    if sectors < (1u64 << 48) {
+    if sectors < INODE_BLOCKS_LIMIT {
         return Ok((sectors, false));
     }
-    let blocks = sectors / (g.block_size / 512) as u64;
-    if (1u64 << 48) <= blocks {
+    let blocks = sectors / (g.block_size / SECTOR_BYTES as usize) as u64;
+    if INODE_BLOCKS_LIMIT <= blocks {
         return Err(FsError::FileTooLarge);
     }
     Ok((blocks, true))
@@ -1078,8 +1195,10 @@ pub(crate) fn patch_inode_mapping(
     root: &[u8; 60],
 ) {
     let (blocks, huge) = blocks_encoding(g, next.blocks).expect("prepared inode blocks");
-    let mtime = time_encoding(next.mtime, 136, next.extra_isize).expect("prepared inode mtime");
-    let ctime = time_encoding(next.ctime, 132, next.extra_isize).expect("prepared inode ctime");
+    let mtime = time_encoding(next.mtime, INODE_MTIME_EXTRA_OFFSET, next.extra_isize)
+        .expect("prepared inode mtime");
+    let ctime = time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)
+        .expect("prepared inode ctime");
     put32(record, 4, next.size as u32);
     put32(record, 108, (next.size >> 32) as u32);
     put32(record, 28, blocks as u32);
@@ -1087,11 +1206,11 @@ pub(crate) fn patch_inode_mapping(
     put32(
         record,
         32,
-        (next.flags & !0x40000) | if huge { 0x40000 } else { 0 },
+        (next.flags & !HUGE_FILE) | if huge { HUGE_FILE } else { 0 },
     );
     record[40..100].copy_from_slice(root);
-    put_time(record, 16, 136, mtime);
-    put_time(record, 12, 132, ctime);
+    put_time(record, 16, INODE_MTIME_EXTRA_OFFSET, mtime);
+    put_time(record, 12, INODE_CTIME_EXTRA_OFFSET, ctime);
     inode_checksum(g, record, next.checksum_seed, next.extra_isize);
 }
 
@@ -1113,7 +1232,7 @@ pub(crate) fn inode_checksum(g: &Geometry, record: &mut [u8], seed: u32, extra: 
 
 /// 最终回收只清当前 inode 的内容引用和分配计数，保留 generation、未知字段和邻记录。
 pub(crate) fn patch_inode_release(g: &Geometry, record: &mut [u8], seed: u32, extra: usize) {
-    let flags = le32(record, 32).expect("prepared freed inode flags") & !0x40000;
+    let flags = le32(record, 32).expect("prepared freed inode flags") & !HUGE_FILE;
     let deletion_time = le32(record, 12).expect("prepared freed inode ctime");
     put32(record, 4, 0);
     put32(record, 108, 0);
@@ -1121,16 +1240,16 @@ pub(crate) fn patch_inode_release(g: &Geometry, record: &mut [u8], seed: u32, ex
     put16(record, 116, 0);
     put16(record, 26, 0);
     put32(record, 104, 0);
-    if g.features_incompat & 0x80 != 0 {
+    if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
         put16(record, 118, 0);
     }
     put32(record, 32, flags);
     record[40..100].fill(0);
     if flags & EXTENTS != 0 {
-        put16(record, 40, 0xf30a);
-        put16(record, 44, 4);
+        put16(record, 40, EXTENT_MAGIC);
+        put16(record, 44, EXTENT_ROOT_ENTRIES as u16);
     }
-    if g.features_incompat & 0x400 != 0 {
+    if g.features_incompat & FEATURE_INCOMPAT_EA_INODE != 0 {
         clear_inline_ea_references(record, extra);
     }
     put32(record, 20, deletion_time);
@@ -1149,10 +1268,10 @@ pub(crate) fn verify_xattr_release(
     g: &Geometry,
     physical: u64,
     data: &[u8],
-    numbers: &mut [u64; 256],
+    numbers: &mut [u64; MAX_EA_INODES],
 ) -> Result<usize, FsError> {
     let data = bytes(data, 0, g.block_size)?;
-    if le32(data, 0)? != 0xea02_0000 || le32(data, 8)? != 1 || le32(data, 4)? == 0 {
+    if le32(data, 0)? != XATTR_MAGIC || le32(data, 8)? != 1 || le32(data, 4)? == 0 {
         return Err(FsError::Corrupt);
     }
     if g.features_ro_compat & METADATA_CSUM != 0
@@ -1160,7 +1279,7 @@ pub(crate) fn verify_xattr_release(
     {
         return Err(FsError::Checksum);
     }
-    if g.features_incompat & 0x400 != 0 {
+    if g.features_incompat & FEATURE_INCOMPAT_EA_INODE != 0 {
         return xattr_ea_inodes(data, 32, numbers);
     }
     Ok(0)
@@ -1171,13 +1290,13 @@ pub(crate) fn inline_ea_inodes(
     g: &Geometry,
     record: &[u8],
     extra: usize,
-    numbers: &mut [u64; 256],
+    numbers: &mut [u64; MAX_EA_INODES],
 ) -> Result<usize, FsError> {
-    if g.features_incompat & 0x400 == 0 {
+    if g.features_incompat & FEATURE_INCOMPAT_EA_INODE == 0 {
         return Ok(0);
     }
-    let header = 128 + extra;
-    if header + 4 <= record.len() && le32(record, header)? == 0xea02_0000 {
+    let header = GOOD_OLD_INODE_BYTES + extra;
+    if header + 4 <= record.len() && le32(record, header)? == XATTR_MAGIC {
         return xattr_ea_inodes(record, header + 4, numbers);
     }
     Ok(0)
@@ -1187,34 +1306,34 @@ pub(crate) fn inline_ea_inodes(
 fn xattr_ea_inodes(
     data: &[u8],
     mut offset: usize,
-    numbers: &mut [u64; 256],
+    numbers: &mut [u64; MAX_EA_INODES],
 ) -> Result<usize, FsError> {
     let mut count = 0;
     loop {
         if le32(data, offset)? == 0 {
             return Ok(count);
         }
-        let entry = bytes(data, offset, 16)?;
+        let entry = bytes(data, offset, XATTR_ENTRY_BYTES)?;
         let number = u64::from(le32(entry, 4)?);
         if number != 0 {
             numbers[count] = number;
             count += 1;
         }
-        offset += (16 + usize::from(entry[0]) + 3) & !3;
+        offset += (XATTR_ENTRY_BYTES + usize::from(entry[0]) + 3) & !3;
     }
 }
 
 /// 准备阶段已验证 entry 跨度；最终清除隐藏引用和值长度，其他 EA 字节保持原样。
 fn clear_inline_ea_references(record: &mut [u8], extra: usize) {
-    let header = 128 + extra;
+    let header = GOOD_OLD_INODE_BYTES + extra;
     if record.len() < header + 4
-        || le32(record, header).expect("prepared inline EA header") != 0xea02_0000
+        || le32(record, header).expect("prepared inline EA header") != XATTR_MAGIC
     {
         return;
     }
     let mut offset = header + 4;
     while le32(record, offset).expect("prepared inline EA entry") != 0 {
-        let span = (16 + usize::from(record[offset]) + 3) & !3;
+        let span = (XATTR_ENTRY_BYTES + usize::from(record[offset]) + 3) & !3;
         if le32(record, offset + 4).expect("prepared inline EA reference") != 0 {
             put32(record, offset + 4, 0);
             put32(record, offset + 8, 0);
@@ -1245,10 +1364,11 @@ pub(crate) fn patch_ea_inode_references(
         seconds: (references >> 32) as i64,
         nanoseconds: 0,
     };
-    let ctime = time_encoding(next.ctime, 132, next.extra_isize).expect("prepared EA inode ctime");
-    put_time(record, 12, 132, ctime);
+    let ctime = time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)
+        .expect("prepared EA inode ctime");
+    put_time(record, 12, INODE_CTIME_EXTRA_OFFSET, ctime);
     put32(record, 36, references as u32);
-    if 156 <= 128 + next.extra_isize {
+    if 156 <= GOOD_OLD_INODE_BYTES + next.extra_isize {
         put32(record, 152, 0);
     }
     put16(record, 26, next.links as u16);

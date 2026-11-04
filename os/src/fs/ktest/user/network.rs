@@ -237,7 +237,10 @@ impl UserOwner {
         let channels = if mode.coordinated() {
             let (ready_reader, ready_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
             let (go_reader, go_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
-            checked(context, ready_reader.set_status_flags(0o4000))?;
+            checked(
+                context,
+                ready_reader.set_status_flags(crate::fs::O_NONBLOCK),
+            )?;
             let ready_fd = checked(
                 context,
                 runtime
@@ -471,14 +474,14 @@ fn coordinate(
             let pid = phase(reader, root, b'R', 0)?;
             blocked(graph, pid)?;
             graph
-                .send_kernel(pid, 10)
+                .send_kernel(pid, crate::task::signal::SIGUSR1)
                 .map_err(|_| TestError("empty read signal failed"))?;
             phase(reader, root, b'I', 4)?;
             go(writer)?;
             let child = phase(reader, root, b'T', 0)?;
             blocked(graph, child)?;
             graph
-                .send_kernel(child, 10)
+                .send_kernel(child, crate::task::signal::SIGUSR1)
                 .map_err(|_| TestError("restarted read signal failed"))?;
             if phase(reader, root, b'H', 10)? != child {
                 return Err(TestError("read handler ran in wrong process"));
@@ -493,7 +496,7 @@ fn coordinate(
             )?;
             blocked(graph, pid)?;
             graph
-                .send_kernel(pid, 10)
+                .send_kernel(pid, crate::task::signal::SIGUSR1)
                 .map_err(|_| TestError("connect signal failed"))?;
             phase(reader, root, b'J', 4)?;
             net.ktest_release_syn()
@@ -513,7 +516,7 @@ fn coordinate(
             )?;
             blocked(graph, pid)?;
             graph
-                .send_kernel(pid, 10)
+                .send_kernel(pid, crate::task::signal::SIGUSR1)
                 .map_err(|_| TestError("restart connect signal failed"))?;
             if phase(reader, root, b'H', 10)? != pid {
                 return Err(TestError("connect handler ran in wrong process"));

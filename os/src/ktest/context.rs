@@ -13,11 +13,12 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
+const MIN_CHILDREN: usize = 64;
 // 每核参与者之外保留一个协调 Task；普通非逐核用例仍有原来的最小登记预算。
-const CHILDREN: usize = if 64 < crate::boot::MAX_CPUS + 1 {
+const CHILDREN: usize = if MIN_CHILDREN < crate::boot::MAX_CPUS + 1 {
     crate::boot::MAX_CPUS + 1
 } else {
-    64
+    MIN_CHILDREN
 };
 const NO_CASE: u32 = u32::MAX;
 static BOOT_ENABLED: AtomicBool = AtomicBool::new(false);

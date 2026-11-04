@@ -2,11 +2,14 @@
 
 use core::convert::TryFrom;
 
-use crate::console::SerialConfig;
+use crate::console::{
+    SerialConfig, UART_LCR_EPAR, UART_LCR_PARITY, UART_LCR_STOP, UART_LCR_WLEN5, UART_LCR_WLEN6,
+    UART_LCR_WLEN7, UART_LCR_WLEN8,
+};
 use crate::fs::FsError;
 
 /// 目标 termios 固定 36 字节。
-pub const TERMIOS_BYTES: usize = 36;
+pub const TERMIOS_BYTES: usize = 4 * core::mem::size_of::<u32>() + 1 + NCCS;
 /// 控制字符固定 19 个。
 pub const NCCS: usize = 19;
 
@@ -136,7 +139,7 @@ pub const HUPCL: u32 = 0x0000_0400;
 /// CLOCAL 本地连接。
 pub const CLOCAL: u32 = 0x0000_0800;
 /// CIBAUD 输入波特率掩码。
-pub const CIBAUD: u32 = 0x100f_0000;
+pub const CIBAUD: u32 = CBAUD << IBSHIFT;
 /// IBSHIFT 输入波特率移位。
 pub const IBSHIFT: u32 = 16;
 /// CMSPAR 粘住校验，未选择。
@@ -177,12 +180,35 @@ pub const IEXTEN: u32 = 0x8000;
 /// EXTPROC 本地位，未选择。
 pub const EXTPROC: u32 = 0x1_0000;
 
+/// 立即提交 termios。
+pub const TCSANOW: u32 = 0;
+/// 排空输出后提交 termios。
+pub const TCSADRAIN: u32 = 1;
+/// 排空输出并清输入后提交 termios。
+pub const TCSAFLUSH: u32 = 2;
+/// 丢弃未读输入。
+pub const TCIFLUSH: u32 = 0;
+/// 丢弃未发输出。
+pub const TCOFLUSH: u32 = 1;
+/// 同时丢弃输入和输出。
+pub const TCIOFLUSH: u32 = 2;
+/// 暂停本地输出。
+pub const TCOOFF: u32 = 0;
+/// 恢复本地输出。
+pub const TCOON: u32 = 1;
+/// 向远端发送停止字符。
+pub const TCIOFF: u32 = 2;
+/// 向远端发送开始字符。
+pub const TCION: u32 = 3;
+/// 默认波特率的目标 CBAUD 编码。
+pub const B38400: u32 = 0x0f;
+
 /// 默认 termios 的 iflag。
 pub const DEFAULT_IFLAG: u32 = ICRNL | IXON;
 /// 默认 termios 的 oflag。
 pub const DEFAULT_OFLAG: u32 = OPOST | ONLCR;
 /// 默认 termios 的 cflag。
-pub const DEFAULT_CFLAG: u32 = 0x0f | CS8 | CREAD | HUPCL;
+pub const DEFAULT_CFLAG: u32 = B38400 | CS8 | CREAD | HUPCL;
 /// 默认 termios 的 lflag。
 pub const DEFAULT_LFLAG: u32 = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
 /// 默认 termios 的 19 个控制字符。
@@ -237,7 +263,7 @@ const STANDARD_BAUDS: [(u32, u32); 19] = [
     (0xc, 4800),
     (0xd, 9600),
     (0xe, 19200),
-    (0xf, 38400),
+    (B38400, 38400),
     (0x1001, 57600),
     (0x1002, 115200),
     (0x1003, 230400),
@@ -392,18 +418,18 @@ pub fn divisor_for_baud(baud_base: u32, baud: u32) -> Option<u16> {
 /// 把 termios 的字长、停止位与校验位转换为 8250 行控值。
 pub fn line_control(cflag: u32) -> u8 {
     let mut value = match cflag & CSIZE {
-        CS5 => 0x00,
-        CS6 => 0x01,
-        CS7 => 0x02,
-        _ => 0x03,
+        CS5 => UART_LCR_WLEN5,
+        CS6 => UART_LCR_WLEN6,
+        CS7 => UART_LCR_WLEN7,
+        _ => UART_LCR_WLEN8,
     };
     if cflag & CSTOPB != 0 {
-        value |= 0x04;
+        value |= UART_LCR_STOP;
     }
     if cflag & PARENB != 0 {
-        value |= 0x08;
+        value |= UART_LCR_PARITY;
         if cflag & PARODD == 0 {
-            value |= 0x10;
+            value |= UART_LCR_EPAR;
         }
     }
     value
@@ -447,7 +473,7 @@ pub fn character_nanos(divisor: u16, baud_base: u32, cflag: u32) -> Option<u64> 
     }
     let numerator = bits
         .checked_mul(u64::from(divisor))?
-        .checked_mul(1_000_000_000)?;
+        .checked_mul(crate::time::NSEC_PER_SEC)?;
     let base = u64::from(baud_base);
     Some(numerator.div_ceil(base).max(1))
 }
@@ -463,9 +489,9 @@ fn char_size(cflag: u32) -> u8 {
 }
 
 /// 两目标共同的 signed pid_t 字节数。
-pub const PID_BYTES: usize = 4;
+pub const PID_BYTES: usize = core::mem::size_of::<i32>();
 /// 两目标共同的窗口尺寸字节数。
-pub const WINSIZE_BYTES: usize = 8;
+pub const WINSIZE_BYTES: usize = 4 * core::mem::size_of::<u16>();
 
 /// 解码完整 pid_t，负进程组号码不能参与图查询。
 pub fn decode_pid(bytes: [u8; PID_BYTES]) -> Result<usize, FsError> {

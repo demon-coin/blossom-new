@@ -5,6 +5,8 @@ use std::path::PathBuf;
 #[path = "src/platform/layout.rs"]
 mod layout;
 
+const DEFAULT_MAX_CPUS: usize = 12;
+
 /// 校验目标架构、平台与测试功能组合，将共同布局常量写入 OUT_DIR 并登记重建条件。
 fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture is missing");
@@ -44,7 +46,7 @@ fn main() {
                 .parse::<usize>()
                 .expect("BLOSSOM_MAX_CPUS is out of range")
         }
-        Err(env::VarError::NotPresent) => 12,
+        Err(env::VarError::NotPresent) => DEFAULT_MAX_CPUS,
         Err(error) => panic!("BLOSSOM_MAX_CPUS cannot be read: {}", error),
     };
     assert!(0 < max_cpus, "BLOSSOM_MAX_CPUS must be a positive integer");

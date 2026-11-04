@@ -16,6 +16,7 @@ use crate::arch::{
     ale::{EmulationResult, Instruction, UserMemory},
     UserAccess,
 };
+use crate::fs::O_RDWR;
 use crate::fs::{
     open_path_with_flags, DescriptorFlags, FileIoContext, FileTable, FsContext, FsError,
     ResolveMode, Vfs,
@@ -30,11 +31,31 @@ use crate::task::process::{
 };
 use crate::task::signal::{
     Sighand, SignalControl, SignalFrameArgs, SignalInfo, SignalInheritance, SignalPayload,
-    SignalSelection, ThreadSignals,
+    SignalSelection, ThreadSignals, SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP,
 };
 use crate::task::time::UserTime;
 use crate::task::{self, JoinHandle, Placement, PreparedTask, Task};
 use crate::wait::{WaitMode, Waiter};
+
+const ILL_ILLOPC: i32 = 1;
+const BUS_ADRALN: i32 = 1;
+const BUS_ADRERR: i32 = 2;
+const BUS_OBJERR: i32 = 3;
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
+const TRAP_BRKPT: i32 = 1;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTDIV: i32 = 3;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTOVF: i32 = 4;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTUND: i32 = 5;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTRES: i32 = 6;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTINV: i32 = 7;
+#[cfg(target_arch = "loongarch64")]
+const FPE_FLTUNK: i32 = 14;
 
 /// 当前用户的不可变凭据；目录和文件权限判断使用真实 inode uid/gid/mode。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +113,7 @@ impl UserRuntime {
             (Arc::clone(&fs.vfs), fs.context.clone())
         };
         let path = vfs.resolve(&context, b"/dev/console", ResolveMode::Follow)?;
-        let console = open_path_with_flags(&vfs, path, 2, FileIoContext::Kernel)?;
+        let console = open_path_with_flags(&vfs, path, O_RDWR, FileIoContext::Kernel)?;
         let first = self.files.reserve(3)?;
         if first.fd() != 0 {
             return Err(FsError::InvalidOperation);
@@ -668,7 +689,7 @@ pub(crate) fn prepare_program(
         runtime.sighand.clone(),
         runtime.credentials.uid,
         SignalInheritance::EMPTY,
-        17,
+        SIGCHLD,
     )?;
     prepare_bound_user(identity, image, runtime, placement, None, 0)
 }
@@ -819,8 +840,8 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 let mm = user.mm().expect("signal delivery has no MM");
                 let mut candidate = user.context().fork();
                 if candidate.setup_signal(&mm, &args).is_err() {
-                    identity.graph().request_exit(&identity, 11);
-                    break 11;
+                    identity.graph().request_exit(&identity, SIGSEGV as i32);
+                    break SIGSEGV as i32;
                 }
                 *user.context() = candidate;
             }
@@ -870,9 +891,9 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                     .fault(address, access)
                 {
                     let (signum, code) = fault_signal(error);
-                    if signum == 9 {
-                        identity.graph().request_exit(&identity, 9);
-                        break 9;
+                    if signum == SIGKILL {
+                        identity.graph().request_exit(&identity, SIGKILL as i32);
+                        break SIGKILL as i32;
                     }
                     signals.force_fault(SignalInfo {
                         signum,
@@ -888,7 +909,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             }
             UserTrap::Exception { code, address } => {
                 #[cfg(target_arch = "loongarch64")]
-                let ale_fault = if code == 9 {
+                let ale_fault = if code == arch::ECODE_ALE {
                     match emulate_ale(&user, address) {
                         EmulationResult::Emulated => continue,
                         EmulationResult::Unsupported => false,
@@ -903,16 +924,17 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 let (signum, si_code) = exception_signal(code, fcsr);
                 #[cfg(target_arch = "loongarch64")]
                 let (signum, si_code) = if ale_fault {
-                    (11, 1)
+                    (SIGSEGV, SEGV_MAPERR)
                 } else {
                     (signum, si_code)
                 };
                 #[cfg(target_arch = "loongarch64")]
-                if code == 18 {
-                    context.fcsr = fcsr & !((fcsr & 0x1f) << 24);
+                if code == arch::ECODE_FPE {
+                    context.fcsr = fcsr
+                        & !((fcsr & arch::FCSR_ENABLE_MASK as usize) << arch::FCSR_CAUSE_SHIFT);
                 }
                 drop(context);
-                let address = if matches!(signum, 4 | 5 | 8) {
+                let address = if matches!(signum, SIGILL | SIGTRAP | SIGFPE) {
                     pc
                 } else {
                     address
@@ -975,13 +997,13 @@ fn fault_signal(error: VmError) -> (u8, i32) {
     match error {
         VmError::NoMemory
         | VmError::File(FsError::NoMemory | FsError::Io(crate::block::BlockError::NoMemory)) => {
-            (9, 0)
+            (SIGKILL, 0)
         }
-        VmError::BeyondEof => (7, 2),
+        VmError::BeyondEof => (SIGBUS, BUS_ADRERR),
         VmError::NotMappable => panic!("user fault has no file mapping capability"),
-        VmError::File(_) => (7, 3),
-        VmError::Permission => (11, 2),
-        VmError::InvalidRange | VmError::Occupied | VmError::Unmapped => (11, 1),
+        VmError::File(_) => (SIGBUS, BUS_OBJERR),
+        VmError::Permission => (SIGSEGV, SEGV_ACCERR),
+        VmError::InvalidRange | VmError::Occupied | VmError::Unmapped => (SIGSEGV, SEGV_MAPERR),
     }
 }
 
@@ -989,10 +1011,14 @@ fn fault_signal(error: VmError) -> (u8, i32) {
 #[cfg(target_arch = "riscv64")]
 fn exception_signal(code: usize, _fcsr: usize) -> (u8, i32) {
     match code {
-        0 | 4 | 6 => (7, 1),
-        1 | 5 | 7 => (11, 2),
-        3 => (5, 1),
-        _ => (4, 1),
+        arch::EXC_INST_MISALIGNED | arch::EXC_LOAD_MISALIGNED | arch::EXC_STORE_MISALIGNED => {
+            (SIGBUS, BUS_ADRALN)
+        }
+        arch::EXC_INST_ACCESS | arch::EXC_LOAD_ACCESS | arch::EXC_STORE_ACCESS => {
+            (SIGSEGV, SEGV_ACCERR)
+        }
+        arch::EXC_BREAKPOINT => (SIGTRAP, TRAP_BRKPT),
+        _ => (SIGILL, ILL_ILLOPC),
     }
 }
 
@@ -1000,26 +1026,26 @@ fn exception_signal(code: usize, _fcsr: usize) -> (u8, i32) {
 #[cfg(target_arch = "loongarch64")]
 fn exception_signal(code: usize, fcsr: usize) -> (u8, i32) {
     match code {
-        7 => (11, 2),
-        8 | 10 => (7, 2),
-        9 => (7, 1),
-        12 => (5, 1),
-        18 => (
-            8,
-            if fcsr & (1 << 28) != 0 {
-                7
-            } else if fcsr & (1 << 27) != 0 {
-                3
-            } else if fcsr & (1 << 26) != 0 {
-                4
-            } else if fcsr & (1 << 25) != 0 {
-                5
-            } else if fcsr & (1 << 24) != 0 {
-                6
+        arch::ECODE_PPI => (SIGSEGV, SEGV_ACCERR),
+        arch::ECODE_ADE | arch::ECODE_BCE => (SIGBUS, BUS_ADRERR),
+        arch::ECODE_ALE => (SIGBUS, BUS_ADRALN),
+        arch::ECODE_BRK => (SIGTRAP, TRAP_BRKPT),
+        arch::ECODE_FPE => (
+            SIGFPE,
+            if fcsr & (1 << (arch::FCSR_CAUSE_SHIFT + 4)) != 0 {
+                FPE_FLTINV
+            } else if fcsr & (1 << (arch::FCSR_CAUSE_SHIFT + 3)) != 0 {
+                FPE_FLTDIV
+            } else if fcsr & (1 << (arch::FCSR_CAUSE_SHIFT + 2)) != 0 {
+                FPE_FLTOVF
+            } else if fcsr & (1 << (arch::FCSR_CAUSE_SHIFT + 1)) != 0 {
+                FPE_FLTUND
+            } else if fcsr & (1 << arch::FCSR_CAUSE_SHIFT) != 0 {
+                FPE_FLTRES
             } else {
-                14
+                FPE_FLTUNK
             },
         ),
-        _ => (4, 1),
+        _ => (SIGILL, ILL_ILLOPC),
     }
 }

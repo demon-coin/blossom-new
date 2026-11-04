@@ -21,7 +21,7 @@ use crate::mm::user_table::{PagePermissions, PageTableError};
 use crate::mm::{alloc_pages, PAGE_SIZE};
 use crate::task::Credentials;
 
-const MAX_PATH_BYTES: usize = 4096;
+use crate::fs::PATH_MAX as MAX_PATH_BYTES;
 pub(crate) const DEFAULT_STACK_BYTES: u64 = 8 * 1024 * 1024;
 const SCRIPT_HEADER_BYTES: usize = 256;
 const MAX_INTERPRETER_DEPTH: usize = 5;

@@ -1,5 +1,6 @@
 //! 调度栈等待边界；启 IRQ 至 IDLE 的精确窗口供 trap 修改返回 PC。
 
+use crate::arch::loongarch64::register as reg;
 use core::arch::global_asm;
 
 global_asm!(
@@ -11,8 +12,8 @@ global_asm!(
 .global la_idle_once_asm
 .type la_idle_once_asm, @function
 la_idle_once_asm:
-    ori $t0, $zero, 4
-    ori $t1, $zero, 4
+    ori $t0, $zero, {crmd_ie}
+    ori $t1, $zero, {crmd_ie}
     b .Lidle_enable
     .balign 32
 .global la_idle_window_start
@@ -22,7 +23,7 @@ la_idle_window_start:
     // 八条指令覆盖启 IE、屏障、提示重查和 IDLE，三个全局标签保持机器协议。
     r#"
     # 精确 32 字节窗口覆盖启 IE、提示重查和 IDLE；窗口中断后返回调度器重查队列。
-    csrxchg $t0, $t1, 0
+    csrxchg $t0, $t1, {csr_crmd}
     dbar 0
     ld.d $t0, $a0, 0
     bnez $t0, .Lidle_skip
@@ -44,10 +45,12 @@ la_idle_window_end:
 la_idle_window_exit:
 .Lidle_skip:
     # 返回调度栈之前只关闭 IE，不覆盖其他 CRMD 位，也不修改 FP 或 KS0。
-    ori $t1, $zero, 4
-    csrxchg $zero, $t1, 0
+    ori $t1, $zero, {crmd_ie}
+    csrxchg $zero, $t1, {csr_crmd}
     jirl $zero, $ra, 0
 .size la_idle_once_asm, .-la_idle_once_asm
 "#,
+    crmd_ie = const reg::CRMD_IE,
+    csr_crmd = const reg::CSR_CRMD,
     execution_tests = const cfg!(feature = "ktest") as usize,
 );

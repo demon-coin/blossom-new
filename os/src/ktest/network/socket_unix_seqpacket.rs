@@ -7,10 +7,10 @@ pub(crate) mod socket_unix_seqpacket {
     use super::owner::StackOwner;
     use super::support::{operation, pattern, socket_retired};
     use crate::fs::{
-        FileIoContext, FileLike, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer,
+        FileIoContext, FileLike, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer, O_NONBLOCK,
     };
     use crate::ktest::execution_services::SuiteBaseline;
-    use crate::net::socket::SocketFile;
+    use crate::net::socket::{SocketFile, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, SHUT_WR};
     use crate::net::UnixSocketType;
     /// 有序记录不合并；PEEK、短读和零容量 recv 保原长，空消息与关闭 EOF 分别消费。
     #[test]
@@ -23,7 +23,7 @@ pub(crate) mod socket_unix_seqpacket {
             SocketFile::try_new_unix_pair(
                 fixture.net.clone(),
                 UnixSocketType::SeqPacket,
-                0o4000,
+                O_NONBLOCK,
                 0,
                 0,
             ),
@@ -49,7 +49,7 @@ pub(crate) mod socket_unix_seqpacket {
             context,
             receiver.receive(
                 &mut ReadBuffer::kernel(&mut prefix),
-                0x2,
+                MSG_PEEK,
                 FileIoContext::Kernel,
             ),
         )?;
@@ -60,7 +60,7 @@ pub(crate) mod socket_unix_seqpacket {
             context,
             receiver.receive(
                 &mut ReadBuffer::kernel(&mut prefix),
-                0x20,
+                MSG_TRUNC,
                 FileIoContext::Kernel,
             ),
         )?;
@@ -145,7 +145,7 @@ pub(crate) mod socket_unix_seqpacket {
             context,
             receiver.receive(
                 &mut ReadBuffer::kernel(&mut output),
-                0x2,
+                MSG_PEEK,
                 FileIoContext::Kernel,
             ),
         )?;
@@ -188,7 +188,7 @@ pub(crate) mod socket_unix_seqpacket {
                 bytes.len(),
             );
         }
-        operation(context, sender.shutdown(1))?;
+        operation(context, sender.shutdown(SHUT_WR))?;
         let empty = operation(
             context,
             receiver.receive(
@@ -217,7 +217,7 @@ pub(crate) mod socket_unix_seqpacket {
             )?,
             5,
         );
-        operation(context, receiver.shutdown(1))?;
+        operation(context, receiver.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, sender.read(&mut output))?, 5);
         context.expect_eq(&output[..5], b"reply");
         context.expect_eq(operation(context, sender.read(&mut output))?, 0);
@@ -226,7 +226,7 @@ pub(crate) mod socket_unix_seqpacket {
                 endpoint.send(
                     &mut WriteBuffer::kernel(&[]),
                     None,
-                    0x4000,
+                    MSG_NOSIGNAL,
                     FileIoContext::Kernel,
                 ),
                 Err(FsError::BrokenPipe),
@@ -250,7 +250,7 @@ pub(crate) mod socket_unix_seqpacket {
             SocketFile::try_new_unix_pair(
                 fixture.net.clone(),
                 UnixSocketType::SeqPacket,
-                0o4000,
+                O_NONBLOCK,
                 0,
                 0,
             ),
@@ -331,7 +331,7 @@ pub(crate) mod socket_unix_seqpacket {
             context,
             receiver.receive(
                 &mut ReadBuffer::kernel(&mut first),
-                0x2,
+                MSG_PEEK,
                 FileIoContext::Kernel,
             ),
         )?;

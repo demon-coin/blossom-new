@@ -11,7 +11,9 @@ use virtio_drivers::transport::pci::bus::{
 use crate::{
     boot::{
         self, AhciResources, BootInfo, GmacResources, PciConfiguration, PciFunctionResource,
-        PciRange, PciResources, Region,
+        PciRange, PciResources, Region, PCI_BUS_SHIFT, PCI_DEVICE_COUNT, PCI_DEVICE_SHIFT,
+        PCI_FUNCTION_COUNT, PCI_FUNCTION_SHIFT, PCI_INTX_PIN_COUNT, PCI_SPACE_CODE_MASK,
+        PCI_SPACE_IO, PCI_SPACE_MEM32, PCI_SPACE_MEM64,
     },
     drivers::{mmio_region_address, ProbeError},
     irq::{self, IrqNumber},
@@ -19,6 +21,41 @@ use crate::{
 };
 
 static DISCOVERED: AtomicBool = AtomicBool::new(false);
+
+const PCI_REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+const PCI_CFG_SPACE_BYTES: u16 = 256;
+const PCI_CFG_EXP_SPACE_BYTES: u16 = 4096;
+const PCI_HEADER_BYTES: u8 = 0x40;
+const PCI_BAR_COUNT: usize = 6;
+const PCI_CAPABILITY_CAPACITY: usize =
+    (PCI_CFG_SPACE_BYTES as usize - PCI_HEADER_BYTES as usize) / PCI_REGISTER_BYTES;
+const PCI_VENDOR_WORD: u8 = 0x00;
+const PCI_CLASS_REVISION_WORD: u8 = 0x08;
+const PCI_CACHE_LINE_WORD: u8 = 0x0c;
+const PCI_SUBSYSTEM_WORD: u8 = 0x2c;
+const PCI_CAPABILITY_LIST_WORD: u8 = 0x34;
+const PCI_INTERRUPT_WORD: u8 = 0x3c;
+const PCI_BAR0: u8 = 0x10;
+const PCI_BAR1: u8 = PCI_BAR0 + PCI_REGISTER_BYTES as u8;
+const PCI_BAR_IO_SPACE: u32 = 1;
+const PCI_BAR_MEMORY_TYPE_MASK: u32 = 6;
+const PCI_BAR_MEMORY_TYPE_32: u32 = 0;
+const PCI_BAR_MEMORY_TYPE_64: u32 = 4;
+const PCI_BAR_MEMORY_ADDRESS_MASK: u32 = !15;
+const PCI_VENDOR_LOONGSON: u16 = 0x0014;
+const PCI_DEVICE_LOONGSON_AHCI: u16 = 0x7a08;
+const PCI_DEVICE_LOONGSON_GMAC: u16 = 0x7a03;
+const PCI_DEVICE_LOONGSON_GMAC2: u16 = 0x7a23;
+const PCI_CLASS_AHCI: u32 = 0x010601;
+const LOONGSON_ROOT_PORT_FIRST: u8 = 9;
+const LOONGSON_ROOT_PORT_LAST: u8 = 20;
+const LOONGSON_CFG_REGISTER_MASK: usize = 0xff;
+const LOONGSON_CFG_EXT_REGISTER_MASK: usize = 0xf00;
+const LOONGSON_CFG_EXT_REGISTER_SHIFT: u32 = 16;
+const LOONGSON_CFG0_TYPE1: usize = 1 << 24;
+const LOONGSON_CFG1_TYPE1: usize = 1 << 28;
+const IO_DOMAIN: u8 = 1;
+const MEMORY_DOMAIN: u8 = 2;
 
 /// 内存 BAR 的总线地址和已验证 CPU 物理窗口；64 位配对的高槽保留为空。
 #[derive(Clone, Copy, Debug)]
@@ -47,8 +84,8 @@ pub struct PciDevice {
     pub header_type: u8,
     /// 首次枚举读取的 class/subclass/progif，不保存未使用的 revision。
     class_code: u32,
-    pub bars: [Option<PciBar>; 6],
-    pub capabilities: [Option<PciCapability>; 48],
+    pub bars: [Option<PciBar>; PCI_BAR_COUNT],
+    pub capabilities: [Option<PciCapability>; PCI_CAPABILITY_CAPACITY],
     pub capability_count: usize,
     pub interrupt: Option<IrqNumber>,
 }
@@ -73,8 +110,8 @@ pub struct PciInventory {
 struct PendingDevice {
     device: PciDevice,
     command: Command,
-    original_bars: [u32; 6],
-    bar_info: [Option<BarInfo>; 6],
+    original_bars: [u32; PCI_BAR_COUNT],
+    bar_info: [Option<BarInfo>; PCI_BAR_COUNT],
 }
 
 #[derive(Clone, Copy)]
@@ -96,23 +133,32 @@ enum HostCam {
 
 /// 计算 Loongson CFG0/CFG1 的字偏移，包含真实硬件禁止访问的根功能。
 fn loongson_offset(bdf: DeviceFunction, offset: u16, extended: bool) -> Option<usize> {
-    if 32 <= bdf.device
-        || 8 <= bdf.function
-        || offset & 3 != 0
-        || (!extended && 256 <= offset)
-        || 4096 <= offset
-        || (bdf.bus == 0 && (9..=20).contains(&bdf.device) && bdf.function != 0)
+    if PCI_DEVICE_COUNT <= bdf.device
+        || PCI_FUNCTION_COUNT <= bdf.function
+        || offset & (PCI_REGISTER_BYTES as u16 - 1) != 0
+        || (!extended && PCI_CFG_SPACE_BYTES <= offset)
+        || PCI_CFG_EXP_SPACE_BYTES <= offset
+        || (bdf.bus == 0
+            && (LOONGSON_ROOT_PORT_FIRST..=LOONGSON_ROOT_PORT_LAST).contains(&bdf.device)
+            && bdf.function != 0)
     {
         return None;
     }
-    let devfn = ((bdf.device as usize) << 3) | bdf.function as usize;
-    let mut address = (devfn << 8) | (offset as usize & 0xff);
+    let devfn =
+        ((bdf.device as usize) << (PCI_DEVICE_SHIFT - PCI_FUNCTION_SHIFT)) | bdf.function as usize;
+    let mut address =
+        (devfn << PCI_FUNCTION_SHIFT) | (offset as usize & LOONGSON_CFG_REGISTER_MASK);
     if extended {
-        address |= (offset as usize & 0xf00) << 16;
+        address |=
+            (offset as usize & LOONGSON_CFG_EXT_REGISTER_MASK) << LOONGSON_CFG_EXT_REGISTER_SHIFT;
     }
     if bdf.bus != 0 {
-        address |= (bdf.bus as usize) << 16;
-        address |= if extended { 1 << 28 } else { 1 << 24 };
+        address |= (bdf.bus as usize) << PCI_BUS_SHIFT;
+        address |= if extended {
+            LOONGSON_CFG1_TYPE1
+        } else {
+            LOONGSON_CFG0_TYPE1
+        };
     }
     Some(address)
 }
@@ -133,7 +179,7 @@ impl ConfigurationAccess for HostCam {
                 let Some(at) = loongson_offset(bdf, offset as u16, true) else {
                     return u32::MAX;
                 };
-                if *length < at + 4 {
+                if *length < at + PCI_REGISTER_BYTES {
                     return u32::MAX;
                 }
                 // SAFETY: 唯一库存持有永久强序 CFG1 映射；对齐偏移和完整 u32 已验证在窗口内。
@@ -155,7 +201,7 @@ impl ConfigurationAccess for HostCam {
                 let at = loongson_offset(bdf, offset as u16, true)
                     .expect("invalid Loongson configuration write");
                 assert!(
-                    at + 4 <= *length,
+                    at + PCI_REGISTER_BYTES <= *length,
                     "Loongson configuration write exceeds CFG1"
                 );
                 // SAFETY: &mut CAM 保证配置写独占；对齐完整 u32 位于永久强序 CFG1 窗口内。
@@ -237,7 +283,10 @@ impl PciInventory {
             .try_reserve_exact(pending.len())
             .map_err(|_| ProbeError::NoMemory)?;
         let mut occupied = Vec::new();
-        let capacity = pending.len().checked_mul(6).ok_or(ProbeError::NoMemory)?;
+        let capacity = pending
+            .len()
+            .checked_mul(PCI_BAR_COUNT)
+            .ok_or(ProbeError::NoMemory)?;
         occupied
             .try_reserve_exact(capacity)
             .map_err(|_| ProbeError::NoMemory)?;
@@ -289,7 +338,7 @@ impl PciInventory {
 
     /// 读取本 inventory 中选定功能的只读配置字，拒绝越界、未对齐与外来身份。
     pub fn read_config_word(&self, device: &PciDevice, offset: u8) -> Result<u32, ProbeError> {
-        if offset & 3 != 0
+        if offset & (PCI_REGISTER_BYTES as u8 - 1) != 0
             || !self
                 .devices
                 .iter()
@@ -300,7 +349,16 @@ impl PciInventory {
             ));
         }
         // 不暴露可能 read-to-clear 或可写字段的可复制 CAM；此入口仅服务身份与 cap。
-        if !matches!(offset, 0x00 | 0x08 | 0x0c | 0x2c | 0x34 | 0x3c) && offset < 0x40 {
+        if !matches!(
+            offset,
+            PCI_VENDOR_WORD
+                | PCI_CLASS_REVISION_WORD
+                | PCI_CACHE_LINE_WORD
+                | PCI_SUBSYSTEM_WORD
+                | PCI_CAPABILITY_LIST_WORD
+                | PCI_INTERRUPT_WORD
+        ) && offset < PCI_HEADER_BYTES
+        {
             return Err(ProbeError::Resource(
                 "PCI configuration field is not read-only inventory data",
             ));
@@ -315,10 +373,10 @@ impl PciInventory {
 
 /// Loongson AHCI 使用 BAR0；其他已明确指定 BDF 的标准 AHCI 功能使用 BAR5。
 fn ahci_bar(vendor: u16, device: u16, class_code: u32) -> Result<usize, ProbeError> {
-    if vendor == 0x0014 && device == 0x7a08 {
+    if vendor == PCI_VENDOR_LOONGSON && device == PCI_DEVICE_LOONGSON_AHCI {
         return Ok(0);
     }
-    if class_code == 0x010601 {
+    if class_code == PCI_CLASS_AHCI {
         return Ok(5);
     }
     Err(ProbeError::Resource(
@@ -328,7 +386,9 @@ fn ahci_bar(vendor: u16, device: u16, class_code: u32) -> Result<usize, ProbeErr
 
 /// 两种单通道 Loongson GMAC 均使用 BAR0，不接受具有不同 DMA 格式的 GNET。
 fn gmac_bar(vendor: u16, device: u16, _class_code: u32) -> Result<usize, ProbeError> {
-    if vendor == 0x0014 && matches!(device, 0x7a03 | 0x7a23) {
+    if vendor == PCI_VENDOR_LOONGSON
+        && matches!(device, PCI_DEVICE_LOONGSON_GMAC | PCI_DEVICE_LOONGSON_GMAC2)
+    {
         return Ok(0);
     }
     Err(ProbeError::Resource(
@@ -441,8 +501,8 @@ fn collect_devices(
             ));
         }
         pending.try_reserve(1).map_err(|_| ProbeError::NoMemory)?;
-        let header_type = (root.read_config_word(bdf, 0x0c) >> 16) as u8;
-        let pin = (root.read_config_word(bdf, 0x3c) >> 8) as u8;
+        let header_type = (root.read_config_word(bdf, PCI_CACHE_LINE_WORD) >> u16::BITS) as u8;
+        let pin = (root.read_config_word(bdf, PCI_INTERRUPT_WORD) >> u8::BITS) as u8;
         let interrupt = if let Some(source) = native_source {
             Some(irq::map_source(source)?)
         } else if pin == 0 {
@@ -454,7 +514,7 @@ fn collect_devices(
                 .map_err(ProbeError::Resource)?;
             Some(irq::map_source(source)?)
         };
-        let mut capabilities = [None; 48];
+        let mut capabilities = [None; PCI_CAPABILITY_CAPACITY];
         let mut capability_count = 0;
         for capability in root.capabilities(bdf) {
             let capability = capability?;
@@ -468,8 +528,9 @@ fn collect_devices(
             });
             capability_count += 1;
         }
-        let original_bars =
-            core::array::from_fn(|index| root.read_config_word(bdf, 0x10 + index as u8 * 4));
+        let original_bars = core::array::from_fn(|index| {
+            root.read_config_word(bdf, PCI_BAR0 + index as u8 * PCI_REGISTER_BYTES as u8)
+        });
         pending.push(PendingDevice {
             device: PciDevice {
                 bus: bdf.bus,
@@ -481,7 +542,7 @@ fn collect_devices(
                 class_code: (u32::from(identity.class) << 16)
                     | (u32::from(identity.subclass) << 8)
                     | u32::from(identity.prog_if),
-                bars: [None; 6],
+                bars: [None; PCI_BAR_COUNT],
                 capabilities,
                 capability_count,
                 interrupt,
@@ -551,12 +612,15 @@ fn selected_native(
             }
             bar?;
             // 仅已知集成 AHCI/GMAC 的错误 pin 按功能号修正，其他功能使用配置声明。
-            let pin =
-                if identity.vendor_id == 0x0014 && matches!(identity.device_id, 0x7a08 | 0x7a03) {
-                    1 + (bdf.function & 3)
-                } else {
-                    (root.read_config_word(bdf, 0x3c) >> 8) as u8
-                };
+            let pin = if identity.vendor_id == PCI_VENDOR_LOONGSON
+                && matches!(
+                    identity.device_id,
+                    PCI_DEVICE_LOONGSON_AHCI | PCI_DEVICE_LOONGSON_GMAC
+                ) {
+                1 + (bdf.function & (PCI_INTX_PIN_COUNT - 1))
+            } else {
+                (root.read_config_word(bdf, PCI_INTERRUPT_WORD) >> u8::BITS) as u8
+            };
             let routed = info
                 .pci
                 .interrupt_source(bdf.bus, bdf.device, bdf.function, pin)
@@ -568,20 +632,26 @@ fn selected_native(
             }
         } else {
             let Ok(index) = bar else { continue };
-            let low = root.read_config_word(bdf, 0x10 + index as u8 * 4);
-            if low & 1 != 0 || !matches!((low >> 1) & 3, 0 | 2) {
+            let low = root.read_config_word(bdf, PCI_BAR0 + index as u8 * PCI_REGISTER_BYTES as u8);
+            if low & PCI_BAR_IO_SPACE != 0
+                || !matches!(
+                    low & PCI_BAR_MEMORY_TYPE_MASK,
+                    PCI_BAR_MEMORY_TYPE_32 | PCI_BAR_MEMORY_TYPE_64
+                )
+            {
                 continue;
             }
-            let high = if low & 6 == 4 {
-                root.read_config_word(bdf, 0x14 + index as u8 * 4)
+            let high = if low & PCI_BAR_MEMORY_TYPE_MASK == PCI_BAR_MEMORY_TYPE_64 {
+                root.read_config_word(bdf, PCI_BAR1 + index as u8 * PCI_REGISTER_BYTES as u8)
             } else {
                 0
             };
-            let address = u64::from(low & !15) | (u64::from(high) << 32);
+            let address =
+                u64::from(low & PCI_BAR_MEMORY_ADDRESS_MASK) | (u64::from(high) << u32::BITS);
             if address == 0 {
                 continue;
             }
-            let physical = translate(&info.pci, 2, address, 1)?;
+            let physical = translate(&info.pci, MEMORY_DOMAIN, address, 1)?;
             if physical.start != registers.start {
                 continue;
             }
@@ -650,7 +720,8 @@ fn configure_resources(
             let address_type = *address_type;
             let size = *size;
             let existing = *address;
-            let address = if existing != 0 && translate(host, 2, existing, size).is_ok() {
+            let address = if existing != 0 && translate(host, MEMORY_DOMAIN, existing, size).is_ok()
+            {
                 existing
             } else {
                 // 固件留下的地址不在 host 窗口（或为零）时，清零后按窗口重新分配。
@@ -660,7 +731,7 @@ fn configure_resources(
                 }
                 allocate(host, occupied, address_type, size)?
             };
-            let physical = translate(host, 2, address, size)?;
+            let physical = translate(host, MEMORY_DOMAIN, address, size)?;
             mmio_region_address(physical)?;
             entry.device.bars[index] = Some(PciBar {
                 bus_address: address,
@@ -706,13 +777,14 @@ fn configure_resources(
             } else {
                 root.set_bar_32(bdf, index as u8, selected.bus_address as u32);
             }
-            let low = root.read_config_word(bdf, 0x10 + index as u8 * 4) & !15;
+            let low = root.read_config_word(bdf, PCI_BAR0 + index as u8 * PCI_REGISTER_BYTES as u8)
+                & PCI_BAR_MEMORY_ADDRESS_MASK;
             let high = if wide {
-                root.read_config_word(bdf, 0x14 + index as u8 * 4)
+                root.read_config_word(bdf, PCI_BAR1 + index as u8 * PCI_REGISTER_BYTES as u8)
             } else {
                 0
             };
-            if (u64::from(low) | (u64::from(high) << 32)) != selected.bus_address {
+            if (u64::from(low) | (u64::from(high) << u32::BITS)) != selected.bus_address {
                 return Err(ProbeError::Resource(
                     "PCI BAR configuration readback differs",
                 ));
@@ -744,11 +816,13 @@ fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice])
     }
     for entry in pending {
         let mut index = 0;
-        while index < 6 {
+        while index < PCI_BAR_COUNT {
             let original = entry.original_bars[index];
-            if original & 7 == 4 && index < 5 {
+            if original & (PCI_BAR_IO_SPACE | PCI_BAR_MEMORY_TYPE_MASK) == PCI_BAR_MEMORY_TYPE_64
+                && index < PCI_BAR_COUNT - 1
+            {
                 let address =
-                    u64::from(original) | (u64::from(entry.original_bars[index + 1]) << 32);
+                    u64::from(original) | (u64::from(entry.original_bars[index + 1]) << u32::BITS);
                 root.set_bar_64(entry.device.bdf(), index as u8, address);
                 index += 2;
             } else {
@@ -765,8 +839,8 @@ fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice])
 /// 把 BAR 类型转换为占用地址域；32/64 位内存 BAR 共享同一内存地址域。
 fn bar_address(bar: &BarInfo) -> (u8, u64, u64) {
     match bar {
-        BarInfo::IO { address, size } => (1, u64::from(*address), u64::from(*size)),
-        BarInfo::Memory { address, size, .. } => (2, *address, *size),
+        BarInfo::IO { address, size } => (IO_DOMAIN, u64::from(*address), u64::from(*size)),
+        BarInfo::Memory { address, size, .. } => (MEMORY_DOMAIN, *address, *size),
     }
 }
 
@@ -785,7 +859,7 @@ fn validate_bar_address(bar: &BarInfo, address: u64) -> Result<(), ProbeError> {
             address_type: MemoryBarType::Below1MiB,
             ..
         } => 1 << 20,
-        _ => 1 << 32,
+        _ => 1 << u32::BITS,
     };
     if !size.is_power_of_two() || address & (size - 1) != 0 || limit < end {
         return Err(ProbeError::Resource(
@@ -797,9 +871,9 @@ fn validate_bar_address(bar: &BarInfo, address: u64) -> Result<(), ProbeError> {
 
 /// 返回 PCI range 所属 IO 或内存地址域，属性位不改变地址域身份。
 fn range_domain(range: &PciRange) -> u8 {
-    match (range.flags >> 24) & 3 {
-        1 => 1,
-        2 | 3 => 2,
+    match range.flags & PCI_SPACE_CODE_MASK {
+        PCI_SPACE_IO => IO_DOMAIN,
+        PCI_SPACE_MEM32 | PCI_SPACE_MEM64 => MEMORY_DOMAIN,
         _ => 0,
     }
 }
@@ -874,11 +948,11 @@ fn allocate(
     }
     let width_limit = match width {
         MemoryBarType::Width64 => u64::MAX,
-        MemoryBarType::Width32 => 1 << 32,
+        MemoryBarType::Width32 => 1 << u32::BITS,
         MemoryBarType::Below1MiB => 1 << 20,
     };
     for range in &host.ranges[..host.range_count] {
-        if (range.flags >> 24) & 3 != 2 {
+        if range.flags & PCI_SPACE_CODE_MASK != PCI_SPACE_MEM32 {
             continue;
         }
         let limit = (range.bus_start as u64)
@@ -899,14 +973,14 @@ fn allocate(
             }
             let collision = occupied
                 .iter()
-                .filter(|old| old.domain == 2 && candidate < old.end && old.start < end)
+                .filter(|old| old.domain == MEMORY_DOMAIN && candidate < old.end && old.start < end)
                 .map(|old| old.end)
                 .max();
             if let Some(next) = collision {
                 candidate = next;
                 continue;
             }
-            reserve(occupied, 2, candidate, size)?;
+            reserve(occupied, MEMORY_DOMAIN, candidate, size)?;
             return Ok(candidate);
         }
     }

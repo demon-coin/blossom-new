@@ -13,7 +13,7 @@ use crate::mm::{self, PAGE_SIZE};
 use crate::sched;
 use crate::sync::{SleepMutex, SpinLock};
 use crate::task::ReclaimScope;
-use crate::time::{self, Duration, MonotonicInstant};
+use crate::time::{self, Duration, MonotonicInstant, NSEC_PER_SEC};
 use crate::timer::{Timer, TimerKind};
 use crate::wait::{WaitNode, WaitQueue, Waiter, Waker};
 use crate::workqueue::{DelayedWork, WorkQueue, WorkQueueConfig};
@@ -24,7 +24,10 @@ const METADATA_BUDGET: usize = 16;
 const DIRTY_EXPIRE: Duration = Duration::from_millis(200);
 const MAX_PAUSE_NS: u64 = 200_000_000;
 const BANDWIDTH_INTERVAL_NS: u64 = 200_000_000;
-const NSEC_PER_SEC: u64 = 1_000_000_000;
+const WB_MAX_ACTIVE: usize = 8;
+const MIN_DIRTY_PAGES: usize = 32;
+const MAX_DIRTY_PAGES: usize = 4096;
+const PERCENT: usize = 100;
 
 static WB_QUEUE: Once<WorkQueue> = Once::new();
 static FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -273,7 +276,7 @@ pub(crate) fn initialize() -> Result<(), FsError> {
         "writeback service initialized twice"
     );
     let queue = WorkQueue::try_new(WorkQueueConfig {
-        max_active: 8,
+        max_active: WB_MAX_ACTIVE,
         ordered: false,
         reclaim: true,
     })
@@ -951,7 +954,10 @@ fn dirty_limit() -> (usize, usize) {
     let memory = mm::stats();
     let dirtyable =
         memory.buddy_free_pages + memory.pcp_cached_pages + FILE_PAGES.load(Ordering::Relaxed);
-    (dirtyable, (dirtyable * DIRTY_RATIO / 100).clamp(32, 4096))
+    (
+        dirtyable,
+        (dirtyable * DIRTY_RATIO / PERCENT).clamp(MIN_DIRTY_PAGES, MAX_DIRTY_PAGES),
+    )
 }
 
 /// 只读取本 VM 当前原页账和真实完成样本，跨锁快照不提供停稳证明。

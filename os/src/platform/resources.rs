@@ -2,13 +2,16 @@
 
 use super::{
     cells, compatible, cstr, enabled, interrupt_parent, number, parent, property, single_region,
-    word, Fdt, Node,
+    word, Fdt, Node, FDT_CELL_BYTES,
 };
 use crate::boot::{
     BoardClockInputs, BootInfo, ClockResource, DeviceClocks, DeviceSetup, GmacResources, PhyMode,
     PinResource, Platform, Region, ResourceReference,
 };
 use core::convert::{TryFrom, TryInto};
+
+const JH7110_SYSCLK_UART0_CORE: u32 = 146;
+const QEMU_CONSOLE_BAUD: u32 = 115_200;
 
 /// 取得唯一启用的具名路径或 alias，不猜另一设备。
 pub(super) fn alias<'a>(tree: &'a Fdt<'a>, name: &str) -> Result<Node<'a>, &'static str> {
@@ -113,7 +116,7 @@ fn dma_parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Option<Node<'a>>,
     let mut at = 0;
     loop {
         let handle = word(raw, at)?;
-        at += 4;
+        at += FDT_CELL_BYTES;
         // 空 phandle 是零参数占位；只有未选项可以跳过，选中的 DMA 父必须存在。
         if handle == 0 {
             if index == 0 {
@@ -128,7 +131,7 @@ fn dma_parent<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Option<Node<'a>>,
         let count = usize::try_from(number(provider, "#interconnect-cells")?)
             .map_err(|_| "FDT DMA interconnect cell count is not representable")?;
         let end = count
-            .checked_mul(4)
+            .checked_mul(FDT_CELL_BYTES)
             .and_then(|size| at.checked_add(size))
             .ok_or("FDT DMA interconnect argument length overflows")?;
         if raw.len() < end {
@@ -150,7 +153,7 @@ fn reference<'a>(
     count_name: &str,
 ) -> Result<(ResourceReference, Node<'a>), &'static str> {
     let handle = word(bytes, *at)?;
-    *at += 4;
+    *at += FDT_CELL_BYTES;
     let provider = tree
         .find_phandle(handle)
         .ok_or("FDT resource provider phandle is missing")?;
@@ -163,7 +166,7 @@ fn reference<'a>(
     }
     let id = if count == 1 {
         let value = word(bytes, *at)?;
-        *at += 4;
+        *at += FDT_CELL_BYTES;
         value
     } else {
         0
@@ -289,7 +292,7 @@ pub(super) fn clocks<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceCloc
             let parent = if let Some(parents) = parents {
                 if parent_at < parents.value.len() {
                     if word(parents.value, parent_at)? == 0 {
-                        parent_at += 4;
+                        parent_at += FDT_CELL_BYTES;
                         None
                     } else {
                         Some(reference(tree, parents.value, &mut parent_at, "#clock-cells")?.0)
@@ -301,7 +304,7 @@ pub(super) fn clocks<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceCloc
                 None
             };
             let rate = rates
-                .map(|r| word(r.value, index * 4))
+                .map(|r| word(r.value, index * FDT_CELL_BYTES))
                 .transpose()?
                 .filter(|rate| *rate != 0)
                 .map(u64::from);
@@ -347,10 +350,10 @@ pub(super) fn setup<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceSetup
         }
     }
     if let Some(raw) = node.property("pinctrl-0") {
-        if raw.value.len() % 4 != 0 {
+        if raw.value.len() % FDT_CELL_BYTES != 0 {
             return Err("FDT pinctrl phandles are truncated");
         }
-        for handle in raw.value.chunks_exact(4) {
+        for handle in raw.value.chunks_exact(FDT_CELL_BYTES) {
             let group = tree
                 .find_phandle(word(handle, 0)?)
                 .ok_or("FDT pinctrl group is missing")?;
@@ -360,10 +363,10 @@ pub(super) fn setup<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceSetup
                 let Some(muxes) = pins.property("pinmux") else {
                     continue;
                 };
-                if muxes.value.len() % 4 != 0 {
+                if muxes.value.len() % FDT_CELL_BYTES != 0 {
                     return Err("FDT pinmux values are truncated");
                 }
-                for mux in muxes.value.chunks_exact(4) {
+                for mux in muxes.value.chunks_exact(FDT_CELL_BYTES) {
                     if result.pin_count == result.pins.len() {
                         return Err("FDT pin capacity exceeded");
                     }
@@ -417,7 +420,7 @@ pub(super) fn discover_uart<'a>(
         if width != 4
             || shift != 2
             || uart_clocks.count != 2
-            || uart_clocks.entries[0].reference.id != 146
+            || uart_clocks.entries[0].reference.id != JH7110_SYSCLK_UART0_CORE
         {
             return Err("FDT VF2 UART0 clocks or register geometry differ from its binding");
         }
@@ -454,7 +457,7 @@ pub(super) fn discover_uart<'a>(
     } else if let Some(baud) = optional_number(uart, "current-speed")? {
         baud
     } else if info.platform == Platform::QemuVirt {
-        115200
+        QEMU_CONSOLE_BAUD
     } else {
         return Err("FDT board UART baud rate is missing");
     };
@@ -485,7 +488,7 @@ pub(super) fn gmac<'a>(
         .find_phandle(number(node, "phy-handle")?)
         .ok_or("FDT GMAC PHY is missing")?;
     let address = number(phy, "reg")?;
-    if 32 <= address {
+    if crate::drivers::dwmac::PHY_ADDRESS_COUNT <= address {
         return Err("FDT GMAC PHY address exceeds Clause 22");
     }
     let mode = match cstr(property(node, "phy-mode")?)? {
@@ -545,7 +548,7 @@ pub(super) fn gmac<'a>(
 pub(super) fn first_irq<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<u32, &'static str> {
     let controller = interrupt_parent(tree, node)?;
     let raw = property(node, "interrupts")?;
-    let width = number(controller, "#interrupt-cells")? as usize * 4;
+    let width = number(controller, "#interrupt-cells")? as usize * FDT_CELL_BYTES;
     if width == 0 || raw.len() % width != 0 {
         return Err("FDT device interrupt cells are truncated");
     }

@@ -5,10 +5,13 @@ use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 
-use crate::block::partition::{self, DeviceName, DeviceSelector};
-use crate::block::{BlockError, BlockView, Disk, DiskRef};
+use crate::block::partition::{self, DeviceName, DeviceSelector, LETTERED_DISK_COUNT};
+use crate::block::{BlockError, BlockView, Disk, DiskRef, NATIVE_TAG_COUNT};
 use crate::boot;
-use crate::drivers::virtio::{VirtioDevice, VirtioInitError};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioInitError, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN,
+    VIRTIO_VENDOR_ID,
+};
 use crate::drivers::{DeviceInventory, ProbeError};
 use crate::mm::dma::DmaError;
 use crate::sync::{SleepMutex, SpinLock};
@@ -119,14 +122,18 @@ impl Storage {
         inventory: &DeviceInventory,
     ) -> Result<(Self, Vec<VirtioDevice>), BlockError> {
         let pci_blocks = inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+            device.vendor_id == VIRTIO_VENDOR_ID
+                && matches!(
+                    device.device_id,
+                    VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                )
         });
         let virtio_count = inventory
             .mmio_blocks
             .len()
             .checked_add(pci_blocks.clone().count())
             .ok_or(BlockError::InvalidRange)?;
-        if 26 < virtio_count {
+        if usize::from(LETTERED_DISK_COUNT) < virtio_count {
             return Err(BlockError::Unsupported);
         }
         let ram_count = usize::from(boot::info().initrd.is_some());
@@ -154,7 +161,7 @@ impl Storage {
         }
         // 原生控制器和 RAM 各有八软件槽及一个原 progress，硬件单通道独立于回调容量。
         let max_active = devices.iter().try_fold(
-            (mmc_count + ahci_count + ram_count) * 9,
+            (mmc_count + ahci_count + ram_count) * (usize::from(NATIVE_TAG_COUNT) + 1),
             |count, device| {
                 count
                     .checked_add(usize::from(device.info().tag_count) + 1)

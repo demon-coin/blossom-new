@@ -30,25 +30,56 @@ pub(super) const DBADDR: usize = 0x88;
 pub(super) const IDSTS: usize = 0x8c;
 pub(super) const IDINTEN: usize = 0x90;
 
-pub(super) const RESET: u32 = 7;
+pub(super) const CONTROLLER_RESET: u32 = 1;
 pub(super) const FIFO_RESET: u32 = 1 << 1;
 pub(super) const DMA_RESET: u32 = 1 << 2;
+pub(super) const RESET: u32 = CONTROLLER_RESET | FIFO_RESET | DMA_RESET;
 pub(super) const INT_ENABLE: u32 = 1 << 4;
 pub(super) const DMA_ENABLE: u32 = 1 << 5;
 pub(super) const USE_IDMAC: u32 = 1 << 25;
 pub(super) const BMOD_RESET: u32 = 1;
 pub(super) const BMOD_ENABLE: u32 = 1 << 7;
+pub(super) const BMOD_FIXED_BURST: u32 = 1 << 1;
 pub(super) const DATA_BUSY: u32 = 1 << 9;
 pub(super) const DMA_REQ: u32 = 1 << 31;
 pub(super) const CMD_DONE: u32 = 1 << 2;
 pub(super) const DATA_OVER: u32 = 1 << 3;
 pub(super) const RESPONSE_TIMEOUT: u32 = 1 << 8;
-pub(super) const ERRORS: u32 = 0xbfc2;
+const RESPONSE_ERROR: u32 = 1 << 1;
+const RESPONSE_CRC_ERROR: u32 = 1 << 6;
+const DATA_CRC_ERROR: u32 = 1 << 7;
+const DATA_TIMEOUT: u32 = 1 << 9;
+const HOST_TIMEOUT: u32 = 1 << 10;
+const FIFO_ERROR: u32 = 1 << 11;
+const HARDWARE_LOCK_ERROR: u32 = 1 << 12;
+const START_BIT_ERROR: u32 = 1 << 13;
+const END_BIT_ERROR: u32 = 1 << 15;
+pub(super) const ERRORS: u32 = RESPONSE_ERROR
+    | RESPONSE_CRC_ERROR
+    | DATA_CRC_ERROR
+    | RESPONSE_TIMEOUT
+    | DATA_TIMEOUT
+    | HOST_TIMEOUT
+    | FIFO_ERROR
+    | HARDWARE_LOCK_ERROR
+    | START_BIT_ERROR
+    | END_BIT_ERROR;
 pub(super) const IRQ_MASK: u32 = ERRORS | CMD_DONE | DATA_OVER;
 pub(super) const IDMAC_DONE: u32 = 1 << 30;
 pub(super) const IDMAC_ERROR: u32 = 1 << 31;
-pub(super) const IDMAC_ERRORS: u32 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 9);
-pub(super) const IDMAC_IRQ: u32 = IDMAC_ERRORS | (1 << 8) | 3;
+const IDMAC_FATAL_BUS_ERROR: u32 = 1 << 2;
+const IDMAC_DESCRIPTOR_UNAVAILABLE: u32 = 1 << 4;
+const IDMAC_CARD_ERROR: u32 = 1 << 5;
+const IDMAC_ABNORMAL_SUMMARY: u32 = 1 << 9;
+const IDMAC_NORMAL_SUMMARY: u32 = 1 << 8;
+pub(super) const IDMAC_TRANSMIT: u32 = 1;
+pub(super) const IDMAC_RECEIVE: u32 = 1 << 1;
+pub(super) const IDMAC_COMPLETION: u32 = IDMAC_TRANSMIT | IDMAC_RECEIVE;
+pub(super) const IDMAC_ERRORS: u32 = IDMAC_FATAL_BUS_ERROR
+    | IDMAC_DESCRIPTOR_UNAVAILABLE
+    | IDMAC_CARD_ERROR
+    | IDMAC_ABNORMAL_SUMMARY;
+pub(super) const IDMAC_IRQ: u32 = IDMAC_ERRORS | IDMAC_NORMAL_SUMMARY | IDMAC_COMPLETION;
 pub(super) const START: u32 = 1 << 31;
 pub(super) const HOLD: u32 = 1 << 29;
 pub(super) const UPDATE_CLOCK: u32 = 1 << 21;
@@ -60,6 +91,31 @@ pub(super) const DATA: u32 = 1 << 9;
 pub(super) const CRC: u32 = 1 << 8;
 pub(super) const LONG: u32 = 1 << 7;
 pub(super) const RESPONSE: u32 = 1 << 6;
+
+pub(super) const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+pub(super) const CLOCK_ENABLE: u32 = 1;
+pub(super) const CLOCK_DIVIDER_MASK: u32 = 0xff;
+pub(super) const CLOCK_DIVIDER_FACTOR: u64 = 2;
+pub(super) const CARD_POWER_ENABLE: u32 = 1;
+pub(super) const CARD_DETECT_ABSENT: u32 = 1;
+pub(super) const CARD_WRITE_PROTECTED: u32 = 1;
+pub(super) const CTYPE_1BIT: u32 = 0;
+pub(super) const CTYPE_4BIT: u32 = 1;
+pub(super) const HCON_ADDRESS_64BIT: u32 = 1 << 27;
+pub(super) const HCON_DMA_INTERFACE_SHIFT: u32 = 16;
+pub(super) const HCON_DMA_INTERFACE_MASK: u32 = 3;
+pub(super) const HCON_DATA_WIDTH_SHIFT: u32 = 7;
+pub(super) const HCON_DATA_WIDTH_MASK: u32 = 7;
+pub(super) const VERSION_MASK: u32 = 0xffff;
+pub(super) const VERSION_240A: u32 = 0x240a;
+pub(super) const DATA_OFFSET_LEGACY: usize = 0x100;
+pub(super) const DATA_OFFSET_240A: usize = 0x200;
+pub(super) const FIFO_RX_WATERMARK_SHIFT: u32 = 16;
+pub(super) const FIFO_WATERMARK_MASK: u32 = 0xfff;
+pub(crate) const FIFO_MIN_DEPTH: u32 = 2;
+pub(crate) const FIFO_MAX_DEPTH: u32 = FIFO_WATERMARK_MASK + 1;
+pub(super) const FIFO_COUNT_SHIFT: u32 = 17;
+pub(super) const FIFO_COUNT_MASK: u32 = 0x1fff;
 
 /// 验证后的永久 MMIO 窗口；方法只接受本模块公开的对齐偏移。
 pub(super) struct Registers(pub usize);
@@ -84,6 +140,6 @@ impl Registers {
 
     /// 读取 R2 的低字在前原始排列。
     pub fn response(&self) -> [u32; 4] {
-        core::array::from_fn(|index| self.read(RESP0 + index * 4))
+        core::array::from_fn(|index| self.read(RESP0 + index * REGISTER_BYTES))
     }
 }

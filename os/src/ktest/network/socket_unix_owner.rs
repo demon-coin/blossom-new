@@ -13,7 +13,7 @@ pub(crate) mod socket_unix_owner {
         FileIoContext, FileLike, FileRef, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer,
     };
     use crate::ktest::execution_services::SuiteBaseline;
-    use crate::net::socket::SocketFile;
+    use crate::net::socket::{SocketFile, SHUT_WR};
     use crate::net::{IoProgress, UnixSocketType};
     /// UNIX 末 OFD 撤真实 watch，别名保活到最后 put，两个 slot 在根未停止时归还。
     #[test]
@@ -74,9 +74,9 @@ pub(crate) mod socket_unix_owner {
         let mut output = [0u8; 16];
         socket_read_exact(&alias, &mut output)?;
         context.expect_eq(&output, b"last alias bytes");
-        operation(context, alias.shutdown(1))?;
+        operation(context, alias.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, second.read(&mut [0u8; 1]))?, 0);
-        operation(context, second.shutdown(1))?;
+        operation(context, second.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, alias.read(&mut [0u8; 1]))?, 0);
         drop(alias);
         context.expect_eq(file_weak.upgrade().is_none(), true);

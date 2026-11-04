@@ -5,7 +5,7 @@ use core::convert::TryFrom;
 use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
 use crate::fs::memfs::{FilesystemStat, MemoryFs};
-use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode};
+use crate::fs::{devfs, procfs, Ext4Volume, Filesystem, Path, ResolveMode, NAME_MAX, PATH_MAX};
 use crate::storage::Storage;
 use crate::syscall::error::{copyout, Errno, SysResult};
 use crate::syscall::Outcome;
@@ -13,7 +13,8 @@ use crate::task::process::{RootRole, ShutdownOperation};
 use crate::task::UserThread;
 use crate::{mm, sched, time};
 
-const PATH_LIMIT: usize = 4096;
+const MOUNT_STRING_LIMIT: usize = 4096;
+const MOUNT_METADATA_CAPACITY: usize = 64;
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
 const MS_SILENT: usize = 0x8000;
@@ -21,6 +22,16 @@ const UMOUNT_NOFOLLOW: usize = 8;
 const STATFS_SIZE: usize = 120;
 const ST_RDONLY: u64 = 1;
 const ST_VALID: u64 = 0x20;
+
+const REBOOT_MAGIC1: u32 = 0xfee1_dead;
+const REBOOT_MAGIC2: u32 = 672_274_793;
+const REBOOT_MAGIC2A: u32 = 85_072_278;
+const REBOOT_MAGIC2B: u32 = 369_367_448;
+const REBOOT_MAGIC2C: u32 = 537_993_216;
+const REBOOT_CMD_CAD_OFF: u32 = 0;
+const REBOOT_CMD_RESTART: u32 = 0x0123_4567;
+const REBOOT_CMD_HALT: u32 = 0xcdef_0123;
+const REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
 
 const UTS_FIELD_LEN: usize = 65;
 #[cfg(target_arch = "riscv64")]
@@ -40,8 +51,8 @@ pub(super) fn uname(user: &UserThread, raw: &[usize; 6]) -> SysResult {
 pub(super) fn sysinfo(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let memory = mm::stats();
     let elapsed = time::now().as_nanos();
-    let uptime =
-        u64::try_from(elapsed.div_ceil(1_000_000_000)).expect("sysinfo uptime exceeds Linux long");
+    let uptime = u64::try_from(elapsed.div_ceil(time::NSEC_PER_SEC))
+        .expect("sysinfo uptime exceeds Linux long");
     let fields = [
         uptime,
         0,
@@ -94,7 +105,7 @@ const fn uname_bytes() -> [u8; UTS_FIELD_LEN * 6] {
 /// 一次导入路径并沿当前 root/cwd 跟随链接，采样所选实际挂载后在锁外交付容量。
 pub(super) fn statfs(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let mm = user.mm().expect("statfs has no MM");
-    let pathname = mm.read_c_string(raw[0], PATH_LIMIT)?;
+    let pathname = mm.read_c_string(raw[0], PATH_MAX)?;
     let runtime = user.runtime().expect("statfs has no runtime");
     let (vfs, context) = {
         let fs = runtime.fs.lock();
@@ -149,7 +160,7 @@ fn encode_statfs(stat: FilesystemStat, mode: AccessMode) -> [u8; STATFS_SIZE] {
         stat.files,
         stat.freefiles,
         stat.device,
-        255,
+        NAME_MAX as u64,
         stat.block_size,
         flags,
     ];
@@ -174,18 +185,18 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let source = if remount || raw[0] == 0 {
         None
     } else {
-        Some(mm.read_c_string(raw[0], PATH_LIMIT)?)
+        Some(mm.read_c_string(raw[0], PATH_MAX)?)
     };
-    let target = mm.read_c_string(raw[1], PATH_LIMIT)?;
+    let target = mm.read_c_string(raw[1], PATH_MAX)?;
     let kind = if remount {
         None
     } else {
-        Some(mm.read_c_string(raw[2], PATH_LIMIT)?)
+        Some(mm.read_c_string(raw[2], MOUNT_STRING_LIMIT)?)
     };
     let options = if raw[4] == 0 {
         None
     } else {
-        Some(mm.read_c_string(raw[4], PATH_LIMIT)?)
+        Some(mm.read_c_string(raw[4], MOUNT_STRING_LIMIT)?)
     };
     let options = options.as_deref().unwrap_or(b"");
     let requested_mode = if raw[3] & MS_RDONLY != 0 {
@@ -217,7 +228,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
             let selector = DeviceSelector::parse(source).map_err(|_| Errno::NoDevice)?;
             let storage = Storage::get().ok_or(Errno::NoDevice)?;
             let view = storage.lookup(selector).ok_or(Errno::NoDevice)?;
-            let volume = Ext4Volume::open(view, requested_mode, 64)?;
+            let volume = Ext4Volume::open(view, requested_mode, MOUNT_METADATA_CAPACITY)?;
             (Filesystem::Ext4(volume), requested_mode)
         }
         b"tmpfs" => {
@@ -262,7 +273,7 @@ pub(super) fn umount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("umount has no MM");
-    let target = mm.read_c_string(raw[0], PATH_LIMIT)?;
+    let target = mm.read_c_string(raw[0], PATH_MAX)?;
     let (vfs, context) = {
         let fs = runtime.fs.lock();
         (fs.vfs.clone(), fs.context.clone())
@@ -300,15 +311,20 @@ pub(super) fn reboot(user: &UserThread, raw: &[usize; 6]) -> Outcome {
     let magic1 = raw[0] as u32;
     let magic2 = raw[1] as u32;
     let command = raw[2] as u32;
-    if magic1 != 0xfee1dead || !matches!(magic2, 672274793 | 85072278 | 369367448 | 537993216) {
+    if magic1 != REBOOT_MAGIC1
+        || !matches!(
+            magic2,
+            REBOOT_MAGIC2 | REBOOT_MAGIC2A | REBOOT_MAGIC2B | REBOOT_MAGIC2C
+        )
+    {
         return Outcome::Return(Errno::InvalidArgument.result());
     }
     let operation = match command {
         // 串口平台没有 CAD 键事件源，其禁用状态固定；重复禁用不另造无人读取的开关。
-        0 => return Outcome::Return(0),
-        0x01234567 => ShutdownOperation::Restart,
-        0xcdef0123 => ShutdownOperation::Halt,
-        0x4321fedc => ShutdownOperation::PowerOff,
+        REBOOT_CMD_CAD_OFF => return Outcome::Return(0),
+        REBOOT_CMD_RESTART => ShutdownOperation::Restart,
+        REBOOT_CMD_HALT => ShutdownOperation::Halt,
+        REBOOT_CMD_POWER_OFF => ShutdownOperation::PowerOff,
         _ => return Outcome::Return(Errno::InvalidArgument.result()),
     };
     let identity = user.identity().expect("reboot has no identity");

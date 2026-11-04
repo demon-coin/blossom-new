@@ -24,7 +24,13 @@ pub(crate) mod resource_limits {
             .map_err(|_| TestError("resource candidate list allocation failed"))?;
         for index in 0..600 {
             let prepared = graph
-                .prepare_process(None, actions.clone(), 0, SignalInheritance::EMPTY, 17)
+                .prepare_process(
+                    None,
+                    actions.clone(),
+                    0,
+                    SignalInheritance::EMPTY,
+                    crate::task::signal::SIGCHLD,
+                )
                 .map_err(|_| TestError("resource identity growth failed"))?;
             context.expect_eq(prepared.identity().tid(), index + 1);
             identities.push(Some(prepared));
@@ -36,7 +42,13 @@ pub(crate) mod resource_limits {
             .tid_object();
         drop(identities[511].take());
         let replacement = graph
-            .prepare_process(None, actions, 0, SignalInheritance::EMPTY, 17)
+            .prepare_process(
+                None,
+                actions,
+                0,
+                SignalInheritance::EMPTY,
+                crate::task::signal::SIGCHLD,
+            )
             .map_err(|_| TestError("resource identity reuse failed"))?;
         context.expect_eq(replacement.identity().tid(), 512);
         context.expect_eq(

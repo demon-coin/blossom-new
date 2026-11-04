@@ -5,11 +5,18 @@ use core::convert::{TryFrom, TryInto};
 use super::resources;
 use super::{
     cells, compatible, device_region, enabled, identity_address, interrupt_parent, number, parent,
-    property, regions, require_controller, single_region, word, Fdt, Node,
+    property, regions, require_controller, single_region, word, Fdt, Node, FDT_CELL_BYTES,
+    IRQ_TYPE_LEVEL_HIGH, PCI_RANGE_BUS_OFFSET, PCI_RANGE_BYTES, PCI_RANGE_CPU_OFFSET,
+    PCI_RANGE_SIZE_OFFSET,
 };
 use crate::boot::{
     AhciResources, BootInfo, LioIntcResources, PciConfiguration, PciFunctionResource, PciIntxRoute,
-    PciRange, Region, SysconAction,
+    PciRange, Region, SysconAction, PCI_BUS_SHIFT, PCI_DEVICE_COUNT, PCI_DEVICE_SHIFT,
+    PCI_FUNCTION_COUNT, PCI_FUNCTION_SHIFT, PCI_SPACE_CODE_MASK, PCI_SPACE_IO, PCI_SPACE_MEM32,
+    PCI_SPACE_MEM64,
+};
+use crate::platform::layout::{
+    DMW_ADDRESS_END, DMW_ADDRESS_MASK, DMW_CACHED_VSEG, DMW_UNCACHED_VSEG, DMW_VSEG_SHIFT,
 };
 
 /// 固件交接中已归一化的物理地址，解析完成后不保留 EFI 表借用。
@@ -29,6 +36,15 @@ const EFI_FDT_GUID: [u8; 16] = [
     0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
 ];
 
+const UHI_FDT_HANDOFF: usize = usize::MAX - 1;
+const LIOINTC_FIRST_PARENT_CAUSE: u32 = 2;
+const LIOINTC_LAST_PARENT_CAUSE: u32 = 3;
+const LIOINTC_REGISTER_BYTES: usize = 0x40;
+const LIOINTC_ISR_BYTES: usize = 2 * core::mem::size_of::<u32>();
+const PCI_BDF_MASK: u32 = ((u8::MAX as u32) << PCI_BUS_SHIFT)
+    | (((PCI_DEVICE_COUNT - 1) as u32) << PCI_DEVICE_SHIFT)
+    | (((PCI_FUNCTION_COUNT - 1) as u32) << PCI_FUNCTION_SHIFT);
+
 /// 一次解释 UHI、显式 a3 DTB 或 EFI64 bootm 交接，不扫描物理内存。
 ///
 /// # Safety
@@ -36,7 +52,7 @@ const EFI_FDT_GUID: [u8; 16] = [
 /// 无并发修改，且对应 RAM 映射已经建立；内容校验不能证明指针可读。
 /// 返回的 DTB 与命令行仍由调用者保活，直到完整 FDT 解析和命令行复制结束。
 pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParameters, &'static str> {
-    if args[0] == usize::MAX - 1 {
+    if args[0] == UHI_FDT_HANDOFF {
         return Ok(FirmwareParameters {
             dtb: physical(args[1])?,
             command_line: None,
@@ -122,7 +138,7 @@ unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'
     let end = address
         .checked_add(size)
         .ok_or("firmware physical storage range overflows")?;
-    if (1usize << 60) < end || (isize::MAX as usize) < size {
+    if (DMW_ADDRESS_END as usize) < end || (isize::MAX as usize) < size {
         return Err("firmware storage range is not representable");
     }
     let pointer = crate::arch::phys_to_virt(address) as *const u8;
@@ -135,10 +151,13 @@ unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'
 
 /// 固件可传物理地址或 cached/uncached DMW 地址；其他地址类别拒绝。
 fn physical(address: usize) -> Result<usize, &'static str> {
-    if !matches!(address >> 60, 0 | 8 | 9) {
+    if !matches!(
+        address >> DMW_VSEG_SHIFT,
+        0 | DMW_UNCACHED_VSEG | DMW_CACHED_VSEG
+    ) {
         return Err("firmware address is neither physical nor a supported DMW alias");
     }
-    let address = address & 0x0fff_ffff_ffff_ffff;
+    let address = address & DMW_ADDRESS_MASK as usize;
     if address == 0 {
         return Err("firmware address is null");
     }
@@ -161,10 +180,10 @@ pub(super) fn discover<'a>(
         let root = interrupt_parent(tree, node)?;
         require_controller(root, "loongson,cpu-interrupt-controller", 1)?;
         let cause = super::irq(node, root)?;
-        if !(2..=3).contains(&cause) {
+        if !(LIOINTC_FIRST_PARENT_CAUSE..=LIOINTC_LAST_PARENT_CAUSE).contains(&cause) {
             return Err("FDT LIOINTC parent cause is unsupported");
         }
-        let index = (cause - 2) as usize;
+        let index = (cause - LIOINTC_FIRST_PARENT_CAUSE) as usize;
         if banks[index].is_some() {
             return Err("FDT LIOINTC parent cause is duplicated");
         }
@@ -179,19 +198,19 @@ pub(super) fn discover<'a>(
             .next()
             .ok_or("FDT LIOINTC CPU1 ISR is missing")??;
         if registers.next().is_some()
-            || main.end - main.start != 0x40
-            || isr0.end - isr0.start != 8
-            || isr1.end - isr1.start != 8
+            || main.end - main.start != LIOINTC_REGISTER_BYTES
+            || isr0.end - isr0.start != LIOINTC_ISR_BYTES
+            || isr1.end - isr1.start != LIOINTC_ISR_BYTES
         {
             return Err("FDT LIOINTC register geometry is unsupported");
         }
         let map = property(node, "loongson,parent_int_map")?;
-        if map.len() != 16 {
+        if map.len() != 4 * FDT_CELL_BYTES {
             return Err("FDT LIOINTC parent masks are truncated");
         }
         let mut parent_map = [0; 4];
         for (slot, value) in parent_map.iter_mut().enumerate() {
-            *value = word(map, slot * 4)?;
+            *value = word(map, slot * FDT_CELL_BYTES)?;
             if *value != if slot == index { u32::MAX } else { 0 } {
                 return Err("FDT LIOINTC source routing is unsupported");
             }
@@ -210,8 +229,8 @@ pub(super) fn discover<'a>(
     ];
     info.interrupts.controller = info.board.liointc[0].registers;
     info.interrupts.parent_controller = info.board.liointc[1].registers;
-    info.interrupts.root_interrupt = 2;
-    info.interrupts.source_count = 64;
+    info.interrupts.root_interrupt = LIOINTC_FIRST_PARENT_CAUSE;
+    info.interrupts.source_count = info.board.liointc.len() as u32 * u32::BITS;
     info.interrupts.uart_source = lio_irq(tree, uart, banks)?;
     if info.hardware_ids[..info.cpu_count]
         .iter()
@@ -274,7 +293,9 @@ fn lio_irq<'a>(
     banks: [Node<'a>; 2],
 ) -> Result<u32, &'static str> {
     let (controller, source, flags) = if let Some(extended) = node.property("interrupts-extended") {
-        if extended.value.len() < 12 || extended.value.len() % 12 != 0 {
+        if extended.value.len() < 3 * FDT_CELL_BYTES
+            || extended.value.len() % (3 * FDT_CELL_BYTES) != 0
+        {
             return Err("FDT LIOINTC extended interrupt is truncated");
         }
         let controller = tree
@@ -282,25 +303,25 @@ fn lio_irq<'a>(
             .ok_or("FDT LIOINTC interrupt parent is missing")?;
         (
             controller,
-            word(extended.value, 4)?,
-            word(extended.value, 8)?,
+            word(extended.value, FDT_CELL_BYTES)?,
+            word(extended.value, 2 * FDT_CELL_BYTES)?,
         )
     } else {
         let controller = interrupt_parent(tree, node)?;
         let raw = property(node, "interrupts")?;
-        if raw.len() != 8 {
+        if raw.len() != 2 * FDT_CELL_BYTES {
             return Err("FDT LIOINTC interrupt is not two cells");
         }
-        (controller, word(raw, 0)?, word(raw, 4)?)
+        (controller, word(raw, 0)?, word(raw, FDT_CELL_BYTES)?)
     };
     let index = banks
         .iter()
         .position(|bank| bank.name.as_ptr() == controller.name.as_ptr())
         .ok_or("FDT device is not connected to selected LIOINTC")?;
-    if 32 <= source || flags != 4 {
+    if u32::BITS <= source || flags != IRQ_TYPE_LEVEL_HIGH {
         return Err("FDT LIOINTC device source or trigger is unsupported");
     }
-    Ok(index as u32 * 32 + source)
+    Ok(index as u32 * u32::BITS + source)
 }
 
 /// 收集 Loongson CFG0/CFG1、窗口与所选集成功能资源，保留 SATA 节点显式声明的端口图。
@@ -332,33 +353,42 @@ fn discover_pci<'a>(
     }
     info.pci.kind = PciConfiguration::Loongson;
     let buses = property(host, "bus-range")?;
-    if buses.len() != 8 || word(buses, 0)? != 0 || 255 < word(buses, 4)? {
+    if buses.len() != 2 * FDT_CELL_BYTES
+        || word(buses, 0)? != 0
+        || (u8::MAX as u32) < word(buses, FDT_CELL_BYTES)?
+    {
         return Err("FDT Loongson PCI bus range is invalid");
     }
     info.pci.bus_start = 0;
-    info.pci.bus_end = word(buses, 4)?;
+    info.pci.bus_end = word(buses, FDT_CELL_BYTES)?;
     let ranges = property(host, "ranges")?;
-    if ranges.is_empty() || ranges.len() % 28 != 0 {
+    if ranges.is_empty() || ranges.len() % PCI_RANGE_BYTES != 0 {
         return Err("FDT Loongson PCI ranges are truncated");
     }
-    for range in ranges.chunks_exact(28) {
+    for range in ranges.chunks_exact(PCI_RANGE_BYTES) {
         if info.pci.range_count == info.pci.ranges.len() {
             return Err("FDT Loongson PCI range capacity exceeded");
         }
         let flags = word(range, 0)?;
-        if !matches!(flags & 0x0300_0000, 0x0100_0000 | 0x0200_0000 | 0x0300_0000) {
+        if !matches!(
+            flags & PCI_SPACE_CODE_MASK,
+            PCI_SPACE_IO | PCI_SPACE_MEM32 | PCI_SPACE_MEM64
+        ) {
             return Err("FDT Loongson PCI window kind is unsupported");
         }
-        let cpu = Region::from_size(cells(&range[12..20])?, cells(&range[20..28])?)?;
+        let cpu = Region::from_size(
+            cells(&range[PCI_RANGE_CPU_OFFSET..PCI_RANGE_SIZE_OFFSET])?,
+            cells(&range[PCI_RANGE_SIZE_OFFSET..PCI_RANGE_BYTES])?,
+        )?;
         device_region(cpu, info)?;
         info.pci.ranges[info.pci.range_count] = PciRange {
             flags,
-            bus_start: cells(&range[4..12])?,
+            bus_start: cells(&range[PCI_RANGE_BUS_OFFSET..PCI_RANGE_CPU_OFFSET])?,
             cpu,
         };
         info.pci.range_count += 1;
     }
-    info.pci.intx_mask = [0x00ff_ff00, 0, 0, 0];
+    info.pci.intx_mask = [PCI_BDF_MASK, 0, 0, 0];
     let sata = host
         .children()
         .find(|node| node.name == "sata@8,0" && enabled(*node))
@@ -392,17 +422,17 @@ fn pci_function<'a>(
     banks: [Node<'a>; 2],
 ) -> Result<PciFunctionResource, &'static str> {
     let reg = property(node, "reg")?;
-    if reg.len() != 20 || reg[4..].iter().any(|byte| *byte != 0) {
+    if reg.len() != 5 * FDT_CELL_BYTES || reg[FDT_CELL_BYTES..].iter().any(|byte| *byte != 0) {
         return Err("FDT selected PCI function reg is not configuration identity");
     }
     let address = word(reg, 0)?;
-    if address & 0xff00_00ff != 0 {
+    if address & !PCI_BDF_MASK != 0 {
         return Err("FDT PCI configuration identity is invalid");
     }
     Ok(PciFunctionResource {
-        bus: (address >> 16) as u8,
-        device: ((address >> 11) & 31) as u8,
-        function: ((address >> 8) & 7) as u8,
+        bus: (address >> PCI_BUS_SHIFT) as u8,
+        device: ((address >> PCI_DEVICE_SHIFT) & u32::from(PCI_DEVICE_COUNT - 1)) as u8,
+        function: ((address >> PCI_FUNCTION_SHIFT) & u32::from(PCI_FUNCTION_COUNT - 1)) as u8,
         interrupt_source: lio_irq(tree, node, banks)?,
         dma_coherent: resources::coherent(tree, node, false)?,
     })
@@ -415,9 +445,9 @@ fn add_route(info: &mut BootInfo, function: PciFunctionResource) -> Result<(), &
     }
     info.pci.intx_routes[info.pci.intx_route_count] = PciIntxRoute {
         child: [
-            ((function.bus as u32) << 16)
-                | ((function.device as u32) << 11)
-                | ((function.function as u32) << 8),
+            ((function.bus as u32) << PCI_BUS_SHIFT)
+                | ((function.device as u32) << PCI_DEVICE_SHIFT)
+                | ((function.function as u32) << PCI_FUNCTION_SHIFT),
             0,
             0,
             0,
@@ -457,7 +487,7 @@ fn discover_mmio<'a>(
     }
     let registers = single_region(tree, sata)?;
     device_region(registers, info)?;
-    if registers.end - registers.start < 0x1100 {
+    if registers.end - registers.start < crate::drivers::ahci::MMIO_BYTES {
         return Err("FDT AHCI MMIO window is too short");
     }
     let dma_mask = sata
@@ -482,7 +512,7 @@ fn discover_mmio<'a>(
     let mut gmac = resources::gmac(tree, mac, false)?;
     gmac.registers = single_region(tree, mac)?;
     device_region(gmac.registers, info)?;
-    if gmac.registers.end - gmac.registers.start < 0x105c {
+    if gmac.registers.end - gmac.registers.start < crate::drivers::dwmac::DWMAC1000_MMIO_MIN_BYTES {
         return Err("FDT GMAC MMIO window is too short");
     }
     gmac.interrupt_source = lio_irq(tree, mac, banks)?;

@@ -17,7 +17,7 @@ pub(crate) fn used_index(disk: &Disk, legacy: bool) -> u16 {
         core::ptr::read_volatile(
             ring.cpu
                 .as_ptr()
-                .add(layout.used_offset() + 2)
+                .add(layout.used_offset() + core::mem::size_of::<u16>())
                 .cast::<u16>(),
         )
     })

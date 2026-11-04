@@ -3,11 +3,47 @@ use crate::boot::BootInfo;
 use crate::platform::LINK_LAYOUT;
 use crate::sched::context::TaskContext;
 use crate::sync::SpinLock;
+use crate::syscall::Errno;
 use core::arch::asm;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
+
+// PCH-PIC 的共享 word、源路由与极性寄存器。
+const PCH_PIC_MASK: usize = 0x20;
+const PCH_PIC_HTMSI_ENABLE: usize = 0x40;
+const PCH_PIC_EDGE: usize = 0x60;
+const PCH_PIC_CLEAR: usize = 0x80;
+const PCH_PIC_ROUTE: usize = 0x100;
+const PCH_PIC_VECTOR: usize = 0x200;
+const PCH_PIC_POLARITY: usize = 0x3e0;
+const IO_WORD_BYTES: usize = core::mem::size_of::<u32>();
+const NODEMAP_ENTRIES_PER_WORD: usize = IO_WORD_BYTES / core::mem::size_of::<u16>();
+const PCH_PIC_SOURCE_COUNT: u32 = 2 * u32::BITS;
+const PCH_PIC_ROUTE_HT: u8 = 1;
+
+// EXTIOI 偏移相对于固件给出的 parent_controller，不能当作绝对 IOCSR 编号。
+const EXTIOI_NODEMAP: usize = 0xa0;
+const EXTIOI_IPMAP: usize = 0xc0;
+const EXTIOI_ENABLE: usize = 0x200;
+const EXTIOI_BOUNCE: usize = 0x280;
+const EXTIOI_ISR: usize = 0x400;
+const EXTIOI_ROUTE: usize = 0x800;
+const EXTIOI_CORES_PER_NODE: usize = 4;
+const EXTIOI_ROUTE_NODE_SHIFT: usize = 4;
+const EXTIOI_NODE_COUNT: usize = 1 << EXTIOI_ROUTE_NODE_SHIFT;
+const EXTIOI_ROOT_INTERRUPT: u32 = reg::CPU_HWI1;
+const EXTIOI_IPMAP_HWI1: u32 = 2;
+const IOCSR_MISC_FUNCTION: usize = 0x420;
+const IOCSR_EXTIOI_ENABLE: u64 = 1 << 48;
+
+const GED_BASE: usize = 0x100e001c;
+const GED_SLEEP_CONTROL: usize = 0;
+const GED_RESET: usize = 2;
+const GED_SLEEP_ENABLE: u8 = 1 << 5;
+const GED_SLEEP_S5: u8 = 5 << 2;
+const GED_RESET_VALUE: u8 = 0x42;
 
 pub mod ale;
 mod counter;
@@ -15,9 +51,17 @@ mod entry;
 mod idle;
 mod liointc;
 mod mmu;
+mod register;
 #[cfg(feature = "ktest")]
 mod register_test;
 mod rtc;
+use register as reg;
+pub(crate) use register::{
+    CRMD_IE, CSR_CRMD, CSR_DMW0, CSR_DMW1, CSR_EUEN, CSR_KS0, ECODE_ADE, ECODE_ALE, ECODE_BCE,
+    ECODE_BRK, ECODE_BTDIS, ECODE_BTE, ECODE_FPDIS, ECODE_FPE, ECODE_INE, ECODE_IPE, ECODE_LASXDIS,
+    ECODE_LSXDIS, ECODE_PIF, ECODE_PIL, ECODE_PIS, ECODE_PME, ECODE_PNR, ECODE_PNX, ECODE_PPI,
+    ECODE_SYS, ECODE_WATCH, EUEN_FP, EUEN_LASX, EUEN_LSX, FCSR_CAUSE_SHIFT, FCSR_ENABLE_MASK,
+};
 mod signal;
 mod switch;
 mod trap;
@@ -149,14 +193,14 @@ fn barrier() {
 pub(super) fn dma_write_barrier() {
     // SAFETY: 引导入口已建立 PLV0，dbar 0x0a 排序前后写访问；
     // 汇编保留 memory 副作用，不声明 nomem/readonly。
-    unsafe { asm!("dbar 0x0a", options(nostack)) };
+    unsafe { asm!("dbar {hint}", hint = const reg::DBAR_COMPLETION_WRITE, options(nostack)) };
 }
 
 /// 在观察设备完成后，以完成型读屏障排序 coherent 数据读取。
 pub(super) fn dma_read_barrier() {
     // SAFETY: PLV0 可执行 dbar 0x05，完成前读并排序后读，不访问额外地址；
     // 汇编的 memory 副作用同时约束编译器读取顺序。
-    unsafe { asm!("dbar 0x05", options(nostack)) };
+    unsafe { asm!("dbar {hint}", hint = const reg::DBAR_COMPLETION_READ, options(nostack)) };
 }
 
 /// 对 coherent 内存和设备 MMIO 执行完成型双向排序。
@@ -173,7 +217,7 @@ pub fn dma_cache_flush(_: usize, _: usize) -> Result<(), &'static str> {
 
 /// 从 CPUId CSR 取得当前硬件身份，不解释 QEMU 的引导参数。
 pub fn boot_hardware_id(_: [usize; 4]) -> usize {
-    csr_read::<0x20>() & 0x3ff
+    csr_read::<{ reg::CSR_CPUID }>() & reg::HARDWARE_CPU_ID_MASK
 }
 /// 将真实 RAM 物理地址转换为缓存 DMW 别名。
 pub fn phys_to_virt(pa: usize) -> usize {
@@ -193,9 +237,18 @@ pub fn mmio_address(pa: usize) -> usize {
 /// 必须由 BSP 在 IRQ 关闭、辅核尚未释放时调用一次；入口已建立 PG、缓存与强序 DMW。
 /// BootInfo 必须是已发布的真实平台对象，调用期间不得修改这些映射。
 pub unsafe fn finish_boot_mappings(_: &BootInfo) {
-    assert_eq!(csr_read::<0>() & 0x18, 0x10);
-    assert_eq!(csr_read::<0x181>(), phys_to_virt(0) | 0x11);
-    assert_eq!(csr_read::<0x180>(), mmio_address(0) | 1);
+    assert_eq!(
+        csr_read::<{ reg::CSR_CRMD }>() & reg::CRMD_ADDRESS_MODE,
+        reg::CRMD_PG
+    );
+    assert_eq!(
+        csr_read::<{ reg::CSR_DMW1 }>(),
+        phys_to_virt(0) | reg::DMW_KERNEL_RAM
+    );
+    assert_eq!(
+        csr_read::<{ reg::CSR_DMW0 }>(),
+        mmio_address(0) | reg::DMW_PLV0
+    );
     // SAFETY: 本函数的 BSP 独占启动契约保证 AP 尚未发布，静态 DMW 映射已通过上面的断言。
     unsafe { mmu::initialize_invalid_tables() };
     crate::console::configure_resources(crate::boot::info());
@@ -207,11 +260,11 @@ pub unsafe fn finish_boot_mappings(_: &BootInfo) {
 /// 必须在本核 IRQ 关闭时安装，不得把同一个对象安装给另一个 CPU。
 pub unsafe fn install_cpu_local(local: *const crate::cpu::CpuLocal) {
     // SAFETY: 调用者保证本核 IRQ 已关闭，指针是本核永久有效对象，KS0 只保存该基址。
-    unsafe { csr_write::<0x30>(local as usize) };
+    unsafe { csr_write::<{ reg::CSR_KS0 }>(local as usize) };
 }
 /// 读取当前 CPU 的 KS0 基址。
 pub fn cpu_local() -> *const crate::cpu::CpuLocal {
-    csr_read::<0x30>() as *const _
+    csr_read::<{ reg::CSR_KS0 }>() as *const _
 }
 
 /// 在调度专用 IRQ 关闭段切换整数现场；恢复后 KS0 仍属于实际执行的 CPU。
@@ -223,7 +276,11 @@ pub fn cpu_local() -> *const crate::cpu::CpuLocal {
 /// 不得持有普通锁、IRQ/preempt guard 或跨切换保存本核借用。
 pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     assert!(!irq_enabled(), "context switch requires IRQ off");
-    assert_eq!(csr_read::<2>(), 0, "context switch requires EUEN off");
+    assert_eq!(
+        csr_read::<{ reg::CSR_EUEN }>(),
+        0,
+        "context switch requires EUEN off"
+    );
     // SAFETY: 调用者独占两个有效现场及栈，断言确认 IRQ 与扩展单元关闭；
     // 汇编仅按 Rust 提供的布局访问整数字段，不恢复 CPU 基址或扩展单元现场。
     unsafe { la_switch_context(prev, next) };
@@ -233,20 +290,20 @@ pub fn init_current_cpu() {
     irq_save();
     // SAFETY: 入口已建立本核 PLV0/DMW 和有效栈；IRQ 已关闭，异常代码在永久内核映射内。
     unsafe {
-        csr_write::<0xc>(la_kernel_trap as usize);
-        csr_write::<0x88>(virt_to_phys(la_kernel_refill as usize));
+        csr_write::<{ reg::CSR_EENTRY }>(la_kernel_trap as usize);
+        csr_write::<{ reg::CSR_TLBRENTRY }>(virt_to_phys(la_kernel_refill as usize));
         let external = if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
-            (1 << 2) | (1 << 3)
+            reg::IRQ_HWI0 | reg::IRQ_HWI1
         } else {
-            1 << 3
+            reg::IRQ_HWI1
         };
-        csr_write::<4>((1 << 11) | (1 << 12) | external);
-        csr_write::<2>(0);
+        csr_write::<{ reg::CSR_ECFG }>(reg::IRQ_TIMER | reg::IRQ_IPI | external);
+        csr_write::<{ reg::CSR_EUEN }>(0);
     }
     mmu::initialize_current_cpu();
     disable_timer();
-    iocsr_write32(0x100c, u32::MAX);
-    iocsr_write32(0x1004, u32::MAX);
+    iocsr_write32(reg::IOCSR_IPI_CLEAR, u32::MAX);
+    iocsr_write32(reg::IOCSR_IPI_ENABLE, u32::MAX);
     barrier();
 }
 /// 在 PLV0 原子关闭本核 IRQ 并返回原 CRMD；编译器内存屏障保持临界区访问位于关 IRQ 之后。
@@ -256,7 +313,7 @@ pub fn irq_save() -> usize {
     // csrxchg 不改写 $t0，inout 声明旧 CRMD 的回写并排除与 $t0 重叠；指令不访问栈。
     // 仅清除 IE；不使用 nomem/readonly，保留普通访存不能跨越 IRQ 边界的编译器屏障。
     unsafe {
-        asm!("csrxchg {old}, $t0, 0", old = inout(reg) 0usize => old, in("$t0") 4usize, options(nostack));
+        asm!("csrxchg {old}, $t0, {crmd}", old = inout(reg) 0usize => old, in("$t0") reg::CRMD_IE, crmd = const reg::CSR_CRMD, options(nostack));
     }
     old
 }
@@ -270,12 +327,12 @@ pub unsafe fn irq_restore(saved: usize) {
     // 只恢复掩码 4 指定的 IE；$t0 保持不变，inout 声明旧 CRMD 回写并排除与 $t0 重叠。
     // 指令不访问栈；不使用 nomem/readonly，保留锁释放及借用结束不能越过恢复 IRQ 的编译器屏障。
     unsafe {
-        asm!("csrxchg {value}, $t0, 0", value = inout(reg) (saved & 4) => _, in("$t0") 4usize, options(nostack));
+        asm!("csrxchg {value}, $t0, {crmd}", value = inout(reg) (saved & reg::CRMD_IE) => _, in("$t0") reg::CRMD_IE, crmd = const reg::CSR_CRMD, options(nostack));
     }
 }
 /// 查询本核全局 IRQ 开关。
 pub fn irq_enabled() -> bool {
-    csr_read::<0>() & 4 != 0
+    csr_read::<{ reg::CSR_CRMD }>() & reg::CRMD_IE != 0
 }
 /// 在 PLV0 打开本核全局 IRQ；编译器内存屏障保持初始化写入和 online 发布位于各自边界。
 pub fn enable_interrupts() {
@@ -283,7 +340,7 @@ pub fn enable_interrupts() {
     // 掩码 4 只使能 IE；$t0 保持不变，inout 声明旧 CRMD 回写并排除与 $t0 重叠。
     // 指令不访问栈；不使用 nomem/readonly，保留普通访存不能跨越开 IRQ 边界的编译器屏障。
     unsafe {
-        asm!("csrxchg {value}, $t0, 0", value = inout(reg) 4usize => _, in("$t0") 4usize, options(nostack));
+        asm!("csrxchg {value}, $t0, {crmd}", value = inout(reg) reg::CRMD_IE => _, in("$t0") reg::CRMD_IE, crmd = const reg::CSR_CRMD, options(nostack));
     }
 }
 /// 等待真实硬件中断。
@@ -335,39 +392,39 @@ pub(crate) fn cpucfg(index: usize) -> u64 {
     unsafe {
         asm!("cpucfg {value}, {index}", value = out(reg) value, index = in(reg) index, options(nomem, nostack));
     }
-    value as u64 & 0xffff_ffff
+    value as u64 & u64::from(u32::MAX)
 }
 
 /// 返回用户现场完整支持的 EUEN 位；扩展依赖必须同时存在于实际 CPU。
 pub(crate) fn user_euen() -> usize {
-    let config = cpucfg(2);
-    if config & 1 == 0 {
+    let config = cpucfg(reg::CPUCFG_FEATURES);
+    if config & reg::CPUCFG_FP == 0 {
         return 0;
     }
-    if config & (1 << 6) == 0 {
-        return 1;
+    if config & reg::CPUCFG_LSX == 0 {
+        return reg::EUEN_SCALAR;
     }
-    if config & (1 << 7) == 0 {
-        return 3;
+    if config & reg::CPUCFG_LASX == 0 {
+        return reg::EUEN_SIMD;
     }
-    7
+    reg::EUEN_WIDE_SIMD
 }
 
 /// 给出实际启用的每寄存器 u64 lane 数，零表示 CPU 没有浮点扩展。
 pub(crate) fn user_fp_lanes() -> usize {
     match user_euen() {
-        7 => 4,
-        3 => 2,
-        1 => 1,
+        reg::EUEN_WIDE_SIMD => 4,
+        reg::EUEN_SIMD => 2,
+        reg::EUEN_SCALAR => 1,
         _ => 0,
     }
 }
 /// 仅资源发现前从 CPUCFG4/5 取得实际 counter 频率，不作为运行期读数路径。
 pub fn boot_counter_frequency() -> u64 {
-    let base = cpucfg(4);
-    let ratio = cpucfg(5);
-    let mul = ratio & 0xffff;
-    let div = ratio >> 16;
+    let base = cpucfg(reg::CPUCFG_COUNTER_BASE);
+    let ratio = cpucfg(reg::CPUCFG_COUNTER_RATIO);
+    let mul = ratio & reg::CPUCFG_COUNTER_MUL_MASK;
+    let div = ratio >> reg::CPUCFG_COUNTER_DIV_SHIFT;
     assert!(
         base != 0 && mul != 0 && div != 0,
         "invalid CPUCFG counter frequency"
@@ -381,25 +438,30 @@ pub fn counter_frequency() -> u64 {
 /// 将绝对 deadline 向上量化到四个 tick，并编程一次事件。
 pub fn program_timer(deadline: u64) {
     disable_timer();
-    let delta = deadline.saturating_sub(read_counter()).max(4);
-    let value = delta.saturating_add(3).min((1u64 << 48) - 4) & !3;
+    let delta = deadline
+        .saturating_sub(read_counter())
+        .max(reg::TIMER_QUANTUM);
+    let value = delta
+        .saturating_add(reg::TIMER_QUANTUM - 1)
+        .min(reg::TIMER_MAX_DELTA)
+        & !(reg::TIMER_QUANTUM - 1);
     // SAFETY: 在 PLV0 写本核 TCFG；上面的量化保证只写有效 tick 位与一次事件使能位。
     unsafe {
-        csr_write::<0x41>(value as usize | 1);
+        csr_write::<{ reg::CSR_TCFG }>(value as usize | reg::TCFG_ENABLE);
     }
 }
 /// 关闭一次事件并清除真实 timer pending。
 pub fn disable_timer() {
     // SAFETY: TCFG/TICLR 是本核定时器 CSR，写零关闭事件、写一清 pending 均不影响映射。
     unsafe {
-        csr_write::<0x41>(0);
-        csr_write::<0x44>(1);
+        csr_write::<{ reg::CSR_TCFG }>(0);
+        csr_write::<{ reg::CSR_TICLR }>(reg::TICLR_CLEAR);
     }
 }
 /// 编码 IOCSR 的十位真实 CPU target；编译逻辑 CPU 容量不参与硬件寻址。
 pub(crate) const fn ipi_target(hardware_id: usize) -> Option<u32> {
-    if hardware_id < 1024 {
-        Some((1 << 31) | ((hardware_id as u32) << 16))
+    if hardware_id < reg::HARDWARE_CPU_ID_COUNT {
+        Some(reg::IPI_SEND_BLOCKING | ((hardware_id as u32) << reg::IPI_SEND_CPU_SHIFT))
     } else {
         None
     }
@@ -407,15 +469,22 @@ pub(crate) const fn ipi_target(hardware_id: usize) -> Option<u32> {
 
 /// 用已编码的 target 向四个硬件 mailbox 之一发表完整 64 位值。
 fn mail_send(target: u32, mailbox: usize, data: usize) {
-    assert!(mailbox < 4, "IOCSR mailbox index is out of range");
+    assert!(
+        mailbox < reg::MAILBOX_COUNT,
+        "IOCSR mailbox index is out of range"
+    );
     let target = u64::from(target);
     iocsr_write64(
-        0x1048,
-        (data as u64 & 0xffff_ffff_0000_0000) | target | (((mailbox * 2 + 1) as u64) << 2),
+        reg::IOCSR_MAIL_SEND,
+        (data as u64 & reg::MAIL_SEND_HIGH_MASK)
+            | target
+            | (((mailbox * 2 + 1) as u64) << reg::MAIL_SEND_BOX_SHIFT),
     );
     iocsr_write64(
-        0x1048,
-        ((data as u64) << 32) | target | (((mailbox * 2) as u64) << 2),
+        reg::IOCSR_MAIL_SEND,
+        ((data as u64) << reg::MAIL_SEND_DATA_SHIFT)
+            | target
+            | (((mailbox * 2) as u64) << reg::MAIL_SEND_BOX_SHIFT),
     );
 }
 /// 板 mailbox1 发表真实栈、mailbox2 发表 CpuLocal，最后发表入口并发送启动 IPI。
@@ -425,7 +494,7 @@ fn mail_send(target: u32, mailbox: usize, data: usize) {
 /// 记录中的栈须独占、满足 16 字节 ABI 对齐，CpuLocal 须属于目标核且完整初始化；两者与 DMW 均须永久有效。
 /// 发布后不得再修改启动记录。
 pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Result<(), isize> {
-    let target = ipi_target(hardware_id).ok_or(-22isize)?;
+    let target = ipi_target(hardware_id).ok_or(-(Errno::InvalidArgument as isize))?;
     barrier();
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
         // SAFETY: 调用者保证物理记录完整、对齐且永久有效；缓存 DMW 映射覆盖该内核静态对象。
@@ -443,14 +512,14 @@ pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Resu
     }
     mail_send(target, 0, entry);
     barrier();
-    iocsr_write32(0x1040, target);
+    iocsr_write32(reg::IOCSR_IPI_SEND, target);
     Ok(())
 }
 /// 队列发表屏障后发送 bit1 的真实 IOCSR IPI。
 pub fn send_ipi(hardware_id: usize) {
     let target = ipi_target(hardware_id).expect("IOCSR IPI target is out of range");
     barrier();
-    iocsr_write32(0x1040, target | 1);
+    iocsr_write32(reg::IOCSR_IPI_SEND, target | 1);
 }
 /// 写入已验证 PCH-PIC 范围的 32 位寄存器，共享 word 由控制器锁保护。
 fn pic_write(offset: usize, value: u32) {
@@ -480,15 +549,18 @@ static EXTERNAL_CONTROLLER: SpinLock<()> = SpinLock::new(());
 /// 定位实际源所在的共享 32 位 word 与位掩码。
 fn source_word(source: u32) -> (usize, u32) {
     assert!(source < crate::boot::info().interrupts.source_count);
-    (source as usize / 32 * 4, 1 << (source % 32))
+    (
+        source as usize / u32::BITS as usize * IO_WORD_BYTES,
+        1 << (source % u32::BITS),
+    )
 }
 
 /// EXTIOI 路由字节用高半表示 node、低半表示该 node 的四核位图。
 pub(crate) const fn extioi_route(hardware_id: usize) -> Option<u8> {
-    let node = hardware_id / 4;
-    let core = hardware_id % 4;
-    if node < 16 {
-        Some(((node as u8) << 4) | (1u8 << core))
+    let node = hardware_id / EXTIOI_CORES_PER_NODE;
+    let core = hardware_id % EXTIOI_CORES_PER_NODE;
+    if node < EXTIOI_NODE_COUNT {
+        Some(((node as u8) << EXTIOI_ROUTE_NODE_SHIFT) | (1u8 << core))
     } else {
         None
     }
@@ -504,63 +576,78 @@ pub unsafe fn external_init(info: &BootInfo) {
         liointc::initialize(info);
         return;
     }
-    assert_eq!(info.interrupts.source_count, 64);
+    assert_eq!(info.interrupts.source_count, PCH_PIC_SOURCE_COUNT);
     let route = extioi_route(info.bsp_hardware_id).expect("EXTIOI target node is out of range");
     // QEMU 的传统 EXTIOI 只解码 node 0 的四核位图；其余核仍可正常启动和接收 IPI。
     // 高 node 的外部 IRQ 需要另行配置 CPU_ENCODE，不能让模拟器静默投递到 core 0。
     assert_eq!(
-        info.bsp_hardware_id / 4,
+        info.bsp_hardware_id / EXTIOI_CORES_PER_NODE,
         0,
         "EXTIOI bitmap mode cannot route to a remote node"
     );
-    assert_eq!(info.interrupts.root_interrupt, 3);
+    assert_eq!(info.interrupts.root_interrupt, EXTIOI_ROOT_INTERRUPT);
     let _controller = EXTERNAL_CONTROLLER.lock();
     for source in 0..info.interrupts.source_count {
         let (word, bit) = source_word(source);
-        pic_write(0x20 + word, pic_read(0x20 + word) | bit);
-        pic_write(0x40 + word, pic_read(0x40 + word) | bit);
-        pic_write(0x60 + word, pic_read(0x60 + word) & !bit);
-        pic_write(0x3e0 + word, pic_read(0x3e0 + word) & !bit);
+        pic_write(PCH_PIC_MASK + word, pic_read(PCH_PIC_MASK + word) | bit);
+        pic_write(
+            PCH_PIC_HTMSI_ENABLE + word,
+            pic_read(PCH_PIC_HTMSI_ENABLE + word) | bit,
+        );
+        pic_write(PCH_PIC_EDGE + word, pic_read(PCH_PIC_EDGE + word) & !bit);
+        pic_write(
+            PCH_PIC_POLARITY + word,
+            pic_read(PCH_PIC_POLARITY + word) & !bit,
+        );
         // SAFETY: 实际源小于 64，两个字节寄存器完整落在已验证 PCH 窗口；
         // 控制器锁与 AP 前初始化保证独占，各源路由到同号 EXTIOI 向量。
         unsafe {
             let base = mmio_address(info.interrupts.controller.start);
-            core::ptr::write_volatile((base + 0x100 + source as usize) as *mut u8, 1);
-            core::ptr::write_volatile((base + 0x200 + source as usize) as *mut u8, source as u8);
+            core::ptr::write_volatile(
+                (base + PCH_PIC_ROUTE + source as usize) as *mut u8,
+                PCH_PIC_ROUTE_HT,
+            );
+            core::ptr::write_volatile(
+                (base + PCH_PIC_VECTOR + source as usize) as *mut u8,
+                source as u8,
+            );
         }
-        let route_reg = ext_reg(0x800 + (source as usize & !3));
-        let shift = source % 4 * 8;
+        let route_reg = ext_reg(EXTIOI_ROUTE + (source as usize & !(IO_WORD_BYTES - 1)));
+        let shift = source % IO_WORD_BYTES as u32 * u8::BITS;
         let route = u32::from(route) << shift;
         iocsr_write32(
             route_reg,
-            (iocsr_read32(route_reg) & !(0xff << shift)) | route,
+            (iocsr_read32(route_reg) & !(u32::from(u8::MAX) << shift)) | route,
         );
         iocsr_write32(
-            ext_reg(0x200 + word),
-            iocsr_read32(ext_reg(0x200 + word)) & !bit,
+            ext_reg(EXTIOI_ENABLE + word),
+            iocsr_read32(ext_reg(EXTIOI_ENABLE + word)) & !bit,
         );
         iocsr_write32(
-            ext_reg(0x280 + word),
-            iocsr_read32(ext_reg(0x280 + word)) | bit,
+            ext_reg(EXTIOI_BOUNCE + word),
+            iocsr_read32(ext_reg(EXTIOI_BOUNCE + word)) | bit,
         );
-        iocsr_write32(ext_reg(0x400 + word), bit);
+        iocsr_write32(ext_reg(EXTIOI_ISR + word), bit);
     }
     // QEMU 的 IPMAP 每个字节选择一组 32 向量的 CPU IP，NODEMAP 每组占 16 位。
-    for group in 0..2usize {
-        let ip_reg = ext_reg(0xc0 + group / 4 * 4);
-        let shift = group % 4 * 8;
+    for group in 0..(PCH_PIC_SOURCE_COUNT / u32::BITS) as usize {
+        let ip_reg = ext_reg(EXTIOI_IPMAP + group / IO_WORD_BYTES * IO_WORD_BYTES);
+        let shift = group % IO_WORD_BYTES * u8::BITS as usize;
         iocsr_write32(
             ip_reg,
-            (iocsr_read32(ip_reg) & !(0xff << shift)) | (2 << shift),
+            (iocsr_read32(ip_reg) & !(u32::from(u8::MAX) << shift)) | (EXTIOI_IPMAP_HWI1 << shift),
         );
-        let node_reg = ext_reg(0xa0 + group / 2 * 4);
-        let shift = group % 2 * 16;
+        let node_reg = ext_reg(EXTIOI_NODEMAP + group / NODEMAP_ENTRIES_PER_WORD * IO_WORD_BYTES);
+        let shift = group % NODEMAP_ENTRIES_PER_WORD * u16::BITS as usize;
         iocsr_write32(
             node_reg,
-            (iocsr_read32(node_reg) & !(0xffff << shift)) | ((1 << group) << shift),
+            (iocsr_read32(node_reg) & !(u32::from(u16::MAX) << shift)) | ((1 << group) << shift),
         );
     }
-    iocsr_write64(0x420, iocsr_read64(0x420) | (1u64 << 48));
+    iocsr_write64(
+        IOCSR_MISC_FUNCTION,
+        iocsr_read64(IOCSR_MISC_FUNCTION) | IOCSR_EXTIOI_ENABLE,
+    );
     barrier();
 }
 
@@ -572,8 +659,8 @@ pub fn external_mask(source: u32) {
     }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
-    pic_write(0x20 + word, pic_read(0x20 + word) | bit);
-    let reg = ext_reg(0x200 + word);
+    pic_write(PCH_PIC_MASK + word, pic_read(PCH_PIC_MASK + word) | bit);
+    let reg = ext_reg(EXTIOI_ENABLE + word);
     iocsr_write32(reg, iocsr_read32(reg) & !bit);
     barrier();
 }
@@ -586,10 +673,10 @@ pub fn external_unmask(source: u32) {
     }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
-    pic_write(0x80 + word, bit);
-    let reg = ext_reg(0x200 + word);
+    pic_write(PCH_PIC_CLEAR + word, bit);
+    let reg = ext_reg(EXTIOI_ENABLE + word);
     iocsr_write32(reg, iocsr_read32(reg) | bit);
-    pic_write(0x20 + word, pic_read(0x20 + word) & !bit);
+    pic_write(PCH_PIC_MASK + word, pic_read(PCH_PIC_MASK + word) & !bit);
     barrier();
 }
 
@@ -599,9 +686,9 @@ pub fn external_claim() -> Option<u32> {
         return liointc::claim();
     }
     let _controller = EXTERNAL_CONTROLLER.lock();
-    let enabled =
-        iocsr_read32(ext_reg(0x200)) as u64 | ((iocsr_read32(ext_reg(0x204)) as u64) << 32);
-    let pending = iocsr_read64(ext_reg(0x400)) & enabled;
+    let enabled = iocsr_read32(ext_reg(EXTIOI_ENABLE)) as u64
+        | ((iocsr_read32(ext_reg(EXTIOI_ENABLE + IO_WORD_BYTES)) as u64) << u32::BITS);
+    let pending = iocsr_read64(ext_reg(EXTIOI_ISR)) & enabled;
     if pending == 0 {
         None
     } else {
@@ -621,7 +708,7 @@ pub unsafe fn external_complete(source: u32) {
     }
     let (word, bit) = source_word(source);
     let _controller = EXTERNAL_CONTROLLER.lock();
-    iocsr_write32(ext_reg(0x400 + word), bit);
+    iocsr_write32(ext_reg(EXTIOI_ISR + word), bit);
     barrier();
 }
 /// 用户与 FS 生命周期已停稳后停其它 online 核，再执行实际 PMC 或 virt GED 断电请求。
@@ -631,7 +718,7 @@ pub fn shutdown() -> ! {
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
         board_action(crate::boot::info().board.poweroff);
     }
-    ged_action(0, 0x34)
+    ged_action(GED_SLEEP_CONTROL, GED_SLEEP_ENABLE | GED_SLEEP_S5)
 }
 
 /// 用户与 FS 生命周期已停稳后永久停全部核，不请求 PMC 或 GED 断电。
@@ -650,7 +737,7 @@ pub fn restart() -> ! {
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
         board_action(crate::boot::info().board.reboot);
     }
-    ged_action(2, 0x42)
+    ged_action(GED_RESET, GED_RESET_VALUE)
 }
 
 /// 致命错误不等待 AP/CSD 或文件生命周期；板只停当前核，不发布全机清理终点。
@@ -660,14 +747,14 @@ pub fn emergency_shutdown() -> ! {
         crate::console::board_stop_current_cpu();
         permanent_idle();
     }
-    ged_action(0, 0x34)
+    ged_action(GED_SLEEP_CONTROL, GED_SLEEP_ENABLE | GED_SLEEP_S5)
 }
 
 /// QEMU 的 catalog、Boot 或 Thread 测试结束后直接请求 GED 断电。
 /// 测试构建只允许 QEMU；早期退出不要求其它核上线或生产服务初始化。
 #[cfg(feature = "ktest")]
 pub fn test_shutdown() -> ! {
-    ged_action(0, 0x34)
+    ged_action(GED_SLEEP_CONTROL, GED_SLEEP_ENABLE | GED_SLEEP_S5)
 }
 
 /// 关闭本核可唤醒源，发布永久确认后只执行 IDLE；只供已完成 CSD 的停核 IPI 使用。
@@ -683,7 +770,7 @@ fn disable_stop_sources() {
     disable_timer();
     // SAFETY: 入口运行于 PLV0，ECFG 为本核 CSR；清使能位只关闭此核 IRQ 源，
     // 停核已不再需要 trap 返回或调度，本函数不改变共享控制器及内核映射。
-    unsafe { csr_write::<4>(0) };
+    unsafe { csr_write::<{ reg::CSR_ECFG }>(0) };
     barrier();
 }
 
@@ -693,7 +780,7 @@ fn ged_action(offset: usize, value: u8) -> ! {
     // SAFETY: 所选 virt 平台的 GED 基址 0x100e001c 在永久强序 DMW 中；
     // 私有调用仅传 sleep_ctl 偏移 0/值 0x34 或 reset 偏移 2/值 0x42，设备要求单字节访问。
     unsafe {
-        core::ptr::write_volatile(mmio_address(0x100e001c + offset) as *mut u8, value);
+        core::ptr::write_volatile(mmio_address(GED_BASE + offset) as *mut u8, value);
     }
     barrier();
     permanent_idle()
@@ -747,10 +834,10 @@ pub fn trigger_unmapped_fault() -> ! {
 /// 等待窗口被中断时先退出汇编等待，避免原因已消费后再次进入 IDLE。
 #[no_mangle]
 extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
-    if (frame.estat >> 16) & 0x3f != 0 {
+    if (frame.estat >> reg::ESTAT_ECODE_SHIFT) & reg::ESTAT_ECODE_MASK != 0 {
         #[cfg(feature = "ktest")]
         crate::ktest::fatal_event(
-            if (frame.estat >> 16) & 0x3f == 0x0d {
+            if (frame.estat >> reg::ESTAT_ECODE_SHIFT) & reg::ESTAT_ECODE_MASK == reg::ECODE_INE {
                 "illegal"
             } else {
                 "panic"
@@ -777,21 +864,21 @@ extern "C" fn loongarch_trap(frame: &mut KernelTrapFrame) {
 /// 在当前 IRQ-off 核完成真实硬中断；返回前 guard 已退出，调用者才能请求普通调度。
 fn handle_hardware_interrupt(estat: usize) {
     let _hardirq = crate::cpu::HardIrqGuard::enter();
-    let pending = estat & csr_read::<4>() & 0x1fff;
-    if pending & (1 << 11) != 0 {
+    let pending = estat & csr_read::<{ reg::CSR_ECFG }>() & reg::ESTAT_IRQ_MASK;
+    if pending & reg::IRQ_TIMER != 0 {
         disable_timer();
         crate::cpu::handle_timer();
     }
-    if pending & (1 << 12) != 0 {
-        let bits = iocsr_read32(0x1000);
-        iocsr_write32(0x100c, bits);
+    if pending & reg::IRQ_IPI != 0 {
+        let bits = iocsr_read32(reg::IOCSR_IPI_STATUS);
+        iocsr_write32(reg::IOCSR_IPI_CLEAR, bits);
         barrier();
         crate::cpu::handle_ipi();
     }
     let external = if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
-        (1 << 2) | (1 << 3)
+        reg::IRQ_HWI0 | reg::IRQ_HWI1
     } else {
-        1 << 3
+        reg::IRQ_HWI1
     };
     if pending & external != 0 {
         crate::irq::handle_external();
@@ -806,14 +893,19 @@ extern "C" fn loongarch_refill(frame: &RefillFrame) -> ! {
         "refill",
         format_args!(
             "refill trap pc={:#x} sp={:#x} cause={:#x} bad={:#x}",
-            frame.era & !1,
+            frame.era & !reg::TLBRERA_IS_TLBR,
             frame.gpr[3],
-            frame.era & 1,
+            frame.era & reg::TLBRERA_IS_TLBR,
             frame.badv
         ),
     );
     #[cfg(not(feature = "ktest"))]
-    crate::console::fatal(frame.era & !1, frame.gpr[3], frame.era & 1, frame.badv)
+    crate::console::fatal(
+        frame.era & !reg::TLBRERA_IS_TLBR,
+        frame.gpr[3],
+        frame.era & reg::TLBRERA_IS_TLBR,
+        frame.badv,
+    )
 }
 
 /// 以一次真实本核 timer IRQ 检查指定 FP 模式与八位 FCC 图样，不遍历其他参数。
@@ -831,7 +923,9 @@ pub(crate) unsafe fn ktest_register_pattern(fp: bool, fcc: u8) -> bool {
     let _irq = crate::sync::IrqSaveGuard::new();
     let counter = &crate::cpu::current().timer_interrupts;
     let before = counter.load(Ordering::Acquire);
-    let ticks = ((counter_frequency() / 10000).max(0x600) as usize + 3) & !3;
+    let ticks = ((counter_frequency() / 10000).max(0x600) as usize
+        + (reg::TIMER_QUANTUM as usize - 1))
+        & !(reg::TIMER_QUANTUM as usize - 1);
     // SAFETY: 调用者保证固定本核、真实异常/timer 与栈有效、无活跃 FP 或持锁现场；
     // 永久 counter 属于本核，ticks 为原测试对齐周期，fcc 为八位值，fp 仅取 0/1。
     let good =
@@ -862,7 +956,9 @@ pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     let saved = irq_save();
     let counter = &crate::cpu::current().timer_interrupts;
     let before = counter.load(core::sync::atomic::Ordering::Acquire);
-    let ticks = ((counter_frequency() / 1000).max(4) as usize + 3) & !3;
+    let ticks = ((counter_frequency() / 1000).max(reg::TIMER_QUANTUM) as usize
+        + (reg::TIMER_QUANTUM as usize - 1))
+        & !(reg::TIMER_QUANTUM as usize - 1);
     // SAFETY: 调用者保证本核 trap/timer 与栈可服务；counter 永久有效。
     // fp=0 使汇编跳过全部 FP/FCSR/FCC 访问，返回恢复同核整数与 IRQ-off 现场。
     let good = unsafe { la_test_register_preservation(counter, ticks, 0, 0) };

@@ -123,7 +123,7 @@ impl CpuSet {
         let mut set = Self::empty();
         for (index, byte) in bytes.iter().take(Self::byte_len()).enumerate() {
             set.words[index / core::mem::size_of::<usize>()] |=
-                usize::from(*byte) << ((index % core::mem::size_of::<usize>()) * 8);
+                usize::from(*byte) << ((index % core::mem::size_of::<usize>()) * u8::BITS as usize);
         }
         set.intersection(Self::prefix(MAX_CPUS))
     }
@@ -133,7 +133,8 @@ impl CpuSet {
         assert!(bytes.len() <= Self::byte_len());
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = (self.words[index / core::mem::size_of::<usize>()]
-                >> ((index % core::mem::size_of::<usize>()) * 8)) as u8;
+                >> ((index % core::mem::size_of::<usize>()) * u8::BITS as usize))
+                as u8;
         }
     }
 }

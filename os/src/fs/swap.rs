@@ -6,8 +6,10 @@ use crate::{config::PAGE_SIZE, drivers::BLOCK_DEVICE, hal::BLOCK_SZ};
 use super::directory_tree::FILE_SYSTEM;
 use lazy_static::*;
 
+const DEFAULT_SWAP_MIB: usize = 16;
+const BITMAP_WORD_BITS: usize = u64::BITS as usize;
 lazy_static! {
-    pub static ref SWAP_DEVICE: Mutex<Swap> = Mutex::new(Swap::new(16));
+    pub static ref SWAP_DEVICE: Mutex<Swap> = Mutex::new(Swap::new(DEFAULT_SWAP_MIB));
 }
 
 #[derive(Debug)]
@@ -46,19 +48,22 @@ impl Swap {
         assert!(block_ids[0] + (BLK_PER_PG - 1) == block_ids[BLK_PER_PG - 1]);
         BLOCK_DEVICE.write_block(block_ids[0], buf);
     }
+    /// 在对应位图字内标记已经写入的交换页。
     fn set_bit(&mut self, pos: usize) {
-        self.bitmap[pos / 64] |= 1 << (pos % 64);
+        self.bitmap[pos / BITMAP_WORD_BITS] |= 1 << (pos % BITMAP_WORD_BITS);
     }
+    /// 清除已归还交换页的占用位。
     fn clear_bit(&mut self, pos: usize) {
-        self.bitmap[pos / 64] &= !(1 << (pos % 64));
+        self.bitmap[pos / BITMAP_WORD_BITS] &= !(1 << (pos % BITMAP_WORD_BITS));
     }
+    /// 查找第一个空闲位，不在选择期间修改位图。
     fn alloc_page(&self) -> Option<usize> {
         for (i, bit) in self.bitmap.iter().enumerate() {
             if *bit == u64::MAX {
                 continue; // 所有 64 位都已被占用，跳过
             }
             let free_bit = (!*bit).trailing_zeros() as usize;
-            return Some(i * 64 + free_bit);
+            return Some(i * BITMAP_WORD_BITS + free_bit);
         }
         None
     }
@@ -76,7 +81,7 @@ impl Swap {
         } else {
             panic!("Swap space exhausted!");
         }
-    }    
+    }
     #[inline(always)]
     pub fn discard(&mut self, swap_id: usize) {
         self.clear_bit(swap_id);

@@ -20,6 +20,7 @@ use crate::mm::space::{sync_all, PteDomain, ResidentPages};
 use crate::mm::user_table::RetiredTables;
 use crate::mm::{FolioRead, FolioRef, PAGE_SIZE};
 use crate::sync::{SleepMutex, SleepMutexGuard, SleepRwLock, SpinLock, SpinLockGuard};
+use crate::syscall::Errno;
 use crate::task::{ReclaimMode, ReclaimScope};
 use index::{FileRole, IndexAllocator, Node, NodeRef, RetiredNode, Tree};
 
@@ -31,9 +32,15 @@ pub enum FolioMark {
     ToWrite,
 }
 
-const ERRSEQ_ERRNO: u32 = 4095;
-const ERRSEQ_SEEN: u32 = 1 << 12;
-const ERRSEQ_INCREMENT: u32 = 1 << 13;
+const ERRSEQ_SHIFT: u32 = 12;
+const ERRSEQ_ERRNO: u32 = (1 << ERRSEQ_SHIFT) - 1;
+const ERRSEQ_SEEN: u32 = 1 << ERRSEQ_SHIFT;
+const ERRSEQ_INCREMENT: u32 = 1 << (ERRSEQ_SHIFT + 1);
+
+/// 当前文件缓存支持的固定块规格，独立于设备扇区与内存页大小。
+pub(crate) const FILE_BLOCK_BYTES_1K: usize = 1024;
+pub(crate) const FILE_BLOCK_BYTES_2K: usize = 2 * FILE_BLOCK_BYTES_1K;
+pub(crate) const FILE_BLOCK_BYTES_4K: usize = 4 * FILE_BLOCK_BYTES_1K;
 
 /// 固定宽度错误序列保留最后具体错误，不建立逐次错误链。
 struct WritebackError {
@@ -83,53 +90,57 @@ impl WritebackError {
 /// 内部错误保留具体类型，序列低位只编码对应的 Linux errno。
 fn writeback_errno(error: FsError) -> u32 {
     match error {
-        FsError::NoMemory | FsError::Io(BlockError::NoMemory) => 12,
-        FsError::NoSpace => 28,
-        FsError::TextBusy => 26,
-        FsError::FileTooLarge => 27,
-        FsError::Unsupported | FsError::Io(BlockError::Unsupported) => 95,
-        FsError::NotFound | FsError::MissingRoot => 2,
-        FsError::Exists => 17,
-        FsError::NotEmpty => 39,
-        FsError::CrossDevice => 18,
-        FsError::TooManyLinks => 31,
-        FsError::NameTooLong => 36,
-        FsError::NotPermitted => 1,
-        FsError::NotDirectory => 20,
+        FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Errno::NoMemory as u32,
+        FsError::NoSpace => Errno::NoSpace as u32,
+        FsError::TextBusy => Errno::TextBusy as u32,
+        FsError::FileTooLarge => Errno::FileTooLarge as u32,
+        FsError::Unsupported | FsError::Io(BlockError::Unsupported) => Errno::Unsupported as u32,
+        FsError::NotFound | FsError::MissingRoot => Errno::NotFound as u32,
+        FsError::Exists => Errno::Exists as u32,
+        FsError::NotEmpty => Errno::NotEmpty as u32,
+        FsError::CrossDevice => Errno::CrossDevice as u32,
+        FsError::TooManyLinks => Errno::TooManyLinks as u32,
+        FsError::NameTooLong => Errno::NameTooLong as u32,
+        FsError::NotPermitted => Errno::NotPermitted as u32,
+        FsError::NotDirectory => Errno::NotDirectory as u32,
         FsError::InvalidName
         | FsError::InvalidOperation
-        | FsError::Io(BlockError::InvalidRange | BlockError::Misaligned) => 22,
-        FsError::Busy | FsError::Io(BlockError::Busy) => 16,
-        FsError::TooManySymlinks => 40,
-        FsError::BadFd => 9,
-        FsError::TooManyFiles => 24,
-        FsError::ReadOnly | FsError::Io(BlockError::ReadOnly) => 30,
-        FsError::IsDirectory => 21,
-        FsError::IllegalSeek => 29,
-        FsError::NotTty => 25,
-        FsError::NoDevice => 19,
-        FsError::NoDeviceAddress => 6,
-        FsError::NoProcess | FsError::NoSuchRoute => 3,
-        FsError::DeviceIo => 5,
-        FsError::AddressFamilyNotSupported => 97,
-        FsError::AddressInUse => 98,
-        FsError::AddressNotAvailable => 99,
-        FsError::NetworkUnreachable => 101,
-        FsError::ConnectionReset => 104,
-        FsError::AlreadyConnected => 106,
-        FsError::NotConnected => 107,
-        FsError::ConnectionRefused => 111,
-        FsError::AlreadyInProgress => 114,
-        FsError::InProgress => 115,
-        FsError::MessageTooLarge => 90,
-        FsError::NotSocket => 88,
-        FsError::DestinationRequired => 89,
-        FsError::WouldBlock => 11,
-        FsError::BrokenPipe => 32,
-        FsError::Interrupted | FsError::InterruptedNoRestart => 4,
-        FsError::BadAddress => 14,
-        FsError::Permission => 13,
-        FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => 5,
+        | FsError::Io(BlockError::InvalidRange | BlockError::Misaligned) => {
+            Errno::InvalidArgument as u32
+        }
+        FsError::Busy | FsError::Io(BlockError::Busy) => Errno::Busy as u32,
+        FsError::TooManySymlinks => Errno::TooManySymlinks as u32,
+        FsError::BadFd => Errno::BadFd as u32,
+        FsError::TooManyFiles => Errno::TooManyFiles as u32,
+        FsError::ReadOnly | FsError::Io(BlockError::ReadOnly) => Errno::ReadOnly as u32,
+        FsError::IsDirectory => Errno::IsDirectory as u32,
+        FsError::IllegalSeek => Errno::IllegalSeek as u32,
+        FsError::NotTty => Errno::NotTty as u32,
+        FsError::NoDevice => Errno::NoDevice as u32,
+        FsError::NoDeviceAddress => Errno::NoDeviceAddress as u32,
+        FsError::NoProcess | FsError::NoSuchRoute => Errno::NoProcess as u32,
+        FsError::DeviceIo => Errno::Io as u32,
+        FsError::AddressFamilyNotSupported => Errno::AddressFamilyNotSupported as u32,
+        FsError::AddressInUse => Errno::AddressInUse as u32,
+        FsError::AddressNotAvailable => Errno::AddressNotAvailable as u32,
+        FsError::NetworkUnreachable => Errno::NetworkUnreachable as u32,
+        FsError::ConnectionReset => Errno::ConnectionReset as u32,
+        FsError::AlreadyConnected => Errno::AlreadyConnected as u32,
+        FsError::NotConnected => Errno::NotConnected as u32,
+        FsError::ConnectionRefused => Errno::ConnectionRefused as u32,
+        FsError::AlreadyInProgress => Errno::AlreadyInProgress as u32,
+        FsError::InProgress => Errno::InProgress as u32,
+        FsError::MessageTooLarge => Errno::MessageTooLarge as u32,
+        FsError::NotSocket => Errno::NotSocket as u32,
+        FsError::DestinationRequired => Errno::DestinationRequired as u32,
+        FsError::WouldBlock => Errno::Again as u32,
+        FsError::BrokenPipe => Errno::BrokenPipe as u32,
+        FsError::Interrupted | FsError::InterruptedNoRestart => Errno::Interrupted as u32,
+        FsError::BadAddress => Errno::BadAddress as u32,
+        FsError::Permission => Errno::Permission as u32,
+        FsError::Corrupt | FsError::Checksum | FsError::LoadAborted | FsError::Io(_) => {
+            Errno::Io as u32
+        }
     }
 }
 
@@ -837,7 +848,10 @@ impl MetadataCache {
 
     /// 在发表候选前解释块几何、设备容量和准确页内范围。
     fn block_range(&self, block: u64, block_size: usize) -> Result<(u64, usize), BlockError> {
-        if !matches!(block_size, 1024 | 2048 | 4096) {
+        if !matches!(
+            block_size,
+            FILE_BLOCK_BYTES_1K | FILE_BLOCK_BYTES_2K | FILE_BLOCK_BYTES_4K
+        ) {
             return Err(BlockError::InvalidRange);
         }
         let size = u64::try_from(block_size).map_err(|_| BlockError::InvalidRange)?;
@@ -1703,7 +1717,10 @@ impl FileMapping {
             core::ptr::eq(inode.mapping(), self),
             "truncate mapping owner changed"
         );
-        if !matches!(block_size, 1024 | 2048 | 4096) {
+        if !matches!(
+            block_size,
+            FILE_BLOCK_BYTES_1K | FILE_BLOCK_BYTES_2K | FILE_BLOCK_BYTES_4K
+        ) {
             return Err(FsError::InvalidOperation);
         }
         let first = new_size.div_ceil(PAGE_SIZE as u64);
@@ -1954,8 +1971,9 @@ pub(crate) fn reclaim_file(attempt: &mut ReclaimAttempt) {
 
 /// 本轮只走入口队列前缀；老化后的 active 页不在同轮再次隔离，访问及弱失败也耗预算。
 fn reclaim_pass(attempt: &mut ReclaimAttempt, writeback: &mut Option<Arc<Ext4Volume>>) {
+    const ACTIVE_AGING_BATCH: usize = 16;
     let (inactive, active) = index::lru_lengths();
-    let aging = active.min(16).min(attempt.scan_remaining());
+    let aging = active.min(ACTIVE_AGING_BATCH).min(attempt.scan_remaining());
     for _ in 0..inactive.min(attempt.scan_remaining() - aging) {
         if !attempt.can_isolate() {
             break;

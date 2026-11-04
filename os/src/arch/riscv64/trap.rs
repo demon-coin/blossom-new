@@ -1,7 +1,7 @@
 //! 共享硬件向量先按 sscratch 分流，再在真实内核栈保存与恢复完整 trap 现场。
 
 use crate::arch::riscv64::{
-    rv_handle_trap, user::rv_user_trap_entry, KernelTrapFrame, UserContext,
+    rv_handle_trap, user::rv_user_trap_entry, KernelTrapFrame, UserContext, SR_FS,
 };
 use core::{
     arch::naked_asm,
@@ -79,7 +79,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_trap_entry() -> ! {
         // 只在原 FS 非 Off 时保存全部 FPR/FCSR，未保存字段仍由 MaybeUninit 表达。
         r#"
     ld t0, {sstatus}(sp)
-    li t1, 0x6000
+    li t1, {fs}
     and t0, t0, t1
     beqz t0, 3f
     fsd f0, ({fpr} + 0 * {float_word})(sp)
@@ -120,7 +120,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_trap_entry() -> ! {
 "#,
         // 关闭 FS 后以完整、独占的 frame 调用普通 Rust 分派。
         r#"
-    li t0, 0x6000
+    li t0, {fs}
     csrc sstatus, t0
     mv a0, sp
     call {handle_trap}
@@ -129,7 +129,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_trap_entry() -> ! {
         r#"
     ld t0, {sstatus}(sp)
     csrw sstatus, t0
-    li t1, 0x6000
+    li t1, {fs}
     and t0, t0, t1
     beqz t0, 4f
     fld f0, ({fpr} + 0 * {float_word})(sp)
@@ -219,6 +219,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_trap_entry() -> ! {
         fpr = const offset_of!(KernelTrapFrame, fpr),
         float_word = const size_of::<u64>(),
         fcsr = const offset_of!(KernelTrapFrame, fcsr),
+        fs = const SR_FS,
         handle_trap = sym rv_handle_trap,
         user_trap = sym rv_user_trap_entry,
             );

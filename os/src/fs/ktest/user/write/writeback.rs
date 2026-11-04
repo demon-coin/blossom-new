@@ -369,7 +369,7 @@ pub(super) mod cases {
             .size
             .div_ceil(PAGE_SIZE as u64)
             * PAGE_SIZE as u64;
-        let traditional = checked(context, inode.metadata_snapshot())?.flags & 0x80000 == 0;
+        let traditional = checked(context, inode.metadata_snapshot())?.flags & codec::EXTENTS == 0;
         let logical = if traditional {
             [0, 12, 268, 65804, 65806]
         } else {

@@ -6,7 +6,7 @@ use core::ops::{Index, IndexMut};
 
 use super::{ProcessError, Slot};
 
-const PAGE_SLOTS: usize = 32;
+const PAGE_SLOTS: usize = u32::BITS as usize;
 pub(crate) const MAX_PID: usize = i32::MAX as usize;
 
 struct SlotPage {

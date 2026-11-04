@@ -16,6 +16,7 @@ use crate::{
 };
 use core::convert::TryFrom;
 use core::{mem::ManuallyDrop, ptr::NonNull};
+pub(crate) use virtio_drivers::transport::pci::VIRTIO_VENDOR_ID;
 use virtio_drivers::{
     device::blk::{BlkInfo, VirtIOBlk, PDU_STRIDE},
     queue::{RingLayout, VirtQueue},
@@ -23,12 +24,36 @@ use virtio_drivers::{
         mmio::{MmioError, MmioTransport, VirtIOHeader},
         pci::{
             bus::{DeviceFunction, PCI_CAP_ID_VNDR},
-            PciRegion, PciTransport, SelectedConstruct, VirtioPciError, VIRTIO_VENDOR_ID,
+            PciRegion, PciTransport, SelectedConstruct, VirtioPciError, VIRTIO_PCI_CAP_COMMON_CFG,
+            VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_NOTIFY_CFG,
         },
         DeviceStatus, DeviceType, InterruptStatus, SomeTransport, Transport,
     },
     DmaRegion, Error, Hal,
 };
+
+pub(crate) const VIRTIO_PCI_BLOCK_LEGACY: u16 = 0x1001;
+pub(crate) const VIRTIO_PCI_BLOCK_MODERN: u16 =
+    VIRTIO_PCI_MODERN_DEVICE_BASE + DeviceType::Block as u16;
+pub(crate) const VIRTIO_PCI_NET_LEGACY: u16 = 0x1000;
+pub(crate) const VIRTIO_PCI_NET_MODERN: u16 =
+    VIRTIO_PCI_MODERN_DEVICE_BASE + DeviceType::Network as u16;
+// 内核所选 split-ring 深度和块控制布局，须与所绑定后端的实际协议保持一致。
+pub(crate) const VIRTIO_MIN_QUEUE_DEPTH: u16 = 4;
+pub(crate) const VIRTIO_MAX_QUEUE_DEPTH: u16 = 128;
+pub(crate) const VIRTIO_CONTROL_SEGMENTS: u16 = 2;
+pub(crate) const VIRTIO_STATUS_BYTES: usize = core::mem::size_of::<u8>();
+pub(crate) const SPLIT_RING_DESCRIPTOR_BYTES: usize = 16;
+const VIRTIO_PCI_MODERN_DEVICE_BASE: u16 = 0x1040;
+const PCI_CONFIG_SPACE_BYTES: usize = 256;
+const PCI_IDENTITY: u8 = 0;
+const VIRTIO_PCI_CAP_BAR: u8 = 4;
+const VIRTIO_PCI_CAP_OFFSET: u8 = 8;
+const VIRTIO_PCI_CAP_LENGTH: u8 = 12;
+const VIRTIO_PCI_NOTIFY_CAP_MULT: u8 = 16;
+const VIRTIO_PCI_CAP_BYTES: u8 = 16;
+const VIRTIO_PCI_NOTIFY_CAP_BYTES: u8 = VIRTIO_PCI_CAP_BYTES + core::mem::size_of::<u32>() as u8;
+const VIRTIO_PCI_CAP_REGION_COUNT: usize = VIRTIO_PCI_CAP_DEVICE_CFG as usize;
 
 /// 保留真实资源、传输与 DMA 准备失败，不把资源不足当无设备。
 #[derive(Debug)]
@@ -330,7 +355,8 @@ impl VirtioDevice {
         let depth = self.info().queue_depth;
         let ring = self.ring.region();
         // 两种 split 布局的 avail 都紧接 descriptor 表，legacy 仅改变 used 对齐。
-        let avail_index_offset = usize::from(depth) * 16 + 2;
+        let avail_index_offset =
+            usize::from(depth) * SPLIT_RING_DESCRIPTOR_BYTES + core::mem::size_of::<u16>();
         assert!(avail_index_offset + core::mem::size_of::<u16>() <= ring.len);
         KernelHal::dma_read_barrier();
         // SAFETY: 本方法借用唯一实例，ring 原页仍 live；offset 是已验证 split
@@ -460,9 +486,9 @@ fn selected_construct(
     inventory: &PciInventory,
     device: &PciDevice,
 ) -> Result<SelectedConstruct, VirtioInitError> {
-    let identity = inventory.read_config_word(device, 0)?;
+    let identity = inventory.read_config_word(device, PCI_IDENTITY)?;
     if identity as u16 != device.vendor_id
-        || (identity >> 16) as u16 != device.device_id
+        || (identity >> u16::BITS) as u16 != device.device_id
         || device.vendor_id != VIRTIO_VENDOR_ID
     {
         return Err(ProbeError::Resource("PCI inventory identity changed").into());
@@ -473,20 +499,20 @@ fn selected_construct(
         .ok_or(ProbeError::Resource(
             "PCI capability inventory count is invalid",
         ))?;
-    let mut regions = [None; 4];
+    let mut regions = [None; VIRTIO_PCI_CAP_REGION_COUNT];
     let mut notify_off_multiplier = 0;
     for cap in caps.iter().flatten() {
         if cap.id != PCI_CAP_ID_VNDR {
             continue;
         }
         let length = cap.private_header as u8;
-        let kind = (cap.private_header >> 8) as u8;
-        if !(1..=4).contains(&kind) {
+        let kind = (cap.private_header >> u8::BITS) as u8;
+        if !(VIRTIO_PCI_CAP_COMMON_CFG..=VIRTIO_PCI_CAP_DEVICE_CFG).contains(&kind) {
             continue;
         }
-        if length < 16
-            || (kind == 2 && length < 20)
-            || 256 < usize::from(cap.offset) + usize::from(length)
+        if length < VIRTIO_PCI_CAP_BYTES
+            || (kind == VIRTIO_PCI_CAP_NOTIFY_CFG && length < VIRTIO_PCI_NOTIFY_CAP_BYTES)
+            || PCI_CONFIG_SPACE_BYTES < usize::from(cap.offset) + usize::from(length)
         {
             return Err(ProbeError::Resource("short VirtIO PCI capability").into());
         }
@@ -494,12 +520,13 @@ fn selected_construct(
         if regions[index].is_some() {
             continue;
         }
-        let bar = cap_word(inventory, device, cap.offset, 4)? as u8;
-        let offset = cap_word(inventory, device, cap.offset, 8)?;
-        let region_length = cap_word(inventory, device, cap.offset, 12)?;
+        let bar = cap_word(inventory, device, cap.offset, VIRTIO_PCI_CAP_BAR)? as u8;
+        let offset = cap_word(inventory, device, cap.offset, VIRTIO_PCI_CAP_OFFSET)?;
+        let region_length = cap_word(inventory, device, cap.offset, VIRTIO_PCI_CAP_LENGTH)?;
         regions[index] = Some(capability_region(device, bar, offset, region_length)?);
-        if kind == 2 {
-            notify_off_multiplier = cap_word(inventory, device, cap.offset, 16)?;
+        if kind == VIRTIO_PCI_CAP_NOTIFY_CFG {
+            notify_off_multiplier =
+                cap_word(inventory, device, cap.offset, VIRTIO_PCI_NOTIFY_CAP_MULT)?;
         }
     }
     Ok(SelectedConstruct {

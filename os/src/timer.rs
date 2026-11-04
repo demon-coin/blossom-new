@@ -665,6 +665,11 @@ pub(crate) mod testing {
         Tail,
     }
 
+    const ARMED: usize = 1;
+    const PAUSED: usize = 2;
+    const RELEASED: usize = 3;
+    const PAUSE_TIMEOUT_SECONDS: u64 = 5;
+
     static PAUSE_TIMER: AtomicUsize = AtomicUsize::new(0);
     static PAUSE_POINT: AtomicUsize = AtomicUsize::new(0);
     static PAUSE_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -680,18 +685,18 @@ pub(crate) mod testing {
         );
         PAUSE_TIMER.store(timer.get_ref() as *const Timer as usize, Ordering::Relaxed);
         PAUSE_POINT.store(point as usize, Ordering::Relaxed);
-        PAUSE_STATE.store(1, Ordering::Release);
+        PAUSE_STATE.store(ARMED, Ordering::Release);
     }
 
     /// 观察真实 runner 已在无锁窗口暂停，不读取另一套生命周期模型。
     pub(crate) fn is_paused() -> bool {
-        PAUSE_STATE.load(Ordering::Acquire) == 2
+        PAUSE_STATE.load(Ordering::Acquire) == PAUSED
     }
 
     /// 在控制者观察暂停以后释放 runner，让其走真实回调尾部。
     pub(crate) fn release_pause() {
         PAUSE_STATE
-            .compare_exchange(2, 3, Ordering::Release, Ordering::Relaxed)
+            .compare_exchange(PAUSED, RELEASED, Ordering::Release, Ordering::Relaxed)
             .expect("timer runner was not paused");
     }
 
@@ -702,9 +707,9 @@ pub(crate) mod testing {
         loop {
             let phase = PAUSE_STATE.load(Ordering::Acquire);
             let next = match phase {
-                0 | 3 => return,
-                1 => 0,
-                2 => 3,
+                0 | RELEASED => return,
+                ARMED => 0,
+                PAUSED => RELEASED,
                 _ => panic!("invalid timer pause state"),
             };
             if PAUSE_STATE
@@ -719,23 +724,23 @@ pub(crate) mod testing {
     /// runner 在锁外且仍持 running 执行权时匹配指定窗口，不解引用或接管节点。
     /// 仅等待另一 CPU 控制者释放，使用有限硬件计数器超时，不睡眠或切换任务。
     pub(super) fn pause(timer: *const Timer, point: PausePoint) {
-        if PAUSE_STATE.load(Ordering::Acquire) != 1
+        if PAUSE_STATE.load(Ordering::Acquire) != ARMED
             || PAUSE_TIMER.load(Ordering::Relaxed) != timer as usize
             || PAUSE_POINT.load(Ordering::Relaxed) != point as usize
         {
             return;
         }
         if PAUSE_STATE
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
         let start = crate::arch::read_counter();
         let limit = crate::arch::counter_frequency()
-            .checked_mul(5)
+            .checked_mul(PAUSE_TIMEOUT_SECONDS)
             .expect("timer pause raw timeout overflow");
-        while PAUSE_STATE.load(Ordering::Acquire) == 2 {
+        while PAUSE_STATE.load(Ordering::Acquire) == PAUSED {
             assert!(
                 crate::arch::read_counter().wrapping_sub(start) < limit,
                 "timer runner pause timed out"

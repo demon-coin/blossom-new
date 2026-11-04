@@ -10,7 +10,7 @@ use crate::fs::file::{
     SeekFrom, WriteBuffer,
 };
 use crate::fs::poll::{PollMask, PollNotify, PollTable, PollWaitHead, Pollable};
-use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path};
+use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path, O_CLOEXEC, O_RDWR};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
 mod index;
@@ -20,11 +20,18 @@ pub const EPOLL_CTL_DEL: u32 = 2;
 pub const EPOLL_CTL_MOD: u32 = 3;
 pub const EPOLLONESHOT: u32 = 1 << 30;
 pub const EPOLLET: u32 = 1 << 31;
-const CLOEXEC: u32 = 0o2000000;
 const RETIRE_BATCH: usize = 16;
 const PROVIDER_SOURCES: usize = 2;
-const ORDINARY_EVENTS: u32 =
-    0x001 | 0x002 | 0x004 | 0x008 | 0x010 | 0x040 | 0x080 | 0x100 | 0x200 | 0x2000;
+const ORDINARY_EVENTS: u32 = PollMask::POLLIN.0
+    | PollMask::POLLPRI.0
+    | PollMask::POLLOUT.0
+    | PollMask::POLLERR.0
+    | PollMask::POLLHUP.0
+    | PollMask::POLLRDNORM.0
+    | PollMask::POLLRDBAND.0
+    | PollMask::POLLWRNORM.0
+    | PollMask::POLLWRBAND.0
+    | PollMask::POLLRDHUP.0;
 const ALWAYS_EVENTS: u32 = PollMask::POLLERR.0 | PollMask::POLLHUP.0;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
 
@@ -630,7 +637,7 @@ pub struct EpollFile {
 impl EpollFile {
     /// fallible 准备完整匿名事件对象；CLOEXEC 由调用者装入原描述符槽。
     pub fn try_new(flags: u32) -> Result<Arc<Self>, FsError> {
-        if flags & !CLOEXEC != 0 {
+        if flags & !O_CLOEXEC != 0 {
             return Err(FsError::InvalidOperation);
         }
         let core = ReadyCore::prepare()?;
@@ -641,7 +648,7 @@ impl EpollFile {
             control: SleepMutex::new(index::Tree::new()),
             scan: SleepMutex::new(()),
             core,
-            flags: AtomicU32::new(2),
+            flags: AtomicU32::new(O_RDWR),
             inode,
         })
         .map_err(|_| FsError::NoMemory)

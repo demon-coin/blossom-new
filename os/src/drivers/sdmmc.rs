@@ -9,22 +9,33 @@ use core::mem::ManuallyDrop;
 use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::block::{BlkOperation, BlockError, IoResult, QueueLimits};
+use crate::block::{
+    BlkOperation, BlockError, IoResult, QueueLimits, NATIVE_TAG_COUNT, SECTOR_BYTES,
+};
 use crate::boot::{self, MmcResources};
 use crate::drivers::{board_setup, mmio_region_address};
 use crate::irq::{self, IrqNumber};
 use crate::mm::dma::{CoherentDma, DmaDirection, DmaDomain};
+use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SpinLock};
 use crate::time::{self, Duration, MonotonicInstant};
 use crate::timer::{self, Timer, TimerKind};
 use crate::wait::{WaitNode, WaitQueue, Waiter, Waker};
 
-use protocol::{Descriptor, BOUNCE_BYTES, DESCRIPTORS, DESC_BYTES};
+use protocol::*;
 use registers::*;
+pub(crate) use registers::{FIFO_MAX_DEPTH, FIFO_MIN_DEPTH};
 
 const COMMAND_MS: u64 = 2000;
 const PROGRAM_MS: u64 = 10_000;
 const RESET_MS: u64 = 500;
+const RESET_HOLD: Duration = Duration::from_micros(10);
+const POWER_UP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_PAYLOAD_SEGMENTS: usize = 32;
+const RESET_RUNNING: u32 = 0;
+const RESET_INTERFACE: u32 = 1;
+const RESET_FIFO: u32 = 2;
+const RESET_STOPPED: u32 = 3;
 
 /// 设备真正访问的两块原页；原 Bio 页不建立此设备的 DMA 映射。
 struct Memory {
@@ -54,7 +65,6 @@ pub(crate) struct Sdmmc {
     readonly: AtomicBool,
     published: AtomicBool,
     stopping: AtomicBool,
-    // 0 为运行，1 等接口/IDMAC reset，2 等第二次 FIFO reset，3 为已确认停止。
     reset_stage: AtomicU32,
     dma_live: AtomicBool,
 }
@@ -78,11 +88,11 @@ impl Sdmmc {
             .checked_sub(resources.registers.start)
             .ok_or(BlockError::InvalidRange)?;
         if base % 8 != 0
-            || span < IDINTEN + 4
+            || span < IDINTEN + REGISTER_BYTES
             || !(resources.bus_width == 1 || resources.bus_width == 4)
             || resources
                 .fifo_depth
-                .is_some_and(|depth| !(2..=4096).contains(&depth))
+                .is_some_and(|depth| !(FIFO_MIN_DEPTH..=FIFO_MAX_DEPTH).contains(&depth))
             || resources.max_frequency == 0
             || resources.setup.clocks.count != 2
         {
@@ -100,7 +110,7 @@ impl Sdmmc {
         )?;
         let memory = Memory {
             bounce: CoherentDma::allocate(domain, BOUNCE_BYTES)?,
-            descriptors: CoherentDma::allocate(domain, 4096)?,
+            descriptors: CoherentDma::allocate(domain, PAGE_SIZE)?,
         };
         let controller = Arc::try_new(Self {
             regs: Registers(base),
@@ -116,12 +126,12 @@ impl Sdmmc {
             readonly: AtomicBool::new(false),
             published: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
-            reset_stage: AtomicU32::new(0),
+            reset_stage: AtomicU32::new(RESET_RUNNING),
             dma_live: AtomicBool::new(false),
         })
         .map_err(|_| BlockError::NoMemory)?;
         // SAFETY: 调用者保证规范化 provider 的独占映射，全部可失败分配已完成。
-        unsafe { board_setup::apply_setup(&resources.setup, Duration::from_micros(10)) }
+        unsafe { board_setup::apply_setup(&resources.setup, RESET_HOLD) }
             .map_err(|_| BlockError::Unsupported)?;
         // SAFETY: apply_setup 已成功，时钟 provider 映射由 prepare 的调用契约保活。
         let frequency = unsafe { board_setup::clock_rate(&resources.setup.clocks.entries[1]) }
@@ -149,14 +159,14 @@ impl Sdmmc {
         QueueLimits {
             capacity_sectors: self.capacity.load(Ordering::Acquire),
             max_bytes: BOUNCE_BYTES,
-            max_segments: 32,
+            max_segments: MAX_PAYLOAD_SEGMENTS,
             max_segment_bytes: BOUNCE_BYTES as u32,
-            logical_block_size: 512,
+            logical_block_size: SECTOR_BYTES as u32,
             dma_boundary_mask: u64::MAX,
             readonly: self.readonly.load(Ordering::Acquire),
             flush: true,
             queue_depth: 1,
-            tag_count: 8,
+            tag_count: NATIVE_TAG_COUNT,
         }
     }
 
@@ -189,7 +199,11 @@ impl Sdmmc {
             self.regs.write(RINTSTS, controller);
             self.regs.write(IDSTS, dma);
             let events = controller
-                | if dma & 3 != 0 { IDMAC_DONE } else { 0 }
+                | if dma & IDMAC_COMPLETION != 0 {
+                    IDMAC_DONE
+                } else {
+                    0
+                }
                 | if dma & IDMAC_ERRORS != 0 {
                     IDMAC_ERROR
                 } else {
@@ -281,7 +295,7 @@ impl Sdmmc {
         self.regs
             .update(CTRL, INT_ENABLE | DMA_ENABLE | USE_IDMAC, RESET);
         self.regs.update(BMOD, BMOD_ENABLE, BMOD_RESET);
-        self.reset_stage.store(1, Ordering::Release);
+        self.reset_stage.store(RESET_INTERFACE, Ordering::Release);
         self.waiters.wake_all();
     }
 
@@ -289,7 +303,7 @@ impl Sdmmc {
     pub(crate) fn reset_complete(&self) -> bool {
         let _guard = self.registers.lock();
         match self.reset_stage.load(Ordering::Acquire) {
-            1 => {
+            RESET_INTERFACE => {
                 if self.regs.read(CTRL) & RESET != 0
                     || self.regs.read(BMOD) & BMOD_RESET != 0
                     || self.regs.read(STATUS) & DMA_REQ != 0
@@ -297,10 +311,10 @@ impl Sdmmc {
                     return false;
                 }
                 self.regs.update(CTRL, 0, FIFO_RESET);
-                self.reset_stage.store(2, Ordering::Release);
+                self.reset_stage.store(RESET_FIFO, Ordering::Release);
                 false
             }
-            2 => {
+            RESET_FIFO => {
                 if self.regs.read(CTRL) & FIFO_RESET != 0 {
                     return false;
                 }
@@ -309,10 +323,10 @@ impl Sdmmc {
                 self.regs.write(RINTSTS, u32::MAX);
                 self.events.store(0, Ordering::Release);
                 self.dma_live.store(false, Ordering::Release);
-                self.reset_stage.store(3, Ordering::Release);
+                self.reset_stage.store(RESET_STOPPED, Ordering::Release);
                 true
             }
-            3 => true,
+            RESET_STOPPED => true,
             _ => false,
         }
     }
@@ -382,9 +396,10 @@ impl Sdmmc {
         let divisor = if input <= target as u64 {
             0
         } else {
-            (input + 2 * target as u64 - 1) / (2 * target as u64)
+            (input + CLOCK_DIVIDER_FACTOR * target as u64 - 1)
+                / (CLOCK_DIVIDER_FACTOR * target as u64)
         };
-        if 255 < divisor {
+        if u64::from(CLOCK_DIVIDER_MASK) < divisor {
             return Err(BlockError::Unsupported);
         }
         self.regs.write(CLKENA, 0);
@@ -392,15 +407,17 @@ impl Sdmmc {
         self.regs.write(CLKSRC, 0);
         self.regs.write(CLKDIV, divisor as u32);
         self.update_clock()?;
-        self.regs.write(CLKENA, 1);
+        self.regs.write(CLKENA, CLOCK_ENABLE);
         self.update_clock()?;
-        if self.regs.read(CLKDIV) & 0xff != divisor as u32 || self.regs.read(CLKENA) & 1 == 0 {
+        if self.regs.read(CLKDIV) & CLOCK_DIVIDER_MASK != divisor as u32
+            || self.regs.read(CLKENA) & CLOCK_ENABLE == 0
+        {
             return Err(BlockError::Io);
         }
         Ok(if divisor == 0 {
             input
         } else {
-            input / (2 * divisor as u64)
+            input / (CLOCK_DIVIDER_FACTOR * divisor as u64)
         })
     }
 
@@ -431,7 +448,9 @@ impl Sdmmc {
             self.resources.registers.end - self.resources.registers.start,
         )?;
         // 仅实现内部 DMA 的 32 位地址格式；64 位 IDMAC 寄存器布局不同。
-        if hcon & (1 << 27) != 0 || (hcon >> 16) & 3 != 0 {
+        if hcon & HCON_ADDRESS_64BIT != 0
+            || (hcon >> HCON_DMA_INTERFACE_SHIFT) & HCON_DMA_INTERFACE_MASK != 0
+        {
             return Err(BlockError::Unsupported);
         }
         let present = if let Some(input) = self.resources.card_detect.as_ref() {
@@ -452,7 +471,7 @@ impl Sdmmc {
             present
         } else {
             let detect = self.regs.read(CDETECT);
-            let present = (detect & 1 == 0) ^ self.resources.cd_inverted;
+            let present = (detect & CARD_DETECT_ABSENT == 0) ^ self.resources.cd_inverted;
             crate::klog!(
                 crate::klog::Level::Info,
                 "SDMMC CD native={:#x} inverted={} present={}",
@@ -467,10 +486,10 @@ impl Sdmmc {
         }
         self.regs.write(INTMASK, 0);
         self.regs.write(IDINTEN, 0);
-        self.regs.write(PWREN, 1);
+        self.regs.write(PWREN, CARD_POWER_ENABLE);
         let power_delay = Duration::from_millis(self.resources.post_power_on_delay_ms as u64);
         timer::sleep(power_delay);
-        self.regs.write(CTYPE, 0);
+        self.regs.write(CTYPE, CTYPE_1BIT);
         self.regs.write(UHS, 0);
         self.regs.write(TMOUT, u32::MAX);
         let fifoth = if self.resources.fifo_depth.is_none() {
@@ -479,79 +498,94 @@ impl Sdmmc {
             0
         };
         let depth = protocol::fifo_depth(self.resources.fifo_depth, fifoth)?;
-        self.regs
-            .write(FIFOTH, ((depth / 2 - 1) << 16) | (depth / 2));
-        let identification_frequency = self.clock(400_000)?;
+        self.regs.write(
+            FIFOTH,
+            ((depth / 2 - 1) << FIFO_RX_WATERMARK_SHIFT) | (depth / 2),
+        );
+        let identification_frequency = self.clock(IDENTIFICATION_HZ)?;
         timer::sleep(power_delay);
-        self.command_polled(0, 0, INITIALIZE)?;
-        let version2 = match self.command_polled(8, 0x1aa, RESPONSE | CRC) {
-            Ok(response) if response[0] & 0xfff == 0x1aa => true,
+        self.command_polled(GO_IDLE_STATE, 0, INITIALIZE)?;
+        let version2 = match self.command_polled(SEND_IF_COND, IF_COND_ARGUMENT, RESPONSE | CRC) {
+            Ok(response) if response[0] & IF_COND_RESPONSE_MASK == IF_COND_ARGUMENT => true,
             Err(BlockError::NotReady) => false,
             _ => return Err(BlockError::Unsupported),
         };
         let until = deadline(COMMAND_MS);
         let ocr = loop {
-            let app = self.command_polled(55, 0, RESPONSE | CRC)?[0];
+            let app = self.command_polled(APP_CMD, 0, RESPONSE | CRC)?[0];
             protocol::check_r1(app)?;
-            if app & (1 << 5) == 0 {
+            if app & R1_APP_CMD == 0 {
                 return Err(BlockError::Unsupported);
             }
             let ocr = self.command_polled(
-                41,
-                0x00ff_8000 | if version2 { 1 << 30 } else { 0 },
+                APP_OP_COND,
+                OCR_VOLTAGE_27_36 | if version2 { OCR_HIGH_CAPACITY } else { 0 },
                 RESPONSE,
             )?[0];
-            if ocr & 0x00ff_8000 == 0 {
+            if ocr & OCR_VOLTAGE_27_36 == 0 {
                 return Err(BlockError::Unsupported);
             }
-            if ocr & (1 << 31) != 0 {
+            if ocr & OCR_POWER_UP_COMPLETE != 0 {
                 break ocr;
             }
             if until <= time::now() {
                 return Err(BlockError::NotReady);
             }
-            timer::sleep(Duration::from_millis(10));
+            timer::sleep(POWER_UP_POLL_INTERVAL);
         };
-        self.command_polled(2, 0, RESPONSE | LONG | CRC)?;
-        let r6 = self.command_polled(3, 0, RESPONSE | CRC)?[0];
-        if r6 & 0xe000 != 0 || r6 >> 16 == 0 {
+        self.command_polled(ALL_SEND_CID, 0, RESPONSE | LONG | CRC)?;
+        let r6 = self.command_polled(SEND_RELATIVE_ADDR, 0, RESPONSE | CRC)?[0];
+        if r6 & R6_ERRORS != 0 || r6 >> RCA_SHIFT == 0 {
             return Err(BlockError::Io);
         }
         let card = Card {
-            rca: r6 & 0xffff_0000,
-            block_addressed: ocr & (1 << 30) != 0,
+            rca: r6 & RCA_MASK,
+            block_addressed: ocr & OCR_HIGH_CAPACITY != 0,
         };
-        let csd = protocol::csd_bits(self.command_polled(9, card.rca, RESPONSE | LONG | CRC)?);
+        let csd =
+            protocol::csd_bits(self.command_polled(SEND_CSD, card.rca, RESPONSE | LONG | CRC)?);
         let sectors = protocol::capacity(csd, card.block_addressed)?;
-        protocol::check_r1(self.command_polled(7, card.rca, RESPONSE | CRC)?[0])?;
+        protocol::check_r1(self.command_polled(SELECT_CARD, card.rca, RESPONSE | CRC)?[0])?;
         self.wait_card(card, deadline(PROGRAM_MS), false)?;
         if !card.block_addressed {
-            protocol::check_r1(self.command_polled(16, 512, RESPONSE | CRC | WAIT_DATA)?[0])?;
+            protocol::check_r1(
+                self.command_polled(
+                    SET_BLOCKLEN,
+                    SECTOR_BYTES as u32,
+                    RESPONSE | CRC | WAIT_DATA,
+                )?[0],
+            )?;
         }
         self.app_polled(card)?;
         let scr = self.scr(fifo_offset, fifo_width)?;
-        if scr >> 60 != 0 || scr & (1 << 48) == 0 {
+        if scr >> SCR_STRUCTURE_SHIFT != 0 || scr & SCR_BUS_WIDTH_1 == 0 {
             return Err(BlockError::Unsupported);
         }
         let mut bus_width = 1;
-        if self.resources.bus_width == 4 && scr & (1 << 50) != 0 {
+        if self.resources.bus_width == 4 && scr & SCR_BUS_WIDTH_4 != 0 {
             self.app_polled(card)?;
-            protocol::check_r1(self.command_polled(6, 2, RESPONSE | CRC | WAIT_DATA)?[0])?;
-            self.regs.write(CTYPE, 1);
+            protocol::check_r1(
+                self.command_polled(
+                    APP_SET_BUS_WIDTH,
+                    SD_BUS_WIDTH_4,
+                    RESPONSE | CRC | WAIT_DATA,
+                )?[0],
+            )?;
+            self.regs.write(CTYPE, CTYPE_4BIT);
             bus_width = 4;
         }
         let card_frequency =
             self.clock(protocol::transfer_frequency(csd)?.min(self.resources.max_frequency))?;
         self.wait_card(card, deadline(PROGRAM_MS), false)?;
-        let write_protect = self.regs.read(WRTPRT) & 1 != 0;
+        let write_protect = self.regs.read(WRTPRT) & CARD_WRITE_PROTECTED != 0;
         let readonly =
-            (!self.resources.disable_wp && write_protect) || csd & ((1 << 13) | (1 << 12)) != 0;
+            (!self.resources.disable_wp && write_protect) || csd & CSD_WRITE_PROTECT != 0;
         self.readonly.store(readonly, Ordering::Release);
         crate::klog!(
             crate::klog::Level::Info,
             "SDMMC OCR={:#010x} RCA={:#06x} CSD={:#034x} SCR={:#018x}",
             ocr,
-            card.rca >> 16,
+            card.rca >> RCA_SHIFT,
             csd,
             scr
         );
@@ -586,8 +620,9 @@ impl Sdmmc {
 
     /// 检查 APP_CMD 已被卡接受，避免将 ACMD 当作普通命令继续执行。
     fn app_polled(&self, card: Card) -> Result<(), BlockError> {
-        let response = protocol::check_r1(self.command_polled(55, card.rca, RESPONSE | CRC)?[0])?;
-        if response & (1 << 5) == 0 {
+        let response =
+            protocol::check_r1(self.command_polled(APP_CMD, card.rca, RESPONSE | CRC)?[0])?;
+        if response & R1_APP_CMD == 0 {
             return Err(BlockError::Unsupported);
         }
         Ok(())
@@ -595,14 +630,16 @@ impl Sdmmc {
 
     /// 八字节 SCR 按线路大端解释；入口和 item 宽度复用复位后已核的 FIFO 几何。
     fn scr(&self, offset: usize, width: usize) -> Result<u64, BlockError> {
-        self.regs.write(BLKSIZ, 8);
-        self.regs.write(BYTCNT, 8);
+        self.regs.write(BLKSIZ, SCR_BYTES as u32);
+        self.regs.write(BYTCNT, SCR_BYTES as u32);
         self.regs.write(RINTSTS, u32::MAX);
         self.regs.write(CMDARG, 0);
-        self.regs
-            .write(CMD, START | HOLD | RESPONSE | CRC | DATA | WAIT_DATA | 51);
+        self.regs.write(
+            CMD,
+            START | HOLD | RESPONSE | CRC | DATA | WAIT_DATA | APP_SEND_SCR,
+        );
         let until = deadline(COMMAND_MS);
-        let mut bytes = [0u8; 8];
+        let mut bytes = [0u8; SCR_BYTES];
         let mut copied = 0;
         let mut seen = 0;
         loop {
@@ -632,7 +669,7 @@ impl Sdmmc {
                 copied += width;
             }
             self.regs.write(RINTSTS, status);
-            if seen & (CMD_DONE | DATA_OVER) == CMD_DONE | DATA_OVER && copied == 8 {
+            if seen & (CMD_DONE | DATA_OVER) == CMD_DONE | DATA_OVER && copied == SCR_BYTES {
                 protocol::check_r1(self.regs.read(RESP0))?;
                 return Ok(u64::from_be_bytes(bytes));
             }
@@ -655,9 +692,9 @@ impl Sdmmc {
                 return Err(BlockError::Io);
             }
             let response = if interrupt {
-                self.command_irq(13, card.rca, RESPONSE | CRC, CMD_DONE, until)?
+                self.command_irq(SEND_STATUS, card.rca, RESPONSE | CRC, CMD_DONE, until)?
             } else {
-                self.command_polled(13, card.rca, RESPONSE | CRC)?
+                self.command_polled(SEND_STATUS, card.rca, RESPONSE | CRC)?
             };
             let response = protocol::check_r1(response[0])?;
             if protocol::ready(response) && self.regs.read(STATUS) & DATA_BUSY == 0 {
@@ -698,7 +735,7 @@ impl Sdmmc {
                 );
                 self.regs.write(IDINTEN, IDMAC_IRQ);
                 self.regs.update(CTRL, 0, USE_IDMAC | DMA_ENABLE);
-                self.regs.write(BMOD, BMOD_ENABLE | 2);
+                self.regs.write(BMOD, BMOD_ENABLE | BMOD_FIXED_BURST);
             }
             self.regs.write(CMDARG, argument);
             self.regs.write(CMD, START | HOLD | flags | index);
@@ -764,12 +801,12 @@ impl Sdmmc {
         bytes: usize,
         transfer: impl FnOnce(*mut u8) -> Result<usize, BlockError>,
     ) -> Result<usize, BlockError> {
-        if bytes == 0 || BOUNCE_BYTES < bytes || bytes % 512 != 0 {
+        if bytes == 0 || BOUNCE_BYTES < bytes || bytes % SECTOR_BYTES as usize != 0 {
             return Err(BlockError::InvalidRange);
         }
         if self.capacity.load(Ordering::Acquire)
             < sector
-                .checked_add((bytes / 512) as u64)
+                .checked_add((bytes / SECTOR_BYTES as usize) as u64)
                 .ok_or(BlockError::InvalidRange)?
         {
             return Err(BlockError::InvalidRange);
@@ -817,15 +854,15 @@ impl Sdmmc {
             if self.stopping.load(Ordering::Acquire) {
                 return Err(BlockError::QueueStopped);
             }
-            self.regs.write(BLKSIZ, 512);
+            self.regs.write(BLKSIZ, SECTOR_BYTES as u32);
             self.regs.write(BYTCNT, bytes as u32);
         }
-        let multiple = 512 < bytes;
+        let multiple = (SECTOR_BYTES as usize) < bytes;
         let index = match (write, multiple) {
-            (false, false) => 17,
-            (false, true) => 18,
-            (true, false) => 24,
-            (true, true) => 25,
+            (false, false) => READ_SINGLE_BLOCK,
+            (false, true) => READ_MULTIPLE_BLOCK,
+            (true, false) => WRITE_BLOCK,
+            (true, true) => WRITE_MULTIPLE_BLOCK,
         };
         let data = self
             .command_irq(
@@ -839,8 +876,14 @@ impl Sdmmc {
         let transferred = (self.regs.read(TBBCNT), self.regs.read(TCBCNT));
         // 无论数据成功与否，多块都尝试 CMD12；错误不触发未知写重放。
         let card_stop = if multiple {
-            self.command_irq(12, 0, RESPONSE | CRC | STOP, CMD_DONE, deadline(COMMAND_MS))
-                .and_then(|response| protocol::check_r1(response[0]).map(|_| ()))
+            self.command_irq(
+                STOP_TRANSMISSION,
+                0,
+                RESPONSE | CRC | STOP,
+                CMD_DONE,
+                deadline(COMMAND_MS),
+            )
+            .and_then(|response| protocol::check_r1(response[0]).map(|_| ()))
         } else {
             Ok(())
         };

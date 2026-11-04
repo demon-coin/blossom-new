@@ -4,7 +4,9 @@ use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, GroupState};
 use crate::fs::ext4::{Ext4Volume, Geometry, InodeData, InodeMetadata};
+use crate::fs::types::{S_IALLUGO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRWXUGO, S_ISGID, S_IXGRP};
 use crate::fs::{FsError, InodeKind, InodeRef};
+use crate::mm::PAGE_SIZE;
 use crate::time;
 use alloc::vec::Vec;
 
@@ -148,8 +150,8 @@ impl Ext4Volume {
         uid: u32,
         gid: u32,
     ) -> Result<UnpublishedInode, FsError> {
-        let directory = mode & 0xf000 == 0x4000;
-        if !matches!(mode & 0xf000, 0x4000 | 0x8000 | 0xa000) {
+        let directory = mode & S_IFMT == S_IFDIR;
+        if !matches!(mode & S_IFMT, S_IFDIR | S_IFREG | S_IFLNK) {
             return Err(FsError::InvalidOperation);
         }
         let mut reservation = self.reserve(hint, true, directory)?;
@@ -182,14 +184,18 @@ impl Ext4Volume {
                 codec::put16(record, 24, gid as u16);
                 codec::put16(record, 122, (gid >> 16) as u16);
                 codec::put32(record, 100, generation);
-                let extra = if g.inode_size == 256 { 32 } else { 0 };
+                let extra = if g.inode_size == codec::LARGE_INODE_BYTES {
+                    codec::INODE_EXTRA_BYTES
+                } else {
+                    0
+                };
                 if extra != 0 {
                     codec::put16(record, 128, extra as u16);
                 }
-                if g.features_incompat & 0x40 != 0 {
+                if g.features_incompat & codec::FEATURE_INCOMPAT_EXTENTS != 0 {
                     codec::put32(record, 32, codec::EXTENTS);
-                    codec::put16(record, 40, 0xf30a);
-                    codec::put16(record, 44, 4);
+                    codec::put16(record, 40, codec::EXTENT_MAGIC);
+                    codec::put16(record, 44, codec::EXTENT_ROOT_ENTRIES as u16);
                 }
                 let seed = codec::crc32c(
                     codec::crc32c(g.checksum_seed, &(number as u32).to_le_bytes()),
@@ -225,33 +231,33 @@ impl Ext4Volume {
             return Err(FsError::NotDirectory);
         }
         let kind_mode = match kind {
-            InodeKind::Regular => 0x8000,
-            InodeKind::Directory => 0x4000,
-            InodeKind::Symlink => 0xa000,
+            InodeKind::Regular => S_IFREG,
+            InodeKind::Directory => S_IFDIR,
+            InodeKind::Symlink => S_IFLNK,
             InodeKind::Character
             | InodeKind::Block
             | InodeKind::Fifo
             | InodeKind::Socket
             | InodeKind::Other => return Err(FsError::InvalidOperation),
         };
-        let parent_setgid = parent.mode & 0o2000 != 0;
+        let parent_setgid = parent.mode & S_ISGID != 0;
         let mut mode = kind_mode
             | if kind == InodeKind::Symlink {
-                0o777
+                S_IRWXUGO
             } else {
-                requested_mode & 0o7777
+                requested_mode & S_IALLUGO
             };
         if kind == InodeKind::Directory && parent_setgid {
-            mode |= 0o2000;
+            mode |= S_ISGID;
         } else if kind != InodeKind::Directory
             && parent_setgid
-            && mode & 0o2010 == 0o2010
+            && mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP)
             && gid != parent.gid
         {
-            mode &= !0o2000;
+            mode &= !S_ISGID;
         }
         if kind != InodeKind::Symlink {
-            mode &= !(umask & 0o777);
+            mode &= !(umask & S_IRWXUGO);
         }
         let gid = if parent_setgid { parent.gid } else { gid };
         let hint =
@@ -334,7 +340,7 @@ impl Ext4Volume {
             return Err(FsError::InvalidOperation);
         }
         let (record, offset) = self.inode_record(inode.number, context)?;
-        let mut numbers = [0u64; 256];
+        let mut numbers = [0u64; codec::MAX_EA_INODES];
         let count = record.with_read(|bytes| {
             let bytes = &bytes[offset..offset + g.inode_size];
             let current = codec::decode_inode(g, inode.number, bytes)?;
@@ -514,7 +520,7 @@ impl Ext4Volume {
         let bitmap = self
             .metadata
             .get(physical, self.geometry.block_size, context)?;
-        let superblock = self.metadata.get(0, 4096, context)?;
+        let superblock = self.metadata.get(0, PAGE_SIZE, context)?;
         Ok(Reservation {
             volume: self.device,
             group,
@@ -535,14 +541,14 @@ impl Ext4Volume {
         // ponytail: 卷分配睡眠锁串行化计数，真实分配竞争成为瓶颈时拆每组锁。
         let _allocation = self.allocation.lock();
         let g = &self.geometry;
-        let superblock = self.metadata.get(0, 4096, None)?;
+        let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
         let available = superblock.with_read(|bytes| -> Result<u64, FsError> {
-            let record = &bytes[1024..2048];
+            let record = &bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END];
             if inode {
                 return Ok(u64::from(codec::le32(record, 16)?));
             }
             Ok(u64::from(codec::le32(record, 12)?)
-                | if g.features_incompat & 0x80 != 0 {
+                | if g.features_incompat & codec::FEATURE_INCOMPAT_64BIT != 0 {
                     u64::from(codec::le32(record, 344)?) << 32
                 } else {
                     0
@@ -573,7 +579,7 @@ impl Ext4Volume {
             } else {
                 layout.block_bitmap
             })?;
-            if inode && state.flags & 2 != 0 {
+            if inode && state.flags & codec::BG_BLOCK_UNINIT != 0 {
                 let blocks = self.metadata_block(layout.block_bitmap)?;
                 self.initialize_bitmap(group, false, &blocks, &descriptor, offset, &mut state)?;
             }
@@ -629,7 +635,7 @@ impl Ext4Volume {
                 .update(&self.claim, |bytes| {
                     codec::patch_super_counts(
                         g,
-                        &mut bytes[1024..2048],
+                        &mut bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END],
                         if inode { 0 } else { -1 },
                         if inode { -1 } else { 0 },
                         now_ns,
@@ -662,16 +668,23 @@ impl Ext4Volume {
         offset: usize,
         state: &mut GroupState,
     ) -> Result<(), FsError> {
-        let flag = if inode { 1 } else { 2 };
+        let flag = if inode {
+            codec::BG_INODE_UNINIT
+        } else {
+            codec::BG_BLOCK_UNINIT
+        };
         if state.flags & flag == 0 {
             return Ok(());
         }
         let g = &self.geometry;
-        if group == 0 || g.features_ro_compat & (0x10 | codec::METADATA_CSUM) == 0 {
+        if group == 0
+            || g.features_ro_compat & (codec::FEATURE_RO_COMPAT_GDT_CSUM | codec::METADATA_CSUM)
+                == 0
+        {
             return Err(FsError::Corrupt);
         }
         let valid = valid_bits(g, group, inode);
-        let mut initialized = [0u8; 4096];
+        let mut initialized = [0u8; codec::MAX_BLOCK_BYTES];
         let bits = &mut initialized[..g.block_size];
         if !inode {
             mark_metadata(g, &self.groups, group, bits);
@@ -769,7 +782,7 @@ impl Ext4Volume {
             .update(&self.claim, |bytes| {
                 codec::patch_super_counts(
                     g,
-                    &mut bytes[1024..2048],
+                    &mut bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END],
                     if reservation.inode { 0 } else { 1 },
                     if reservation.inode { 1 } else { 0 },
                     now_ns,

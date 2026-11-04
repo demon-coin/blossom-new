@@ -1,6 +1,7 @@
 //! 主辅核机器入口；建立 DMW 与受信栈后才进入普通 Rust。
 
 use crate::arch::boot_clear_words;
+use crate::arch::loongarch64::register as reg;
 use crate::cpu::{CpuBoot, BOOT_STACK, STACK_SIZE};
 use crate::platform::LINK_LAYOUT;
 use core::arch::naked_asm;
@@ -28,23 +29,32 @@ unsafe extern "C" fn __primary_entry(_arg0: usize, _arg1: usize, _arg2: usize, _
     move $s1, $a1
     move $s2, $a2
     move $s3, $a3
-    li.w $t0, 4
-    csrxchg $zero, $t0, 0
-    csrwr $zero, 0x30
+    li.w $t0, {reg_crmd_ie}
+    csrxchg $zero, $t0, {csr_crmd}
+    csrwr $zero, {csr_ks0}
     li.d $t0, {direct_base}
-    ori $t0, $t0, 0x11
-    csrwr $t0, 0x181
+    ori $t0, $t0, {reg_dmw_kernel_ram}
+    csrwr $t0, {csr_dmw1}
     li.d $t0, {mmio_base}
-    ori $t0, $t0, 1
-    csrwr $t0, 0x180
-    csrwr $zero, 0x182
-    csrwr $zero, 0x183
+    ori $t0, $t0, {reg_dmw_plv0}
+    csrwr $t0, {csr_dmw0}
+    csrwr $zero, {csr_dmw2}
+    csrwr $zero, {csr_dmw3}
     la.abs $t0, {high}
     jirl $zero, $t0, 0
 "#,
             direct_base = const LINK_LAYOUT.direct_map_virt_base,
             mmio_base = const LINK_LAYOUT.mmio_virt_base,
             high = sym la_primary_high,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_dmw0 = const reg::CSR_DMW0,
+            csr_dmw1 = const reg::CSR_DMW1,
+            csr_dmw2 = const reg::CSR_DMW2,
+            csr_dmw3 = const reg::CSR_DMW3,
+            csr_ks0 = const reg::CSR_KS0,
+            reg_crmd_ie = const reg::CRMD_IE,
+            reg_dmw_kernel_ram = const reg::DMW_KERNEL_RAM,
+            reg_dmw_plv0 = const reg::DMW_PLV0,
         );
     }
 }
@@ -60,8 +70,8 @@ unsafe extern "C" fn la_primary_high() -> ! {
         naked_asm!(
             r#"
     # DATF/DATM 一致缓存保证 DA refill 能看到内核写入的叶。
-    li.w $t0, 0xb0
-    csrwr $t0, 0
+    li.w $t0, {reg_crmd_boot}
+    csrwr $t0, {csr_crmd}
     la.abs $sp, {stack}
     li.d $t0, {stack_size}
     add.d $sp, $sp, $t0
@@ -80,6 +90,8 @@ unsafe extern "C" fn la_primary_high() -> ! {
             bss_end = sym __bss_end,
             clear_bss = sym la_clear_bss,
             primary_main = sym crate::primary_main,
+            csr_crmd = const reg::CSR_CRMD,
+            reg_crmd_boot = const reg::CRMD_BOOT,
         );
     }
 }
@@ -105,23 +117,32 @@ unsafe extern "C" fn __secondary_entry() -> ! {
     unsafe {
         naked_asm!(
             r#"
-    li.w $t0, 4
-    csrxchg $zero, $t0, 0
-    csrwr $zero, 0x30
+    li.w $t0, {reg_crmd_ie}
+    csrxchg $zero, $t0, {csr_crmd}
+    csrwr $zero, {csr_ks0}
     li.d $t0, {direct_base}
-    ori $t0, $t0, 0x11
-    csrwr $t0, 0x181
+    ori $t0, $t0, {reg_dmw_kernel_ram}
+    csrwr $t0, {csr_dmw1}
     li.d $t0, {mmio_base}
-    ori $t0, $t0, 1
-    csrwr $t0, 0x180
-    csrwr $zero, 0x182
-    csrwr $zero, 0x183
+    ori $t0, $t0, {reg_dmw_plv0}
+    csrwr $t0, {csr_dmw0}
+    csrwr $zero, {csr_dmw2}
+    csrwr $zero, {csr_dmw3}
     la.abs $t0, {high}
     jirl $zero, $t0, 0
 "#,
             direct_base = const LINK_LAYOUT.direct_map_virt_base,
             mmio_base = const LINK_LAYOUT.mmio_virt_base,
             high = sym la_secondary_high,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_dmw0 = const reg::CSR_DMW0,
+            csr_dmw1 = const reg::CSR_DMW1,
+            csr_dmw2 = const reg::CSR_DMW2,
+            csr_dmw3 = const reg::CSR_DMW3,
+            csr_ks0 = const reg::CSR_KS0,
+            reg_crmd_ie = const reg::CRMD_IE,
+            reg_dmw_kernel_ram = const reg::DMW_KERNEL_RAM,
+            reg_dmw_plv0 = const reg::DMW_PLV0,
         );
     }
 }
@@ -136,15 +157,15 @@ unsafe extern "C" fn la_secondary_high() -> ! {
     unsafe {
         naked_asm!(
             r#"
-    li.w $t0, 0xb0
-    csrwr $t0, 0
+    li.w $t0, {reg_crmd_boot}
+    csrwr $t0, {csr_crmd}
     .if {board_platform}
-    li.w $t0, 0x1028
+    li.w $t0, {reg_iocsr_mailbox1}
     iocsrrd.d $sp, $t0
-    li.w $t0, 0x1030
+    li.w $t0, {reg_iocsr_mailbox2}
     iocsrrd.d $a0, $t0
     .else
-    li.w $t0, 0x1028
+    li.w $t0, {reg_iocsr_mailbox1}
     iocsrrd.d $t1, $t0
     li.d $t0, {direct_base}
     or $t1, $t1, $t0
@@ -158,6 +179,10 @@ unsafe extern "C" fn la_secondary_high() -> ! {
             boot_stack = const offset_of!(CpuBoot, stack_top),
             boot_local = const offset_of!(CpuBoot, local),
             secondary_main = sym crate::secondary_main,
+            csr_crmd = const reg::CSR_CRMD,
+            reg_crmd_boot = const reg::CRMD_BOOT,
+            reg_iocsr_mailbox1 = const reg::IOCSR_MAILBOX1,
+            reg_iocsr_mailbox2 = const reg::IOCSR_MAILBOX2,
         );
     }
 }

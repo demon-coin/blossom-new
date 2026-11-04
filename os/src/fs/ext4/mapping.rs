@@ -23,7 +23,15 @@ enum Step {
 /// 校验 inode 内根节点或全部传统块指针，不读取额外节点。
 pub(crate) fn validate_root(g: &Geometry, inode: &InodeData) -> Result<(), FsError> {
     if inode.flags & EXTENTS != 0 {
-        extent_step(g, inode, &inode.block, 0, None, None, 1u64 << 32)?;
+        extent_step(
+            g,
+            inode,
+            &inode.block,
+            0,
+            None,
+            None,
+            codec::EXTENT_LOGICAL_BLOCKS,
+        )?;
     } else {
         validate_pointers(g, &inode.block)?;
     }
@@ -66,12 +74,20 @@ fn extent_map(
     logical: u64,
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<BlockMapping, FsError> {
-    if (1u64 << 32) <= logical {
+    if codec::EXTENT_LOGICAL_BLOCKS <= logical {
         return Err(FsError::Corrupt);
     }
     let g = volume.geometry();
-    let mut step = extent_step(g, inode, &inode.block, logical, None, None, 1u64 << 32)?;
-    let mut visited = [0u64; 32];
+    let mut step = extent_step(
+        g,
+        inode,
+        &inode.block,
+        logical,
+        None,
+        None,
+        codec::EXTENT_LOGICAL_BLOCKS,
+    )?;
+    let mut visited = [0u64; codec::EXTENT_DEPTH_LIMIT];
     let mut count = 0usize;
     loop {
         match step {
@@ -117,7 +133,7 @@ fn extent_step(
     let mut selected = None;
     let mut next_start = high;
     for index in 0..usize::from(header.entries) {
-        let offset = 12 + index * 12;
+        let offset = codec::EXTENT_HEADER_BYTES + index * codec::EXTENT_ENTRY_BYTES;
         let start = u64::from(codec::le32(data, offset)?);
         if start < previous_end
             || high <= start
@@ -201,7 +217,7 @@ fn indirect_map(
 ) -> Result<BlockMapping, FsError> {
     let g = volume.geometry();
     validate_pointers(g, &inode.block)?;
-    if logical < 12 {
+    if logical < codec::DIRECT_BLOCKS as u64 {
         let physical = u64::from(codec::le32(&inode.block, logical as usize * 4)?);
         return Ok(if physical == 0 {
             BlockMapping::Hole { len: 1 }
@@ -210,10 +226,10 @@ fn indirect_map(
         });
     }
     let pointers = (g.block_size / 4) as u64;
-    let mut remaining = logical - 12;
+    let mut remaining = logical - codec::DIRECT_BLOCKS as u64;
     let mut span = pointers;
     let mut depth = 1usize;
-    while span <= remaining && depth < 3 {
+    while span <= remaining && depth < codec::INDIRECT_LEVELS {
         remaining -= span;
         span = span.checked_mul(pointers).ok_or(FsError::Corrupt)?;
         depth += 1;
@@ -221,8 +237,11 @@ fn indirect_map(
     if span <= remaining {
         return Err(FsError::Corrupt);
     }
-    let mut physical = u64::from(codec::le32(&inode.block, (11 + depth) * 4)?);
-    let mut visited = [0u64; 3];
+    let mut physical = u64::from(codec::le32(
+        &inode.block,
+        (codec::DIRECT_BLOCKS - 1 + depth) * 4,
+    )?);
+    let mut visited = [0u64; codec::INDIRECT_LEVELS];
     for level in 0..depth {
         if physical == 0 {
             return Ok(BlockMapping::Hole {
@@ -410,10 +429,10 @@ pub(crate) fn prepare(
 ) -> Result<PreparedMapping, FsError> {
     let g = volume.geometry();
     let limit = if inode.flags & EXTENTS != 0 {
-        1u64 << 32
+        codec::EXTENT_LOGICAL_BLOCKS
     } else {
         let n = (g.block_size / 4) as u64;
-        12 + n + n * n + n * n * n
+        codec::DIRECT_BLOCKS as u64 + n + n * n + n * n * n
     };
     if limit <= logical {
         return Err(FsError::FileTooLarge);
@@ -579,7 +598,7 @@ fn prepare_extent(
     } else {
         prepared.nodes[0].depth as usize
     };
-    if 32 < depth {
+    if codec::EXTENT_DEPTH_LIMIT < depth {
         return Err(FsError::FileTooLarge);
     }
     prepared
@@ -597,15 +616,16 @@ fn prepare_extent(
             .map_err(|_| FsError::NoMemory)?;
     }
     if prepared.nodes.is_empty() {
-        prepared
-            .nodes
-            .push(read_node(&inode.block, entry_storage(4)?)?);
+        prepared.nodes.push(read_node(
+            &inode.block,
+            entry_storage(codec::EXTENT_ROOT_ENTRIES)?,
+        )?);
     }
 
-    let mut path = [0usize; 33];
-    let mut slots = [0usize; 33];
-    let mut visited = [0u64; 32];
-    let mut high = 1u64 << 32;
+    let mut path = [0usize; codec::EXTENT_DEPTH_LIMIT + 1];
+    let mut slots = [0usize; codec::EXTENT_DEPTH_LIMIT + 1];
+    let mut visited = [0u64; codec::EXTENT_DEPTH_LIMIT];
+    let mut high = codec::EXTENT_LOGICAL_BLOCKS;
     for level in 0..depth {
         let parent_index = path[level];
         let node = &prepared.nodes[parent_index];
@@ -637,7 +657,9 @@ fn prepare_extent(
             }
             index
         } else {
-            let entries = entry_storage((g.block_size - 12) / 12)?;
+            let entries = entry_storage(
+                (g.block_size - codec::EXTENT_HEADER_BYTES) / codec::EXTENT_ENTRY_BYTES,
+            )?;
             let buffer = volume.metadata_block(physical)?;
             let mut child = buffer.with_read(|bytes| {
                 extent_step(
@@ -665,7 +687,7 @@ fn prepare_extent(
         BlockMapping::Hole { .. } => {
             let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
             let physical = block.physical();
-            if (1u64 << 48) <= physical {
+            if codec::EXTENT_PHYSICAL_LIMIT <= physical {
                 volume.release_unpublished_block(block);
                 return Err(FsError::FileTooLarge);
             }
@@ -701,7 +723,7 @@ fn prepare_extent(
             prepared.nodes[node_index].dirty = true;
             let right_key = entry_key(&prepared.nodes[right_index].entries[0]);
             if level == 0 {
-                if 32 <= prepared.nodes[0].depth {
+                if codec::EXTENT_DEPTH_LIMIT <= usize::from(prepared.nodes[0].depth) {
                     return Err(FsError::FileTooLarge);
                 }
                 let node_depth = prepared.nodes[0].depth;
@@ -718,7 +740,7 @@ fn prepare_extent(
                     .entries
                     .push(index_entry(right_key, right));
                 prepared.nodes[0].depth += 1;
-                prepared.nodes[0].max = 4;
+                prepared.nodes[0].max = codec::EXTENT_ROOT_ENTRIES;
                 break;
             }
             let left_key = entry_key(&prepared.nodes[node_index].entries[0]);
@@ -761,7 +783,7 @@ fn new_node(
     depth: u16,
 ) -> Result<u64, FsError> {
     let g = volume.geometry();
-    let max = (g.block_size - 12) / 12;
+    let max = (g.block_size - codec::EXTENT_HEADER_BYTES) / codec::EXTENT_ENTRY_BYTES;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(max + 2)
@@ -777,7 +799,7 @@ fn new_node(
     let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
     let physical = block.physical();
     prepared.allocated.push(block);
-    if (1u64 << 48) <= physical {
+    if codec::EXTENT_PHYSICAL_LIMIT <= physical {
         return Err(FsError::FileTooLarge);
     }
     let buffer = volume.metadata_block(physical)?;
@@ -800,7 +822,7 @@ fn consolidate_path(
     volume: &Ext4Volume,
     inode: &InodeData,
     prepared: &mut PreparedMapping,
-    slots: &mut [usize; 33],
+    slots: &mut [usize; codec::EXTENT_DEPTH_LIMIT + 1],
     depth: usize,
 ) -> Result<(), FsError> {
     let g = volume.geometry();
@@ -821,8 +843,9 @@ fn consolidate_path(
             .entries
             .get(sibling_slot + 1)
             .map(entry_key)
-            .unwrap_or(1u64 << 32);
-        let entries = entry_storage((g.block_size - 12) / 12)?;
+            .unwrap_or(codec::EXTENT_LOGICAL_BLOCKS);
+        let entries =
+            entry_storage((g.block_size - codec::EXTENT_HEADER_BYTES) / codec::EXTENT_ENTRY_BYTES)?;
         let buffer = volume.metadata_block(sibling_physical)?;
         let node_depth = prepared.nodes[level].depth;
         let mut sibling = buffer.with_read(|bytes| {
@@ -872,7 +895,9 @@ fn consolidate_path(
     }
     // 单子根降深不需要申请新节点，inline 容量始终是四项。
     for level in 1..=depth {
-        if prepared.nodes[0].entries.len() != 1 || 4 < prepared.nodes[level].entries.len() {
+        if prepared.nodes[0].entries.len() != 1
+            || codec::EXTENT_ROOT_ENTRIES < prepared.nodes[level].entries.len()
+        {
             break;
         }
         if index_physical(&prepared.nodes[0].entries[0]) != prepared.nodes[level].physical {
@@ -885,7 +910,7 @@ fn consolidate_path(
             prepared.nodes[0].entries.push(entry);
         }
         prepared.nodes[0].depth = prepared.nodes[level].depth;
-        prepared.nodes[0].max = 4;
+        prepared.nodes[0].max = codec::EXTENT_ROOT_ENTRIES;
         prepared.nodes[level].dirty = false;
         prepared.retired.push(release);
     }
@@ -899,7 +924,12 @@ fn leaves_merge(left: &[u8; 12], right: &[u8; 12]) -> Result<bool, FsError> {
     Ok(unwritten == next_unwritten
         && entry_key(left) + len == entry_key(right)
         && physical + len == next_physical
-        && len + next_len <= if unwritten { 32767 } else { 32768 })
+        && len + next_len
+            <= u64::from(if unwritten {
+                codec::EXTENT_UNWRITTEN_MAX_LEN
+            } else {
+                codec::EXTENT_INIT_MAX_LEN
+            }))
 }
 
 /// 条目 key 是逻辑 FS 块号，与物理块地址的高低半编码无关。
@@ -929,7 +959,11 @@ fn leaf_entry(logical: u64, physical: u64, len: u64, unwritten: bool) -> [u8; 12
     codec::put16(
         &mut entry,
         4,
-        (len + if unwritten { 32768 } else { 0 }) as u16,
+        (len + if unwritten {
+            u64::from(codec::EXTENT_INIT_MAX_LEN)
+        } else {
+            0
+        }) as u16,
     );
     codec::put16(&mut entry, 6, (physical >> 32) as u16);
     codec::put32(&mut entry, 8, physical as u32);
@@ -988,7 +1022,11 @@ fn merge_leaf(entries: &mut Vec<[u8; 12]>) -> Result<(), FsError> {
         let right = entries[index + 1];
         let (physical, len, unwritten) = leaf_fields(&left)?;
         let (next_physical, next_len, next_unwritten) = leaf_fields(&right)?;
-        let max = if unwritten { 32767 } else { 32768 };
+        let max = u64::from(if unwritten {
+            codec::EXTENT_UNWRITTEN_MAX_LEN
+        } else {
+            codec::EXTENT_INIT_MAX_LEN
+        });
         if unwritten == next_unwritten
             && entry_key(&left) + len == entry_key(&right)
             && physical + len == next_physical
@@ -1008,7 +1046,7 @@ fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
     if node.new {
         bytes.fill(0);
     }
-    codec::put16(bytes, 0, 0xf30a);
+    codec::put16(bytes, 0, codec::EXTENT_MAGIC);
     codec::put16(bytes, 2, node.entries.len() as u16);
     codec::put16(bytes, 4, node.max as u16);
     codec::put16(bytes, 6, node.depth);
@@ -1017,23 +1055,26 @@ fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
         bytes[12 + index * 12..24 + index * 12].copy_from_slice(entry);
     }
     if node.buffer.is_some() && g.features_ro_compat & codec::METADATA_CSUM != 0 {
-        let tail = 12 + node.max * 12;
+        let tail = codec::EXTENT_HEADER_BYTES + node.max * codec::EXTENT_ENTRY_BYTES;
         codec::put32(bytes, tail, codec::crc32c(seed, &bytes[..tail]));
     }
 }
 
 /// 传统块号分解为 inode 槽及至多三层指针槽，不改变已有映射格式。
-fn indirect_offsets(g: &Geometry, logical: u64) -> Result<([usize; 4], usize), FsError> {
-    let mut offsets = [0usize; 4];
-    if logical < 12 {
+fn indirect_offsets(
+    g: &Geometry,
+    logical: u64,
+) -> Result<([usize; codec::INDIRECT_LEVELS + 1], usize), FsError> {
+    let mut offsets = [0usize; codec::INDIRECT_LEVELS + 1];
+    if logical < codec::DIRECT_BLOCKS as u64 {
         offsets[0] = logical as usize;
         return Ok((offsets, 1));
     }
     let n = (g.block_size / 4) as u64;
-    let mut remaining = logical - 12;
+    let mut remaining = logical - codec::DIRECT_BLOCKS as u64;
     let mut span = n;
     let mut depth = 1;
-    while span <= remaining && depth < 3 {
+    while span <= remaining && depth < codec::INDIRECT_LEVELS {
         remaining -= span;
         span *= n;
         depth += 1;
@@ -1041,7 +1082,7 @@ fn indirect_offsets(g: &Geometry, logical: u64) -> Result<([usize; 4], usize), F
     if span <= remaining {
         return Err(FsError::FileTooLarge);
     }
-    offsets[0] = 11 + depth;
+    offsets[0] = codec::DIRECT_BLOCKS - 1 + depth;
     for slot in &mut offsets[1..=depth] {
         span /= n;
         *slot = (remaining / span) as usize;
@@ -1189,10 +1230,10 @@ pub(crate) fn prepare_truncate(
     volume.require_write(volume.claim())?;
     let g = volume.geometry();
     let limit = if inode.flags & EXTENTS != 0 {
-        1u64 << 32
+        codec::EXTENT_LOGICAL_BLOCKS
     } else {
         let n = (g.block_size / 4) as u64;
-        12 + n + n * n + n * n * n
+        codec::DIRECT_BLOCKS as u64 + n + n * n + n * n * n
     };
     let keep = codec::ceil_div(new_size, g.block_size as u64)?;
     if limit < keep {
@@ -1220,8 +1261,8 @@ pub(crate) fn prepare_truncate(
         }
         prepared.root.fill(0);
         if inode.flags & EXTENTS != 0 {
-            codec::put16(&mut prepared.root, 0, 0xf30a);
-            codec::put16(&mut prepared.root, 4, 4);
+            codec::put16(&mut prepared.root, 0, codec::EXTENT_MAGIC);
+            codec::put16(&mut prepared.root, 4, codec::EXTENT_ROOT_ENTRIES as u16);
         }
     } else if new_size <= inode.size {
         validate_root(g, inode)?;
@@ -1283,7 +1324,8 @@ fn load_truncate_extent(
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<NodeEdit, FsError> {
     let g = volume.geometry();
-    let entries = entry_storage((g.block_size - 12) / 12)?;
+    let entries =
+        entry_storage((g.block_size - codec::EXTENT_HEADER_BYTES) / codec::EXTENT_ENTRY_BYTES)?;
     g.validate_blocks(physical, 1)?;
     let buffer = volume
         .metadata_cache()
@@ -1368,19 +1410,19 @@ fn prepare_extent_truncate(
     prepared: &mut PreparedTruncate,
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
-    let mut root = read_node(&inode.block, entry_storage(4)?)?;
+    let mut root = read_node(&inode.block, entry_storage(codec::EXTENT_ROOT_ENTRIES)?)?;
     truncate_extent_node(
         volume,
         inode,
         &mut root,
         keep,
-        1u64 << 32,
+        codec::EXTENT_LOGICAL_BLOCKS,
         prepared,
         context,
     )?;
     if root.entries.is_empty() {
         root.depth = 0;
-        root.max = 4;
+        root.max = codec::EXTENT_ROOT_ENTRIES;
     }
     while root.depth != 0 && root.entries.len() == 1 {
         let entry = root.entries[0];
@@ -1390,7 +1432,7 @@ fn prepare_extent_truncate(
             .iter()
             .position(|node| node.physical == physical);
         let child = if let Some(index) = staged {
-            if 4 < prepared.nodes[index].entries.len() {
+            if codec::EXTENT_ROOT_ENTRIES < prepared.nodes[index].entries.len() {
                 break;
             }
             prepared.nodes.remove(index)
@@ -1401,10 +1443,10 @@ fn prepare_extent_truncate(
                 physical,
                 root.depth - 1,
                 entry_key(&entry),
-                1u64 << 32,
+                codec::EXTENT_LOGICAL_BLOCKS,
                 context,
             )?;
-            if 4 < child.entries.len() {
+            if codec::EXTENT_ROOT_ENTRIES < child.entries.len() {
                 break;
             }
             child
@@ -1415,7 +1457,7 @@ fn prepare_extent_truncate(
             root.entries.push(entry);
         }
         root.depth = child.depth;
-        root.max = 4;
+        root.max = codec::EXTENT_ROOT_ENTRIES;
     }
     patch_node(
         volume.geometry(),
@@ -1430,7 +1472,7 @@ fn prepare_extent_truncate(
 fn read_truncate_indirect(
     g: &Geometry,
     bytes: &[u8],
-    pointers: &mut [u32; 1024],
+    pointers: &mut [u32; codec::MAX_BLOCK_BYTES / core::mem::size_of::<u32>()],
 ) -> Result<(), FsError> {
     for (index, pointer) in pointers[..g.block_size / 4].iter_mut().enumerate() {
         *pointer = codec::le32(bytes, index * 4)?;
@@ -1458,7 +1500,7 @@ fn truncate_indirect_node(
     let buffer = volume
         .metadata_cache()
         .get(physical, g.block_size, context)?;
-    let mut pointers = [0u32; 1024];
+    let mut pointers = [0u32; codec::MAX_BLOCK_BYTES / core::mem::size_of::<u32>()];
     buffer.with_read(|bytes| read_truncate_indirect(g, bytes, &mut pointers))??;
     let mut first = n;
     for index in (0..n).rev() {
@@ -1502,7 +1544,7 @@ fn prepare_indirect_truncate(
     prepared: &mut PreparedTruncate,
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<(), FsError> {
-    for slot in (keep.min(12) as usize..12).rev() {
+    for slot in (keep.min(codec::DIRECT_BLOCKS as u64) as usize..codec::DIRECT_BLOCKS).rev() {
         let physical = u64::from(codec::le32(&inode.block, slot * 4)?);
         if physical != 0 {
             retire_data(volume, physical, 1, prepared, context)?;
@@ -1510,15 +1552,22 @@ fn prepare_indirect_truncate(
         }
     }
     let n = (volume.geometry().block_size / 4) as u64;
-    let mut low = 12;
+    let mut low = codec::DIRECT_BLOCKS as u64;
     let mut span = n;
-    for depth in 1..=3 {
-        let physical = u64::from(codec::le32(&inode.block, (11 + depth) * 4)?);
+    for depth in 1..=codec::INDIRECT_LEVELS {
+        let physical = u64::from(codec::le32(
+            &inode.block,
+            (codec::DIRECT_BLOCKS - 1 + depth) * 4,
+        )?);
         if keep < low + span
             && physical != 0
             && truncate_indirect_node(volume, physical, depth, low, keep, prepared, context)?
         {
-            codec::put32(&mut prepared.root, (11 + depth) * 4, 0);
+            codec::put32(
+                &mut prepared.root,
+                (codec::DIRECT_BLOCKS - 1 + depth) * 4,
+                0,
+            );
         }
         low += span;
         span *= n;

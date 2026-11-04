@@ -73,7 +73,7 @@ impl UserOwner {
         checked(context, runtime.install_console())?;
         let (reader, user_writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
         let (user_reader, writer) = checked(context, crate::fs::pipe::try_new(0, 0, 0))?;
-        checked(context, reader.set_status_flags(0o4000))?;
+        checked(context, reader.set_status_flags(crate::fs::O_NONBLOCK))?;
         let command_fd = checked(
             context,
             runtime

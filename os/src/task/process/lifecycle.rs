@@ -80,7 +80,7 @@ impl TaskGraph {
             process.leader_status = None;
             process.control_event = None;
             let leader_charge = process.leader_charge.take();
-            identity.group.relations.lock().exit_signal = 17;
+            identity.group.relations.lock().exit_signal = SIGCHLD;
             let mut tid = identity.tid.lock();
             if Arc::ptr_eq(&tid, &identity.group.pid) {
                 (None, None, leader_charge)
@@ -173,10 +173,12 @@ impl TaskGraph {
             ptr::eq(self, identity.graph.as_ref()),
             "identity belongs to another graph"
         );
-        let signal = status & 0x7f;
+        let signal = status & WAIT_SIGNAL_MASK;
         assert!(
-            status & !0xffff == 0
-                && (status & 0xff == 0 || (status & 0xff00 == 0 && (1..=64).contains(&signal))),
+            status & !WAIT_STATUS_MASK == 0
+                && (status & EXIT_STATUS_MASK == 0
+                    || (status & (EXIT_STATUS_MASK << EXIT_STATUS_SHIFT) == 0
+                        && (1..=SIGNAL_COUNT as i32).contains(&signal))),
             "invalid Linux exit status"
         );
         let (user, group, released, exit, stopped, parent, hangup, charge) = {
@@ -243,7 +245,7 @@ impl TaskGraph {
             let stopped = group
                 .signals
                 .remove_member(&signals)
-                .map(|signum| child_event(&group, 5, signum as i32));
+                .map(|signum| child_event(&group, CLD_STOPPED, signum as i32));
             if let Some(event) = stopped {
                 process.control_event = Some(event);
             }
@@ -341,12 +343,12 @@ impl TaskGraph {
                 // 父可能在timer.stop期间最后退出并转亲；最终发布只使用此刻的关系与动作表。
                 let signum = group.relations.lock().exit_signal;
                 let parent = parent_number
-                    .filter(|_| signum == 17)
+                    .filter(|_| signum == SIGCHLD)
                     .and_then(|pid| slots[pid - 1].process.as_ref())
                     .map(|parent| parent.group.clone());
                 let autoreap = parent.as_ref().is_some_and(|parent| {
                     parent.signals.deliver_child_exit(
-                        child_signal_info(17, exit_child_event(&group, exit.status)),
+                        child_signal_info(SIGCHLD, exit_child_event(&group, exit.status)),
                         slots
                             .iter()
                             .filter_map(|slot| slot.thread.as_ref())
@@ -418,13 +420,13 @@ impl TaskGraph {
                 let child = slots[index].process.as_mut().expect("child disappeared");
                 child.parent = parent.as_ref().map(|parent| parent.tgid());
                 if self.root_role == RootRole::System {
-                    child.group.relations.lock().exit_signal = 17;
+                    child.group.relations.lock().exit_signal = SIGCHLD;
                 }
                 let child_group = child.group.clone();
                 let event = child.exit;
                 let autoreap = match (parent.as_ref(), event) {
                     (Some(parent), Some(event)) => parent.signals.deliver_child_exit(
-                        child_signal_info(17, exit_child_event(&child_group, event.status)),
+                        child_signal_info(SIGCHLD, exit_child_event(&child_group, event.status)),
                         slots
                             .iter()
                             .filter_map(|slot| slot.thread.as_ref())

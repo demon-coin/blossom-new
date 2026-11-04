@@ -30,7 +30,12 @@ fn file_number(
     fixture: &Owner,
     volume: &Arc<Ext4Volume>,
 ) -> Result<u64, TestError> {
-    let root = checked(context, fixture.cache().iget(volume, 2))?;
+    let root = checked(
+        context,
+        fixture
+            .cache()
+            .iget(volume, crate::fs::ext4::codec::ROOT_INODE),
+    )?;
     checked(
         context,
         root.with_map_read(|metadata, block| volume.lookup(metadata, block, b"pattern")),

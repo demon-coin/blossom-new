@@ -15,8 +15,7 @@ use crate::sync::SpinLock;
 use crate::task::{JoinHandle, State, Task};
 use crate::{cpu, mm, sched, task};
 
-const NONBLOCK: u32 = 0o4000;
-const CLOEXEC: u32 = 0o2000000;
+use crate::fs::{O_CLOEXEC as CLOEXEC, O_NONBLOCK as NONBLOCK};
 const ADDRESS: usize = 0x4600_0000;
 const RW: PagePermissions = PagePermissions {
     read: true,

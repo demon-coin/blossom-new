@@ -3,6 +3,8 @@ use lazy_static::lazy_static;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use spin::Mutex;
 
+const ZRAM_SLOTS: usize = 2048;
+
 #[derive(Debug)]
 /// Zram错误枚举
 pub enum ZramError {
@@ -138,5 +140,5 @@ impl Zram {
 
 lazy_static! {
     /// 全局ZRAM设备
-    pub static ref ZRAM_DEVICE: Arc<Mutex<Zram>> = Arc::new(Mutex::new(Zram::new(2048)));
+    pub static ref ZRAM_DEVICE: Arc<Mutex<Zram>> = Arc::new(Mutex::new(Zram::new(ZRAM_SLOTS)));
 }

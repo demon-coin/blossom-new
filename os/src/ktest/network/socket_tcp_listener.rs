@@ -12,11 +12,11 @@ pub(crate) mod socket_tcp_listener {
     };
     use super::support::{observe, operation, socket_retired, SERVER};
     use crate::fs::epoll::{EpollEvent, EpollFile, EPOLLET, EPOLL_CTL_ADD};
-    use crate::fs::{FileIoContext, FileLike, FileRef, FsError, PollMask, Pollable};
+    use crate::fs::{FileIoContext, FileLike, FileRef, FsError, PollMask, Pollable, O_NONBLOCK};
     use crate::fs::{ReadBuffer, WriteBuffer};
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
-    use crate::net::socket::SocketFile;
+    use crate::net::socket::{SocketFile, SHUT_WR};
     use crate::net::table::TcpTuple;
     use crate::net::IoProgress;
     use crate::{time, timer};
@@ -132,9 +132,9 @@ pub(crate) mod socket_tcp_listener {
             ));
         }
 
-        operation(context, client_a.shutdown(1))?;
+        operation(context, client_a.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, server_a.read(&mut [0u8; 1]))?, 0);
-        operation(context, server_a.shutdown(1))?;
+        operation(context, server_a.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, client_a.read(&mut [0u8; 1]))?, 0);
         drop(server_a);
         context.expect_eq(server_a_file_weak.upgrade().is_none(), true);
@@ -244,9 +244,9 @@ pub(crate) mod socket_tcp_listener {
             PollMask::default(),
         );
         for (client, server) in [(&client_b, &server_b), (&client_c, &server_c)] {
-            operation(context, client.shutdown(1))?;
+            operation(context, client.shutdown(SHUT_WR))?;
             context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
-            operation(context, server.shutdown(1))?;
+            operation(context, server.shutdown(SHUT_WR))?;
             context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
         }
         drop((
@@ -300,7 +300,7 @@ pub(crate) mod socket_tcp_listener {
             ..SERVER
         };
         let listener = socket_listener(context, &fixture.net, local.port)?;
-        operation(context, listener.set_status_flags(0o4000))?;
+        operation(context, listener.set_status_flags(O_NONBLOCK))?;
         let client = operation(
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
@@ -339,7 +339,7 @@ pub(crate) mod socket_tcp_listener {
         context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
 
         // 首笔应用发送就是 FIN；任何先行 payload 都会另带 ACK，使这个被动握手窗口消失。
-        operation(context, client.shutdown(1))?;
+        operation(context, client.shutdown(SHUT_WR))?;
         observe(
             || child.state() == State::CloseWait,
             "passive child did not process actual FIN into CLOSE-WAIT",
@@ -376,7 +376,7 @@ pub(crate) mod socket_tcp_listener {
         let mut output = [0u8; 18];
         socket_read_exact(&client, &mut output)?;
         context.expect_eq(&output, b"accepted after FIN");
-        operation(context, server.shutdown(1))?;
+        operation(context, server.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
         context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         let child_weak = Arc::downgrade(&child);

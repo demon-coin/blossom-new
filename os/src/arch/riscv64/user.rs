@@ -1,7 +1,10 @@
 //! 每个用户线程独占的整数、浮点现场及本次调用的受信续接。
 
 use crate::arch::{
-    riscv64::{irq_enabled, rv_dispatch_interrupt},
+    riscv64::{
+        irq_enabled, rv_dispatch_interrupt, CAUSE_IRQ_FLAG, EXC_INST_PAGE_FAULT,
+        EXC_LOAD_PAGE_FAULT, EXC_STORE_PAGE_FAULT, EXC_SYSCALL, SR_FS,
+    },
     UserAccess, UserTrap,
 };
 use core::arch::asm;
@@ -82,7 +85,7 @@ pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
         asm!("csrr {status}, sstatus", status = out(reg) status, options(nomem, nostack));
     }
     assert_eq!(
-        status & 0x6000,
+        status & SR_FS,
         0,
         "kernel FP must be disabled before user entry"
     );
@@ -91,21 +94,21 @@ pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
     unsafe {
         rv_run_user(context);
     }
-    if context.scause & (1usize << 63) != 0 {
+    if context.scause & CAUSE_IRQ_FLAG != 0 {
         rv_dispatch_interrupt(context.scause, context.pc, context.gpr[2], context.stval);
         return UserTrap::Interrupt;
     }
     match context.scause {
-        8 => UserTrap::Syscall,
-        12 => UserTrap::PageFault {
+        EXC_SYSCALL => UserTrap::Syscall,
+        EXC_INST_PAGE_FAULT => UserTrap::PageFault {
             address: context.stval,
             access: UserAccess::Execute,
         },
-        13 => UserTrap::PageFault {
+        EXC_LOAD_PAGE_FAULT => UserTrap::PageFault {
             address: context.stval,
             access: UserAccess::Read,
         },
-        15 => UserTrap::PageFault {
+        EXC_STORE_PAGE_FAULT => UserTrap::PageFault {
             address: context.stval,
             access: UserAccess::Write,
         },

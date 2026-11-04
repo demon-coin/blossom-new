@@ -30,7 +30,11 @@ pub use file::{
     open_path, open_path_with_flags, stat_path, DirectoryFile, FileIoContext, FileLike, FileRef,
     FileStat, InodeFile, SeekFrom,
 };
-pub(crate) use file::{set_nonblocking, set_status_flags};
+pub(crate) use file::{
+    set_nonblocking, set_status_flags, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
+    O_DSYNC, O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC,
+    O_TRUNC, O_WRONLY,
+};
 pub use file::{ReadBuffer, UserIoVector, WriteBuffer};
 pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
 pub(crate) use inode::{
@@ -42,6 +46,10 @@ pub use path::{FsContext, LastComponent, LookupParent, Path, ResolveMode, Vfs};
 pub use poll::{PollMask, Pollable};
 pub(crate) use types::{DirectoryCursor, DirectoryPosition};
 pub use types::{DirectoryEntry, InodeKind, InodeTime};
+pub(crate) use types::{
+    MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, PATH_MAX, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK, S_IRWXUGO,
+};
 
 use crate::block::BlockError;
 

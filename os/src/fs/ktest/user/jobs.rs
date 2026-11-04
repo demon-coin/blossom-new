@@ -150,7 +150,9 @@ impl UserOwner {
         if new_pgid.number() != old_number || Arc::ptr_eq(&old_pgid, &new_pgid) {
             return Err(TestError("PGID number was not reused by a distinct object"));
         }
-        let delivered = self.graph().send_process_group(&old_pgid, 10);
+        let delivered = self
+            .graph()
+            .send_process_group(&old_pgid, crate::task::signal::SIGUSR1);
         context.expect_eq(delivered, Err(SignalError::NoProcess));
         if delivered != Err(SignalError::NoProcess) {
             return Err(TestError(

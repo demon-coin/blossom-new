@@ -10,17 +10,18 @@ use crate::fs::file::{
     ReadBuffer, SeekFrom, WriteBuffer,
 };
 use crate::fs::poll::{PollContext, PollMask, PollNotify, PollTable, PollWaitHead, Pollable};
-use crate::fs::{DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path};
+use crate::fs::{
+    DirectoryEntry, FsError, InodeKind, InodeRef, InodeTime, Path, O_CLOEXEC, O_NONBLOCK,
+};
 use crate::mm::{self, OwnedPages};
 use crate::sync::SleepMutex;
+use crate::task::signal::SIGPIPE;
 use crate::wait::WaitResult;
 
 pub const PIPE_BUF: usize = 4096;
-pub const PIPE_CAPACITY: usize = 16 * PIPE_BUF;
+pub const PIPE_CAPACITY: usize = SLOTS * PIPE_BUF;
 const SLOTS: usize = 16;
-const O_NONBLOCK: u32 = 0o4000;
-const O_CLOEXEC: u32 = 0o2000000;
-const SPACE_SHIFT: u32 = 17;
+const SPACE_SHIFT: u32 = usize::BITS - PIPE_CAPACITY.leading_zeros();
 const BYTE_MASK: u64 = (1 << SPACE_SHIFT) - 1;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
 
@@ -338,7 +339,7 @@ impl PipeEnd {
     /// 无读端的非零用户写发送线程定向内核信号，内核调用没有用户信号副作用。
     fn broken_pipe(&self, caller: FileIoContext<'_>, count: usize) -> Result<usize, FsError> {
         if let FileIoContext::User(user) = caller {
-            user.send_kernel_signal(13);
+            user.send_kernel_signal(SIGPIPE);
         }
         Self::progress(count, FsError::BrokenPipe)
     }
@@ -714,7 +715,7 @@ impl FileLike for PipeEnd {
         Ok(FileStat {
             inode: self.pipe.inode,
             kind: InodeKind::Fifo,
-            mode: 0o010600,
+            mode: crate::fs::types::S_IFIFO | 0o600,
             size: 0,
             uid: self.pipe.uid,
             gid: self.pipe.gid,

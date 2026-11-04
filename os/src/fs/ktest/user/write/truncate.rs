@@ -477,7 +477,7 @@ pub(super) mod cases {
         }
         checked(context, file.truncate(0))?;
         let block = volume.geometry().block_size;
-        let traditional = checked(context, inode.metadata_snapshot())?.flags & 0x80000 == 0;
+        let traditional = checked(context, inode.metadata_snapshot())?.flags & codec::EXTENTS == 0;
         let logical = if traditional {
             [0, 12, 268, 65804, 65806]
         } else {

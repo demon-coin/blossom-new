@@ -2,29 +2,42 @@
 
 use core::convert::TryInto;
 
+use crate::arch::loongarch64::register as reg;
 use crate::arch::loongarch64::user::UserContext;
 use crate::arch::loongarch64::user_fp_lanes;
-use crate::arch::{UserAccess, USER_ADDRESS_END};
+use crate::arch::{UserAccess, STACK_ALIGNMENT, USER_ADDRESS_END};
 use crate::mm::space::{Mm, VmError};
 use crate::task::signal::{
-    AltStack, SignalFrameArgs, SignalFrameRestore, SignalInfo, SignalPayload, SA_ONSTACK,
+    AltStack, SignalFrameArgs, SignalFrameRestore, SignalInfo, SignalPayload, SA_ONSTACK, SIGFPE,
     SS_DISABLE, UNBLOCKABLE,
 };
 
 /// 保持用户 ABI 的最小备用栈；最大 LASX 帧连同对齐消耗仍小于此容量。
 pub(crate) const SIGNAL_MIN_STACK: usize = 4096;
 
+const WORD_BYTES: usize = core::mem::size_of::<u64>();
+const CONTEXT_INFO_ALIGNMENT: usize = 16;
+const SIGMASK_RESERVED_BYTES: usize = 128;
+const STACK_FLAGS: usize = STACK + WORD_BYTES;
+const STACK_SIZE: usize = STACK + 2 * WORD_BYTES;
+const FP_TRAILER_BYTES: usize = 2 * WORD_BYTES;
+const PADDING_COPY_CHUNK: usize = 128;
+
 const INFO_SIZE: usize = 128;
 const UCONTEXT: usize = INFO_SIZE;
-const STACK: usize = UCONTEXT + 16;
-const MASK: usize = UCONTEXT + 40;
-const MCONTEXT: usize = UCONTEXT + 176;
-const REGISTERS: usize = MCONTEXT + 8;
-const FLAGS: usize = REGISTERS + 32 * 8;
-const EXTCONTEXT: usize = MCONTEXT + 272;
-const SCTX_INFO_SIZE: usize = 16;
-const MAX_BODY_SIZE: usize = 32 * 4 * 8 + 16;
-const MAX_FRAME_SIZE: usize = EXTCONTEXT + SCTX_INFO_SIZE + MAX_BODY_SIZE + 16 + SCTX_INFO_SIZE;
+const STACK: usize = UCONTEXT + 2 * WORD_BYTES;
+const MASK: usize = STACK + 3 * WORD_BYTES;
+const MCONTEXT: usize =
+    (MASK + SIGMASK_RESERVED_BYTES + CONTEXT_INFO_ALIGNMENT - 1) & !(CONTEXT_INFO_ALIGNMENT - 1);
+const REGISTERS: usize = MCONTEXT + WORD_BYTES;
+const FLAGS: usize = REGISTERS + 32 * WORD_BYTES;
+const EXTCONTEXT: usize = (FLAGS + core::mem::size_of::<u32>() + CONTEXT_INFO_ALIGNMENT - 1)
+    & !(CONTEXT_INFO_ALIGNMENT - 1);
+const SCTX_INFO_SIZE: usize = CONTEXT_INFO_ALIGNMENT;
+const MAX_BODY_SIZE: usize =
+    core::mem::size_of::<[crate::arch::loongarch64::user::FpRegister; 32]>() + FP_TRAILER_BYTES;
+const MAX_FRAME_SIZE: usize =
+    EXTCONTEXT + SCTX_INFO_SIZE + MAX_BODY_SIZE + CONTEXT_INFO_ALIGNMENT + SCTX_INFO_SIZE;
 const _: () = assert!(MAX_FRAME_SIZE < SIGNAL_MIN_STACK);
 const FPU_MAGIC: u32 = 0x4650_5501;
 const LSX_MAGIC: u32 = 0x5358_0001;
@@ -72,20 +85,20 @@ impl FpLayout {
 
     /// 返回寄存器之后 FCC 的字节偏移。
     fn registers_size(&self) -> usize {
-        32 * self.lanes * 8
+        32 * self.lanes * WORD_BYTES
     }
 
     /// 返回含尾部 ABI padding 的具体 body 大小。
     fn body_size(&self) -> usize {
-        self.registers_size() + 16
+        self.registers_size() + FP_TRAILER_BYTES
     }
 
     /// LASX body 需 32 字节对齐，其余扩展沿记录头的 16 字节边界。
     fn alignment(&self) -> usize {
         if self.lanes == 4 {
-            32
+            core::mem::align_of::<crate::arch::loongarch64::user::FpRegister>()
         } else {
-            16
+            CONTEXT_INFO_ALIGNMENT
         }
     }
 }
@@ -99,8 +112,8 @@ impl UserContext {
         let mut bytes = [0u8; MAX_FRAME_SIZE];
         args.info.encode(&mut bytes[..INFO_SIZE]);
         put_u64(&mut bytes, STACK, args.altstack.base as u64);
-        put_u32(&mut bytes, STACK + 8, args.altstack.flags);
-        put_u64(&mut bytes, STACK + 16, args.altstack.size as u64);
+        put_u32(&mut bytes, STACK_FLAGS, args.altstack.flags);
+        put_u64(&mut bytes, STACK_SIZE, args.altstack.size as u64);
         put_u64(&mut bytes, MASK, args.restore_mask);
         put_u64(&mut bytes, MCONTEXT, self.pc as u64);
         for (index, register) in self.gpr.iter().enumerate().skip(1) {
@@ -149,7 +162,7 @@ impl UserContext {
     /// 完整验证成功后若 FCSR 有已启用异常，先回写清除 cause 的原槽，失败仍不提交候选。
     pub(crate) fn restore_signal(&self, mm: &Mm) -> Result<SignalFrameRestore, VmError> {
         let sp = self.gpr[3];
-        if sp & 15 != 0 {
+        if sp & (STACK_ALIGNMENT - 1) != 0 {
             return Err(VmError::InvalidRange);
         }
         let mut bytes = [0u8; EXTCONTEXT + SCTX_INFO_SIZE];
@@ -178,7 +191,7 @@ impl UserContext {
                 .checked_add(SCTX_INFO_SIZE)
                 .ok_or(VmError::InvalidRange)?;
             if size < SCTX_INFO_SIZE + layout.body_size()
-                || size & 15 != 0
+                || size & (CONTEXT_INFO_ALIGNMENT - 1) != 0
                 || body & (layout.alignment() - 1) != 0
             {
                 return Err(VmError::InvalidRange);
@@ -239,7 +252,7 @@ fn frame_address(
     } else {
         sp
     };
-    let top_aligned = top & !15;
+    let top_aligned = top & !(STACK_ALIGNMENT - 1);
     let end = top_aligned
         .checked_sub(SCTX_INFO_SIZE)
         .ok_or(VmError::InvalidRange)?;
@@ -280,8 +293,8 @@ fn context_flags(args: &SignalFrameArgs, used_fp: bool) -> u32 {
 fn decode_altstack(bytes: &[u8]) -> AltStack {
     AltStack {
         base: get_u64(bytes, STACK) as usize,
-        size: get_u64(bytes, STACK + 16) as usize,
-        flags: get_u32(bytes, STACK + 8),
+        size: get_u64(bytes, STACK_SIZE) as usize,
+        flags: get_u32(bytes, STACK_FLAGS),
     }
 }
 
@@ -292,7 +305,7 @@ fn restore_fcsr_pending(
     context: &mut UserContext,
 ) -> Result<Option<SignalInfo>, VmError> {
     let fcsr = context.fcsr as u32;
-    let enabled = (fcsr & 0x1f) << 24;
+    let enabled = (fcsr & reg::FCSR_ENABLE_MASK) << reg::FCSR_CAUSE_SHIFT;
     if fcsr & enabled == 0 {
         return Ok(None);
     }
@@ -309,12 +322,12 @@ fn restore_fcsr_pending(
         "successful signal FCSR copy is incomplete"
     );
     context.fcsr = cleared as usize;
-    Ok(Some(SignalInfo::kernel(8)))
+    Ok(Some(SignalInfo::kernel(SIGFPE)))
 }
 
 /// 完整访问扩展记录尾部 padding，复用固定小缓冲且不为用户 size 分配内核存储。
 fn copyin_padding(mm: &Mm, mut address: usize, end: usize) -> Result<(), VmError> {
-    let mut bytes = [0u8; 128];
+    let mut bytes = [0u8; PADDING_COPY_CHUNK];
     while address < end {
         let count = (end - address).min(bytes.len());
         copyin_exact(mm, address, &mut bytes[..count])?;

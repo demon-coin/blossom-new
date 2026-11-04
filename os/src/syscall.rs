@@ -19,8 +19,10 @@ use crate::fs::ReadBuffer;
 use crate::klog;
 use crate::random;
 use crate::sched;
-use crate::syscall::error::{copyout, Errno, SysResult};
+use crate::syscall::error::{copyout, SysResult};
+use crate::task::process::{EXIT_STATUS_MASK, EXIT_STATUS_SHIFT};
 use crate::task::UserThread;
+pub(crate) use error::Errno;
 
 #[cfg(target_arch = "riscv64")]
 const ARGUMENT_REGISTER: usize = 10;
@@ -30,6 +32,9 @@ const ARGUMENT_REGISTER: usize = 4;
 const NUMBER_REGISTER: usize = 17;
 #[cfg(target_arch = "loongarch64")]
 const NUMBER_REGISTER: usize = 11;
+
+const SYSCALL_INSTRUCTION_BYTES: usize = 4;
+const RESTART_SYSCALL: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Request {
@@ -51,13 +56,21 @@ impl Request {
     /// 只在普通返回时写 a0 并越过原 syscall；fault、中断和其他控制转移不调用此尾部。
     pub(crate) fn return_to(self, context: &mut UserContext, result: isize) {
         context.gpr[ARGUMENT_REGISTER] = result as usize;
-        context.pc = self.pc.checked_add(4).expect("syscall PC overflow");
+        context.pc = self
+            .pc
+            .checked_add(SYSCALL_INSTRUCTION_BYTES)
+            .expect("syscall PC overflow");
     }
 
     /// 重放仅由内部restart结果授权的原始调用，恢复参数与原PC而不推断用户指令。
     pub(crate) fn restart_to(self, context: &mut UserContext, restart_block: bool) {
-        context.gpr[ARGUMENT_REGISTER..ARGUMENT_REGISTER + 6].copy_from_slice(&self.arguments);
-        context.gpr[NUMBER_REGISTER] = if restart_block { 128 } else { self.number };
+        context.gpr[ARGUMENT_REGISTER..ARGUMENT_REGISTER + self.arguments.len()]
+            .copy_from_slice(&self.arguments);
+        context.gpr[NUMBER_REGISTER] = if restart_block {
+            RESTART_SYSCALL
+        } else {
+            self.number
+        };
         context.pc = self.pc;
     }
 }
@@ -135,7 +148,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if matches!(request.number, 101..=103 | 113..=115 | 153 | 165 | 169) {
         return time::dispatch(user, request);
     }
-    if request.number == 128 {
+    if request.number == RESTART_SYSCALL {
         return match user.take_restart() {
             Some(Restart::Sleep {
                 request,
@@ -173,8 +186,16 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         };
     }
     let result: SysResult = match request.number {
-        93 => return Outcome::Exit(((raw[0] & 255) << 8) as i32),
-        94 => return Outcome::GroupExit(((raw[0] & 255) << 8) as i32),
+        93 => {
+            return Outcome::Exit(
+                ((raw[0] & EXIT_STATUS_MASK as usize) << EXIT_STATUS_SHIFT) as i32,
+            )
+        }
+        94 => {
+            return Outcome::GroupExit(
+                ((raw[0] & EXIT_STATUS_MASK as usize) << EXIT_STATUS_SHIFT) as i32,
+            )
+        }
         17 => file::getcwd(user, raw),
         23 => file::dup(user, raw[0]),
         24 => file::dup3(user, raw),
@@ -290,12 +311,14 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
 
 /// 从同一记录环读取有界的最后完整正文；不清环、不移动打印者或 kmsg 的游标。
 fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
+    const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
     let action = raw[0] as i32;
-    if action == 10 {
+    if action == SYSLOG_ACTION_SIZE_BUFFER {
         return Ok((klog::CAPACITY * klog::TEXT_CAPACITY) as isize);
     }
-    if action != 3 {
-        return Err(if (0..=9).contains(&action) {
+    if action != SYSLOG_ACTION_READ_ALL {
+        return Err(if (0..SYSLOG_ACTION_SIZE_BUFFER).contains(&action) {
             Errno::NoSyscall
         } else {
             Errno::InvalidArgument

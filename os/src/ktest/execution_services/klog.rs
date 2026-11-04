@@ -7,7 +7,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::fs::poll::{PollContext, PollMask, PollTable};
-use crate::fs::{FileRef, FsError, SeekFrom};
+use crate::fs::{FileRef, FsError, SeekFrom, O_NONBLOCK};
 use crate::klog::{self as log, Cursor, Level};
 use crate::sync::{Completion, SpinLock};
 use crate::task::{self, State, Task};
@@ -277,7 +277,7 @@ fn assert_kmsg_record(file: &FileRef, record: &log::Record) {
 
 /// 慢 UART 导致真实 TX 等待；独立 kmsg 在同一停点读整记录并接受原 IPI 延期通知。
 fn test_uart() -> ::ktest::TestResult {
-    let kmsg = super::open_observation(b"/kmsg", 0x800).expect("kmsg open failed");
+    let kmsg = super::open_observation(b"/kmsg", O_NONBLOCK).expect("kmsg open failed");
     assert_eq!(kmsg.seek(SeekFrom::End(0)), Ok(0));
     let notified = PollContext::try_new().expect("kmsg poll context failed");
     let mut table = PollTable::new(notified.clone(), 1).expect("kmsg poll table failed");

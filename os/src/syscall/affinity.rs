@@ -52,7 +52,9 @@ pub(super) fn set(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// 按 unsigned-long 对齐交付内部前缀，并保留用户更长缓冲的尾部。
 pub(super) fn get(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let length = raw[1];
-    if length % core::mem::size_of::<usize>() != 0 || length < cpu::count().div_ceil(8) {
+    if length % core::mem::size_of::<usize>() != 0
+        || length < cpu::count().div_ceil(u8::BITS as usize)
+    {
         return Err(Errno::InvalidArgument);
     }
     let task = target(user, raw[0], false)?;

@@ -444,7 +444,7 @@ fn drain_worker(state: Arc<Control>, token: ChildToken, index: usize) -> Result<
 fn exhaust_pages(fixture: &mut Waiting) -> usize {
     let mut held_pages = 0;
     mm::drain_all_pages();
-    for order in (0..=10).rev() {
+    for order in (0..=mm::MAX_ORDER).rev() {
         loop {
             assert!(
                 fixture.pages.len() < fixture.pages.capacity(),
@@ -453,7 +453,7 @@ fn exhaust_pages(fixture: &mut Waiting) -> usize {
             let Some(pages) = mm::alloc_pages(order, false) else {
                 break;
             };
-            held_pages += pages.len() / 4096;
+            held_pages += pages.len() / mm::PAGE_SIZE;
             fixture.pages.push(pages);
         }
     }

@@ -3,6 +3,7 @@
 
 mod descriptors;
 mod phy;
+pub(crate) use self::phy::PHY_ADDRESS_COUNT;
 
 use alloc::{
     sync::{Arc, Weak},
@@ -21,7 +22,7 @@ use crate::{
         self,
         dma::{DmaDomain, DmaError, MappedPages},
     },
-    net::{stats::InterfaceStats, NetStack, NetStackRef},
+    net::{stats::InterfaceStats, NetStack, NetStackRef, ETHERNET_FRAME_CAPACITY},
     sync::{SleepMutex, SpinLock},
     time::{self, Duration},
     timer::{self, Timer, TimerKind},
@@ -30,14 +31,133 @@ use crate::{
 
 use self::{
     descriptors::{device_owned, Ring},
-    phy::{Link, Phy},
+    phy::{Link, Phy, SPEED_10, SPEED_100, SPEED_1000},
 };
 
 const RING_LEN: usize = 32;
 const BUFFER_LEN: usize = 2048;
-const FRAME_MIN: usize = 14;
-const FRAME_MAX: usize = 1514;
+const FRAME_MIN: usize = smoltcp::wire::ETHERNET_HEADER_LEN;
+const FRAME_MAX: usize = ETHERNET_FRAME_CAPACITY;
 const RX_BUDGET: usize = 16;
+const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+const MAC_CONFIG: usize = 0;
+const MAC_ADDRESS_ENABLE: u32 = 1 << 31;
+const MAC_FILTER_MULTICAST: u32 = 1 << 4;
+const MAC_FILTER_HASH_OR_PERFECT: u32 = 1 << 10;
+const MAC_PORT_SELECT: u32 = 1 << 15;
+const MAC_FAST_ETHERNET: u32 = 1 << 14;
+const DMA_BUS_MODE: usize = 0x1000;
+const DMA_SOFTWARE_RESET: u32 = 1;
+const DMA_BURST_LENGTH: u32 = 8;
+const DMA_RESET_TIMEOUT: Duration = Duration::from_secs(2);
+const DWMAC4_PACKET_FILTER: usize = 0x8;
+const DWMAC4_TX_FLOW_CONTROL: usize = 0x70;
+const DWMAC4_RX_FLOW_CONTROL: usize = 0x90;
+const DWMAC4_RX_QUEUE_CONTROL0: usize = 0xa0;
+const DWMAC4_RX_QUEUE_CONTROL1: usize = 0xa4;
+const DWMAC4_INTERRUPT_ENABLE: usize = 0xb4;
+const DWMAC4_VERSION: usize = 0x110;
+const DWMAC4_HW_FEATURE1: usize = 0x120;
+const DWMAC4_ADDRESS_HIGH: usize = 0x300;
+const DWMAC4_MTL_TX_OPERATION: usize = 0xd00;
+const DWMAC4_MTL_TX_WEIGHT: usize = 0xd18;
+const DWMAC4_MTL_RX_OPERATION: usize = 0xd30;
+const DWMAC4_DMA_CHANNEL_CONTROL: usize = 0x1100;
+const DWMAC4_DMA_TX_CONTROL: usize = 0x1104;
+const DWMAC4_DMA_RX_CONTROL: usize = 0x1108;
+const DWMAC4_DMA_TX_BASE_HIGH: usize = 0x1110;
+const DWMAC4_DMA_TX_BASE: usize = 0x1114;
+const DWMAC4_DMA_RX_BASE_HIGH: usize = 0x1118;
+const DWMAC4_DMA_RX_BASE: usize = 0x111c;
+const DWMAC4_DMA_TX_TAIL: usize = 0x1120;
+const DWMAC4_DMA_RX_TAIL: usize = 0x1128;
+const DWMAC4_DMA_TX_RING_LENGTH: usize = 0x112c;
+const DWMAC4_DMA_RX_RING_LENGTH: usize = 0x1130;
+const DWMAC4_DMA_INTERRUPT_ENABLE: usize = 0x1134;
+const DWMAC4_DMA_STATUS: usize = 0x1160;
+const DWMAC4_STATUS_ACK_MASK: u32 = 0xffff;
+const DWMAC4_DMA_NORMAL_INTERRUPT: u32 = 1 << 15;
+const DWMAC4_DMA_ABNORMAL_INTERRUPT: u32 = 1 << 14;
+const DWMAC4_DMA_FATAL_BUS_ERROR: u32 = 1 << 12;
+const DWMAC4_DMA_RX_BUFFER_UNAVAILABLE: u32 = 1 << 7;
+const DWMAC4_DMA_RX_INTERRUPT: u32 = 1 << 6;
+const DWMAC4_DMA_TX_INTERRUPT: u32 = 1;
+const DWMAC4_MAC_TRANSMIT: u32 = 1 << 1;
+const DWMAC4_MAC_RECEIVE: u32 = 1;
+const DWMAC4_MAC_DUPLEX: u32 = 1 << 13;
+const DWMAC4_DMA_START_TX: u32 = 1;
+const DWMAC4_DMA_START_RX: u32 = 1;
+const DWMAC4_DMA_DESCRIPTOR_CACHE: u32 = 1 << 19;
+const DWMAC4_DMA_SKIP_SHIFT: u32 = 18;
+const DWMAC4_DMA_BURST_SHIFT: u32 = 16;
+const DWMAC4_DMA_SECOND_PACKET: u32 = 1 << 4;
+const DWMAC4_DMA_RX_BUFFER_SHIFT: u32 = 1;
+const DWMAC4_FIFO_BASE_BYTES: usize = 128;
+const DWMAC4_FIFO_SIZE_MASK: u32 = 0x1f;
+const DWMAC4_TX_FIFO_SIZE_SHIFT: u32 = 6;
+const DWMAC4_MTL_FIFO_UNIT_BYTES: usize = 256;
+const DWMAC4_MTL_TX_SIZE_MAX: usize = 0x1ff;
+const DWMAC4_MTL_TX_SIZE_SHIFT: u32 = 16;
+const DWMAC4_MTL_RX_SIZE_MAX: usize = 0x3ff;
+const DWMAC4_MTL_RX_SIZE_SHIFT: u32 = 20;
+const DWMAC4_MTL_TX_QUEUE_ENABLE: u32 = 2 << 2;
+const DWMAC4_MTL_TX_STORE_FORWARD: u32 = 1 << 1;
+const DWMAC4_MTL_RX_STORE_FORWARD: u32 = 1 << 5;
+const DWMAC4_MTL_TX_WEIGHT_DEFAULT: u32 = 0x10;
+const DWMAC4_RX_QUEUE_DCB: u32 = 2;
+const DWMAC4_MULTICAST_BROADCAST_QUEUE: u32 = 1 << 20;
+const DWMAC1000_FRAME_FILTER: usize = 0x4;
+const DWMAC1000_FLOW_CONTROL: usize = 0x18;
+const DWMAC1000_VERSION: usize = 0x20;
+const DWMAC1000_INTERRUPT_MASK: usize = 0x3c;
+const DWMAC1000_ADDRESS_HIGH: usize = 0x40;
+const DWMAC1000_MMC_RX_INTERRUPT_MASK: usize = 0x10c;
+const DWMAC1000_MMC_TX_INTERRUPT_MASK: usize = 0x110;
+const DWMAC1000_MMC_RX_IPC_INTERRUPT_MASK: usize = 0x200;
+const DWMAC1000_DMA_TX_POLL: usize = 0x1004;
+const DWMAC1000_DMA_RX_POLL: usize = 0x1008;
+const DWMAC1000_DMA_RX_BASE: usize = 0x100c;
+const DWMAC1000_DMA_TX_BASE: usize = 0x1010;
+const DWMAC1000_DMA_STATUS: usize = 0x1014;
+const DWMAC1000_DMA_CONTROL: usize = 0x1018;
+const DWMAC1000_DMA_INTERRUPT_ENABLE: usize = 0x101c;
+const DWMAC1000_DMA_HW_FEATURE: usize = 0x1058;
+const DWMAC1000_STATUS_ACK_MASK: u32 = 0x1ffff;
+const DWMAC1000_DMA_NORMAL_INTERRUPT: u32 = 1 << 16;
+const DWMAC1000_DMA_ABNORMAL_INTERRUPT: u32 = 1 << 15;
+const DWMAC1000_DMA_FATAL_BUS_ERROR: u32 = 1 << 13;
+const DWMAC1000_DMA_RX_INTERRUPT: u32 = 1 << 6;
+const DWMAC1000_DMA_TX_UNDERFLOW: u32 = 1 << 5;
+const DWMAC1000_DMA_TX_INTERRUPT: u32 = 1;
+const DWMAC1000_MAC_TRANSMIT: u32 = 1 << 3;
+const DWMAC1000_MAC_RECEIVE: u32 = 1 << 2;
+const DWMAC1000_MAC_DUPLEX: u32 = 1 << 11;
+const DWMAC1000_MAC_DISABLE_CARRIER_SENSE: u32 = 1 << 16;
+const DWMAC1000_DMA_START_TX: u32 = 1 << 13;
+const DWMAC1000_DMA_START_RX: u32 = 1 << 1;
+const DWMAC1000_ENHANCED_DESCRIPTORS: u32 = 1 << 24;
+const DWMAC1000_DMA_SKIP_SHIFT: u32 = 2;
+const DWMAC1000_DMA_ALTERNATE_DESCRIPTOR: u32 = 1 << 7;
+const DWMAC1000_DMA_TX_BURST_SHIFT: u32 = 8;
+const DWMAC1000_DMA_RX_BURST_SHIFT: u32 = 17;
+const DWMAC1000_DMA_SEPARATE_BURST: u32 = 1 << 23;
+const DWMAC1000_DMA_RX_STORE_FORWARD: u32 = 1 << 25;
+const DWMAC1000_DMA_TX_STORE_FORWARD: u32 = 1 << 21;
+const DWMAC1000_DMA_SECOND_FRAME: u32 = 1 << 2;
+const DWMAC1000_MAC_INTERRUPT_DISABLE: u32 = 0x60f;
+const MAC_VERSION_MASK: u32 = 0xff;
+const DWMAC_CORE_5_10: u32 = 0x51;
+const DWMAC_CORE_5_20: u32 = 0x52;
+const DWMAC_CORE_3_70: u32 = 0x37;
+const STARFIVE_INTERFACE_BITS: u32 = 3;
+const STARFIVE_INTERFACE_MASK: u32 = (1 << STARFIVE_INTERFACE_BITS) - 1;
+const STARFIVE_INTERFACE_RGMII: u32 = 1;
+const STARFIVE_INTERFACE_RMII: u32 = 4;
+const STARFIVE_TX_CLOCK_INDEX: usize = 3;
+pub(crate) const DWMAC1000_MMIO_MIN_BYTES: usize = DWMAC1000_DMA_HW_FEATURE + REGISTER_BYTES;
+const RGMII_GIGABIT_CLOCK_HZ: u64 = 125_000_000;
+const MII_FAST_ETHERNET_CLOCK_HZ: u64 = 25_000_000;
+const MII_ETHERNET_CLOCK_HZ: u64 = MII_FAST_ETHERNET_CLOCK_HZ / 10;
 
 /// 原生错误保留资源、DMA、IRQ、协议和未确认停止的不同责任。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +196,10 @@ struct Registers {
 impl Registers {
     /// volatile 访问完整已映射的对齐寄存器，不借出设备内存引用。
     fn read(self, offset: usize) -> u32 {
-        assert!(offset % 4 == 0 && offset + 4 <= self.region.end - self.region.start);
+        assert!(
+            offset % REGISTER_BYTES == 0
+                && offset + REGISTER_BYTES <= self.region.end - self.region.start
+        );
         // SAFETY: prepare 调用者证明此完整 MMIO 永久强序映射和设备独占；
         // 私有寄存器表中的偏移逐次检查，IRQ/Work 访问不建立普通内存别名。
         unsafe {
@@ -86,7 +209,10 @@ impl Registers {
 
     /// 写控制字段后真实设备屏障排序 DMA 描述符和通知。
     fn write(self, offset: usize, value: u32) {
-        assert!(offset % 4 == 0 && offset + 4 <= self.region.end - self.region.start);
+        assert!(
+            offset % REGISTER_BYTES == 0
+                && offset + REGISTER_BYTES <= self.region.end - self.region.start
+        );
         arch::dma_write_barrier();
         // SAFETY: 与 read 相同的完整映射、对齐及硬件独占义务覆盖整个设备生命期。
         unsafe {
@@ -101,32 +227,46 @@ impl Registers {
     /// 两代 DMA 中断寄存器不同，所有 W1C 都使用各自实际原因位。
     fn interrupt_register(self) -> usize {
         match self.generation {
-            Generation::Dwmac4 => 0x1134,
-            Generation::Dwmac1000 => 0x101c,
+            Generation::Dwmac4 => DWMAC4_DMA_INTERRUPT_ENABLE,
+            Generation::Dwmac1000 => DWMAC1000_DMA_INTERRUPT_ENABLE,
         }
     }
 
     /// 返回设备 DMA 状态偏移，不把旧代 CSR5 当新代通道状态。
     fn status_register(self) -> usize {
         match self.generation {
-            Generation::Dwmac4 => 0x1160,
-            Generation::Dwmac1000 => 0x1014,
+            Generation::Dwmac4 => DWMAC4_DMA_STATUS,
+            Generation::Dwmac1000 => DWMAC1000_DMA_STATUS,
         }
     }
 
     /// 仅含本通道实际可应答的中断原因，不写过程状态等只读位。
     fn status_mask(self) -> u32 {
         match self.generation {
-            Generation::Dwmac4 => 0xffff,
-            Generation::Dwmac1000 => 0x1ffff,
+            Generation::Dwmac4 => DWMAC4_STATUS_ACK_MASK,
+            Generation::Dwmac1000 => DWMAC1000_STATUS_ACK_MASK,
         }
     }
 
     /// 每条 TX/RX 都请求完成 IRQ，包含真实异常摘要和 fatal bus error。
     fn interrupt_mask(self) -> u32 {
         match self.generation {
-            Generation::Dwmac4 => (1 << 15) | (1 << 14) | (1 << 12) | (1 << 7) | (1 << 6) | 1,
-            Generation::Dwmac1000 => (1 << 16) | (1 << 15) | (1 << 13) | (1 << 6) | (1 << 5) | 1,
+            Generation::Dwmac4 => {
+                DWMAC4_DMA_NORMAL_INTERRUPT
+                    | DWMAC4_DMA_ABNORMAL_INTERRUPT
+                    | DWMAC4_DMA_FATAL_BUS_ERROR
+                    | DWMAC4_DMA_RX_BUFFER_UNAVAILABLE
+                    | DWMAC4_DMA_RX_INTERRUPT
+                    | DWMAC4_DMA_TX_INTERRUPT
+            }
+            Generation::Dwmac1000 => {
+                DWMAC1000_DMA_NORMAL_INTERRUPT
+                    | DWMAC1000_DMA_ABNORMAL_INTERRUPT
+                    | DWMAC1000_DMA_FATAL_BUS_ERROR
+                    | DWMAC1000_DMA_RX_INTERRUPT
+                    | DWMAC1000_DMA_TX_UNDERFLOW
+                    | DWMAC1000_DMA_TX_INTERRUPT
+            }
         }
     }
 
@@ -151,8 +291,8 @@ impl Registers {
     fn fatal(self, reason: u32) -> bool {
         reason
             & match self.generation {
-                Generation::Dwmac4 => 1 << 12,
-                Generation::Dwmac1000 => 1 << 13,
+                Generation::Dwmac4 => DWMAC4_DMA_FATAL_BUS_ERROR,
+                Generation::Dwmac1000 => DWMAC1000_DMA_FATAL_BUS_ERROR,
             }
             != 0
     }
@@ -160,27 +300,29 @@ impl Registers {
     /// 两代 MAC0 地址寄存器采用相同字节顺序但不同偏移。
     fn address_register(self) -> usize {
         match self.generation {
-            Generation::Dwmac4 => 0x300,
-            Generation::Dwmac1000 => 0x40,
+            Generation::Dwmac4 => DWMAC4_ADDRESS_HIGH,
+            Generation::Dwmac1000 => DWMAC1000_ADDRESS_HIGH,
         }
     }
 
     /// 仅从真实硬件取六字节地址，合法性由资源边界统一检查。
     fn mac_address(self) -> [u8; 6] {
         let high = self.read(self.address_register()).to_le_bytes();
-        let low = self.read(self.address_register() + 4).to_le_bytes();
+        let low = self
+            .read(self.address_register() + REGISTER_BYTES)
+            .to_le_bytes();
         [low[0], low[1], low[2], low[3], high[0], high[1]]
     }
 
     /// MAC0 使用有效的 DT 或硬件地址，不生成本地 fallback。
     fn set_mac_address(self, mac: [u8; 6]) {
         self.write(
-            self.address_register() + 4,
+            self.address_register() + REGISTER_BYTES,
             u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]),
         );
         self.write(
             self.address_register(),
-            (1 << 31) | u32::from(u16::from_le_bytes([mac[4], mac[5]])),
+            MAC_ADDRESS_ENABLE | u32::from(u16::from_le_bytes([mac[4], mac[5]])),
         );
     }
 
@@ -189,26 +331,42 @@ impl Registers {
         self.interrupts(false);
         match self.generation {
             Generation::Dwmac4 => {
-                self.write(0x1104, self.read(0x1104) & !1);
-                self.write(0x1108, self.read(0x1108) & !1);
-                self.write(0, self.read(0) & !3);
+                self.write(
+                    DWMAC4_DMA_TX_CONTROL,
+                    self.read(DWMAC4_DMA_TX_CONTROL) & !DWMAC4_DMA_START_TX,
+                );
+                self.write(
+                    DWMAC4_DMA_RX_CONTROL,
+                    self.read(DWMAC4_DMA_RX_CONTROL) & !DWMAC4_DMA_START_RX,
+                );
+                self.write(
+                    MAC_CONFIG,
+                    self.read(MAC_CONFIG) & !(DWMAC4_MAC_TRANSMIT | DWMAC4_MAC_RECEIVE),
+                );
             }
             Generation::Dwmac1000 => {
-                self.write(0x1018, self.read(0x1018) & !((1 << 13) | (1 << 1)));
-                self.write(0, self.read(0) & !((1 << 3) | (1 << 2)));
+                self.write(
+                    DWMAC1000_DMA_CONTROL,
+                    self.read(DWMAC1000_DMA_CONTROL)
+                        & !(DWMAC1000_DMA_START_TX | DWMAC1000_DMA_START_RX),
+                );
+                self.write(
+                    MAC_CONFIG,
+                    self.read(MAC_CONFIG) & !(DWMAC1000_MAC_TRANSMIT | DWMAC1000_MAC_RECEIVE),
+                );
             }
         }
     }
 
     /// 已关闭新收发并保证 PHY 输入时钟后请求软件复位，只有 SWR 清零才允许归页。
     fn request_reset(self) {
-        self.write(0x1000, self.read(0x1000) | 1);
+        self.write(DMA_BUS_MODE, self.read(DMA_BUS_MODE) | DMA_SOFTWARE_RESET);
     }
 
     /// 可睡有界等待仅用于准备和停止，不用于稳态帧完成。
     fn wait_reset(self) -> Result<(), GmacError> {
-        let deadline = time::now().checked_add(Duration::from_secs(2)).unwrap();
-        while self.read(0x1000) & 1 != 0 {
+        let deadline = time::now().checked_add(DMA_RESET_TIMEOUT).unwrap();
+        while self.read(DMA_BUS_MODE) & DMA_SOFTWARE_RESET != 0 {
             if deadline <= time::now() {
                 return Err(GmacError::StopUnconfirmed);
             }
@@ -225,71 +383,108 @@ impl Registers {
         self.set_mac_address(mac);
         match self.generation {
             Generation::Dwmac4 => {
-                let feature = self.read(0x120);
-                let rx_fifo = 128usize
-                    .checked_shl(feature & 0x1f)
+                let feature = self.read(DWMAC4_HW_FEATURE1);
+                let rx_fifo = DWMAC4_FIFO_BASE_BYTES
+                    .checked_shl(feature & DWMAC4_FIFO_SIZE_MASK)
                     .ok_or(GmacError::Resource("invalid RX FIFO feature"))?;
-                let tx_fifo = 128usize
-                    .checked_shl((feature >> 6) & 0x1f)
+                let tx_fifo = DWMAC4_FIFO_BASE_BYTES
+                    .checked_shl((feature >> DWMAC4_TX_FIFO_SIZE_SHIFT) & DWMAC4_FIFO_SIZE_MASK)
                     .ok_or(GmacError::Resource("invalid TX FIFO feature"))?;
-                if rx_fifo < 256 || tx_fifo < 256 {
+                if rx_fifo < DWMAC4_MTL_FIFO_UNIT_BYTES || tx_fifo < DWMAC4_MTL_FIFO_UNIT_BYTES {
                     return Err(GmacError::Resource("GMAC FIFO is too small"));
                 }
                 self.write(
-                    0xd00,
-                    (((tx_fifo / 256 - 1).min(0x1ff) as u32) << 16) | (2 << 2) | (1 << 1),
+                    DWMAC4_MTL_TX_OPERATION,
+                    (((tx_fifo / DWMAC4_MTL_FIFO_UNIT_BYTES - 1).min(DWMAC4_MTL_TX_SIZE_MAX)
+                        as u32)
+                        << DWMAC4_MTL_TX_SIZE_SHIFT)
+                        | DWMAC4_MTL_TX_QUEUE_ENABLE
+                        | DWMAC4_MTL_TX_STORE_FORWARD,
                 );
-                self.write(0xd18, 0x10);
+                self.write(DWMAC4_MTL_TX_WEIGHT, DWMAC4_MTL_TX_WEIGHT_DEFAULT);
                 self.write(
-                    0xd30,
-                    (((rx_fifo / 256 - 1).min(0x3ff) as u32) << 20) | (1 << 5),
+                    DWMAC4_MTL_RX_OPERATION,
+                    (((rx_fifo / DWMAC4_MTL_FIFO_UNIT_BYTES - 1).min(DWMAC4_MTL_RX_SIZE_MAX)
+                        as u32)
+                        << DWMAC4_MTL_RX_SIZE_SHIFT)
+                        | DWMAC4_MTL_RX_STORE_FORWARD,
                 );
-                self.write(0xa0, 2);
-                self.write(0xa4, 1 << 20);
+                self.write(DWMAC4_RX_QUEUE_CONTROL0, DWMAC4_RX_QUEUE_DCB);
+                self.write(DWMAC4_RX_QUEUE_CONTROL1, DWMAC4_MULTICAST_BROADCAST_QUEUE);
                 // 接受广播、全部组播与 MAC0 精确匹配，硬件不处理协议校验或 FCS stripping。
-                self.write(0x8, (1 << 10) | (1 << 4));
-                self.write(0x70, 0);
-                self.write(0x90, 0);
-                self.write(0xb4, 0);
-                self.write(0x1000, 1 << 19);
-                self.write(0x1100, inner.rx_ring.skip_length() << 18);
-                self.write(0x1104, (8 << 16) | (1 << 4));
-                self.write(0x1108, (8 << 16) | ((BUFFER_LEN as u32) << 1));
-                self.write(0x1110, (inner.tx_ring.address(0) >> 32) as u32);
-                self.write(0x1114, inner.tx_ring.address(0) as u32);
-                self.write(0x1118, (inner.rx_ring.address(0) >> 32) as u32);
-                self.write(0x111c, inner.rx_ring.address(0) as u32);
-                self.write(0x112c, RING_LEN as u32 - 1);
-                self.write(0x1130, RING_LEN as u32 - 1);
-                self.write(0x1120, inner.tx_ring.address(0) as u32);
-                self.write(0x1128, inner.rx_ring.address(RING_LEN - 1) as u32);
-                self.write(0, 0);
+                self.write(
+                    DWMAC4_PACKET_FILTER,
+                    MAC_FILTER_HASH_OR_PERFECT | MAC_FILTER_MULTICAST,
+                );
+                self.write(DWMAC4_TX_FLOW_CONTROL, 0);
+                self.write(DWMAC4_RX_FLOW_CONTROL, 0);
+                self.write(DWMAC4_INTERRUPT_ENABLE, 0);
+                self.write(DMA_BUS_MODE, DWMAC4_DMA_DESCRIPTOR_CACHE);
+                self.write(
+                    DWMAC4_DMA_CHANNEL_CONTROL,
+                    inner.rx_ring.skip_length() << DWMAC4_DMA_SKIP_SHIFT,
+                );
+                self.write(
+                    DWMAC4_DMA_TX_CONTROL,
+                    (DMA_BURST_LENGTH << DWMAC4_DMA_BURST_SHIFT) | DWMAC4_DMA_SECOND_PACKET,
+                );
+                self.write(
+                    DWMAC4_DMA_RX_CONTROL,
+                    (DMA_BURST_LENGTH << DWMAC4_DMA_BURST_SHIFT)
+                        | ((BUFFER_LEN as u32) << DWMAC4_DMA_RX_BUFFER_SHIFT),
+                );
+                self.write(
+                    DWMAC4_DMA_TX_BASE_HIGH,
+                    (inner.tx_ring.address(0) >> u32::BITS) as u32,
+                );
+                self.write(DWMAC4_DMA_TX_BASE, inner.tx_ring.address(0) as u32);
+                self.write(
+                    DWMAC4_DMA_RX_BASE_HIGH,
+                    (inner.rx_ring.address(0) >> u32::BITS) as u32,
+                );
+                self.write(DWMAC4_DMA_RX_BASE, inner.rx_ring.address(0) as u32);
+                self.write(DWMAC4_DMA_TX_RING_LENGTH, RING_LEN as u32 - 1);
+                self.write(DWMAC4_DMA_RX_RING_LENGTH, RING_LEN as u32 - 1);
+                self.write(DWMAC4_DMA_TX_TAIL, inner.tx_ring.address(0) as u32);
+                self.write(
+                    DWMAC4_DMA_RX_TAIL,
+                    inner.rx_ring.address(RING_LEN - 1) as u32,
+                );
+                self.write(MAC_CONFIG, 0);
             }
             Generation::Dwmac1000 => {
-                if self.read(0x1058) & (1 << 24) == 0 {
+                if self.read(DWMAC1000_DMA_HW_FEATURE) & DWMAC1000_ENHANCED_DESCRIPTORS == 0 {
                     return Err(GmacError::Resource(
                         "GMAC enhanced descriptors are unavailable",
                     ));
                 }
                 // 增强格式32B，DSL单位为32bit字；非一致64B槽需跳八字，ATDS必须置位。
                 self.write(
-                    0x1000,
-                    (inner.rx_ring.skip_length() << 2)
-                        | (1 << 7)
-                        | (8 << 8)
-                        | (8 << 17)
-                        | (1 << 23),
+                    DMA_BUS_MODE,
+                    (inner.rx_ring.skip_length() << DWMAC1000_DMA_SKIP_SHIFT)
+                        | DWMAC1000_DMA_ALTERNATE_DESCRIPTOR
+                        | (DMA_BURST_LENGTH << DWMAC1000_DMA_TX_BURST_SHIFT)
+                        | (DMA_BURST_LENGTH << DWMAC1000_DMA_RX_BURST_SHIFT)
+                        | DWMAC1000_DMA_SEPARATE_BURST,
                 );
-                self.write(0x100c, inner.rx_ring.address(0) as u32);
-                self.write(0x1010, inner.tx_ring.address(0) as u32);
-                self.write(0x1018, (1 << 25) | (1 << 21) | (1 << 2));
-                self.write(0x3c, 0x60f);
-                self.write(0x4, (1 << 10) | (1 << 4));
-                self.write(0x18, 0);
-                self.write(0x10c, u32::MAX);
-                self.write(0x110, u32::MAX);
-                self.write(0x200, u32::MAX);
-                self.write(0, 1 << 16);
+                self.write(DWMAC1000_DMA_RX_BASE, inner.rx_ring.address(0) as u32);
+                self.write(DWMAC1000_DMA_TX_BASE, inner.tx_ring.address(0) as u32);
+                self.write(
+                    DWMAC1000_DMA_CONTROL,
+                    DWMAC1000_DMA_RX_STORE_FORWARD
+                        | DWMAC1000_DMA_TX_STORE_FORWARD
+                        | DWMAC1000_DMA_SECOND_FRAME,
+                );
+                self.write(DWMAC1000_INTERRUPT_MASK, DWMAC1000_MAC_INTERRUPT_DISABLE);
+                self.write(
+                    DWMAC1000_FRAME_FILTER,
+                    MAC_FILTER_HASH_OR_PERFECT | MAC_FILTER_MULTICAST,
+                );
+                self.write(DWMAC1000_FLOW_CONTROL, 0);
+                self.write(DWMAC1000_MMC_RX_INTERRUPT_MASK, u32::MAX);
+                self.write(DWMAC1000_MMC_TX_INTERRUPT_MASK, u32::MAX);
+                self.write(DWMAC1000_MMC_RX_IPC_INTERRUPT_MASK, u32::MAX);
+                self.write(MAC_CONFIG, DWMAC1000_MAC_DISABLE_CARRIER_SENSE);
             }
         }
         Ok(())
@@ -299,12 +494,23 @@ impl Registers {
     fn start_dma(self) {
         match self.generation {
             Generation::Dwmac4 => {
-                self.write(0x1104, self.read(0x1104) | 1);
-                self.write(0x1108, self.read(0x1108) | 1);
+                self.write(
+                    DWMAC4_DMA_TX_CONTROL,
+                    self.read(DWMAC4_DMA_TX_CONTROL) | DWMAC4_DMA_START_TX,
+                );
+                self.write(
+                    DWMAC4_DMA_RX_CONTROL,
+                    self.read(DWMAC4_DMA_RX_CONTROL) | DWMAC4_DMA_START_RX,
+                );
             }
             Generation::Dwmac1000 => {
-                self.write(0x1018, self.read(0x1018) | (1 << 13) | (1 << 1));
-                self.write(0x1008, 0);
+                self.write(
+                    DWMAC1000_DMA_CONTROL,
+                    self.read(DWMAC1000_DMA_CONTROL)
+                        | DWMAC1000_DMA_START_TX
+                        | DWMAC1000_DMA_START_RX,
+                );
+                self.write(DWMAC1000_DMA_RX_POLL, 0);
             }
         }
     }
@@ -312,31 +518,49 @@ impl Registers {
     /// DWMAC4 用 tail 边界，DWMAC1000 用 poll-demand，不能交换两代通知格式。
     fn notify(self, receive: bool, tail: u64) {
         match self.generation {
-            Generation::Dwmac4 => self.write(if receive { 0x1128 } else { 0x1120 }, tail as u32),
-            Generation::Dwmac1000 => self.write(if receive { 0x1008 } else { 0x1004 }, 0),
+            Generation::Dwmac4 => self.write(
+                if receive {
+                    DWMAC4_DMA_RX_TAIL
+                } else {
+                    DWMAC4_DMA_TX_TAIL
+                },
+                tail as u32,
+            ),
+            Generation::Dwmac1000 => self.write(
+                if receive {
+                    DWMAC1000_DMA_RX_POLL
+                } else {
+                    DWMAC1000_DMA_TX_POLL
+                },
+                0,
+            ),
         }
     }
 
     /// 仅改变真实协商出的 MAC 速率和双工；没有 carrier 时停止 MAC 接收与发送。
     fn set_link(self, link: Option<Link>) {
         let (enable, duplex) = match self.generation {
-            Generation::Dwmac4 => (3, 1 << 13),
-            Generation::Dwmac1000 => ((1 << 2) | (1 << 3), 1 << 11),
+            Generation::Dwmac4 => (DWMAC4_MAC_TRANSMIT | DWMAC4_MAC_RECEIVE, DWMAC4_MAC_DUPLEX),
+            Generation::Dwmac1000 => (
+                DWMAC1000_MAC_RECEIVE | DWMAC1000_MAC_TRANSMIT,
+                DWMAC1000_MAC_DUPLEX,
+            ),
         };
-        let mut control = self.read(0) & !(enable | duplex | (1 << 15) | (1 << 14));
-        self.write(0, control);
+        let mut control =
+            self.read(MAC_CONFIG) & !(enable | duplex | MAC_PORT_SELECT | MAC_FAST_ETHERNET);
+        self.write(MAC_CONFIG, control);
         if let Some(link) = link {
             control |= enable;
             if link.full_duplex {
                 control |= duplex;
             }
-            if link.speed < 1000 {
-                control |= 1 << 15;
+            if link.speed < SPEED_1000 {
+                control |= MAC_PORT_SELECT;
             }
-            if link.speed == 100 {
-                control |= 1 << 14;
+            if link.speed == SPEED_100 {
+                control |= MAC_FAST_ETHERNET;
             }
-            self.write(0, control);
+            self.write(MAC_CONFIG, control);
         }
     }
 }
@@ -442,11 +666,11 @@ impl Dwmac {
             }
         };
         let minimum = match generation {
-            Generation::Dwmac4 => 0x1164,
-            Generation::Dwmac1000 => 0x105c,
+            Generation::Dwmac4 => DWMAC4_DMA_STATUS + REGISTER_BYTES,
+            Generation::Dwmac1000 => DWMAC1000_MMIO_MIN_BYTES,
         };
         if resources.registers.start == 0
-            || resources.registers.start % 4 != 0
+            || resources.registers.start % REGISTER_BYTES != 0
             || resources
                 .registers
                 .end
@@ -466,12 +690,13 @@ impl Dwmac {
         // SAFETY: syscon 与 MAC 同属本次独占硬件，资源检查覆盖写入的完整字段。
         unsafe { configure_interface(resources, generation) }?;
         let version = registers.read(match generation {
-            Generation::Dwmac4 => 0x110,
-            Generation::Dwmac1000 => 0x20,
-        }) & 0xff;
+            Generation::Dwmac4 => DWMAC4_VERSION,
+            Generation::Dwmac1000 => DWMAC1000_VERSION,
+        }) & MAC_VERSION_MASK;
         if !matches!(
             (generation, version),
-            (Generation::Dwmac4, 0x51 | 0x52) | (Generation::Dwmac1000, 0x37)
+            (Generation::Dwmac4, DWMAC_CORE_5_10 | DWMAC_CORE_5_20)
+                | (Generation::Dwmac1000, DWMAC_CORE_3_70)
         ) {
             return Err(GmacError::Resource(
                 "selected GMAC hardware version is unsupported",
@@ -496,7 +721,7 @@ impl Dwmac {
             phy::clock_range(frequency)?
         } else {
             // 所选 LS2K1000LA 平台要求 CSR100–150MHz 的 /62 编码，不伪造精确输入率。
-            1
+            phy::CSR_100_150M
         };
         let phy = Phy::prepare(registers, resources, csr_divider)?;
         // CSR/MDIO 时钟已由板设置开启，管理事务不依赖 RGMII RXC 或 DMA 复位；
@@ -504,7 +729,11 @@ impl Dwmac {
         registers.request_reset();
         registers.wait_reset()?;
         let line = boot::info().board.cache_line_size;
-        if !resources.dma_coherent && (line == 0 || 64 < line || !line.is_power_of_two()) {
+        if !resources.dma_coherent
+            && (line == 0
+                || descriptors::ISOLATED_DESCRIPTOR_BYTES < line
+                || !line.is_power_of_two())
+        {
             return Err(GmacError::Resource(
                 "GMAC cacheline does not fit descriptor isolation",
             ));
@@ -1014,16 +1243,16 @@ impl Dwmac {
         if self.registers.generation != Generation::Dwmac4 || self.resources.tx_use_rgmii_clock {
             return Ok(());
         }
-        if self.resources.setup.clocks.count < 4 {
+        if self.resources.setup.clocks.count < STARFIVE_TX_CLOCK_INDEX + 1 {
             return Err(GmacError::Resource("GMAC TX clock is missing"));
         }
         let mut setup = DeviceSetup::default();
         setup.clocks.count = 1;
-        setup.clocks.entries[0] = self.resources.setup.clocks.entries[3];
+        setup.clocks.entries[0] = self.resources.setup.clocks.entries[STARFIVE_TX_CLOCK_INDEX];
         setup.clocks.entries[0].rate = Some(match link.speed {
-            1000 => 125_000_000,
-            100 => 25_000_000,
-            10 => 2_500_000,
+            SPEED_1000 => RGMII_GIGABIT_CLOCK_HZ,
+            SPEED_100 => MII_FAST_ETHERNET_CLOCK_HZ,
+            SPEED_10 => MII_ETHERNET_CLOCK_HZ,
             _ => return Err(GmacError::Io("invalid negotiated GMAC speed")),
         });
         // SAFETY: 同一 MAC 的真实规范化时钟引用和永久 provider 映射仍由根拥有，
@@ -1189,13 +1418,13 @@ unsafe fn configure_interface(
     let offset = resources.sysreg[0] as usize;
     let shift = resources.sysreg[1];
     if resources.syscon.start == 0
-        || offset % 4 != 0
-        || 29 < shift
+        || offset % REGISTER_BYTES != 0
+        || u32::BITS - STARFIVE_INTERFACE_BITS < shift
         || resources
             .syscon
             .end
             .checked_sub(resources.syscon.start)
-            .is_none_or(|length| length < offset + 4)
+            .is_none_or(|length| length < offset + REGISTER_BYTES)
     {
         return Err(GmacError::Resource(
             "GMAC interface syscon field is invalid",
@@ -1203,16 +1432,16 @@ unsafe fn configure_interface(
     }
     let address = arch::mmio_address(resources.syscon.start) + offset;
     let mode = if resources.phy_mode == boot::PhyMode::Rmii {
-        4
+        STARFIVE_INTERFACE_RMII
     } else {
-        1
+        STARFIVE_INTERFACE_RGMII
     };
     // SAFETY: offset/shift 和完整窗口已核对，调用者独占此实际字段，volatile 不借设备内存引用。
     unsafe {
         let value = ptr::read_volatile(address as *const u32);
         ptr::write_volatile(
             address as *mut u32,
-            (value & !(7 << shift)) | (mode << shift),
+            (value & !(STARFIVE_INTERFACE_MASK << shift)) | (mode << shift),
         );
     }
     arch::dma_barrier();

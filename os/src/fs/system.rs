@@ -12,6 +12,10 @@ use crate::fs::{
 };
 use crate::mm::PAGE_SIZE;
 
+const METADATA_CACHE_CAPACITY: usize = 64;
+const DENTRY_CAPACITY: usize = 128;
+const MOUNT_CAPACITY: usize = 12;
+
 /// 启动参数选中的精确设备和分区；是否存在由已发现的视图表检查。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BootDevices<'a> {
@@ -77,8 +81,14 @@ pub(crate) fn mount_disks(
     root_mode: AccessMode,
     rootdir: &[u8],
 ) -> Result<(Vfs, FsContext), FsError> {
-    let volume = Ext4Volume::open(root, root_mode, 64)?;
-    let vfs = Vfs::try_new(Filesystem::Ext4(volume), inodes, 128, 12, root_mode)?;
+    let volume = Ext4Volume::open(root, root_mode, METADATA_CACHE_CAPACITY)?;
+    let vfs = Vfs::try_new(
+        Filesystem::Ext4(volume),
+        inodes,
+        DENTRY_CAPACITY,
+        MOUNT_CAPACITY,
+        root_mode,
+    )?;
     let physical_root = vfs.root();
     let physical_context = FsContext::new(physical_root.clone(), physical_root)?;
     let root = vfs.resolve(&physical_context, rootdir, ResolveMode::Follow)?;
@@ -86,7 +96,7 @@ pub(crate) fn mount_disks(
     drop(physical_context);
     if let Some(extra) = extra {
         let covered = vfs.resolve(&context, b"/mnt/extra", ResolveMode::Follow)?;
-        let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, 64)?;
+        let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, METADATA_CACHE_CAPACITY)?;
         vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly)?;
     }
     Ok((vfs, context))

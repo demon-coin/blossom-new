@@ -6,7 +6,7 @@ use core::ops::Range;
 
 use crate::block::{
     Bio, BioAllocator, BioCompletion, BioLane, BioReserve, BlockError, FsClaim, MetadataIoContext,
-    MAX_BATCH,
+    MAX_BATCH, SECTOR_BYTES,
 };
 use crate::cache::FolioMark;
 use crate::fs::background::WritebackDomain;
@@ -14,7 +14,7 @@ use crate::fs::{BlockMapping, Ext4Volume, FsError, InodeRef};
 use crate::mm::{FolioRef, FolioWriteback, PAGE_SIZE};
 use crate::task::ReclaimScope;
 
-const SECTORS_PER_PAGE: usize = PAGE_SIZE / 512;
+const SECTORS_PER_PAGE: usize = PAGE_SIZE / SECTOR_BYTES as usize;
 const WINDOW_RANGES: usize = MAX_BATCH * SECTORS_PER_PAGE;
 
 /// 一个有界准备窗口只保存原页引用和真实块地址，不复制页内容。
@@ -474,8 +474,8 @@ fn prepare_metadata_page(
     while pending != 0 {
         let start = pending.trailing_zeros() as usize;
         let count = (pending >> start).trailing_ones() as usize;
-        let offset = start * 512;
-        let len = count * 512;
+        let offset = start * SECTOR_BYTES as usize;
+        let len = count * SECTOR_BYTES as usize;
         let target = byte_offset
             .checked_add(offset as u64)
             .ok_or(BlockError::InvalidRange)?;
@@ -545,5 +545,5 @@ fn page_window(range: &Range<u64>) -> Result<(u64, u64), FsError> {
 
 /// 把已经校验的页内准确范围转换为原 PageDesc 的八位 sector mask。
 fn range_mask(offset: usize, len: usize) -> u8 {
-    (((1u16 << (len / 512)) - 1) << (offset / 512)) as u8
+    (((1u16 << (len / SECTOR_BYTES as usize)) - 1) << (offset / SECTOR_BYTES as usize)) as u8
 }

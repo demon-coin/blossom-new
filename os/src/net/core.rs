@@ -9,9 +9,14 @@ use smoltcp::wire::IpVersion;
 
 use crate::fs::{FsError, ReadBuffer, WriteBuffer};
 use crate::net::address::{AddressFamily, InetEndpoint};
-use crate::net::packet::{zeroed_bytes, OwnedPacket};
+use crate::net::packet::{zeroed_bytes, OwnedPacket, MAX_IP_PACKET_LEN};
+use crate::net::socket::STREAM_PREFIX_LEN;
 use crate::net::IoProgress;
-use crate::time::MonotonicInstant;
+use crate::time::{MonotonicInstant, NSEC_PER_USEC};
+
+const TCP_MAX_RECEIVE_CAPACITY: usize = 1 << 30;
+const IPV4_MIN_MTU: usize = 68;
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(7200);
 
 /// 立即工作、绝对定时和仅等待输入保持不同责任，egress 阻塞由真实容量源解除。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,10 +45,10 @@ impl TcpCore {
         ip_mtu: usize,
         seed: u64,
     ) -> Result<Self, FsError> {
-        if rx_len == 0 || tx_len == 0 || (1usize << 30) < rx_len {
+        if rx_len == 0 || tx_len == 0 || TCP_MAX_RECEIVE_CAPACITY < rx_len {
             return Err(FsError::InvalidOperation);
         }
-        if ip_mtu < 68 || (u16::MAX as usize) < ip_mtu {
+        if ip_mtu < IPV4_MIN_MTU || MAX_IP_PACKET_LEN < ip_mtu {
             return Err(FsError::InvalidOperation);
         }
         let mut socket = tcp::Socket::new(
@@ -148,7 +153,9 @@ impl TcpCore {
             PollAt::Ingress => ProtocolDeadline::Ingress,
             PollAt::Time(at) => {
                 let micros = u64::try_from(at.total_micros()).expect("negative TCP deadline");
-                let nanos = micros.checked_mul(1000).expect("TCP deadline overflow");
+                let nanos = micros
+                    .checked_mul(NSEC_PER_USEC)
+                    .expect("TCP deadline overflow");
                 ProtocolDeadline::At(MonotonicInstant::from_nanos(nanos))
             }
         }
@@ -165,7 +172,7 @@ impl TcpCore {
             return Ok(IoProgress::Ready(0));
         }
         let before = target.copied();
-        let mut prefix = [0u8; 4096];
+        let mut prefix = [0u8; STREAM_PREFIX_LEN];
         let length = {
             let bytes = match self.socket.peek((target.len() - before).min(prefix.len())) {
                 Ok(bytes) => bytes,
@@ -311,13 +318,13 @@ impl TcpCore {
     /// 原 TCP 探测使用 7200 秒，关闭直接撤销原探测期限。
     pub fn set_keepalive(&mut self, enabled: bool) {
         self.socket
-            .set_keep_alive(enabled.then_some(Duration::from_secs(7200)));
+            .set_keep_alive(enabled.then_some(TCP_KEEPALIVE_IDLE));
     }
 
     /// 路由已选择实际源和介质后更新唯一发送环境。
     pub fn set_ip_mtu(&mut self, mtu: usize) {
         assert!(
-            68 <= mtu && mtu <= u16::MAX as usize,
+            IPV4_MIN_MTU <= mtu && mtu <= MAX_IP_PACKET_LEN,
             "invalid TCP route MTU"
         );
         self.context.set_ip_mtu(mtu);
@@ -389,5 +396,5 @@ fn copy_progress(copied: usize, result: Result<usize, FsError>) -> Result<IoProg
 
 /// 单调纳秒转 raw 微秒；u64 纳秒除以一千后始终可表示为 i64。
 fn raw_time(now: MonotonicInstant) -> Instant {
-    Instant::from_micros((now.as_nanos() / 1000) as i64)
+    Instant::from_micros((now.as_nanos() / NSEC_PER_USEC) as i64)
 }

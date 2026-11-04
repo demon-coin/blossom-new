@@ -16,6 +16,8 @@ use crate::task::{self, JoinHandle, PreparedTask};
 use crate::time::Duration;
 use crate::timer;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
+
+const CREATE_COOLDOWN: Duration = Duration::from_secs(1);
 #[cfg(feature = "ktest")]
 pub(super) static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -854,7 +856,7 @@ fn manager(cpu: usize) -> i32 {
                     }
                     wake_rescuers(cpu);
                     // 管理等待已撤销，固定栈 timer 独占下一代 Waiter；冷却期间不持 STATE_LOCK。
-                    timer::sleep(Duration::from_secs(1));
+                    timer::sleep(CREATE_COOLDOWN);
                 }
             }
         }
@@ -1145,8 +1147,15 @@ pub(super) mod testing {
         Finished,
         BeforeWait,
     }
-    static PAUSE: [[AtomicUsize; 3]; crate::boot::MAX_CPUS] =
-        [const { [const { AtomicUsize::new(0) }; 3] }; crate::boot::MAX_CPUS];
+    const PAUSE_POINTS: usize = PausePoint::BeforeWait as usize + 1;
+    const ARMED: usize = 1;
+    const PAUSED: usize = 2;
+    const RELEASED: usize = 3;
+    const PAUSE_TIMEOUT_SECONDS: u64 = 10;
+    const SERVICE_TIMEOUT_SECONDS: u64 = 10;
+    const SERVICES_PER_CPU: usize = 2;
+    static PAUSE: [[AtomicUsize; PAUSE_POINTS]; crate::boot::MAX_CPUS] =
+        [const { [const { AtomicUsize::new(0) }; PAUSE_POINTS] }; crate::boot::MAX_CPUS];
     /// 真实当前与累积池计数，sleeping/running 是成对 scheduler 反馈而非模型值。
     pub(crate) struct PoolStats {
         pub workers: usize,
@@ -1194,7 +1203,7 @@ pub(super) mod testing {
     /// 返回每 CPU 的原 manager 与基础 worker 数，不计动态执行者或域救援者。
     /// 仅在服务初始化、入口登记及停稳之后用于常驻基线，不创建另一份任务统计。
     pub(crate) fn service_count() -> usize {
-        2 * cpu::count()
+        SERVICES_PER_CPU * cpu::count()
     }
     /// 取得常驻服务的真实弱观察：2*CPU 为 manager，2*CPU+1 为基础 worker。
     /// 入口尚未登记或索引越界返回 None；只在状态锁内复制 Weak，升级和最终 Drop 均在锁外。
@@ -1207,8 +1216,8 @@ pub(super) mod testing {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 索引对应真实永久池，活链的池强票保活节点；锁只保护遍历和复制原弱观察。
             unsafe {
-                let state = &*pool(index / 2).state.get();
-                if index % 2 == 0 {
+                let state = &*pool(index / SERVICES_PER_CPU).state.get();
+                if index % SERVICES_PER_CPU == 0 {
                     state.manager_task.clone()
                 } else {
                     let mut cursor = state.workers_head;
@@ -1235,7 +1244,7 @@ pub(super) mod testing {
     pub(crate) fn wait_services_blocked() {
         let start = crate::arch::read_counter();
         let limit = crate::arch::counter_frequency()
-            .checked_mul(10)
+            .checked_mul(SERVICE_TIMEOUT_SECONDS)
             .expect("work service deadline overflow");
         loop {
             let mut ready = true;
@@ -1287,20 +1296,30 @@ pub(super) mod testing {
     pub(crate) fn arm_pause(cpu: usize, point: PausePoint) {
         assert!(cpu < cpu::count());
         assert_eq!(
-            PAUSE[cpu][point as usize].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire),
+            PAUSE[cpu][point as usize].compare_exchange(
+                0,
+                ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            ),
             Ok(0)
         );
     }
     /// 检查真实执行者是否已到达指定窗口，不混淆同 CPU 的不同停点。
     pub(crate) fn is_paused(cpu: usize, point: PausePoint) -> bool {
-        PAUSE[cpu][point as usize].load(Ordering::Acquire) == 2
+        PAUSE[cpu][point as usize].load(Ordering::Acquire) == PAUSED
     }
     /// 唯一 Thread 控制者放行指定窗口的真实执行者。
     /// 不得持状态锁、调度锁或执行者退出依赖锁；与取消串行，返回不代表已经完成 close/join。
     pub(crate) fn release_pause(cpu: usize, point: PausePoint) {
         assert_eq!(
-            PAUSE[cpu][point as usize].compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
-            Ok(2)
+            PAUSE[cpu][point as usize].compare_exchange(
+                PAUSED,
+                RELEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            ),
+            Ok(PAUSED)
         );
     }
     /// 取消尚未到达的武装，或按原 2→3 握手放行已经暂停的真实 worker。
@@ -1315,9 +1334,9 @@ pub(super) mod testing {
         loop {
             let state = pause.load(Ordering::Acquire);
             let next = match state {
-                0 | 3 => return,
-                1 => 0,
-                2 => 3,
+                0 | RELEASED => return,
+                ARMED => 0,
+                PAUSED => RELEASED,
                 _ => unreachable!("invalid work pause state"),
             };
             if pause
@@ -1332,22 +1351,22 @@ pub(super) mod testing {
     pub(super) fn pause(cpu: usize, point: PausePoint) {
         let pause = &PAUSE[cpu][point as usize];
         if pause
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
         let start = crate::arch::read_counter();
         let limit = crate::arch::counter_frequency()
-            .checked_mul(10)
+            .checked_mul(PAUSE_TIMEOUT_SECONDS)
             .expect("work pause deadline overflow");
-        while pause.load(Ordering::Acquire) == 2 {
+        while pause.load(Ordering::Acquire) == PAUSED {
             assert!(
                 crate::arch::read_counter().wrapping_sub(start) < limit,
                 "work pause deadline expired"
             );
             core::hint::spin_loop();
         }
-        assert_eq!(pause.swap(0, Ordering::AcqRel), 3);
+        assert_eq!(pause.swap(0, Ordering::AcqRel), RELEASED);
     }
 }

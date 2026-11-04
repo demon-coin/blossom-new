@@ -30,6 +30,15 @@ const KICK_STOP: usize = 1 << 3;
 /// 仅唤醒 idle 核重查 ready 队列，不向可能已经运行的新任务请求抢占。
 pub(crate) const KICK_SCHED_WAKE: usize = 1 << 4;
 
+#[cfg(feature = "ktest")]
+const TEST_PAUSE_IDLE: usize = 0;
+#[cfg(feature = "ktest")]
+const TEST_PAUSE_ARMED: usize = 1;
+#[cfg(feature = "ktest")]
+const TEST_PAUSE_REACHED: usize = 2;
+#[cfg(feature = "ktest")]
+const TEST_PAUSE_RELEASED: usize = 3;
+
 /// 链接期保留的主核启动栈，不依赖页分配器。
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -186,9 +195,9 @@ impl CpuLocal {
             kick_reasons: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             #[cfg(feature = "ktest")]
-            test_idle_pause: AtomicUsize::new(0),
+            test_idle_pause: AtomicUsize::new(TEST_PAUSE_IDLE),
             #[cfg(feature = "ktest")]
-            test_ipi_pause: AtomicUsize::new(0),
+            test_ipi_pause: AtomicUsize::new(TEST_PAUSE_IDLE),
             #[cfg(feature = "ktest")]
             test_idle_waits: AtomicUsize::new(0),
             #[cfg(feature = "ktest")]
@@ -399,6 +408,8 @@ pub(crate) fn wait_until_started(ready: &AtomicBool) {
 /// 全部 AP 尚未启动；记录交给固件后不得再改写或回收对应栈，映射永久有效。
 /// 等待期间若 AP 会向 BSP 提交同步 CSD，本核须能服务对应 IPI；不得持有目标初始化所需的锁。
 pub unsafe fn start_secondaries() {
+    const AP_ONLINE_TIMEOUT_SECS: u64 = 5;
+
     for id in 1..count() {
         let local = get(id);
         // SAFETY: id 位于已构造的 CPU 范围，静态记录已发布且不会被回收。
@@ -414,7 +425,8 @@ pub unsafe fn start_secondaries() {
                 local.hardware_id, error
             );
         }
-        let deadline = crate::arch::read_counter() + crate::boot::info().counter_frequency * 5;
+        let deadline = crate::arch::read_counter()
+            + crate::boot::info().counter_frequency * AP_ONLINE_TIMEOUT_SECS;
         while !local.online.load(Ordering::Acquire) {
             if deadline <= crate::arch::read_counter() {
                 // SAFETY: 超时目标可能正在使用栈；仅回收从未尝试启动的后缀。
@@ -751,21 +763,31 @@ fn test_pause_state(target: usize, boundary: TestPause) -> &'static AtomicUsize 
 #[cfg(feature = "ktest")]
 pub(crate) fn test_arm_pause(target: usize, boundary: TestPause) {
     test_pause_state(target, boundary)
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            TEST_PAUSE_IDLE,
+            TEST_PAUSE_ARMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .expect("CPU test pause already armed");
 }
 
 /// 观察目标是否已经在真实 IRQ-off 边界停下。
 #[cfg(feature = "ktest")]
 pub(crate) fn test_is_paused(target: usize, boundary: TestPause) -> bool {
-    test_pause_state(target, boundary).load(Ordering::Acquire) == 2
+    test_pause_state(target, boundary).load(Ordering::Acquire) == TEST_PAUSE_REACHED
 }
 
 /// 释放已经到达的停点，不改变软件通知或硬件 pending。
 #[cfg(feature = "ktest")]
 pub(crate) fn test_release_pause(target: usize, boundary: TestPause) {
     test_pause_state(target, boundary)
-        .compare_exchange(2, 3, Ordering::Release, Ordering::Relaxed)
+        .compare_exchange(
+            TEST_PAUSE_REACHED,
+            TEST_PAUSE_RELEASED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
         .expect("CPU test pause has not been reached");
 }
 
@@ -777,9 +799,9 @@ pub(crate) fn test_cancel_pause(target: usize, boundary: TestPause) {
     loop {
         let observed = state.load(Ordering::Acquire);
         let replacement = match observed {
-            0 | 3 => return,
-            1 => 0,
-            2 => 3,
+            TEST_PAUSE_IDLE | TEST_PAUSE_RELEASED => return,
+            TEST_PAUSE_ARMED => TEST_PAUSE_IDLE,
+            TEST_PAUSE_REACHED => TEST_PAUSE_RELEASED,
             _ => panic!("CPU test pause has invalid state"),
         };
         if state
@@ -794,8 +816,15 @@ pub(crate) fn test_cancel_pause(target: usize, boundary: TestPause) {
 /// 仅在已武装时停留于本核无锁边界，以统一单调时钟限制验收等待。
 #[cfg(feature = "ktest")]
 fn test_pause_boundary(state: &AtomicUsize) {
+    const TIMEOUT: crate::time::Duration = crate::time::Duration::from_secs(5);
+
     if state
-        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            TEST_PAUSE_ARMED,
+            TEST_PAUSE_REACHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         return;
@@ -805,13 +834,13 @@ fn test_pause_boundary(state: &AtomicUsize) {
         "CPU test pause requires IRQ off"
     );
     let deadline = crate::time::now()
-        .checked_add(crate::time::Duration::from_secs(5))
+        .checked_add(TIMEOUT)
         .expect("CPU test pause deadline overflows");
-    while state.load(Ordering::Acquire) != 3 {
+    while state.load(Ordering::Acquire) != TEST_PAUSE_RELEASED {
         assert!(crate::time::now() < deadline, "CPU test pause timed out");
         spin_loop();
     }
-    state.store(0, Ordering::Release);
+    state.store(TEST_PAUSE_IDLE, Ordering::Release);
 }
 
 /// 在 idle 发表且放开调度锁后、最终队列与提示检查之前提供单次停点。

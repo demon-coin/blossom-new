@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::bootmem::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
-use crate::mm::{alloc_pages, slub, OwnedPages};
+use crate::mm::{alloc_pages, slub, OwnedPages, PAGE_SHIFT};
 
 struct HeapAllocator;
 
@@ -29,10 +29,7 @@ fn page_order(layout: Layout) -> Option<usize> {
     if PAGE_SIZE << MAX_ORDER < required {
         return None;
     }
-    Some(
-        required.next_power_of_two().trailing_zeros() as usize
-            - PAGE_SIZE.trailing_zeros() as usize,
-    )
+    Some(required.next_power_of_two().trailing_zeros() as usize - PAGE_SHIFT)
 }
 
 // SAFETY: BSP 在任何堆消费者和 AP 运行前发布唯一页与 SLUB 后端，具体静态对象不持有

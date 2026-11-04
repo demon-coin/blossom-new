@@ -4,33 +4,47 @@ use core::arch::asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::arch::loongarch64::register as reg;
+use crate::mm::{PAGE_SHIFT, PAGE_SIZE};
+
 use super::{csr_write, irq_enabled, virt_to_phys};
 use crate::mm::user_table::PagePermissions;
 
-pub const USER_ADDRESS_END: usize = 1 << 39;
-pub const USER_STACK_TOP: usize = USER_ADDRESS_END - 4096;
-pub const SIGNAL_RETURN_PAGE: usize = USER_ADDRESS_END - 4096;
+pub(super) const PT_INDEX_BITS: usize = 9;
+pub(super) const PT_ENTRIES: usize = PAGE_SIZE / core::mem::size_of::<usize>();
+pub(super) const PHYSICAL_BITS: usize = 48;
+pub(super) const USER_ADDRESS_BITS: usize = PAGE_SHIFT + USER_LEVELS * PT_INDEX_BITS;
+pub const USER_ADDRESS_END: usize = 1 << USER_ADDRESS_BITS;
+pub const USER_STACK_TOP: usize = USER_ADDRESS_END - PAGE_SIZE;
+pub const SIGNAL_RETURN_PAGE: usize = USER_ADDRESS_END - PAGE_SIZE;
 pub const USER_LEVELS: usize = 3;
 
 const VALID: usize = 1;
 const DIRTY: usize = 1 << 1;
-const USER: usize = 3 << 2;
+const USER: usize = reg::PLV_USER << 2;
 const CACHED: usize = 1 << 4;
 const PRESENT: usize = 1 << 7;
 const WRITE: usize = 1 << 8;
 const PROTNONE: usize = 1 << 10;
 const NO_READ: usize = 1 << 61;
 const NO_EXEC: usize = 1 << 62;
-const PHYSICAL: usize = ((1usize << 48) - 1) & !4095;
+const PWCL_PTWIDTH_SHIFT: usize = 5;
+const PWCL_DIR0BASE_SHIFT: usize = 10;
+const PWCL_DIR0WIDTH_SHIFT: usize = 15;
+const PWCH_DIR2WIDTH_SHIFT: usize = 6;
+const TLBIDX_PS_SHIFT: usize = 24;
+const INVTLB_ALL_NONGLOBAL: usize = 0x3;
+
+const PHYSICAL: usize = ((1usize << PHYSICAL_BITS) - 1) & !(PAGE_SIZE - 1);
 
 #[repr(C, align(4096))]
-struct InvalidTable([usize; 512]);
+struct InvalidTable([usize; PT_ENTRIES]);
 
 // refill 在 DA 下访问这些永久物理页；初始化完成后不再修改。
 #[no_mangle]
-static mut LA_INVALID_ROOT: InvalidTable = InvalidTable([0; 512]);
-static mut INVALID_MIDDLE: InvalidTable = InvalidTable([0; 512]);
-static mut INVALID_LEAF: InvalidTable = InvalidTable([0; 512]);
+static mut LA_INVALID_ROOT: InvalidTable = InvalidTable([0; PT_ENTRIES]);
+static mut INVALID_MIDDLE: InvalidTable = InvalidTable([0; PT_ENTRIES]);
+static mut INVALID_LEAF: InvalidTable = InvalidTable([0; PT_ENTRIES]);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// 在 BSP 独占启动段逐项写入常驻 invalid 链，不在内核栈上构造表数组。
@@ -45,7 +59,7 @@ pub(super) unsafe fn initialize_invalid_tables() {
     let root = addr_of_mut!(LA_INVALID_ROOT).cast::<usize>();
     let middle = addr_of_mut!(INVALID_MIDDLE).cast::<usize>();
     let leaf = addr_of_mut!(INVALID_LEAF).cast::<usize>();
-    for index in 0..512 {
+    for index in 0..PT_ENTRIES {
         // SAFETY: BSP 独占三张静态对齐页，AP 尚未启动；index 严格处于各页边界内。
         unsafe {
             leaf.add(index).write(0);
@@ -137,7 +151,7 @@ pub unsafe fn initialize_user_root(root: *mut usize) {
         INITIALIZED.load(Ordering::Acquire),
         "invalid tables are not initialized"
     );
-    for index in 0..512 {
+    for index in 0..PT_ENTRIES {
         // SAFETY: 调用者保证一整页独占可写，index 小于每页 512 项，写入永久下级 sentinel。
         unsafe { root.add(index).write(user_empty_entry(2)) };
     }
@@ -154,12 +168,19 @@ pub(super) fn initialize_current_cpu() {
     // 三层覆盖 39 位地址，不启用零宽度的 DIR2/DIR4；PTE 宽度为 64 位。
     // SAFETY: 当前 PLV0/IRQ-off，代码和栈仅依赖 DMW；静态 invalid 链已经发布。
     unsafe {
-        csr_write::<0x1c>(12 | (9 << 5) | (21 << 10) | (9 << 15));
-        csr_write::<0x1d>(30 | (9 << 6));
-        csr_write::<0x1e>(12);
-        csr_write::<0x10>(12 << 24);
-        csr_write::<0x8e>(12);
-        csr_write::<0x1a>(virt_to_phys(addr_of_mut!(LA_INVALID_ROOT) as usize));
+        csr_write::<{ reg::CSR_PWCL }>(
+            PAGE_SHIFT
+                | (PT_INDEX_BITS << PWCL_PTWIDTH_SHIFT)
+                | ((PAGE_SHIFT + PT_INDEX_BITS) << PWCL_DIR0BASE_SHIFT)
+                | (PT_INDEX_BITS << PWCL_DIR0WIDTH_SHIFT),
+        );
+        csr_write::<{ reg::CSR_PWCH }>(
+            (PAGE_SHIFT + 2 * PT_INDEX_BITS) | (PT_INDEX_BITS << PWCH_DIR2WIDTH_SHIFT),
+        );
+        csr_write::<{ reg::CSR_STLBPS }>(PAGE_SHIFT);
+        csr_write::<{ reg::CSR_TLBIDX }>(PAGE_SHIFT << TLBIDX_PS_SHIFT);
+        csr_write::<{ reg::CSR_TLBREHI }>(PAGE_SHIFT);
+        csr_write::<{ reg::CSR_PGDH }>(virt_to_phys(addr_of_mut!(LA_INVALID_ROOT) as usize));
     }
     activate_kernel_root();
 }
@@ -171,11 +192,11 @@ pub(super) fn initialize_current_cpu() {
 /// 当前须 PLV0、IRQ 关闭，代码、栈和 CpuLocal 的永久 DMW 映射必须有效。
 pub unsafe fn activate_user_root(root_phys: usize) {
     assert!(!irq_enabled(), "user root switch requires IRQ off");
-    assert_eq!(root_phys & 4095, 0, "unaligned user root");
+    assert_eq!(root_phys & (PAGE_SIZE - 1), 0, "unaligned user root");
     // SAFETY: 调用者保活根和可达页，PGDL 不参与当前 PLV0 DMW 翻译；ASID 固定为零。
     unsafe {
-        csr_write::<0x19>(root_phys);
-        csr_write::<0x18>(0);
+        csr_write::<{ reg::CSR_PGDL }>(root_phys);
+        csr_write::<{ reg::CSR_ASID }>(0);
     }
     flush_user_translations();
 }
@@ -190,7 +211,9 @@ pub fn activate_kernel_root() {
 /// 完成页表写入并失效本核全部非全局项，保留内核 DMW 不受影响。
 pub fn flush_user_translations() {
     // SAFETY: 当前 PLV0；invtlb 0x3 清除 Global=0 的全部项，前置 dbar 排序页表写入。
-    unsafe { asm!("dbar 0", "invtlb 0x3, $zero, $zero", options(nostack)) };
+    unsafe {
+        asm!("dbar 0", "invtlb {operation}, $zero, $zero", operation = const INVTLB_ALL_NONGLOBAL, options(nostack))
+    };
 }
 
 /// 排序用户代码写入并同步本核取指视图。

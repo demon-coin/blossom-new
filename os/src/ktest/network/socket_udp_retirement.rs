@@ -11,7 +11,7 @@ pub(crate) mod socket_udp_retirement {
     use crate::fs::{FileIoContext, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer};
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
-    use crate::net::socket::SocketFile;
+    use crate::net::socket::{SocketFile, MSG_DONTWAIT};
     use crate::net::IoProgress;
     /// 真实发送准备 OOM 后结束末 SocketFile，放压不再提交工作，原 reaper 须归还节点和绑定。
     #[test]
@@ -294,7 +294,7 @@ pub(crate) mod socket_udp_retirement {
                     )?;
                     let record = child_operation(receiver.receive(
                         &mut ReadBuffer::kernel(&mut []),
-                        0x40,
+                        MSG_DONTWAIT,
                         FileIoContext::Kernel,
                     ))?;
                     if record.source != Some(SocketAddress::Inet(old))
@@ -334,7 +334,7 @@ pub(crate) mod socket_udp_retirement {
             let mut bytes = [0u8; 64];
             if receiver.receive(
                 &mut ReadBuffer::kernel(&mut bytes),
-                0x40,
+                MSG_DONTWAIT,
                 FileIoContext::Kernel,
             ) != Err(FsError::WouldBlock)
             {
@@ -347,7 +347,7 @@ pub(crate) mod socket_udp_retirement {
                 let sent = child_operation(sender.send(
                     &mut WriteBuffer::kernel(input),
                     None,
-                    0x40,
+                    MSG_DONTWAIT,
                     FileIoContext::Kernel,
                 ))?;
                 if sent != input.len() {
@@ -363,7 +363,7 @@ pub(crate) mod socket_udp_retirement {
                 )?;
                 let record = child_operation(receiver.receive(
                     &mut ReadBuffer::kernel(&mut bytes),
-                    0x40,
+                    MSG_DONTWAIT,
                     FileIoContext::Kernel,
                 ))?;
                 if record.source != Some(SocketAddress::Inet(old))
@@ -381,7 +381,7 @@ pub(crate) mod socket_udp_retirement {
             if child_operation(sender.send(
                 &mut WriteBuffer::kernel(input),
                 Some(SocketAddress::Inet(destination)),
-                0x40,
+                MSG_DONTWAIT,
                 FileIoContext::Kernel,
             ))? != input.len()
             {
@@ -403,7 +403,7 @@ pub(crate) mod socket_udp_retirement {
             )?;
             let record = child_operation(receiver.receive(
                 &mut ReadBuffer::kernel(&mut bytes),
-                0x40,
+                MSG_DONTWAIT,
                 FileIoContext::Kernel,
             ))?;
             // 未连接 sendto 保通配绑定名；报文源来自本次 lo 路由，端口仍属于同一新租约。

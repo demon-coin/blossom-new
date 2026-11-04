@@ -17,7 +17,8 @@ pub(crate) mod user_table;
 pub(crate) mod vma;
 
 pub use anon::AnonPageRef;
-pub(crate) use bootmem::PAGE_SIZE;
+pub(crate) use bootmem::{PAGE_SHIFT, PAGE_SIZE};
+pub(crate) use buddy::MAX_ORDER;
 pub use folio::{FolioRead, FolioRef, FolioWriteback};
 pub use frame_allocator::{alloc_pages, alloc_pages_in, OwnedPages};
 #[cfg(feature = "ktest")]

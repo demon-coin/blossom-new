@@ -1,11 +1,14 @@
 //! 文件间传输只提交目标实际接受量，位置锁先于原管道页环，同步在两者之外完成。
 
 use crate::fs::file::{FileIoContext, FileLike, FileRef, InodeFile};
-use crate::fs::{FsError, InodeKind};
+use crate::fs::{FsError, InodeKind, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY};
 use crate::wait::WaitMode;
 
-const O_APPEND: u32 = 0o2000;
 const SPLICE_NONBLOCK: u32 = 2;
+const SPLICE_F_MOVE: u32 = 1;
+const SPLICE_F_MORE: u32 = 4;
+const SPLICE_F_GIFT: u32 = 8;
+const SPLICE_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 const TRANSFER_CHUNK: usize = 4096;
 
 /// 核明确位置和完整请求可表示为非负 loff_t，不用截断掩盖溢出。
@@ -62,7 +65,10 @@ pub(crate) fn copy_file_range(
     }
     let input = input.ok_or(FsError::InvalidOperation)?;
     let output = output.ok_or(FsError::InvalidOperation)?;
-    if source.flags() & 3 == 1 || target.flags() & 3 == 0 || target.flags() & O_APPEND != 0 {
+    if source.flags() & O_ACCMODE == O_WRONLY
+        || target.flags() & O_ACCMODE == O_RDONLY
+        || target.flags() & O_APPEND != 0
+    {
         return Err(FsError::BadFd);
     }
     if !input
@@ -228,7 +234,7 @@ pub(crate) fn splice(
     flags: u32,
     caller: FileIoContext<'_>,
 ) -> Result<usize, FsError> {
-    if flags & !15 != 0 {
+    if flags & !SPLICE_FLAGS != 0 {
         return Err(FsError::InvalidOperation);
     }
     let input_pipe = source.pipe_end();
@@ -238,7 +244,7 @@ pub(crate) fn splice(
     {
         return Err(FsError::IllegalSeek);
     }
-    if source.flags() & 3 == 1 || target.flags() & 3 == 0 {
+    if source.flags() & O_ACCMODE == O_WRONLY || target.flags() & O_ACCMODE == O_RDONLY {
         return Err(FsError::BadFd);
     }
     let nonblocking = flags & SPLICE_NONBLOCK != 0;

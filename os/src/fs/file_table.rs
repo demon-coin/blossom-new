@@ -36,7 +36,7 @@ enum Slot {
     },
 }
 
-const PAGE_SLOTS: usize = 64;
+const PAGE_SLOTS: usize = u64::BITS as usize;
 
 /// 每页空闲位与槽在同一短锁内修改，页拥有只在目录增长时移动。
 struct SlotPage {

@@ -1,5 +1,6 @@
 //! PLV3 私有现场；返回同一普通 Task 的 Rust 调用栈。
 
+use crate::arch::loongarch64::register as reg;
 use crate::arch::loongarch64::user::entry::la_run_user;
 pub(in crate::arch::loongarch64) use crate::arch::loongarch64::user::entry::{
     la_user_kernel_refill_fault, la_user_trap,
@@ -83,30 +84,34 @@ pub fn signal_return_code() -> &'static [u8] {
 /// 本核 IRQ 必须关闭，当前 Rust 栈、代码和 CpuLocal 永久映射有效；不得跨入口保留活跃 FP。
 pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
     assert!(!irq_enabled(), "user entry requires IRQ off");
-    assert_eq!(csr_read::<2>(), 0, "user entry requires kernel EUEN off");
+    assert_eq!(
+        csr_read::<{ reg::CSR_EUEN }>(),
+        0,
+        "user entry requires kernel EUEN off"
+    );
     // SAFETY: 调用者独占私有现场并保活当前 Mm；汇编保存本次真实 Rust SP，返回时恢复入口 CSR。
     unsafe { la_run_user(context) };
     assert!(!irq_enabled(), "user trap returned with IRQ enabled");
     assert_eq!(
-        csr_read::<2>(),
+        csr_read::<{ reg::CSR_EUEN }>(),
         0,
         "user trap returned with kernel FP enabled"
     );
-    match (context.estat >> 16) & 0x3f {
+    match (context.estat >> reg::ESTAT_ECODE_SHIFT) & reg::ESTAT_ECODE_MASK {
         0 => {
             handle_hardware_interrupt(context.estat);
             UserTrap::Interrupt
         }
-        11 => UserTrap::Syscall,
-        1 | 5 => UserTrap::PageFault {
+        reg::ECODE_SYS => UserTrap::Syscall,
+        reg::ECODE_PIL | reg::ECODE_PNR => UserTrap::PageFault {
             address: context.badv,
             access: UserAccess::Read,
         },
-        2 | 4 => UserTrap::PageFault {
+        reg::ECODE_PIS | reg::ECODE_PME => UserTrap::PageFault {
             address: context.badv,
             access: UserAccess::Write,
         },
-        3 | 6 => UserTrap::PageFault {
+        reg::ECODE_PIF | reg::ECODE_PNX => UserTrap::PageFault {
             address: context.badv,
             access: UserAccess::Execute,
         },
@@ -137,7 +142,7 @@ extern "C" fn loongarch_user_kernel_fault(
         );
     } else {
         crate::ktest::fatal_event(
-            if (cause >> 16) & 0x3f == 0x0d {
+            if (cause >> reg::ESTAT_ECODE_SHIFT) & reg::ESTAT_ECODE_MASK == reg::ECODE_INE {
                 "illegal"
             } else {
                 "panic"

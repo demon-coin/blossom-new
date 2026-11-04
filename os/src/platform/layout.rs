@@ -52,3 +52,12 @@ pub const LOONGARCH64_LS2K1000LA: KernelLinkLayout = KernelLinkLayout {
     mmio_virt_base: 0x8000_0000_0000_0000,
     ram_phys_base: 0,
 };
+
+// DMW 顶部段号与低60位地址部分分开解释，不能套用页表物理地址宽度。
+pub(crate) const DMW_VSEG_SHIFT: u32 = 60;
+pub(crate) const DMW_ADDRESS_END: u64 = 1 << DMW_VSEG_SHIFT;
+pub(crate) const DMW_ADDRESS_MASK: u64 = DMW_ADDRESS_END - 1;
+pub(crate) const DMW_CACHED_VSEG: usize =
+    (LOONGARCH64_QEMU_VIRT.direct_map_virt_base >> DMW_VSEG_SHIFT) as usize;
+pub(crate) const DMW_UNCACHED_VSEG: usize =
+    (LOONGARCH64_QEMU_VIRT.mmio_virt_base >> DMW_VSEG_SHIFT) as usize;

@@ -12,7 +12,10 @@ use crate::block::{
     self, AccessMode, BioAllocator, BlockError, BlockView, Disk, DiskRef, IoResult,
 };
 use crate::cache::{BufferRef, FolioIndex, MetadataCache};
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioIdentity, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN,
+    VIRTIO_VENDOR_ID,
+};
 use crate::drivers::DeviceInventory;
 use crate::fs::ext4::{codec, Ext4Volume};
 use crate::fs::{FsError, InodeMetadata};
@@ -96,10 +99,13 @@ fn patterned(bytes: &[u8], tag: u8, offset: u64, len: usize) -> bool {
 
 /// 每例借整组保活库存准备 root/extra 工作副本；前例已完成 stop，不重复一次性发现。
 fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice>, TestError> {
-    let pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     if inventory.mmio_blocks.len() + pci.clone().count() != count {
         return Err(TestError(
             "cache attached device count differs from declared resources",
@@ -248,7 +254,7 @@ impl Returned {
 pub(crate) struct HeapPressure {
     pages: Vec<mm::OwnedPages>,
     // 每个独占原堆对象的首字保存本类别下一节点，压力期间不申请链表节点。
-    heap: [usize; 12],
+    heap: [usize; mm::SLUB_SIZES.len()],
 }
 
 impl HeapPressure {
@@ -260,7 +266,7 @@ impl HeapPressure {
             .map_err(|_| TestError("cache prepare-OOM pressure slots unavailable"))?;
         Ok(Self {
             pages,
-            heap: [0; 12],
+            heap: [0; mm::SLUB_SIZES.len()],
         })
     }
 
@@ -268,7 +274,7 @@ impl HeapPressure {
     pub(crate) fn exhaust(&mut self) -> (bool, bool) {
         mm::shrink_all();
         mm::drain_all_pages();
-        for order in [10, 0] {
+        for order in [mm::MAX_ORDER, 0] {
             while let Some(pages) = mm::alloc_pages(order, false) {
                 assert!(
                     self.pages.len() < self.pages.capacity(),
@@ -278,7 +284,8 @@ impl HeapPressure {
             }
         }
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
-            let layout = Layout::from_size_align(size, 8).expect("cache heap pressure layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("cache heap pressure layout");
             loop {
                 // SAFETY: 固定有效非零布局，真实全局分配器返回的成功对象由本 owner 独占。
                 let pointer = black_box(unsafe { alloc(layout) });
@@ -298,7 +305,8 @@ impl HeapPressure {
             .copied()
             .chain(core::iter::once(mm::PAGE_SIZE * 2))
         {
-            let layout = Layout::from_size_align(size, 8).expect("cache heap probe layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("cache heap probe layout");
             // SAFETY: 有效原布局探测同一真实 allocator，black_box 保留实际 NULL 观察。
             let pointer = black_box(unsafe { alloc(layout) });
             if !pointer.is_null() {
@@ -315,7 +323,8 @@ impl Drop for HeapPressure {
     /// 正文返回或展开都按原布局释放每个节点，最后锁外归还全部物理页。
     fn drop(&mut self) {
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
-            let layout = Layout::from_size_align(size, 8).expect("cache heap release layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("cache heap release layout");
             while self.heap[index] != 0 {
                 let pointer = self.heap[index] as *mut u8;
                 // SAFETY: 节点是本链尚未归还的原 alloc，首字已初始化，布局与分配相同。
@@ -442,7 +451,8 @@ impl Owner {
         let ring = device.control_regions().0;
         let layout = virtio_drivers::queue::RingLayout::new(info.queue_depth, legacy)
             .map_err(|_| TestError("cache real ring layout invalid"))?;
-        let avail_address = ring.cpu.as_ptr() as usize + layout.avail_offset() + 2;
+        let avail_address =
+            ring.cpu.as_ptr() as usize + layout.avail_offset() + core::mem::size_of::<u16>();
         let queue = WorkQueue::try_new(WorkQueueConfig {
             max_active: usize::from(info.tag_count) + 1,
             ordered: false,

@@ -14,7 +14,7 @@ pub(crate) fn fill_insecure(bytes: &mut [u8]) {
     }
     // ponytail: 此来源没有安全熵承诺；密钥和安全随机必须使用真实熵源。
     let mut seed = arch::read_counter() ^ NONCE.fetch_add(1, Ordering::Relaxed);
-    for chunk in bytes.chunks_mut(8) {
+    for chunk in bytes.chunks_mut(core::mem::size_of::<u64>()) {
         let word = mix_random_word(seed).to_le_bytes();
         chunk.copy_from_slice(&word[..chunk.len()]);
         seed = seed.wrapping_add(WORD_INCREMENT);

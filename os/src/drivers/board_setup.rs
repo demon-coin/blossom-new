@@ -23,10 +23,132 @@ const PLL_SYSCON: usize = 0x1303_0000;
 const SYS_PIN: usize = 0x1304_0000;
 const AON_CRG: usize = 0x1700_0000;
 const AON_PIN: usize = 0x1702_0000;
-const ENABLE: u32 = 1 << 31;
-const DIV_MASK: u32 = 0x00ff_ffff;
-const MUX_MASK: u32 = 0x0f00_0000;
+pub(crate) const ENABLE: u32 = 1 << 31;
+pub(crate) const DIV_MASK: u32 = 0x00ff_ffff;
+pub(crate) const MUX_MASK: u32 = 0x0f00_0000;
 const TRANSITION_TIMEOUT: Duration = Duration::from_millis(1);
+
+// CRG 的每个时钟占一字，reset 另按32个源共用一字。
+const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+pub(crate) const CLOCK_MUX_SHIFT: u32 = 24;
+const MAX_CLOCK_DEPTH: usize = 16;
+const SYS_RESET_ASSERT: usize = 0x2f8;
+const SYS_RESET_STATUS: usize = 0x308;
+pub(crate) const AON_RESET_ASSERT: usize = 0x38;
+pub(crate) const AON_RESET_STATUS: usize = 0x3c;
+const SYS_CRG_MIN_BYTES: usize = SYS_RESET_STATUS + 3 * REGISTER_BYTES;
+const AON_CRG_MIN_BYTES: usize = AON_RESET_STATUS + REGISTER_BYTES;
+
+// ID 属于各自 provider，不能跨 SYS/AON 解释。
+const SYSCLK_BUS_ROOT: u32 = 5;
+const SYSCLK_AXI_CFG0: u32 = 7;
+const SYSCLK_STG_AXIAHB: u32 = 8;
+const SYSCLK_AHB0: u32 = 9;
+const SYSCLK_AHB1: u32 = 10;
+const SYSCLK_APB_BUS: u32 = 11;
+const SYSCLK_APB0: u32 = 12;
+const SYSCLK_SDIO0_AHB: u32 = 91;
+const SYSCLK_SDIO1_AHB: u32 = 92;
+const SYSCLK_SDIO0_SDCARD: u32 = 93;
+const SYSCLK_SDIO1_SDCARD: u32 = 94;
+const SYSCLK_GMAC1_AHB: u32 = 97;
+const SYSCLK_GMAC1_AXI: u32 = 98;
+const SYSCLK_GMAC_SRC: u32 = 99;
+const SYSCLK_GMAC1_GTXCLK: u32 = 100;
+const SYSCLK_GMAC1_RMII_RTX: u32 = 101;
+const SYSCLK_GMAC1_PTP: u32 = 102;
+const SYSCLK_GMAC1_RX: u32 = 103;
+const SYSCLK_GMAC1_RX_INV: u32 = 104;
+const SYSCLK_GMAC1_TX: u32 = 105;
+const SYSCLK_GMAC1_TX_INV: u32 = 106;
+const SYSCLK_GMAC1_GTXC: u32 = 107;
+const SYSCLK_GMAC0_GTXCLK: u32 = 108;
+const SYSCLK_GMAC0_PTP: u32 = 109;
+const SYSCLK_GMAC_PHY: u32 = 110;
+const SYSCLK_GMAC0_GTXC: u32 = 111;
+const SYSCLK_IOMUX_APB: u32 = 112;
+const AONCLK_GMAC0_AHB: u32 = 2;
+const AONCLK_GMAC0_AXI: u32 = 3;
+const AONCLK_GMAC0_RMII_RTX: u32 = 4;
+const AONCLK_GMAC0_TX: u32 = 5;
+const AONCLK_GMAC0_TX_INV: u32 = 6;
+const AONCLK_GMAC0_RX: u32 = 7;
+const AONCLK_GMAC0_RX_INV: u32 = 8;
+const SYSRST_IOMUX_APB: u32 = 2;
+const SYSRST_SDIO0_AHB: u32 = 64;
+const SYSRST_GMAC1_AHB: u32 = 67;
+const AONRST_GMAC0_AXI: u32 = 0;
+const AONRST_IOMUX: u32 = 2;
+
+const PLL_MODE_MASK: u32 = 3;
+const PLL_MODE_INTEGER: u32 = 3;
+const PLL_FBDIV_MASK: u32 = 0xfff;
+const PLL_FBDIV_MIN: u32 = 8;
+const PLL_PREDIV_MASK: u32 = 0x3f;
+const PLL_FRAC_BITS: u32 = 24;
+const PLL_FRAC_MASK: u32 = (1 << PLL_FRAC_BITS) - 1;
+const PLL_POSTDIV_SHIFT: u32 = 28;
+const PLL_POSTDIV_MASK: u32 = 3;
+const PLL0_PD: usize = 0x18;
+const PLL0_PD_SHIFT: u32 = 24;
+const PLL0_FBDIV: usize = 0x1c;
+const PLL0_FRAC: usize = 0x20;
+const PLL0_PREDIV: usize = 0x24;
+const PLL2_PD: usize = 0x2c;
+const PLL2_PD_SHIFT: u32 = 15;
+const PLL2_FBDIV_SHIFT: u32 = 17;
+const PLL2_FRAC: usize = 0x30;
+const PLL2_PREDIV: usize = 0x34;
+const PLL_MIN_BYTES: usize = PLL2_PREDIV + REGISTER_BYTES;
+
+pub(crate) const SYS_GPIO_COUNT: u32 = 64;
+const SYS_DOEN: usize = 0;
+const SYS_DOUT: usize = 0x40;
+const SYS_GPI: usize = 0x80;
+const SYS_GPIOIN: usize = 0x118;
+const SYS_PADCFG: usize = 0x120;
+const SYS_FUNC_SEL: usize = 0x29c;
+const SYS_PIN_MIN_BYTES: usize = SYS_FUNC_SEL + 6 * REGISTER_BYTES;
+const AON_PIN_MIN_BYTES: usize = 0x48;
+const GPIO_SLOTS_PER_WORD: u32 = 4;
+const GPIO_SLOT_BITS: u32 = 8;
+const GPIO_DOUT_MASK: u32 = 0x7f;
+const GPIO_DOEN_MASK: u32 = 0x3f;
+const GPIO_GPI_MASK: u32 = 0x7f;
+const GPIO_GPI_PIN_BIAS: u32 = 2;
+const GPIO_OUTPUT_DISABLE: u32 = 1;
+const PINMUX_PIN_MASK: u32 = 0xff;
+const PINMUX_FUNCTION_SHIFT: u32 = 8;
+const PINMUX_FUNCTION_MASK: u32 = 3;
+const PINMUX_DOEN_SHIFT: u32 = 10;
+const PINMUX_DOEN_MASK: u32 = 0x3f;
+const PINMUX_DOUT_SHIFT: u32 = 16;
+const PINMUX_DOUT_MASK: u32 = 0xff;
+const PINMUX_DIN_SHIFT: u32 = 24;
+const GPI_NONE: u32 = 0xff;
+const PAD_GMAC1_MDC: u32 = 75;
+const PAD_GMAC1_RXC: u32 = 82;
+const PAD_GMAC1_TXC: u32 = 88;
+const PAD_GMAC0_MDC: u32 = 6;
+const PAD_GMAC0_TXC: u32 = 19;
+const PADCFG_INPUT_ENABLE: u32 = 1;
+const PADCFG_DRIVE_SHIFT: u32 = 1;
+const PADCFG_DRIVE_MASK: u32 = 3 << PADCFG_DRIVE_SHIFT;
+const PADCFG_PULL_UP: u32 = 1 << 3;
+const PADCFG_PULL_DOWN: u32 = 1 << 4;
+const PADCFG_SLEW_SHIFT: u32 = 5;
+const PADCFG_SLEW_MASK: u32 = 1 << PADCFG_SLEW_SHIFT;
+const PADCFG_SCHMITT_ENABLE: u32 = 1 << 6;
+const GPOUT_SDIO0_RST: u32 = 19;
+const GPOUT_SDIO1_CLK: u32 = 55;
+const GPOUT_SDIO1_CMD: u32 = 57;
+const GPOUT_SDIO1_RST: u32 = 66;
+const GPOEN_SDIO1_CMD: u32 = 19;
+const GPOEN_SDIO1_DATA7: u32 = 27;
+const GPI_SDIO0_CD: u32 = 11;
+const GPI_SDIO0_WP: u32 = 13;
+const GPI_SDIO1_CD: u32 = 41;
+const GPI_SDIO1_STRB: u32 = 53;
 
 // 可睡锁串行共享寄存器的 RMW；IRQ/早期 RTC 不得与这些初始化动作并发。
 static SETUP_LOCK: SleepMutex<()> = SleepMutex::new(());
@@ -113,29 +235,55 @@ pub(crate) unsafe fn clock_rate(clock: &ClockResource) -> Result<u64, &'static s
 /// GPIO provider 与所选设备的 SYS CRG 必须来自唯一启动快照，并已有完整永久 MMIO
 /// 映射；调用者独占该 pin 的功能选择，全部共享 CRG/pinctrl 更新遵守 SETUP_LOCK。
 pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, &'static str> {
-    check_region(input.provider, SYS_PIN, 0x2b4)?;
-    if 64 <= input.pin {
+    check_region(input.provider, SYS_PIN, SYS_PIN_MIN_BYTES)?;
+    if SYS_GPIO_COUNT <= input.pin {
         return Err("JH7110 SYS GPIO input pin is outside the supported range");
     }
     let _guard = SETUP_LOCK.lock();
     let provider = crg(SYS_CRG)?;
-    enable_clock(ResourceReference { provider, id: 112 }, 0)?;
-    set_reset(ResourceReference { provider, id: 2 }, false)?;
+    enable_clock(
+        ResourceReference {
+            provider,
+            id: SYSCLK_IOMUX_APB,
+        },
+        0,
+    )?;
+    set_reset(
+        ResourceReference {
+            provider,
+            id: SYSRST_IOMUX_APB,
+        },
+        false,
+    )?;
     let pin = input.pin;
-    let offset = pin as usize / 4 * 4;
-    let shift = pin % 4 * 8;
+    let offset = pin as usize / GPIO_SLOTS_PER_WORD as usize * REGISTER_BYTES;
+    let shift = pin % GPIO_SLOTS_PER_WORD * GPIO_SLOT_BITS;
     update(
         input.provider,
-        0x120 + pin as usize * 4,
-        (1 << 0) | (1 << 6),
-        (1 << 0) | (1 << 6),
+        SYS_PADCFG + pin as usize * REGISTER_BYTES,
+        PADCFG_INPUT_ENABLE | PADCFG_SCHMITT_ENABLE,
+        PADCFG_INPUT_ENABLE | PADCFG_SCHMITT_ENABLE,
     )?;
-    update(input.provider, 0x40 + offset, 0x7f << shift, 0)?;
-    update(input.provider, offset, 0x3f << shift, 1 << shift)?;
+    update(
+        input.provider,
+        SYS_DOUT + offset,
+        GPIO_DOUT_MASK << shift,
+        0,
+    )?;
+    update(
+        input.provider,
+        SYS_DOEN + offset,
+        GPIO_DOEN_MASK << shift,
+        GPIO_OUTPUT_DISABLE << shift,
+    )?;
     if let Some((offset, shift)) = function_field(pin) {
-        update(input.provider, offset, 3 << shift, 0)?;
+        update(input.provider, offset, PINMUX_FUNCTION_MASK << shift, 0)?;
     }
-    Ok(read(input.provider, 0x118 + pin as usize / 32 * 4) & (1 << (pin % 32)) != 0)
+    Ok(read(
+        input.provider,
+        SYS_GPIOIN + pin as usize / u32::BITS as usize * REGISTER_BYTES,
+    ) & (1 << (pin % u32::BITS))
+        != 0)
 }
 
 /// 检查完整寄存器范围，防止偏移或地址加法溢出后再进行 MMIO。
@@ -226,14 +374,15 @@ fn validate_clock(clock: &ClockResource) -> Result<(), &'static str> {
     }
     match clock.reference.provider.start {
         SYS_CRG => {
-            check_region(clock.reference.provider, SYS_CRG, 0x314)?;
-            if !matches!(clock.reference.id, 91..=94 | 97..=112) {
+            check_region(clock.reference.provider, SYS_CRG, SYS_CRG_MIN_BYTES)?;
+            if !matches!(clock.reference.id, SYSCLK_SDIO0_AHB..=SYSCLK_SDIO1_SDCARD | SYSCLK_GMAC1_AHB..=SYSCLK_IOMUX_APB)
+            {
                 return Err("clock id is outside supported JH7110 SYS SDIO/GMAC/IOMUX bindings");
             }
         }
         AON_CRG => {
-            check_region(clock.reference.provider, AON_CRG, 0x40)?;
-            if !matches!(clock.reference.id, 2..=8) {
+            check_region(clock.reference.provider, AON_CRG, AON_CRG_MIN_BYTES)?;
+            if !matches!(clock.reference.id, AONCLK_GMAC0_AHB..=AONCLK_GMAC0_RX_INV) {
                 return Err("clock id is outside supported JH7110 AON GMAC bindings");
             }
         }
@@ -269,7 +418,11 @@ fn crg(base: usize) -> Result<Region, &'static str> {
                 check_region(
                     reference.provider,
                     base,
-                    if base == SYS_CRG { 0x314 } else { 0x40 },
+                    if base == SYS_CRG {
+                        SYS_CRG_MIN_BYTES
+                    } else {
+                        AON_CRG_MIN_BYTES
+                    },
                 )?;
                 return Ok(reference.provider);
             }
@@ -281,27 +434,31 @@ fn crg(base: usize) -> Result<Region, &'static str> {
 /// 只把实际硬件支持的 GMAC mux 父引用转换成选择位；固定输入 phandle 丢失身份时拒绝猜测。
 fn parent_index(clock: ResourceReference, parent: ResourceReference) -> Result<u32, &'static str> {
     if clock.provider.start == AON_CRG
-        && clock.id == 5
+        && clock.id == AONCLK_GMAC0_TX
         && parent.provider.start == SYS_CRG
-        && parent.id == 108
+        && parent.id == SYSCLK_GMAC0_GTXCLK
     {
-        check_region(parent.provider, SYS_CRG, 0x314)?;
+        check_region(parent.provider, SYS_CRG, SYS_CRG_MIN_BYTES)?;
         return Ok(0);
     }
     if parent.provider != clock.provider {
         return Err("assigned clock parent provider is not connected to this mux");
     }
     let parents = match (clock.provider.start, clock.id) {
-        (SYS_CRG, 103) => return Err("GMAC RX external parent identity is not normalized"),
-        (SYS_CRG, 105) => [100, 101],
-        (AON_CRG, 5) => {
+        (SYS_CRG, SYSCLK_GMAC1_RX) => {
+            return Err("GMAC RX external parent identity is not normalized")
+        }
+        (SYS_CRG, SYSCLK_GMAC1_TX) => [SYSCLK_GMAC1_GTXCLK, SYSCLK_GMAC1_RMII_RTX],
+        (AON_CRG, AONCLK_GMAC0_TX) => {
             // AON 的 GTX 父源来自 SYS；本轮实际 DT 只指定同 AON 的 RMII_RTX。
-            if parent.id == 4 {
+            if parent.id == AONCLK_GMAC0_RMII_RTX {
                 return Ok(1);
             }
             return Err("AON GMAC TX parent must name RMII_RTX or normalized SYS GTX clock");
         }
-        (AON_CRG, 7) => return Err("GMAC RX external parent identity is not normalized"),
+        (AON_CRG, AONCLK_GMAC0_RX) => {
+            return Err("GMAC RX external parent identity is not normalized")
+        }
         _ => return Err("assigned parent targets a clock without a supported mux"),
     };
     parents
@@ -320,9 +477,9 @@ fn configure_clock(clock: &ClockResource) -> Result<(), &'static str> {
         let index = parent_index(clock.reference, parent)?;
         update(
             clock.reference.provider,
-            clock.reference.id as usize * 4,
+            clock.reference.id as usize * REGISTER_BYTES,
             MUX_MASK,
-            index << 24,
+            index << CLOCK_MUX_SHIFT,
         )?;
     }
     if let Some(requested) = clock.rate {
@@ -351,7 +508,8 @@ fn local(reference: ResourceReference, id: u32) -> Parent {
 
 /// 读取所选 mux 的实际值，保留不合法硬件选择的错误。
 fn selection(reference: ResourceReference) -> Result<u32, &'static str> {
-    let selection = (read(reference.provider, reference.id as usize * 4) & MUX_MASK) >> 24;
+    let selection = (read(reference.provider, reference.id as usize * REGISTER_BYTES) & MUX_MASK)
+        >> CLOCK_MUX_SHIFT;
     if 1 < selection {
         return Err("JH7110 clock mux selection is outside its two parents");
     }
@@ -361,63 +519,73 @@ fn selection(reference: ResourceReference) -> Result<u32, &'static str> {
 /// 描述实际 SDIO/GMAC 到已有总线根的窄树，不支持其它外设的任意时钟遍历。
 fn parent(reference: ResourceReference) -> Result<Parent, &'static str> {
     let result = match (reference.provider.start, reference.id) {
-        (SYS_CRG, 5) => {
+        (SYS_CRG, SYSCLK_BUS_ROOT) => {
             if selection(reference)? == 0 {
                 Parent::Oscillator
             } else {
                 Parent::Pll(2)
             }
         }
-        (SYS_CRG, 7) => local(reference, 5),
-        (SYS_CRG, 8) => local(reference, 7),
-        (SYS_CRG, 9 | 10 | 11) => local(reference, 8),
-        (SYS_CRG, 12) => local(reference, 11),
-        (SYS_CRG, 91 | 92 | 97) => local(reference, 9),
-        (SYS_CRG, 93 | 94) => local(reference, 7),
-        (SYS_CRG, 98) => local(reference, 8),
-        (SYS_CRG, 99 | 100 | 108) => Parent::Pll(0),
-        (SYS_CRG, 101) => Parent::Rmii,
-        (SYS_CRG, 102 | 109 | 110) => local(reference, 99),
-        (SYS_CRG, 103) => {
+        (SYS_CRG, SYSCLK_AXI_CFG0) => local(reference, SYSCLK_BUS_ROOT),
+        (SYS_CRG, SYSCLK_STG_AXIAHB) => local(reference, SYSCLK_AXI_CFG0),
+        (SYS_CRG, SYSCLK_AHB0 | SYSCLK_AHB1 | SYSCLK_APB_BUS) => {
+            local(reference, SYSCLK_STG_AXIAHB)
+        }
+        (SYS_CRG, SYSCLK_APB0) => local(reference, SYSCLK_APB_BUS),
+        (SYS_CRG, SYSCLK_SDIO0_AHB | SYSCLK_SDIO1_AHB | SYSCLK_GMAC1_AHB) => {
+            local(reference, SYSCLK_AHB0)
+        }
+        (SYS_CRG, SYSCLK_SDIO0_SDCARD | SYSCLK_SDIO1_SDCARD) => local(reference, SYSCLK_AXI_CFG0),
+        (SYS_CRG, SYSCLK_GMAC1_AXI) => local(reference, SYSCLK_STG_AXIAHB),
+        (SYS_CRG, SYSCLK_GMAC_SRC | SYSCLK_GMAC1_GTXCLK | SYSCLK_GMAC0_GTXCLK) => Parent::Pll(0),
+        (SYS_CRG, SYSCLK_GMAC1_RMII_RTX) => Parent::Rmii,
+        (SYS_CRG, SYSCLK_GMAC1_PTP | SYSCLK_GMAC0_PTP | SYSCLK_GMAC_PHY) => {
+            local(reference, SYSCLK_GMAC_SRC)
+        }
+        (SYS_CRG, SYSCLK_GMAC1_RX) => {
             if selection(reference)? == 0 {
                 Parent::Rgmii
             } else {
-                local(reference, 101)
+                local(reference, SYSCLK_GMAC1_RMII_RTX)
             }
         }
-        (SYS_CRG, 104) => local(reference, 103),
-        (SYS_CRG, 105) => local(
+        (SYS_CRG, SYSCLK_GMAC1_RX_INV) => local(reference, SYSCLK_GMAC1_RX),
+        (SYS_CRG, SYSCLK_GMAC1_TX) => local(
             reference,
-            if selection(reference)? == 0 { 100 } else { 101 },
+            if selection(reference)? == 0 {
+                SYSCLK_GMAC1_GTXCLK
+            } else {
+                SYSCLK_GMAC1_RMII_RTX
+            },
         ),
-        (SYS_CRG, 106) => local(reference, 105),
-        (SYS_CRG, 107) => local(reference, 100),
-        (SYS_CRG, 111) => local(reference, 108),
-        (SYS_CRG, 112) => local(reference, 11),
-        (AON_CRG, 2 | 3) => Parent::Clock(ResourceReference {
+        (SYS_CRG, SYSCLK_GMAC1_TX_INV) => local(reference, SYSCLK_GMAC1_TX),
+        (SYS_CRG, SYSCLK_GMAC1_GTXC) => local(reference, SYSCLK_GMAC1_GTXCLK),
+        (SYS_CRG, SYSCLK_GMAC0_GTXC) => local(reference, SYSCLK_GMAC0_GTXCLK),
+        (SYS_CRG, SYSCLK_IOMUX_APB) => local(reference, SYSCLK_APB_BUS),
+        (AON_CRG, AONCLK_GMAC0_AHB | AONCLK_GMAC0_AXI) => Parent::Clock(ResourceReference {
             provider: crg(SYS_CRG)?,
-            id: 8,
+            id: SYSCLK_STG_AXIAHB,
         }),
-        (AON_CRG, 4) => Parent::Rmii,
-        (AON_CRG, 5) => {
+        (AON_CRG, AONCLK_GMAC0_RMII_RTX) => Parent::Rmii,
+        (AON_CRG, AONCLK_GMAC0_TX) => {
             if selection(reference)? == 0 {
                 Parent::Clock(ResourceReference {
                     provider: crg(SYS_CRG)?,
-                    id: 108,
+                    id: SYSCLK_GMAC0_GTXCLK,
                 })
             } else {
-                local(reference, 4)
+                local(reference, AONCLK_GMAC0_RMII_RTX)
             }
         }
-        (AON_CRG, 6) => local(reference, 5),
-        (AON_CRG, 7) => {
+        (AON_CRG, AONCLK_GMAC0_TX_INV) => local(reference, AONCLK_GMAC0_TX),
+        (AON_CRG, AONCLK_GMAC0_RX) => {
             if selection(reference)? == 0 {
                 Parent::Rgmii
             } else {
-                local(reference, 4)
+                local(reference, AONCLK_GMAC0_RMII_RTX)
             }
         }
-        (AON_CRG, 8) => local(reference, 7),
+        (AON_CRG, AONCLK_GMAC0_RX_INV) => local(reference, AONCLK_GMAC0_RX),
         _ => return Err("JH7110 clock tree edge is unsupported"),
     };
     Ok(result)
@@ -426,13 +594,16 @@ fn parent(reference: ResourceReference) -> Result<Parent, &'static str> {
 /// 返回真实整数分频的范围；零表示本节点不含分频字段。
 fn divider_max(reference: ResourceReference) -> u32 {
     match (reference.provider.start, reference.id) {
-        (SYS_CRG, 7) => 3,
-        (SYS_CRG, 8) => 2,
-        (SYS_CRG, 11) => 8,
-        (SYS_CRG, 93 | 94 | 100 | 108) => 15,
-        (SYS_CRG, 99) => 7,
-        (SYS_CRG, 101) | (AON_CRG, 4) => 30,
-        (SYS_CRG, 102 | 109 | 110) => 31,
+        (SYS_CRG, SYSCLK_AXI_CFG0) => 3,
+        (SYS_CRG, SYSCLK_STG_AXIAHB) => 2,
+        (SYS_CRG, SYSCLK_APB_BUS) => 8,
+        (
+            SYS_CRG,
+            SYSCLK_SDIO0_SDCARD | SYSCLK_SDIO1_SDCARD | SYSCLK_GMAC1_GTXCLK | SYSCLK_GMAC0_GTXCLK,
+        ) => 15,
+        (SYS_CRG, SYSCLK_GMAC_SRC) => 7,
+        (SYS_CRG, SYSCLK_GMAC1_RMII_RTX) | (AON_CRG, AONCLK_GMAC0_RMII_RTX) => 30,
+        (SYS_CRG, SYSCLK_GMAC1_PTP | SYSCLK_GMAC0_PTP | SYSCLK_GMAC_PHY) => 31,
         _ => 0,
     }
 }
@@ -440,8 +611,8 @@ fn divider_max(reference: ResourceReference) -> u32 {
 /// 只对有 gate 的节点写 bit31；反相节点递归到真实 gated parent，绝不伪造门位。
 fn gated(reference: ResourceReference) -> bool {
     matches!((reference.provider.start, reference.id),
-        (SYS_CRG, 9 | 10 | 12 | 91..=94 | 97 | 98 | 102 | 105 | 107..=112)
-        | (AON_CRG, 2 | 3 | 5))
+        (SYS_CRG, SYSCLK_AHB0 | SYSCLK_AHB1 | SYSCLK_APB0 | SYSCLK_SDIO0_AHB..=SYSCLK_SDIO1_SDCARD | SYSCLK_GMAC1_AHB | SYSCLK_GMAC1_AXI | SYSCLK_GMAC1_PTP | SYSCLK_GMAC1_TX | SYSCLK_GMAC1_GTXC..=SYSCLK_IOMUX_APB)
+        | (AON_CRG, AONCLK_GMAC0_AHB | AONCLK_GMAC0_AXI | AONCLK_GMAC0_TX))
 }
 
 /// 检查实际分频不为零且位于该寄存器的硬件范围内。
@@ -450,7 +621,7 @@ fn divisor(reference: ResourceReference) -> Result<u64, &'static str> {
     if maximum == 0 {
         return Ok(1);
     }
-    let divisor = read(reference.provider, reference.id as usize * 4) & DIV_MASK;
+    let divisor = read(reference.provider, reference.id as usize * REGISTER_BYTES) & DIV_MASK;
     if divisor == 0 || maximum < divisor {
         return Err("JH7110 clock divider is zero or outside the hardware range");
     }
@@ -462,7 +633,7 @@ fn enable_clock(reference: ResourceReference, depth: usize) -> Result<(), &'stat
     if fixed(reference) {
         return Ok(());
     }
-    if 16 <= depth {
+    if MAX_CLOCK_DEPTH <= depth {
         return Err("JH7110 selected clock path exceeds its bounded depth");
     }
     if let Parent::Clock(upstream) = parent(reference)? {
@@ -472,7 +643,7 @@ fn enable_clock(reference: ResourceReference, depth: usize) -> Result<(), &'stat
     if gated(reference) {
         update(
             reference.provider,
-            reference.id as usize * 4,
+            reference.id as usize * REGISTER_BYTES,
             ENABLE,
             ENABLE,
         )?;
@@ -493,24 +664,42 @@ fn oscillator_rate() -> Result<u64, &'static str> {
 /// 读取实际 PLL 的整数或小数配置，计算原有 PLL 输出；不修改共享 PLL。
 fn pll_rate(id: u32) -> Result<u64, &'static str> {
     let registers = boot::info().board.clock_inputs.pll_registers;
-    check_region(registers, PLL_SYSCON, 0x38)?;
+    check_region(registers, PLL_SYSCON, PLL_MIN_BYTES)?;
     let (pd, shift, fbdiv_offset, fbdiv_shift, frac_offset, prediv_offset) = match id {
-        0 => (0x18, 24, 0x1c, 0, 0x20, 0x24),
-        2 => (0x2c, 15, 0x2c, 17, 0x30, 0x34),
+        0 => (
+            PLL0_PD,
+            PLL0_PD_SHIFT,
+            PLL0_FBDIV,
+            0,
+            PLL0_FRAC,
+            PLL0_PREDIV,
+        ),
+        2 => (
+            PLL2_PD,
+            PLL2_PD_SHIFT,
+            PLL2_PD,
+            PLL2_FBDIV_SHIFT,
+            PLL2_FRAC,
+            PLL2_PREDIV,
+        ),
         _ => return Err("PLL id is outside the selected SDIO/GMAC clock paths"),
     };
-    let mode = (read(registers, pd) >> shift) & 3;
-    let fbdiv = (read(registers, fbdiv_offset) >> fbdiv_shift) & 0xfff;
+    let mode = (read(registers, pd) >> shift) & PLL_MODE_MASK;
+    let fbdiv = (read(registers, fbdiv_offset) >> fbdiv_shift) & PLL_FBDIV_MASK;
     let fraction = read(registers, frac_offset);
-    let prediv = read(registers, prediv_offset) & 0x3f;
-    if prediv == 0 || fbdiv < 8 || !matches!(mode, 0 | 3) {
+    let prediv = read(registers, prediv_offset) & PLL_PREDIV_MASK;
+    if prediv == 0 || fbdiv < PLL_FBDIV_MIN || !matches!(mode, 0 | PLL_MODE_INTEGER) {
         return Err("JH7110 PLL mode or divider is invalid");
     }
-    let fractional = if mode == 0 { fraction & 0x00ff_ffff } else { 0 };
-    let postdiv = (fraction >> 28) & 3;
+    let fractional = if mode == 0 {
+        fraction & PLL_FRAC_MASK
+    } else {
+        0
+    };
+    let postdiv = (fraction >> PLL_POSTDIV_SHIFT) & PLL_POSTDIV_MASK;
     let oscillator = u128::from(oscillator_rate()?);
-    let multiplied =
-        oscillator * u128::from(fbdiv) + oscillator * u128::from(fractional) / (1u128 << 24);
+    let multiplied = oscillator * u128::from(fbdiv)
+        + oscillator * u128::from(fractional) / (1u128 << PLL_FRAC_BITS);
     let output = multiplied / (u128::from(prediv) << postdiv);
     u64::try_from(output)
         .ok()
@@ -531,7 +720,7 @@ fn parent_rate(upstream: Parent, depth: usize) -> Result<u64, &'static str> {
 
 /// 沿已选择的真实父边计算频率，gate 关闭不改变源频率但零分频保留错误。
 fn rate(reference: ResourceReference, depth: usize) -> Result<u64, &'static str> {
-    if 16 <= depth {
+    if MAX_CLOCK_DEPTH <= depth {
         return Err("JH7110 selected clock path exceeds its bounded depth");
     }
     let output = parent_rate(parent(reference)?, depth + 1)? / divisor(reference)?;
@@ -571,29 +760,38 @@ fn set_rate(
     requested: u64,
     depth: usize,
 ) -> Result<(), &'static str> {
-    if 16 <= depth {
+    if MAX_CLOCK_DEPTH <= depth {
         return Err("JH7110 selected clock path exceeds its bounded depth");
     }
     if matches!((reference.provider.start, reference.id),
-        (SYS_CRG, 93 | 94 | 99..=102 | 108..=110) | (AON_CRG, 4))
+        (SYS_CRG, SYSCLK_SDIO0_SDCARD | SYSCLK_SDIO1_SDCARD | SYSCLK_GMAC_SRC..=SYSCLK_GMAC1_PTP | SYSCLK_GMAC0_GTXCLK..=SYSCLK_GMAC_PHY) | (AON_CRG, AONCLK_GMAC0_RMII_RTX))
     {
         let source = parent_rate(parent(reference)?, depth + 1)?;
         let maximum = divider_max(reference);
-        let divider = if matches!((reference.provider.start, reference.id), (SYS_CRG, 93 | 94)) {
+        let divider = if matches!(
+            (reference.provider.start, reference.id),
+            (SYS_CRG, SYSCLK_SDIO0_SDCARD | SYSCLK_SDIO1_SDCARD)
+        ) {
             sd_divider(source, requested, maximum)?
         } else {
             exact_divider(source, requested, maximum)?
         };
         return update(
             reference.provider,
-            reference.id as usize * 4,
+            reference.id as usize * REGISTER_BYTES,
             DIV_MASK,
             divider,
         );
     }
     if matches!(
         (reference.provider.start, reference.id),
-        (SYS_CRG, 104..=107 | 111) | (AON_CRG, 5 | 6 | 8)
+        (
+            SYS_CRG,
+            SYSCLK_GMAC1_RX_INV..=SYSCLK_GMAC1_GTXC | SYSCLK_GMAC0_GTXC
+        ) | (
+            AON_CRG,
+            AONCLK_GMAC0_TX | AONCLK_GMAC0_TX_INV | AONCLK_GMAC0_RX_INV
+        )
     ) {
         if let Parent::Clock(upstream) = parent(reference)? {
             return set_rate(upstream, requested, depth + 1);
@@ -609,18 +807,22 @@ fn set_rate(
 /// 取得真实复位字和状态字；JH7110 asserted 为零、deasserted 为一。
 fn reset_registers(reference: ResourceReference) -> Result<(usize, usize, u32), &'static str> {
     let (assert, status) = match (reference.provider.start, reference.id) {
-        (SYS_CRG, 2 | 64..=67) => {
-            check_region(reference.provider, SYS_CRG, 0x314)?;
-            (0x2f8, 0x308)
+        (SYS_CRG, SYSRST_IOMUX_APB | SYSRST_SDIO0_AHB..=SYSRST_GMAC1_AHB) => {
+            check_region(reference.provider, SYS_CRG, SYS_CRG_MIN_BYTES)?;
+            (SYS_RESET_ASSERT, SYS_RESET_STATUS)
         }
-        (AON_CRG, 0..=2) => {
-            check_region(reference.provider, AON_CRG, 0x40)?;
-            (0x38, 0x3c)
+        (AON_CRG, AONRST_GMAC0_AXI..=AONRST_IOMUX) => {
+            check_region(reference.provider, AON_CRG, AON_CRG_MIN_BYTES)?;
+            (AON_RESET_ASSERT, AON_RESET_STATUS)
         }
         _ => return Err("reset provider/id is outside the supported SDIO/GMAC/IOMUX bindings"),
     };
-    let word = reference.id as usize / 32 * 4;
-    Ok((assert + word, status + word, 1 << (reference.id % 32)))
+    let word = reference.id as usize / u32::BITS as usize * REGISTER_BYTES;
+    Ok((
+        assert + word,
+        status + word,
+        1 << (reference.id % u32::BITS),
+    ))
 }
 
 /// 更新 assert 位后等待独立 status 位，不把写入完成当作复位完成。
@@ -647,9 +849,9 @@ fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
         return Err("pin pull-up and bias-disable conflict");
     }
     if pin.pull_up || pin.bias_disable {
-        mask |= (1 << 4) | (1 << 3);
+        mask |= PADCFG_PULL_DOWN | PADCFG_PULL_UP;
         if pin.pull_up {
-            value |= 1 << 3;
+            value |= PADCFG_PULL_UP;
         }
     }
     if let Some(strength) = pin.drive_strength {
@@ -660,14 +862,17 @@ fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
             12 => 3,
             _ => return Err("JH7110 pin drive-strength must be 2/4/8/12 mA"),
         };
-        mask |= 3 << 1;
-        value |= encoded << 1;
+        mask |= PADCFG_DRIVE_MASK;
+        value |= encoded << PADCFG_DRIVE_SHIFT;
     }
-    for (setting, bit) in [(pin.input_enable, 0), (pin.schmitt_enable, 6)] {
+    for (setting, bit) in [
+        (pin.input_enable, PADCFG_INPUT_ENABLE),
+        (pin.schmitt_enable, PADCFG_SCHMITT_ENABLE),
+    ] {
         if let Some(enabled) = setting {
-            mask |= 1 << bit;
+            mask |= bit;
             if enabled {
-                value |= 1 << bit;
+                value |= bit;
             }
         }
     }
@@ -675,8 +880,8 @@ fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
         if 1 < slew {
             return Err("JH7110 pin slew-rate must be zero or one");
         }
-        mask |= 1 << 5;
-        value |= slew << 5;
+        mask |= PADCFG_SLEW_MASK;
+        value |= slew << PADCFG_SLEW_SHIFT;
     }
     Ok((mask, value))
 }
@@ -684,52 +889,56 @@ fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
 /// GPIO function0 的选择位来自实际 SYS func_sel；专用 SD/GMAC pad 不制造虚构 mux 字段。
 fn function_field(pin: u32) -> Option<(usize, u32)> {
     match pin {
-        6 => Some((0x2b0, 0)),
-        7..=9 => Some((0x2b0, 2 + 3 * (pin - 7))),
-        10..=19 => Some((0x29c, 2 + 3 * (pin - 10))),
-        20..=29 => Some((0x2a0, 3 * (pin - 20))),
-        30..=35 => Some((0x2a4, 3 * (pin - 30))),
-        36..=40 => Some((0x2a4, 17 + 3 * (pin - 36))),
-        41..=51 => Some((0x2a8, 3 * (pin - 41))),
-        52..=54 => Some((0x2ac, 2 * (pin - 52))),
-        55..=63 => Some((0x2ac, 6 + 3 * (pin - 55))),
-        82 => Some((0x29c, 0)),
+        6 => Some((SYS_FUNC_SEL + 5 * REGISTER_BYTES, 0)),
+        7..=9 => Some((SYS_FUNC_SEL + 5 * REGISTER_BYTES, 2 + 3 * (pin - 7))),
+        10..=19 => Some((SYS_FUNC_SEL, 2 + 3 * (pin - 10))),
+        20..=29 => Some((SYS_FUNC_SEL + REGISTER_BYTES, 3 * (pin - 20))),
+        30..=35 => Some((SYS_FUNC_SEL + 2 * REGISTER_BYTES, 3 * (pin - 30))),
+        36..=40 => Some((SYS_FUNC_SEL + 2 * REGISTER_BYTES, 17 + 3 * (pin - 36))),
+        41..=51 => Some((SYS_FUNC_SEL + 3 * REGISTER_BYTES, 3 * (pin - 41))),
+        52..=54 => Some((SYS_FUNC_SEL + 4 * REGISTER_BYTES, 2 * (pin - 52))),
+        55..=63 => Some((SYS_FUNC_SEL + 4 * REGISTER_BYTES, 6 + 3 * (pin - 55))),
+        PAD_GMAC1_RXC => Some((SYS_FUNC_SEL, 0)),
         _ => None,
     }
 }
 
 /// 只接受 SDIO GPIO 信号及 SD/GMAC 固定功能；电气无寄存器的 GMAC pad 明确拒绝配置。
 fn validate_pin(pin: &PinResource) -> Result<(), &'static str> {
-    let number = pin.mux & 255;
-    let function = (pin.mux >> 8) & 3;
+    let number = pin.mux & PINMUX_PIN_MASK;
+    let function = (pin.mux >> PINMUX_FUNCTION_SHIFT) & PINMUX_FUNCTION_MASK;
     let (mask, _) = pad_config(pin)?;
     match pin.provider.start {
         SYS_PIN => {
-            check_region(pin.provider, SYS_PIN, 0x2b4)?;
-            if 88 < number || function != 0 {
+            check_region(pin.provider, SYS_PIN, SYS_PIN_MIN_BYTES)?;
+            if PAD_GMAC1_TXC < number || function != 0 {
                 return Err("SYS pin mux is outside supported SDIO/GMAC function zero");
             }
-            if number < 64 {
-                let output = (pin.mux >> 16) & 255;
-                let enable = (pin.mux >> 10) & 63;
-                let input = pin.mux >> 24;
-                if !matches!(output, 0 | 1 | 19 | 55 | 57..=66)
-                    || !matches!(enable, 0 | 1 | 19..=27)
-                    || !matches!(input, 11..=13 | 41..=53 | 255)
-                    || 127 < output
+            if number < SYS_GPIO_COUNT {
+                let output = (pin.mux >> PINMUX_DOUT_SHIFT) & PINMUX_DOUT_MASK;
+                let enable = (pin.mux >> PINMUX_DOEN_SHIFT) & PINMUX_DOEN_MASK;
+                let input = pin.mux >> PINMUX_DIN_SHIFT;
+                if !matches!(
+                    output,
+                    0 | 1 | GPOUT_SDIO0_RST | GPOUT_SDIO1_CLK | GPOUT_SDIO1_CMD..=GPOUT_SDIO1_RST
+                ) || !matches!(enable, 0 | 1 | GPOEN_SDIO1_CMD..=GPOEN_SDIO1_DATA7)
+                    || !matches!(input, GPI_SDIO0_CD..=GPI_SDIO0_WP | GPI_SDIO1_CD..=GPI_SDIO1_STRB | GPI_NONE)
+                    || GPIO_DOUT_MASK < output
                 {
                     return Err("SYS GPIO mux does not name a supported SDIO signal");
                 }
-            } else if pin.mux != (number | (1 << 10)) {
+            } else if pin.mux != (number | (GPIO_OUTPUT_DISABLE << PINMUX_DOEN_SHIFT)) {
                 return Err("dedicated SDIO/GMAC pad has invalid GPIO routing fields");
             }
-            if 75 <= number && mask != 0 {
+            if PAD_GMAC1_MDC <= number && mask != 0 {
                 return Err("dedicated GMAC pads have no supported pad electrical registers");
             }
         }
         AON_PIN => {
-            check_region(pin.provider, AON_PIN, 0x48)?;
-            if !(6..=19).contains(&number) || pin.mux != (number | (1 << 10)) {
+            check_region(pin.provider, AON_PIN, AON_PIN_MIN_BYTES)?;
+            if !(PAD_GMAC0_MDC..=PAD_GMAC0_TXC).contains(&number)
+                || pin.mux != (number | (GPIO_OUTPUT_DISABLE << PINMUX_DOEN_SHIFT))
+            {
                 return Err("AON pin mux is outside supported dedicated GMAC pads");
             }
             if mask != 0 {
@@ -748,8 +957,20 @@ fn prepare_pins(setup: &DeviceSetup) -> Result<(), &'static str> {
         .any(|pin| pin.provider.start == SYS_PIN)
     {
         let provider = crg(SYS_CRG)?;
-        enable_clock(ResourceReference { provider, id: 112 }, 0)?;
-        set_reset(ResourceReference { provider, id: 2 }, false)?;
+        enable_clock(
+            ResourceReference {
+                provider,
+                id: SYSCLK_IOMUX_APB,
+            },
+            0,
+        )?;
+        set_reset(
+            ResourceReference {
+                provider,
+                id: SYSRST_IOMUX_APB,
+            },
+            false,
+        )?;
     }
     if setup.pins[..setup.pin_count]
         .iter()
@@ -758,7 +979,7 @@ fn prepare_pins(setup: &DeviceSetup) -> Result<(), &'static str> {
         set_reset(
             ResourceReference {
                 provider: crg(AON_CRG)?,
-                id: 2,
+                id: AONRST_IOMUX,
             },
             false,
         )?;
@@ -768,33 +989,48 @@ fn prepare_pins(setup: &DeviceSetup) -> Result<(), &'static str> {
 
 /// 按一个 pin 的字节槽修改 DOUT/DOEN/GPI；专用 pad 仅有已验证的固定功能。
 fn apply_pin(pin: &PinResource) -> Result<(), &'static str> {
-    let number = pin.mux & 255;
+    let number = pin.mux & PINMUX_PIN_MASK;
     if pin.provider.start == SYS_PIN {
-        if number < 64 {
-            let offset = number as usize / 4 * 4;
-            let shift = number % 4 * 8;
-            let output = (pin.mux >> 16) & 255;
-            let enable = (pin.mux >> 10) & 63;
-            let input = pin.mux >> 24;
-            update(pin.provider, 0x40 + offset, 0x7f << shift, output << shift)?;
-            update(pin.provider, offset, 0x3f << shift, enable << shift)?;
-            if input != 255 {
-                let input_offset = input as usize / 4 * 4;
-                let input_shift = input % 4 * 8;
+        if number < SYS_GPIO_COUNT {
+            let offset = number as usize / GPIO_SLOTS_PER_WORD as usize * REGISTER_BYTES;
+            let shift = number % GPIO_SLOTS_PER_WORD * GPIO_SLOT_BITS;
+            let output = (pin.mux >> PINMUX_DOUT_SHIFT) & PINMUX_DOUT_MASK;
+            let enable = (pin.mux >> PINMUX_DOEN_SHIFT) & PINMUX_DOEN_MASK;
+            let input = pin.mux >> PINMUX_DIN_SHIFT;
+            update(
+                pin.provider,
+                SYS_DOUT + offset,
+                GPIO_DOUT_MASK << shift,
+                output << shift,
+            )?;
+            update(
+                pin.provider,
+                SYS_DOEN + offset,
+                GPIO_DOEN_MASK << shift,
+                enable << shift,
+            )?;
+            if input != GPI_NONE {
+                let input_offset = input as usize / GPIO_SLOTS_PER_WORD as usize * REGISTER_BYTES;
+                let input_shift = input % GPIO_SLOTS_PER_WORD * GPIO_SLOT_BITS;
                 update(
                     pin.provider,
-                    0x80 + input_offset,
-                    0x7f << input_shift,
-                    (number + 2) << input_shift,
+                    SYS_GPI + input_offset,
+                    GPIO_GPI_MASK << input_shift,
+                    (number + GPIO_GPI_PIN_BIAS) << input_shift,
                 )?;
             }
         }
         if let Some((offset, shift)) = function_field(number) {
-            update(pin.provider, offset, 3u32 << shift, 0)?;
+            update(pin.provider, offset, PINMUX_FUNCTION_MASK << shift, 0)?;
         }
         let (mask, value) = pad_config(pin)?;
         if mask != 0 {
-            update(pin.provider, 0x120 + number as usize * 4, mask, value)?;
+            update(
+                pin.provider,
+                SYS_PADCFG + number as usize * REGISTER_BYTES,
+                mask,
+                value,
+            )?;
         }
     }
     Ok(())

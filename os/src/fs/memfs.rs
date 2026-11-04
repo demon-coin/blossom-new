@@ -11,14 +11,19 @@ use crate::fs::ext4::Ext4Volume;
 use crate::fs::inode::{
     Inode, InodeCache, InodeMetadata, InodeRef, MemoryContent, MemoryDirectory,
 };
-use crate::fs::types::InodeKind;
+use crate::fs::types::{InodeKind, S_IALLUGO, S_IFCHR, S_IFDIR, S_IFREG, S_IRWXUGO, S_ISVTX};
 use crate::fs::FsError;
 use crate::mm::PAGE_SIZE;
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 
 mod options;
 pub use options::TmpfsOptions;
-static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1 << 32);
+
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const DEVFS_MAGIC: u64 = 0x1373;
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const MEMORY_DEVICE_BASE: u64 = 1u64 << u32::BITS;
+static NEXT_DEVICE: AtomicU64 = AtomicU64::new(MEMORY_DEVICE_BASE);
 
 /// 后端容量快照只保存块与 inode 计数；挂载模式由取得快照的完整 Path 提供。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,7 +204,7 @@ impl MemoryFs {
         let options = TmpfsOptions::parse(options, pages)?;
         Self::try_with_limits(
             MemoryFsKind::Tmpfs,
-            options.mode.unwrap_or(0o1777),
+            options.mode.unwrap_or(S_ISVTX | S_IRWXUGO),
             options.limits(pages),
         )
     }
@@ -235,7 +240,7 @@ impl MemoryFs {
         .map_err(|_| FsError::NoMemory)?;
         let metadata = InodeMetadata::memory(
             InodeKind::Directory,
-            0x4000 | (root_mode & 0x0fff),
+            S_IFDIR | (root_mode & S_IALLUGO),
             0,
             0,
             2,
@@ -276,9 +281,9 @@ impl MemoryFs {
     pub fn statfs(&self) -> Result<FilesystemStat, FsError> {
         let mut stat = FilesystemStat {
             fs_type: match self.kind {
-                MemoryFsKind::Tmpfs => 0x0102_1994,
-                MemoryFsKind::Devfs => 0x1373,
-                MemoryFsKind::Procfs => 0x9fa0,
+                MemoryFsKind::Tmpfs => TMPFS_MAGIC,
+                MemoryFsKind::Devfs => DEVFS_MAGIC,
+                MemoryFsKind::Procfs => PROC_SUPER_MAGIC,
             },
             block_size: PAGE_SIZE as u64,
             blocks: 0,
@@ -375,11 +380,11 @@ impl MemoryFs {
             ) => InodeKind::Regular,
             _ => return Err(FsError::InvalidOperation),
         };
-        let mode = (mode & 0x0fff)
+        let mode = (mode & S_IALLUGO)
             | if kind == InodeKind::Character {
-                0x2000
+                S_IFCHR
             } else {
-                0x8000
+                S_IFREG
             };
         let inode = self.allocate(
             InodeMetadata::memory(kind, mode, 0, 0, 1, 0),
@@ -399,7 +404,14 @@ impl MemoryFs {
         let _rename = self.rename.lock();
         self.require_initialization_parent(parent)?;
         let inode = self.allocate(
-            InodeMetadata::memory(InodeKind::Directory, 0x4000 | (mode & 0x0fff), 0, 0, 2, 0),
+            InodeMetadata::memory(
+                InodeKind::Directory,
+                S_IFDIR | (mode & S_IALLUGO),
+                0,
+                0,
+                2,
+                0,
+            ),
             MemoryContent::Directory(SpinLock::new(MemoryDirectory {
                 parent: parent.number(),
                 next_cookie: 2,

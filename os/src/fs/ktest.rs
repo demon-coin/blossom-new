@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::block::{self, AccessMode, BlockError, BlockView, Disk, DiskIdentity, DiskRef};
-use crate::drivers::virtio::{VirtioDevice, VirtioIdentity};
+use crate::drivers::virtio::{
+    VirtioDevice, VirtioIdentity, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN,
+    VIRTIO_VENDOR_ID,
+};
 use crate::drivers::DeviceInventory;
-use crate::fs::ext4::Ext4Volume;
+use crate::fs::ext4::{codec, Ext4Volume};
 use crate::fs::inode::{InodeCache, InodeCacheWatch, InodeRef, InvalidateGuard};
 use crate::fs::{
     DentryRef, DescriptorFlags, FileRef, FileTable, FsContext, FsError, InodeKind, OpenOptions,
@@ -178,10 +181,13 @@ fn devices(
     inventory: &DeviceInventory,
     count: usize,
 ) -> Result<Vec<VirtioDevice>, TestError> {
-    let pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     if inventory.mmio_blocks.len() + pci.clone().count() != count {
         return Err(TestError(
             "filesystem attached disks differ from declared roles",
@@ -850,7 +856,7 @@ impl Owner {
         volume: &Arc<Ext4Volume>,
         name: &[u8],
     ) -> Result<InodeRef, TestError> {
-        let root = checked(context, self.cache().iget(volume, 2))?;
+        let root = checked(context, self.cache().iget(volume, codec::ROOT_INODE))?;
         checked(context, root.lookup(self.cache(), name))
     }
 

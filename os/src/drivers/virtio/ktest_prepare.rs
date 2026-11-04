@@ -14,7 +14,10 @@ use virtio_drivers::transport::{
     DeviceStatus, SomeTransport,
 };
 
-use super::{VirtioDevice, VirtioIdentity, VirtioInitError};
+use super::{
+    VirtioDevice, VirtioIdentity, VirtioInitError, VIRTIO_PCI_BLOCK_LEGACY,
+    VIRTIO_PCI_BLOCK_MODERN, VIRTIO_VENDOR_ID,
+};
 use crate::block::{BlockError, Disk, DiskRef};
 use crate::drivers::{self, DeviceInventory};
 use crate::mm::dma::DmaError;
@@ -50,7 +53,11 @@ fn inventory() -> Result<DeviceInventory, TestError> {
             .devices()
             .iter()
             .filter(|device| {
-                device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+                device.vendor_id == VIRTIO_VENDOR_ID
+                    && matches!(
+                        device.device_id,
+                        VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                    )
             })
             .count();
     if count != 1 {
@@ -73,7 +80,11 @@ fn prepare(inventory: &DeviceInventory) -> Result<VirtioDevice, VirtioInitError>
             .devices()
             .iter()
             .find(|device| {
-                device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+                device.vendor_id == VIRTIO_VENDOR_ID
+                    && matches!(
+                        device.device_id,
+                        VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                    )
             })
             .ok_or(crate::drivers::ProbeError::Resource(
                 "scratch PCI candidate missing",
@@ -102,7 +113,11 @@ fn transport(inventory: &DeviceInventory) -> Result<SomeTransport<'static>, Test
             .devices()
             .iter()
             .find(|device| {
-                device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+                device.vendor_id == VIRTIO_VENDOR_ID
+                    && matches!(
+                        device.device_id,
+                        VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                    )
             })
             .ok_or(TestError("feature PCI candidate missing"))?;
         let selected = super::selected_construct(&inventory.pci, device)

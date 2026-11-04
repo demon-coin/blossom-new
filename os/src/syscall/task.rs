@@ -2,23 +2,33 @@
 
 use core::convert::TryInto;
 
+use crate::fs::PATH_MAX;
 use crate::mm::space::VmError;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::clone::{self, CloneArguments, CloneError};
 use crate::task::exec::{self, Arguments, ExecError, LoadedImage};
-use crate::task::process::{ChildEvent, Resource, ResourceLimit, WaitSelector};
-use crate::task::signal::{SignalInfo, SignalPayload};
+use crate::task::process::{
+    ChildEvent, Resource, ResourceLimit, WaitSelector, EXIT_STATUS_SHIFT, WAIT_CONTINUED,
+    WAIT_CORE_DUMP, WAIT_STOPPED, WALL, WCLONE, WCONTINUED as CONTINUED, WEXITED as EXITED,
+    WNOHANG as NOHANG, WNOWAIT as NOWAIT, WSTOPPED as STOPPED,
+};
+use crate::task::signal::{
+    SignalInfo, SignalPayload, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED,
+    SIGCHLD, SIGINFO_BYTES, SIGSEGV,
+};
 use crate::task::{UserRuntime, UserThread};
+use crate::time::{NSEC_PER_SEC, NSEC_PER_USEC};
 use crate::wait::{WaitNode, WaitResult, Waiter};
 
-const NOHANG: u32 = 1;
-const STOPPED: u32 = 2;
-const EXITED: u32 = 4;
-const CONTINUED: u32 = 8;
-const NOWAIT: u32 = 0x0100_0000;
-const WALL: u32 = 0x4000_0000;
-const WCLONE: u32 = 0x8000_0000;
+const RLIMIT_STACK: u32 = 3;
+const RLIMIT_NPROC: u32 = 6;
+const RLIMIT_NOFILE: u32 = 7;
+const RLIMIT_SIGPENDING: u32 = 11;
+const RLIM_NLIMITS: u32 = 16;
+const P_ALL: i32 = 0;
+const P_PID: i32 = 1;
+const P_PGID: i32 = 2;
 
 /// 按架构次序解码本次六参数并发表真实child，返回用户TID而非TaskId。
 pub(super) fn clone(user: &UserThread, request: Request) -> SysResult {
@@ -53,7 +63,7 @@ pub(super) fn execve(user: &UserThread, request: Request) -> Outcome {
 fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, UserRuntime), Errno> {
     let runtime = user.runtime().expect("exec has no runtime");
     let mm = user.mm().expect("exec has no MM");
-    let pathname = mm.read_c_string(raw[0], 4096)?;
+    let pathname = mm.read_c_string(raw[0], PATH_MAX)?;
     let stack_limit = user
         .identity()
         .expect("exec has no identity")
@@ -74,7 +84,10 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
 /// 不可回返点后不伪造errno返回旧现场，已存在的致命组原因保持优先。
 fn abort_exec(user: &UserThread) -> Outcome {
     let identity = user.identity().expect("failed exec has no identity");
-    let status = identity.graph().exit_request(&identity).unwrap_or(11);
+    let status = identity
+        .graph()
+        .exit_request(&identity)
+        .unwrap_or(SIGSEGV as i32);
     identity.graph().request_exit(&identity, status);
     Outcome::GroupExit(status)
 }
@@ -108,14 +121,14 @@ fn resource_limit(
     new_address: Option<usize>,
     old_address: Option<usize>,
 ) -> SysResult {
-    if 16 <= resource {
+    if RLIM_NLIMITS <= resource {
         return Err(Errno::InvalidArgument);
     }
     let resource = match resource {
-        3 => Resource::Stack,
-        6 => Resource::Nproc,
-        7 => Resource::NoFile,
-        11 => Resource::SigPending,
+        RLIMIT_STACK => Resource::Stack,
+        RLIMIT_NPROC => Resource::Nproc,
+        RLIMIT_NOFILE => Resource::NoFile,
+        RLIMIT_SIGPENDING => Resource::SigPending,
         _ => return Err(Errno::NoSyscall),
     };
     let mm = user.mm().expect("rlimit has no MM");
@@ -193,14 +206,14 @@ pub(super) fn waitid(user: &UserThread, request: Request) -> Outcome {
     }
     let identity = user.identity().expect("waitid has no identity");
     let selector = match raw[0] as i32 {
-        0 => Ok(WaitSelector::Any),
-        1 if raw[1] as i32 > 0 => identity
+        P_ALL => Ok(WaitSelector::Any),
+        P_PID if raw[1] as i32 > 0 => identity
             .graph()
             .pid_object(raw[1] as i32 as usize)
             .map(WaitSelector::Pid)
             .ok_or(Errno::NoChild),
-        2 if raw[1] as i32 == 0 => Ok(WaitSelector::Group(identity.group().pgid_object())),
-        2 if raw[1] as i32 > 0 => identity
+        P_PGID if raw[1] as i32 == 0 => Ok(WaitSelector::Group(identity.group().pgid_object())),
+        P_PGID if raw[1] as i32 > 0 => identity
             .graph()
             .pid_object(raw[1] as i32 as usize)
             .map(WaitSelector::Group)
@@ -217,13 +230,13 @@ pub(super) fn waitid(user: &UserThread, request: Request) -> Outcome {
     };
     let result: SysResult = (|| {
         let mm = user.mm().expect("waitid has no MM");
-        let mut bytes = [0u8; 128];
+        let mut bytes = [0u8; SIGINFO_BYTES];
         if let Some(event) = event {
             if raw[4] != 0 {
                 copyout(&mm, raw[4], &usage(event))?;
             }
             SignalInfo {
-                signum: 17,
+                signum: SIGCHLD,
                 errno: 0,
                 code: event.code,
                 payload: SignalPayload::Child {
@@ -280,11 +293,11 @@ pub(super) fn wait4(user: &UserThread, request: Request) -> Outcome {
     let result: SysResult = (|| {
         let mm = user.mm().expect("wait4 has no MM");
         let status = match event.code {
-            1 => event.status << 8,
-            2 => event.status,
-            3 => event.status | 0x80,
-            5 => (event.status << 8) | 0x7f,
-            6 => 0xffff,
+            CLD_EXITED => event.status << EXIT_STATUS_SHIFT,
+            CLD_KILLED => event.status,
+            CLD_DUMPED => event.status | WAIT_CORE_DUMP,
+            CLD_STOPPED => (event.status << EXIT_STATUS_SHIFT) | WAIT_STOPPED,
+            CLD_CONTINUED => WAIT_CONTINUED,
             _ => unreachable!("unknown child event"),
         };
         if raw[1] != 0 {
@@ -334,9 +347,9 @@ fn wait_event(
 fn usage(event: ChildEvent) -> [u8; 144] {
     let mut bytes = [0u8; 144];
     for (offset, ns) in [(0, event.user_ns), (16, event.kernel_ns)] {
-        bytes[offset..offset + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+        bytes[offset..offset + 8].copy_from_slice(&(ns / NSEC_PER_SEC).to_le_bytes());
         bytes[offset + 8..offset + 16]
-            .copy_from_slice(&((ns % 1_000_000_000) / 1000).to_le_bytes());
+            .copy_from_slice(&((ns % NSEC_PER_SEC) / NSEC_PER_USEC).to_le_bytes());
     }
     bytes
 }

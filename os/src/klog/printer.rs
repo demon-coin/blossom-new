@@ -13,6 +13,7 @@ use crate::wait::{WaitNode, WaitQueue, Waiter};
 use super::{Cursor, ReadRecord, StackText};
 
 static RECORD_WAIT: WaitQueue = WaitQueue::new();
+const HEADER_TEXT_CAPACITY: usize = 256;
 
 /// 在 BSP 开放中断与启动 AP 前一次准备读者源和打印任务，全部成功后无分配发表。
 pub fn initialize_service() -> Result<(), AllocError> {
@@ -83,7 +84,7 @@ fn run() -> i32 {
     loop {
         let current = read_next(&mut cursor);
         let record = &current.record;
-        let mut header = StackText::<256>::new();
+        let mut header = StackText::<HEADER_TEXT_CAPACITY>::new();
         write!(
             header,
             "KLOG seq={} level={} ns={} cpu={} task=",
@@ -186,6 +187,10 @@ pub mod testing {
     pub(crate) enum PausePoint {
         AfterPartialWrite,
     }
+    const ARMED: usize = 1;
+    const PAUSED: usize = 2;
+    const RELEASED: usize = 3;
+    const SERVICE_TIMEOUT_SECONDS: u64 = 10;
 
     /// 入口只保存弱观察，任务的强拥有与执行栈仍由真实调度器负责。
     pub(super) fn install_service() {
@@ -246,13 +251,13 @@ pub mod testing {
             return;
         }
         if PAUSE
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(ARMED, PAUSED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             RESUME.wait();
             assert_eq!(
-                PAUSE.compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire),
-                Ok(3),
+                PAUSE.compare_exchange(RELEASED, 0, Ordering::AcqRel, Ordering::Acquire),
+                Ok(RELEASED),
                 "log resume token without release"
             );
         }
@@ -282,7 +287,7 @@ pub mod testing {
             PausePoint::AfterPartialWrite => {
                 assert!(
                     PAUSE
-                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .compare_exchange(0, ARMED, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok(),
                     "log pause already armed"
                 );
@@ -292,15 +297,15 @@ pub mod testing {
 
     /// 此值仅说明停点已到达，调用者仍须用 service_state 验证真实 Blocked。
     pub(crate) fn is_paused() -> bool {
-        PAUSE.load(Ordering::Acquire) == 2
+        PAUSE.load(Ordering::Acquire) == PAUSED
     }
 
     /// 仅赢得原停点 2→3 放行责任的控制者发布一个真实完成 token。
     /// Thread 控制者不得持观察锁、调度锁、PORT 或服务恢复所需锁；不等待服务。
     pub(crate) fn release_pause() {
         assert_eq!(
-            PAUSE.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire),
-            Ok(2),
+            PAUSE.compare_exchange(PAUSED, RELEASED, Ordering::AcqRel, Ordering::Acquire),
+            Ok(PAUSED),
             "log printer has not reached its pause"
         );
         RESUME.complete();
@@ -317,16 +322,16 @@ pub mod testing {
         loop {
             let state = PAUSE.load(Ordering::Acquire);
             let next = match state {
-                0 | 3 => return,
-                1 => 0,
-                2 => 3,
+                0 | RELEASED => return,
+                ARMED => 0,
+                PAUSED => RELEASED,
                 _ => unreachable!("invalid log pause state"),
             };
             if PAUSE
                 .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                if state == 2 {
+                if state == PAUSED {
                     RESUME.complete();
                 }
                 return;
@@ -359,7 +364,7 @@ pub mod testing {
         sched::assert_switchable();
         let start = crate::arch::read_counter();
         let limit = crate::arch::counter_frequency()
-            .checked_mul(10)
+            .checked_mul(SERVICE_TIMEOUT_SECONDS)
             .expect("log service deadline overflow");
         loop {
             let observed = snapshot();

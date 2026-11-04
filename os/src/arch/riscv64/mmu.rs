@@ -1,13 +1,22 @@
 //! 用户 Sv39 根借用永久内核高半映射，低半页表由 MM 独占拥有。
 
-use crate::mm::user_table::PagePermissions;
+use crate::{
+    arch::riscv64::{
+        PAGE_SHIFT, PHYSICAL_TO_PTE_SHIFT, PTE_ACCESSED, PTE_DIRTY, PTE_EXEC, PTE_LEAF,
+        PTE_PPN_SHIFT, PTE_READ, PTE_USER, PTE_VALID, PTE_WRITE, PT_HALF_ENTRIES, SATP_MODE_SV39,
+        SATP_PPN_MASK, SV39_LEVELS, SV39_VA_BITS,
+    },
+    mm::{user_table::PagePermissions, PAGE_SIZE},
+};
 use core::{arch::asm, ptr};
 
-pub const USER_ADDRESS_END: usize = 1 << 38;
-pub const USER_STACK_TOP: usize = USER_ADDRESS_END - 4096;
-pub const SIGNAL_RETURN_PAGE: usize = USER_ADDRESS_END - 4096;
-pub const USER_LEVELS: usize = 3;
-const PPN_MASK: usize = ((1usize << 44) - 1) << 10;
+pub const USER_ADDRESS_END: usize = 1 << (SV39_VA_BITS - 1);
+pub const USER_STACK_TOP: usize = USER_ADDRESS_END - PAGE_SIZE;
+pub const SIGNAL_RETURN_PAGE: usize = USER_ADDRESS_END - PAGE_SIZE;
+pub const USER_LEVELS: usize = SV39_LEVELS;
+const PPN_MASK: usize = SATP_PPN_MASK << PTE_PPN_SHIFT;
+const PTE_FLAGS_MASK: usize = (1 << PTE_PPN_SHIFT) - 1;
+const USER_BACKING_FLAGS: usize = PTE_USER | PTE_ACCESSED;
 
 /// 未映射的 Sv39 项在所有层级均为零。
 pub const fn user_empty_entry(_level: usize) -> usize {
@@ -16,17 +25,17 @@ pub const fn user_empty_entry(_level: usize) -> usize {
 
 /// 编码仅含 V 位的非叶目录，物理地址合法性由调用者作往返检查。
 pub const fn user_table_entry(physical: usize) -> usize {
-    ((physical >> 2) & PPN_MASK) | 1
+    ((physical >> PHYSICAL_TO_PTE_SHIFT) & PPN_MASK) | PTE_VALID
 }
 
 /// 仅在非叶层识别有效且没有 R/W/X 的目录项。
 pub const fn user_entry_is_table(entry: usize, level: usize) -> bool {
-    0 < level && entry & 0xf == 1
+    0 < level && entry & (PTE_VALID | PTE_LEAF) == PTE_VALID
 }
 
 /// 从硬件 PPN 字段取得页对齐物理地址。
 pub const fn user_entry_physical(entry: usize, _level: usize) -> usize {
-    (entry & PPN_MASK) << 2
+    (entry & PPN_MASK) << PHYSICAL_TO_PTE_SHIFT
 }
 
 /// 编码用户叶项；无权限页保留 PPN 并关闭 V，Sv39 纯写权限无效。
@@ -36,43 +45,46 @@ pub const fn user_leaf_entry(physical: usize, permissions: PagePermissions) -> u
     }
     // V=0 时 U/A 由软件保留，用于区分无权限叶与没有 backing 的空槽。
     if !permissions.read && !permissions.execute {
-        return ((physical >> 2) & PPN_MASK) | 0x50;
+        return ((physical >> PHYSICAL_TO_PTE_SHIFT) & PPN_MASK) | USER_BACKING_FLAGS;
     }
-    ((physical >> 2) & PPN_MASK)
-        | 0x51
-        | ((permissions.read as usize) << 1)
-        | ((permissions.write as usize) << 2)
-        | ((permissions.execute as usize) << 3)
-        | ((permissions.write as usize) << 7)
+    ((physical >> PHYSICAL_TO_PTE_SHIFT) & PPN_MASK)
+        | (USER_BACKING_FLAGS | PTE_VALID)
+        | ((permissions.read as usize) * PTE_READ)
+        | ((permissions.write as usize) * PTE_WRITE)
+        | ((permissions.execute as usize) * PTE_EXEC)
+        | ((permissions.write as usize) * PTE_DIRTY)
 }
 
 /// 解码有效用户叶或保留 backing 的无权限叶，目录与非法 R/W 组合不属于用户叶。
 pub const fn user_leaf_permissions(entry: usize) -> Option<PagePermissions> {
-    if entry & 0x3ff == 0x50 {
+    if entry & PTE_FLAGS_MASK == USER_BACKING_FLAGS {
         return Some(PagePermissions {
             read: false,
             write: false,
             execute: false,
         });
     }
-    if entry & 0x11 != 0x11 || entry & 0xe == 0 || entry & 6 == 4 {
+    if entry & (PTE_VALID | PTE_USER) != (PTE_VALID | PTE_USER)
+        || entry & PTE_LEAF == 0
+        || entry & (PTE_READ | PTE_WRITE) == PTE_WRITE
+    {
         return None;
     }
     Some(PagePermissions {
-        read: entry & 2 != 0,
-        write: entry & 4 != 0,
-        execute: entry & 8 != 0,
+        read: entry & PTE_READ != 0,
+        write: entry & PTE_WRITE != 0,
+        execute: entry & PTE_EXEC != 0,
     })
 }
 
 /// 保留原 PFN、读执行权限及访问位，只撤销写许可和保守脏位。
 pub const fn user_leaf_mkclean(entry: usize) -> usize {
-    entry & !((1 << 2) | (1 << 7))
+    entry & !(PTE_WRITE | PTE_DIRTY)
 }
 
 /// 当前 D 表达写授权时预置的保守脏义务，不表示精确 store 次数。
 pub const fn user_leaf_dirty(entry: usize) -> bool {
-    entry & (1 << 7) != 0
+    entry & PTE_DIRTY != 0
 }
 
 /// 清空用户低半，并借用已经发表且不再修改的最终内核根高半。
@@ -86,8 +98,12 @@ pub unsafe fn initialize_user_root(root: *mut usize) {
     unsafe {
         assert_ne!(ptr::read(ptr::addr_of!(super::RV_FINAL_SATP)), 0);
         let kernel = ptr::addr_of!(super::FINAL_TABLES).cast::<usize>();
-        ptr::write_bytes(root, 0, 256);
-        ptr::copy_nonoverlapping(kernel.add(256), root.add(256), 256);
+        ptr::write_bytes(root, 0, PT_HALF_ENTRIES);
+        ptr::copy_nonoverlapping(
+            kernel.add(PT_HALF_ENTRIES),
+            root.add(PT_HALF_ENTRIES),
+            PT_HALF_ENTRIES,
+        );
     }
 }
 
@@ -97,9 +113,9 @@ pub unsafe fn initialize_user_root(root: *mut usize) {
 /// root_phys 必须为已初始化、4KiB 对齐的 Sv39 根；完整表和所有映射的页仍被保活。
 /// 内核高半必须包含当前代码、栈与 CpuLocal；本核 IRQ 已关闭，MM 活动归属由调用者管理。
 pub unsafe fn activate_user_root(root_phys: usize) {
-    assert_eq!(root_phys & 4095, 0);
+    assert_eq!(root_phys & (PAGE_SIZE - 1), 0);
     assert!(!super::irq_enabled());
-    let satp = (8usize << 60) | (root_phys >> 12);
+    let satp = SATP_MODE_SV39 | (root_phys >> PAGE_SHIFT);
     // SAFETY: 调用者保证根及当前内核映射存活；ASID 固定零，完整 sfence 同时排序新 PTE。
     unsafe {
         asm!("fence rw, rw", "csrw satp, {satp}", "sfence.vma", satp = in(reg) satp, options(nostack));

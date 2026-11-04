@@ -3,6 +3,8 @@ use super::report::{self, Json, Nullable};
 use ::ktest::{CaseDesc, Context, Defaults, Isolation, SuiteDesc, SuiteSlot, TestError};
 use core::mem::{align_of, size_of};
 
+const ASCII_DEL: u8 = 0x7f;
+
 unsafe extern "C" {
     static __ktest_suites_start: u8;
     static __ktest_suites_end: u8;
@@ -89,8 +91,8 @@ impl Registry {
                 {
                     return Err(TestError("case weakens suite defaults"));
                 }
-                if case.name.bytes().any(|b| b < 32 || b == 127)
-                    || suite.name.bytes().any(|b| b < 32 || b == 127)
+                if case.name.bytes().any(|b| b < b' ' || b == ASCII_DEL)
+                    || suite.name.bytes().any(|b| b < b' ' || b == ASCII_DEL)
                 {
                     return Err(TestError("control character in test name"));
                 }

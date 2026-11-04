@@ -16,16 +16,18 @@ use crate::fs::poll::{PollMask, PollTable, PollWaitHead};
 use crate::fs::{FsError, ReadBuffer};
 use crate::net::address::{AddressFamily, AddressOperation, InetEndpoint, SocketAddress};
 use crate::net::lifecycle::{EgressWait, RetirementLink};
-use crate::net::packet::{zeroed_bytes, OwnedPacket};
-use crate::net::socket::SocketTimeouts;
+use crate::net::packet::{
+    zeroed_bytes, OwnedPacket, IPV6_UDP_HEADER_LEN, MAX_IPV4_UDP_PAYLOAD_LEN,
+    MAX_IPV6_UDP_PAYLOAD_LEN,
+};
+use crate::net::socket::{SocketTimeouts, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR};
 use crate::net::table::{BindLease, TransportProtocol};
 use crate::net::{EndpointSlot, IoProgress, MessageResult, NetStack, NetStackRef, PROTOCOL_BUDGET};
 use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::workqueue::Work;
 
 const PACKET_RECORDS: usize = 32;
-const PAYLOAD_CAPACITY: usize = 131072;
-const MSG_TRUNC: u32 = 0x20;
+const PAYLOAD_CAPACITY: usize = 128 * 1024;
 
 /// 后台输入在普通操作持有协议对象时保留；预留槽位内的移动不分配。
 struct Input {
@@ -505,8 +507,8 @@ impl UdpEndpoint {
         }
         self.check_family(&state, destination.address, AddressOperation::Send)?;
         let protocol_limit = match destination.address {
-            IpAddress::Ipv4(_) => 65507,
-            IpAddress::Ipv6(_) => 65487,
+            IpAddress::Ipv4(_) => MAX_IPV4_UDP_PAYLOAD_LEN,
+            IpAddress::Ipv6(_) => MAX_IPV6_UDP_PAYLOAD_LEN,
         };
         if protocol_limit < payload.len() || state.send_budget < payload.len() {
             return Err(FsError::MessageTooLarge);
@@ -519,7 +521,7 @@ impl UdpEndpoint {
             .map_or(self.family.unspecified(), |lease| lease.local().address);
         let route = net.resolve_route(destination.address, bound)?;
         if matches!(destination.address, IpAddress::Ipv6(_))
-            && route.mtu.saturating_sub(48) < payload.len()
+            && route.mtu.saturating_sub(IPV6_UDP_HEADER_LEN) < payload.len()
         {
             return Err(FsError::MessageTooLarge);
         }
@@ -737,17 +739,17 @@ impl UdpEndpoint {
 
     /// 未连接也先提交方向关闭；已有原 RX record 先于读 EOF。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
-        if 2 < how {
+        if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
         }
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
         }
-        if how == 0 || how == 2 {
+        if how == SHUT_RD || how == SHUT_RDWR {
             state.read_closed = true;
         }
-        if how == 1 || how == 2 {
+        if how == SHUT_WR || how == SHUT_RDWR {
             state.write_closed = true;
         }
         if state.peer.is_some() {

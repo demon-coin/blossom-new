@@ -1,6 +1,8 @@
 //! 映射读取与真实固定 CPU 子任务；timer 覆盖后交还生产 LocalEvent。
 
 use crate::ktest::{spawn_on, ChildHandle};
+#[cfg(target_arch = "riscv64")]
+use crate::mm;
 use crate::sync::{IrqSaveGuard, PreemptGuard, SpinLock};
 use crate::{arch, boot, cpu, sched, time};
 use ::ktest::{Fixture, TestContext, TestError, TestResult};
@@ -33,31 +35,35 @@ fn translation(address: usize) -> Option<(usize, usize)> {
         core::arch::asm!("csrr {value}, satp", value = out(reg) satp, options(nomem, nostack));
     }
     assert_eq!(satp >> 60, 8, "final SATP is not Sv39");
-    translation_from((satp & ((1usize << 44) - 1)) << 12, address)
+    translation_from((satp & arch::SATP_PPN_MASK) << mm::PAGE_SHIFT, address)
 }
 
 /// 只读遍历指定 Sv39 根，当前表与 bootstrap 表都必须属于永久内核保留 RAM。
 #[cfg(target_arch = "riscv64")]
 fn translation_from(mut physical: usize, address: usize) -> Option<(usize, usize)> {
-    for level in (0..3).rev() {
+    for level in (0..arch::SV39_LEVELS).rev() {
         let kernel = boot::kernel_region();
         assert!(
-            kernel.start <= physical && physical + 4096 <= kernel.end,
+            kernel.start <= physical && physical + mm::PAGE_SIZE <= kernel.end,
             "page table outside kernel reservation"
         );
-        let index = (address >> (12 + level * 9)) & 511;
+        let index =
+            (address >> (mm::PAGE_SHIFT + level * arch::PT_INDEX_BITS)) & arch::PT_INDEX_MASK;
         // SAFETY: 完整页表处于实际内核保留 RAM，直映永久有效；引导后页表不修改。
         let entry = unsafe {
             core::ptr::read_volatile((arch::phys_to_virt(physical) as *const usize).add(index))
         };
-        if entry & 1 == 0 {
+        if entry & arch::PTE_VALID == 0 {
             return None;
         }
-        if entry & 0xe != 0 {
-            let mask = (1usize << (12 + level * 9)) - 1;
-            return Some((((entry >> 10) << 12) | (address & mask), entry & 0xff));
+        if entry & (arch::PTE_READ | arch::PTE_WRITE | arch::PTE_EXEC) != 0 {
+            let mask = (1usize << (mm::PAGE_SHIFT + level * arch::PT_INDEX_BITS)) - 1;
+            return Some((
+                ((entry >> arch::PTE_PPN_SHIFT) << mm::PAGE_SHIFT) | (address & mask),
+                entry & u8::MAX as usize,
+            ));
         }
-        physical = (entry >> 10) << 12;
+        physical = (entry >> arch::PTE_PPN_SHIFT) << mm::PAGE_SHIFT;
     }
     None
 }
@@ -76,8 +82,8 @@ fn expect_ram_mapping(context: &mut TestContext<'_>, info: &boot::BootInfo, addr
         .zip(&info.reserved_no_map[..info.reserved_count])
         .any(|(region, no_map)| {
             *no_map
-                && region.start / 4096 <= address / 4096
-                && address / 4096 < region.end.div_ceil(4096)
+                && region.start / mm::PAGE_SIZE <= address / mm::PAGE_SIZE
+                && address / mm::PAGE_SIZE < region.end.div_ceil(mm::PAGE_SIZE)
         });
     if no_map {
         context.expect_eq(translation(arch::phys_to_virt(address)), None);
@@ -97,8 +103,10 @@ fn mapping_csrs() -> [usize; 3] {
     let device;
     // SAFETY: 三个已存在 CSR 只读且不改写 DMW 或地址模式。
     unsafe {
-        core::arch::asm!("csrrd {crmd}, 0", "csrrd {cached}, 0x181", "csrrd {device}, 0x180",
-        crmd = out(reg) crmd, cached = out(reg) cached, device = out(reg) device, options(nomem, nostack));
+        core::arch::asm!("csrrd {crmd}, {csr_crmd}", "csrrd {cached}, {dmw1}", "csrrd {device}, {dmw0}",
+        crmd = out(reg) crmd, cached = out(reg) cached, device = out(reg) device,
+        csr_crmd = const arch::CSR_CRMD, dmw1 = const arch::CSR_DMW1,
+        dmw0 = const arch::CSR_DMW0, options(nomem, nostack));
     }
     [crmd, cached, device]
 }
@@ -167,12 +175,12 @@ pub(crate) mod mapping {
                 .iter()
                 .zip(&info.reserved_no_map[..info.reserved_count])
             {
-                let start = region.start & !4095;
+                let start = region.start & !(crate::mm::PAGE_SIZE - 1);
                 let end = region
                     .end
-                    .checked_add(4095)
+                    .checked_add(crate::mm::PAGE_SIZE - 1)
                     .expect("reservation page rounding overflow")
-                    & !4095;
+                    & !(crate::mm::PAGE_SIZE - 1);
                 for address in [Some(start), Some(end - 1), start.checked_sub(1), Some(end)]
                     .iter()
                     .flatten()

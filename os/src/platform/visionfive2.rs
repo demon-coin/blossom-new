@@ -3,9 +3,13 @@
 use super::resources;
 use super::{
     compatible, device_region, device_source, enabled, interrupt_parent, number, property,
-    region_at, single_region, word, Fdt, Node,
+    region_at, single_region, word, Fdt, Node, FDT_CELL_BYTES,
 };
 use crate::boot::{BootInfo, GmacResources, GpioInputResource, MmcResources};
+use crate::drivers::sdmmc::{FIFO_MAX_DEPTH, FIFO_MIN_DEPTH};
+
+const GPIO_ACTIVE_LOW: u32 = 1;
+const MMC_POST_POWER_ON_DELAY_MS: u32 = 10;
 
 /// 从当前 OS DT 构造所用资源快照，未认领的完整硬件描述不取得运行期拥有。
 pub(super) fn discover<'a>(
@@ -36,7 +40,10 @@ pub(super) fn discover<'a>(
         device_region(registers, info)?;
         info.board.ccache = registers;
         info.board.cache_line_size = number(ccache, "cache-block-size")? as usize;
-        if info.board.cache_line_size != 64 || registers.end - registers.start < 0x208 {
+        if info.board.cache_line_size != crate::arch::SIFIVE_CCACHE_LINE_SIZE
+            || registers.end - registers.start
+                < crate::arch::SIFIVE_CCACHE_FLUSH64 + core::mem::size_of::<u64>()
+        {
             return Err("FDT JH7110 ccache geometry is unsupported");
         }
         info.board.clock_inputs = resources::jh7110_clock_inputs(tree, uart)?;
@@ -98,7 +105,7 @@ fn discover_mmc<'a>(
         return Err("FDT SDIO1 clock, reset or pin resources are incomplete");
     }
     let sysreg = property(mmc, "starfive,sysreg")?;
-    if sysreg.len() != 16 {
+    if sysreg.len() != 4 * FDT_CELL_BYTES {
         return Err("FDT MMC sysreg binding is invalid");
     }
     let syscon = tree
@@ -109,7 +116,11 @@ fn discover_mmc<'a>(
         interrupt_source,
         setup,
         syscon: single_region(tree, syscon)?,
-        sysreg: [word(sysreg, 4)?, word(sysreg, 8)?, word(sysreg, 12)?],
+        sysreg: [
+            word(sysreg, FDT_CELL_BYTES)?,
+            word(sysreg, 2 * FDT_CELL_BYTES)?,
+            word(sysreg, 3 * FDT_CELL_BYTES)?,
+        ],
         bus_width: number(mmc, "bus-width")?,
         max_frequency: number(mmc, "max-frequency")?,
         fifo_depth: resources::optional_number(mmc, "fifo-depth")?,
@@ -118,7 +129,7 @@ fn discover_mmc<'a>(
         cd_inverted: mmc.property("cd-inverted").is_some(),
         disable_wp: mmc.property("disable-wp").is_some(),
         post_power_on_delay_ms: resources::optional_number(mmc, "post-power-on-delay-ms")?
-            .unwrap_or(10),
+            .unwrap_or(MMC_POST_POWER_ON_DELAY_MS),
         dma_coherent: resources::coherent(tree, mmc, true)?,
         dma_mask: u32::MAX as u64,
     };
@@ -126,7 +137,7 @@ fn discover_mmc<'a>(
         || resource.max_frequency == 0
         || resource
             .fifo_depth
-            .is_some_and(|depth| depth < 2 || 4096 < depth)
+            .is_some_and(|depth| depth < FIFO_MIN_DEPTH || FIFO_MAX_DEPTH < depth)
     {
         return Err("FDT SDIO1 card interface is unsupported");
     }
@@ -142,7 +153,7 @@ fn card_detect_gpio<'a>(
     let Some(raw) = mmc.property("cd-gpios") else {
         return Ok(None);
     };
-    if raw.value.len() != 12 {
+    if raw.value.len() != 3 * FDT_CELL_BYTES {
         return Err("FDT SDIO card-detect GPIO must contain one two-cell reference");
     }
     let gpio = tree
@@ -155,9 +166,9 @@ fn card_detect_gpio<'a>(
     {
         return Err("FDT SDIO card-detect provider is not a supported SYS GPIO controller");
     }
-    let pin = word(raw.value, 4)?;
-    let flags = word(raw.value, 8)?;
-    if 64 <= pin || flags & !1 != 0 {
+    let pin = word(raw.value, FDT_CELL_BYTES)?;
+    let flags = word(raw.value, 2 * FDT_CELL_BYTES)?;
+    if crate::drivers::board_setup::SYS_GPIO_COUNT <= pin || flags & !GPIO_ACTIVE_LOW != 0 {
         return Err("FDT SDIO card-detect GPIO pin or flags are unsupported");
     }
     let provider = single_region(tree, gpio)?;
@@ -165,7 +176,7 @@ fn card_detect_gpio<'a>(
     Ok(Some(GpioInputResource {
         provider,
         pin,
-        active_low: flags & 1 != 0,
+        active_low: flags & GPIO_ACTIVE_LOW != 0,
     }))
 }
 
@@ -188,14 +199,17 @@ fn discover_gmac<'a>(
     resource.interrupt_source = resources::first_irq(tree, mac)?;
     device_source(resource.interrupt_source, info)?;
     let sysreg = property(mac, "starfive,syscon")?;
-    if sysreg.len() != 12 {
+    if sysreg.len() != 3 * FDT_CELL_BYTES {
         return Err("FDT GMAC syscon binding is invalid");
     }
     let syscon = tree
         .find_phandle(word(sysreg, 0)?)
         .ok_or("FDT GMAC syscon is missing")?;
     resource.syscon = single_region(tree, syscon)?;
-    resource.sysreg = [word(sysreg, 4)?, word(sysreg, 8)?];
+    resource.sysreg = [
+        word(sysreg, FDT_CELL_BYTES)?,
+        word(sysreg, 2 * FDT_CELL_BYTES)?,
+    ];
     resources::require_names(
         mac,
         "clock-names",

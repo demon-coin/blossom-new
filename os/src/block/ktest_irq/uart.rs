@@ -157,6 +157,7 @@ impl Uart {
 
     /// 失败清理可以读走未被 IRQ 消费的 payload，只为结束 raw ownership，不算真实接收证据。
     fn finish(&mut self) -> TestResult {
+        const ACK_LINE_BYTES: usize = 64;
         console::disable_interrupts();
         let stage = self
             .stage
@@ -171,7 +172,7 @@ impl Uart {
         if console::received() == stage.before && control_byte()? != stage.byte {
             return Err(TestError("multi-IRQ cleanup payload mismatch"));
         }
-        let mut line = [0u8; 64];
+        let mut line = [0u8; ACK_LINE_BYTES];
         let mut length = 0;
         loop {
             let byte = control_byte()?;

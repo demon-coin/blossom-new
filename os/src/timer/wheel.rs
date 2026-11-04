@@ -5,9 +5,12 @@ use crate::time::MonotonicInstant;
 use super::{ArmError, Timer};
 
 /// 粗定时器的一个基础 tick，对应 HZ=100。
-pub(crate) const TICK_NS: u64 = 10_000_000;
+pub(crate) const TICK_NS: u64 = crate::time::NSEC_PER_SEC / WHEEL_HZ;
+const WHEEL_HZ: u64 = 100;
 const LEVELS: usize = 8;
-const BUCKETS_PER_LEVEL: usize = 64;
+const BUCKET_BITS: usize = 6;
+const BUCKETS_PER_LEVEL: usize = 1 << BUCKET_BITS;
+const BUCKET_MASK: usize = BUCKETS_PER_LEVEL - 1;
 const LEVEL_SHIFT: usize = 3;
 const BUCKETS: usize = LEVELS * BUCKETS_PER_LEVEL;
 const UNLINKED: usize = usize::MAX;
@@ -64,11 +67,11 @@ impl Wheel {
             let shift = level * LEVEL_SHIFT;
             let granularity = 1u64 << shift;
             let level_clk = self.clk.div_ceil(granularity);
-            let start = (level_clk & (BUCKETS_PER_LEVEL as u64 - 1)) as u32;
+            let start = (level_clk & BUCKET_MASK as u64) as u32;
             let distance = bits.rotate_right(start).trailing_zeros() as u64;
             let tick = (level_clk + distance) << shift;
-            let bucket = level * BUCKETS_PER_LEVEL
-                + ((start as usize + distance as usize) & (BUCKETS_PER_LEVEL - 1));
+            let bucket =
+                level * BUCKETS_PER_LEVEL + ((start as usize + distance as usize) & BUCKET_MASK);
             if first.is_none_or(|(_, earliest)| tick < earliest) {
                 first = Some((bucket, tick));
             }
@@ -99,7 +102,7 @@ impl Wheel {
     ) -> Result<(u64, usize, u64), ArmError> {
         let clk = self.forward_clock(now);
         if deadline <= now {
-            return Ok((clk, (clk & (BUCKETS_PER_LEVEL as u64 - 1)) as usize, clk));
+            return Ok((clk, (clk & BUCKET_MASK as u64) as usize, clk));
         }
         let deadline_ns = deadline.as_nanos();
         let last_tick = deadline_ns.div_ceil(TICK_NS);
@@ -109,9 +112,7 @@ impl Wheel {
         let expires = deadline_ns / TICK_NS;
         let delta = expires.saturating_sub(clk);
         let mut level = 0;
-        while level + 1 < LEVELS
-            && ((BUCKETS_PER_LEVEL as u64 - 1) << (level * LEVEL_SHIFT)) <= delta
-        {
+        while level + 1 < LEVELS && ((BUCKET_MASK as u64) << (level * LEVEL_SHIFT)) <= delta {
             level += 1;
         }
         // 请求先落在 tick 内，再严格取下一个层粒度边界，避免 tick
@@ -121,8 +122,8 @@ impl Wheel {
         effective_tick
             .checked_mul(TICK_NS)
             .ok_or(ArmError::OutOfRange)?;
-        let bucket = level * BUCKETS_PER_LEVEL
-            + ((effective_tick >> shift) & (BUCKETS_PER_LEVEL as u64 - 1)) as usize;
+        let bucket =
+            level * BUCKETS_PER_LEVEL + ((effective_tick >> shift) & BUCKET_MASK as u64) as usize;
         Ok((clk, bucket, effective_tick))
     }
 

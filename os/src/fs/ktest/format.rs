@@ -42,7 +42,16 @@ fn write_view_fixture(disk: &DiskRef, byte: u64, bytes: &[u8]) -> Result<(), FsE
     memory.push(mapped);
     // SAFETY: 独占页的完整映射范围已初始化，无裸别名或回调；memory 移入唯一 Bio，
     // completion 全尾前没有 CPU 借用，真实设备收权后才领取并释放原页。
-    let bio = unsafe { Bio::try_new(disk, BlkOperation::Write, byte / 512, memory, 0, None) }?;
+    let bio = unsafe {
+        Bio::try_new(
+            disk,
+            BlkOperation::Write,
+            byte / crate::block::SECTOR_BYTES,
+            memory,
+            0,
+            None,
+        )
+    }?;
     let completion = bio.completion();
     disk.submit_bio(bio);
     let result = completion.wait();

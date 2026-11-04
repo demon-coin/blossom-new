@@ -1,6 +1,9 @@
 //! 真实 timer trap 的寄存器往返探针，只在受控 ktest 环境启用。
 
+use crate::arch::riscv64::{SR_FS, SR_FS_DIRTY, SR_SIE};
 use core::{arch::naked_asm, sync::atomic::AtomicUsize};
+
+const REGISTER_PROBE_FRAME_BYTES: usize = 112;
 
 /// 临时开放 IRQ 等待本核计数推进，检查整数及可选 FP 图样并恢复调用者的整数 ABI 与状态。
 ///
@@ -24,7 +27,7 @@ pub(super) unsafe extern "C" fn rv_register_roundtrip(
             ".option arch, +d",
             // 固定 112 字节 ABI 栈帧保存调用者及原 sstatus，记录本核 SP/TP。
             r#"
-    addi sp, sp, -112
+    addi sp, sp, -{frame_size}
     sd ra, 0(sp)
     sd s0, 8(sp)
     sd s1, 16(sp)
@@ -43,7 +46,7 @@ pub(super) unsafe extern "C" fn rv_register_roundtrip(
             // 仅受控 FP 模式启用 D 并设置图样；整数模式保持 FS Off。
             r#"
     beqz s5, 1f
-    li t0, 0x6000
+    li t0, {fs_dirty}
     csrs sstatus, t0
     frcsr t0
     sd t0, 64(sp)
@@ -54,7 +57,7 @@ pub(super) unsafe extern "C" fn rv_register_roundtrip(
     li t0, 0x400fedcba9876543
     fmv.d.x f31, t0
     j 2f
-1:  li t0, 0x6000
+1:  li t0, {fs}
     csrc sstatus, t0
 2:  li t0, 0x123456789abcdef
     li t1, 0x76543210fedcba98
@@ -63,11 +66,11 @@ pub(super) unsafe extern "C" fn rv_register_roundtrip(
 "#,
             // 真正开放 IRQ 并等待 timer 计数推进，再在 IRQ-off 下检查完整图样。
             r#"
-    csrsi sstatus, 2
+    csrsi sstatus, {sie}
 3:  ld a0, 0(s3)
     fence r, r
     bltu a0, s4, 3b
-    csrci sstatus, 2
+    csrci sstatus, {sie}
     li a0, 0
     bne sp, s0, 9f
     bne tp, s1, 9f
@@ -105,10 +108,14 @@ pub(super) unsafe extern "C" fn rv_register_roundtrip(
     ld s3, 32(sp)
     ld s4, 40(sp)
     ld s5, 48(sp)
-    addi sp, sp, 112
+    addi sp, sp, {frame_size}
     ret
 "#,
             ".option pop",
+            fs = const SR_FS,
+            fs_dirty = const SR_FS_DIRTY,
+            sie = const SR_SIE,
+            frame_size = const REGISTER_PROBE_FRAME_BYTES,
         );
     }
 }

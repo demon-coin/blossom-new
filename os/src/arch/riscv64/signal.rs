@@ -1,6 +1,6 @@
 //! RV64 信号帧以固定小端字节布局保存用户现场，扩展描述位于完整浮点 union 内。
 
-use crate::arch::riscv64::user::UserContext;
+use crate::arch::{riscv64::user::UserContext, STACK_ALIGNMENT};
 use crate::mm::space::{Mm, VmError};
 use crate::task::signal::{SignalFrameArgs, SignalFrameRestore, SA_ONSTACK};
 
@@ -9,16 +9,22 @@ pub(crate) const SIGNAL_MIN_STACK: usize = 2048;
 
 // RV64 stack_t 为 24 字节，sigset 保留区为 128 字节，mcontext 按 16 字节对齐。
 const INFO_SIZE: usize = 128;
+const ABI_WORD_BYTES: usize = core::mem::size_of::<u64>();
+const ALTSTACK_SIZE: usize = 3 * ABI_WORD_BYTES;
+const SIGNAL_MASK_RESERVED: usize = 128;
 const UCONTEXT: usize = INFO_SIZE;
-const ALTSTACK: usize = UCONTEXT + 16;
-const MASK: usize = UCONTEXT + 40;
-const MCONTEXT: usize = UCONTEXT + 176;
-const FP: usize = MCONTEXT + 32 * 8;
-// F/D/Q 共用 528 字节；只支持 D 也必须保留 Q 和扩展描述的固定位置。
-const FP_UNION_SIZE: usize = 528;
-const FCSR: usize = FP + 32 * 8;
-const EXT_RESERVED: usize = FP + 129 * 4;
-const EXT_HEADER: usize = EXT_RESERVED + 4;
+const ALTSTACK: usize = UCONTEXT + 2 * ABI_WORD_BYTES;
+const ALTSTACK_FLAGS: usize = ALTSTACK + ABI_WORD_BYTES;
+const ALTSTACK_BYTES: usize = ALTSTACK + 2 * ABI_WORD_BYTES;
+const MASK: usize = ALTSTACK + ALTSTACK_SIZE;
+const MCONTEXT: usize =
+    (MASK + SIGNAL_MASK_RESERVED + STACK_ALIGNMENT - 1) & !(STACK_ALIGNMENT - 1);
+const FP: usize = MCONTEXT + 32 * ABI_WORD_BYTES;
+// Q 现场包含 64 个 64 位字、FCSR 和三个保留字；union 按 16 字节对齐。
+const FP_UNION_SIZE: usize = 64 * ABI_WORD_BYTES + 4 * core::mem::size_of::<u32>();
+const FCSR: usize = FP + 32 * ABI_WORD_BYTES;
+const EXT_RESERVED: usize = FP + 129 * core::mem::size_of::<u32>();
+const EXT_HEADER: usize = EXT_RESERVED + core::mem::size_of::<u32>();
 const FRAME_SIZE: usize = FP + FP_UNION_SIZE;
 
 impl UserContext {
@@ -28,8 +34,8 @@ impl UserContext {
         let mut frame = [0u8; FRAME_SIZE];
         args.info.encode(&mut frame[..INFO_SIZE]);
         put_u64(&mut frame, ALTSTACK, args.altstack.base as u64);
-        put_u32(&mut frame, ALTSTACK + 8, args.altstack.flags);
-        put_u64(&mut frame, ALTSTACK + 16, args.altstack.size as u64);
+        put_u32(&mut frame, ALTSTACK_FLAGS, args.altstack.flags);
+        put_u64(&mut frame, ALTSTACK_BYTES, args.altstack.size as u64);
         put_u64(&mut frame, MASK, args.restore_mask);
         put_u64(&mut frame, MCONTEXT, self.pc as u64);
         for register in 1..32 {
@@ -62,7 +68,7 @@ impl UserContext {
 
     /// 完整读取并解码当前 SP 上的帧；用户可修改返回现场，失败不改动当前现场。
     pub(crate) fn restore_signal(&self, mm: &Mm) -> Result<SignalFrameRestore, VmError> {
-        if self.gpr[2] & 15 != 0 {
+        if self.gpr[2] & (STACK_ALIGNMENT - 1) != 0 {
             return Err(VmError::InvalidRange);
         }
         let mut frame = [0u8; FRAME_SIZE];
@@ -94,8 +100,8 @@ impl UserContext {
             // 备用栈的更新规则由持有原栈状态的提交者按恢复后的 SP 应用。
             altstack: crate::task::signal::AltStack {
                 base: get_u64(&frame, ALTSTACK) as usize,
-                size: get_u64(&frame, ALTSTACK + 16) as usize,
-                flags: get_u32(&frame, ALTSTACK + 8),
+                size: get_u64(&frame, ALTSTACK_BYTES) as usize,
+                flags: get_u32(&frame, ALTSTACK_FLAGS),
             },
             pending_signal: None,
         })
@@ -115,7 +121,8 @@ fn frame_address(sp: usize, args: &SignalFrameArgs) -> Result<usize, VmError> {
     } else {
         sp
     };
-    let address = top.checked_sub(FRAME_SIZE).ok_or(VmError::InvalidRange)? & !15;
+    let address =
+        top.checked_sub(FRAME_SIZE).ok_or(VmError::InvalidRange)? & !(STACK_ALIGNMENT - 1);
     if (nested || switch_stack) && !stack.on_stack(address) {
         return Err(VmError::InvalidRange);
     }

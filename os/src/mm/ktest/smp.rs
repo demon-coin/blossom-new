@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ktest::{Fixture, TestContext, TestError, TestResult};
 
 const MAX: usize = crate::boot::MAX_CPUS;
-const WORK: usize = 32;
+pub(super) const WORK: usize = 32;
 
 pub(crate) struct State {
     pub(crate) stop: AtomicBool,

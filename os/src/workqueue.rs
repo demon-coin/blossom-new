@@ -25,6 +25,10 @@ use crate::wait::{WaitNode, WaitQueue, Waiter};
 // ponytail: 全域短元数据锁限制并行提交吞吐；仅在实际测得竞争后拆分域与池锁。
 pub(super) static STATE_LOCK: SpinLock<()> = SpinLock::new(());
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+// flush 串行排空旧色后复用另一色，颜色只占一个选择位。
+const FLUSH_COLOR_BITS: usize = 1;
+const FLUSH_COLORS: usize = 1 << FLUSH_COLOR_BITS;
+const FLUSH_COLOR_MASK: usize = FLUSH_COLORS - 1;
 #[cfg(feature = "ktest")]
 static LIVE_DOMAINS: AtomicUsize = AtomicUsize::new(0);
 
@@ -46,7 +50,7 @@ pub(super) struct DomainState {
     closed: bool,
     published: bool,
     color: usize,
-    counts: [usize; 2],
+    counts: [usize; FLUSH_COLORS],
     active: usize,
     reserved_active: usize,
     reserved_workers: usize,
@@ -94,7 +98,7 @@ impl WorkQueue {
                 closed: false,
                 published: false,
                 color: 0,
-                counts: [0; 2],
+                counts: [0; FLUSH_COLORS],
                 active: 0,
                 reserved_active: 0,
                 reserved_workers: 0,
@@ -233,8 +237,12 @@ impl Domain {
             // SAFETY: 颜色与票数始终在同一锁下变更。
             let state = unsafe { &mut *self.state.get() };
             let old = state.color;
-            assert_eq!(state.counts[old ^ 1], 0, "flush reused a live color");
-            state.color ^= 1;
+            assert_eq!(
+                state.counts[old ^ FLUSH_COLOR_MASK],
+                0,
+                "flush reused a live color"
+            );
+            state.color ^= FLUSH_COLOR_MASK;
             old
         };
         wait_until(&self.finished, || {
@@ -251,7 +259,7 @@ impl Drop for Domain {
         let _lock = STATE_LOCK.lock();
         // SAFETY: 最后引用持有者独占对象，仍采用统一锁核对状态。
         let state = unsafe { &*self.state.get() };
-        assert_eq!(state.counts, [0; 2]);
+        assert_eq!(state.counts, [0; FLUSH_COLORS]);
         assert_eq!(state.active, 0);
         assert_eq!(state.reserved_active, 0);
         assert_eq!(state.reserved_workers, 0);

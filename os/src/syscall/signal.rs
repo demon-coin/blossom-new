@@ -6,16 +6,21 @@ use crate::mm::space::Mm;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::signal::{
-    AltStack, SignalAction, SignalError, SignalInfo, SignalPayload, UNBLOCKABLE,
+    AltStack, SignalAction, SignalError, SignalInfo, SignalPayload, SIGINFO_BYTES, SIGNAL_COUNT,
+    SIGSEGV, SIGSET_BYTES, UNBLOCKABLE,
 };
 use crate::task::UserThread;
-use crate::time::{self, Duration, MonotonicInstant};
+use crate::time::{self, Duration, MonotonicInstant, NSEC_PER_SEC};
 use crate::wait::{WaitMode, WaitResult, Waiter};
 
 #[cfg(target_arch = "riscv64")]
 const STACK_REGISTER: usize = 2;
 #[cfg(target_arch = "loongarch64")]
 const STACK_REGISTER: usize = 3;
+
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
 
 /// 分派实际信号调用；恢复现场和中断重启不经过普通返回尾部。
 pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
@@ -55,7 +60,7 @@ fn signal_error(error: SignalError) -> Errno {
 /// 信号号码先按int解释再验证，不能将超范围整数截断成有效信号。
 fn signum(raw: usize) -> Result<u8, Errno> {
     let signal = raw as i32;
-    if !(0..=64).contains(&signal) {
+    if !(0..=SIGNAL_COUNT as i32).contains(&signal) {
         return Err(Errno::InvalidArgument);
     }
     Ok(signal as u8)
@@ -95,7 +100,7 @@ fn send(user: &UserThread, number: usize, raw: [usize; 6]) -> SysResult {
 
 /// 完整快照24字节动作后一次替换；旧动作copyout失败不撤已生效的新动作。
 fn action(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    if raw[3] != 8 {
+    if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("sigaction has no MM");
@@ -127,7 +132,7 @@ fn action(user: &UserThread, raw: [usize; 6]) -> SysResult {
 
 /// mask提交去除不可阻断位；查询不要求how有效，新值输入先完整取得。
 fn mask(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    if raw[3] != 8 {
+    if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("sigprocmask has no MM");
@@ -136,9 +141,9 @@ fn mask(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[1] != 0 {
         let value = sigset(&mm, raw[1])?;
         let replacement = match raw[0] as i32 {
-            0 => old | value,
-            1 => old & !value,
-            2 => value,
+            SIG_BLOCK => old | value,
+            SIG_UNBLOCK => old & !value,
+            SIG_SETMASK => value,
             _ => return Err(Errno::InvalidArgument),
         };
         old = signals.replace_mask(replacement);
@@ -151,7 +156,7 @@ fn mask(user: &UserThread, raw: [usize; 6]) -> SysResult {
 
 /// 只报告当前线程阻塞的private和group pending号码集合。
 fn pending(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    if raw[1] != 8 {
+    if raw[1] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("sigpending has no MM");
@@ -193,7 +198,7 @@ fn altstack(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// 临时mask跨停止/继续保留，实际handler帧保存原mask；无handler只重放本次原请求。
 fn suspend(user: &UserThread, request: Request) -> Outcome {
     let result = (|| -> Result<(), Errno> {
-        if request.arguments[1] != 8 {
+        if request.arguments[1] != SIGSET_BYTES {
             return Err(Errno::InvalidArgument);
         }
         let mm = user.mm().expect("sigsuspend has no MM");
@@ -219,7 +224,7 @@ fn suspend(user: &UserThread, request: Request) -> Outcome {
 
 /// 期限只建立一次；暂时解除所请求信号的阻断以复用唯一Waiter通知，领取后不回队。
 fn timedwait(user: &UserThread, raw: [usize; 6]) -> SysResult {
-    if raw[3] != 8 {
+    if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
     let mm = user.mm().expect("sigtimedwait has no MM");
@@ -256,7 +261,7 @@ fn timedwait(user: &UserThread, raw: [usize; 6]) -> SysResult {
     }
     if let Some(info) = selected {
         if raw[1] != 0 {
-            let mut bytes = [0u8; 128];
+            let mut bytes = [0u8; SIGINFO_BYTES];
             info.encode(&mut bytes);
             copyout(&mm, raw[1], &bytes)?;
         }
@@ -281,7 +286,7 @@ fn queue(user: &UserThread, number: usize, raw: [usize; 6]) -> SysResult {
     if pid <= 0 || tid.is_some_and(|tid| tid <= 0) {
         return Err(Errno::InvalidArgument);
     }
-    let mut bytes = [0u8; 128];
+    let mut bytes = [0u8; SIGINFO_BYTES];
     copyin(&mm, &mut bytes, address)?;
     let info = SignalInfo {
         signum: signal,
@@ -322,8 +327,8 @@ fn sigreturn(user: &UserThread) -> Outcome {
         }
         Err(_) => {
             let identity = user.identity().expect("sigreturn has no identity");
-            identity.graph().request_exit(&identity, 11);
-            Outcome::GroupExit(11)
+            identity.graph().request_exit(&identity, SIGSEGV as i32);
+            Outcome::GroupExit(SIGSEGV as i32)
         }
     }
 }
@@ -339,7 +344,7 @@ fn word(bytes: &[u8], offset: usize) -> u64 {
 
 /// 两目标sigset_t固定8字节，输入不建立用户引用。
 fn sigset(mm: &Mm, address: usize) -> Result<u64, Errno> {
-    let mut bytes = [0u8; 8];
+    let mut bytes = [0u8; SIGSET_BYTES];
     copyin(mm, &mut bytes, address)?;
     Ok(u64::from_le_bytes(bytes))
 }
@@ -350,7 +355,7 @@ fn timeout(mm: &Mm, address: usize) -> Result<MonotonicInstant, Errno> {
     copyin(mm, &mut bytes, address)?;
     let seconds = word(&bytes, 0) as i64;
     let nanos = word(&bytes, 8) as i64;
-    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+    if seconds < 0 || !(0..NSEC_PER_SEC as i64).contains(&nanos) {
         return Err(Errno::InvalidArgument);
     }
     time::now()

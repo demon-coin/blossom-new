@@ -16,7 +16,10 @@ use crate::sync::SpinLock;
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{
     drivers::{
-        virtio::{VirtioDevice, VirtioIdentity, VirtioInitError},
+        virtio::{
+            VirtioDevice, VirtioIdentity, VirtioInitError, VIRTIO_PCI_BLOCK_LEGACY,
+            VIRTIO_PCI_BLOCK_MODERN, VIRTIO_VENDOR_ID,
+        },
         DeviceInventory,
     },
     irq, mm, sched, task, time, timer,
@@ -30,33 +33,42 @@ use smoltcp::wire::{
 };
 use virtio_drivers::{transport::DeviceStatus, BufferDirection, Error};
 
+const GATE_UNSET: u8 = 0;
+const GATE_ARMED: u8 = 1;
+const GATE_ENTERED: u8 = 2;
+const GATE_RELEASED: u8 = 3;
 /// 一个原子保存未设、已设、已进入和已释放事实，默认不阻塞生产 Work。
 pub(super) struct Gate(AtomicU8);
 impl Gate {
     /// 停点初态不改变原有执行路径。
     const fn new() -> Self {
-        Self(AtomicU8::new(0))
+        Self(AtomicU8::new(GATE_UNSET))
     }
     /// 普通测试控制者为下一次实际执行设置一次停点。
     fn arm(&self) {
-        self.0.store(1, Ordering::Release);
+        self.0.store(GATE_ARMED, Ordering::Release);
     }
     /// 仅在实际停点执行后返回 true。
     fn entered(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 2
+        self.0.load(Ordering::Acquire) == GATE_ENTERED
     }
     /// 清理和正文共用此释放动作，不触碰生产队列票。
     fn release(&self) {
-        self.0.store(3, Ordering::Release);
+        self.0.store(GATE_RELEASED, Ordering::Release);
     }
     /// 调用点没有短锁，等待沿真实 timer 与 scheduler，设备继续生产 used。
     pub(super) fn stop(&self) {
         if self
             .0
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                GATE_ARMED,
+                GATE_ENTERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
-            while self.0.load(Ordering::Acquire) == 2 {
+            while self.0.load(Ordering::Acquire) == GATE_ENTERED {
                 timer::sleep(time::Duration::from_millis(1));
             }
         }
@@ -144,7 +156,7 @@ struct Pool {
     pages: usize,
     heads: usize,
     device_pages: usize,
-    addresses: [u64; 32],
+    addresses: [u64; super::POOL_MAX_SLOTS],
 }
 #[derive(Debug)]
 struct Snapshot {
@@ -180,7 +192,7 @@ fn pool(slots: &[super::Slot], heads: &[Option<usize>], domain: DmaDomain) -> Re
         pages: 0,
         heads: 0,
         device_pages: 0,
-        addresses: [0; 32],
+        addresses: [0; super::POOL_MAX_SLOTS],
     };
     for (index, slot) in slots.iter().enumerate() {
         match slot.state {
@@ -236,7 +248,7 @@ impl VirtioNet {
             pages: 0,
             heads: 0,
             device_pages: 0,
-            addresses: [0; 32],
+            addresses: [0; super::POOL_MAX_SLOTS],
         };
         let (rx, tx, pending_rx, pending_tx, status) = if let Some(inner) = state.inner.as_ref() {
             (
@@ -1116,7 +1128,11 @@ impl Owner {
             );
         }
         for device in inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
+            device.vendor_id == VIRTIO_VENDOR_ID
+                && matches!(
+                    device.device_id,
+                    VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+                )
         }) {
             // SAFETY: BDF 来自同一次库存且无其它 driver 拥有；与 NIC 不同，完整 BAR 映射有效。
             devices.push(

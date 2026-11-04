@@ -6,11 +6,19 @@ use alloc::vec::Vec;
 
 use crate::block::AccessMode;
 use crate::fs::memfs::{Filesystem, MemoryFsKind};
+use crate::fs::types::{
+    MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, PATH_MAX, S_IALLUGO, S_IRWXUGO, S_ISVTX, S_IXUGO,
+};
 use crate::fs::{
     DentryCache, DentryRef, DirectoryWriteGuard, FsError, InodeCache, InodeKind, InodeMetadata,
     InodeRef,
 };
 use crate::sync::SpinLock;
+
+const MAXSYMLINKS: usize = 40;
+const DEFAULT_UMASK: u16 = 0o022;
+const OWNER_PERMISSION_SHIFT: u32 = 6;
+const GROUP_PERMISSION_SHIFT: u32 = 3;
 
 /// 只控制没有尾随斜杠的最终符号链接，中间链接始终跟随。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,7 +132,7 @@ impl Path {
 
     /// 核真实inode访问位；普通文件和名字写受挂载模式约束，设备数据写仍保留DAC。
     pub fn check_access(&self, uid: u32, gid: u32, mask: u16) -> Result<(), FsError> {
-        if mask & !7 != 0 {
+        if mask & !(MAY_READ | MAY_WRITE | MAY_EXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
         let data = self.inode()?.metadata_snapshot()?;
@@ -182,7 +190,7 @@ impl FsContext {
                 return Ok(Self {
                     root,
                     cwd,
-                    umask: 0o022,
+                    umask: DEFAULT_UMASK,
                 });
             }
             ancestor = ancestor
@@ -207,7 +215,7 @@ impl FsContext {
 
     /// 在共享 FsContext 锁内替换掩码，并返回旧值。
     pub fn exchange_umask(&mut self, mask: u16) -> u16 {
-        core::mem::replace(&mut self.umask, mask & 0o777)
+        core::mem::replace(&mut self.umask, mask & S_IRWXUGO)
     }
 
     /// 只替换 cwd；调用方先在锁外验证新 Path，并在锁外释放旧 Path。
@@ -338,7 +346,7 @@ impl Vfs {
             // 先验证当前目录，再处理点组件；file/.. 和 missing/.. 不做词法折叠。
             require_directory(&current)?;
             if let Some((uid, gid)) = credentials {
-                current.check_access(uid, gid, 1)?;
+                current.check_access(uid, gid, MAY_EXEC)?;
             }
             while offset < pending.len() && pending[offset] == b'/' {
                 offset += 1;
@@ -372,7 +380,7 @@ impl Vfs {
             let follow = inode.metadata_snapshot()?.kind == InodeKind::Symlink
                 && (mode == ResolveMode::Follow || end < pending.len());
             if follow {
-                if *links == 40 {
+                if *links == MAXSYMLINKS {
                     return Err(FsError::TooManySymlinks);
                 }
                 *links += 1;
@@ -607,7 +615,7 @@ impl Vfs {
                         &parent_metadata,
                         credentials.0,
                         credentials.1,
-                        1,
+                        MAY_EXEC,
                     )?;
                     if let Some(inode) = directory.lookup(&self.inodes, name.as_slice())? {
                         if exclusive {
@@ -618,7 +626,7 @@ impl Vfs {
                             if no_follow {
                                 return Err(FsError::TooManySymlinks);
                             }
-                            if links == 40 {
+                            if links == MAXSYMLINKS {
                                 return Err(FsError::TooManySymlinks);
                             }
                             links += 1;
@@ -664,8 +672,8 @@ impl Vfs {
                     let new_inode = self.inodes.prepare_regular_inode(
                         &parent_inode,
                         &parent_metadata,
-                        requested_mode & 0o7777,
-                        umask & 0o777,
+                        requested_mode & S_IALLUGO,
+                        umask & S_IRWXUGO,
                         credentials.0,
                         credentials.1,
                         now_ns,
@@ -777,8 +785,8 @@ impl Vfs {
         let new_inode = self.inodes.prepare_directory_inode(
             &parent_inode,
             &parent_metadata,
-            mode & 0o1777,
-            umask & 0o777,
+            mode & (S_ISVTX | S_IRWXUGO),
+            umask & S_IRWXUGO,
             credentials.0,
             credentials.1,
             now_ns,
@@ -1140,8 +1148,20 @@ impl Vfs {
         let destination_parent = target_parent.unwrap_or(source_parent);
         let old_metadata = source_parent.metadata_snapshot();
         let new_metadata = destination_parent.metadata_snapshot();
-        check_access_metadata(&old.parent, &old_metadata, credentials.0, credentials.1, 1)?;
-        check_access_metadata(&new.parent, &new_metadata, credentials.0, credentials.1, 1)?;
+        check_access_metadata(
+            &old.parent,
+            &old_metadata,
+            credentials.0,
+            credentials.1,
+            MAY_EXEC,
+        )?;
+        check_access_metadata(
+            &new.parent,
+            &new_metadata,
+            credentials.0,
+            credentials.1,
+            MAY_EXEC,
+        )?;
         old.parent.check_writable()?;
         new.parent.check_writable()?;
         let source_inode = source_parent
@@ -1220,7 +1240,7 @@ impl Vfs {
                 return Err(FsError::NotFound);
             }
             if !same_parent {
-                check_inode_mode_access(metadata, credentials.0, credentials.1, 2)?;
+                check_inode_mode_access(metadata, credentials.0, credentials.1, MAY_WRITE)?;
             }
         }
         let target_is_directory = target_metadata
@@ -1723,17 +1743,17 @@ fn path_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, FsError> {
         .map_err(|_| FsError::NoMemory)?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(4096)
+        .try_reserve_exact(PATH_MAX)
         .map_err(|_| FsError::NoMemory)?;
-    bytes.resize(4096, 0);
+    bytes.resize(PATH_MAX, 0);
     for filesystem in &filesystems {
         guards.push(filesystem.lock_rename());
     }
     let result = collect_path_bytes(path, root, &mut bytes);
     drop(guards);
     let start = result?;
-    let length = 4095 - start;
-    bytes.copy_within(start..4095, 0);
+    let length = PATH_MAX - 1 - start;
+    bytes.copy_within(start..PATH_MAX - 1, 0);
     bytes.truncate(length);
     Ok(bytes)
 }
@@ -1784,7 +1804,7 @@ fn check_access_metadata(
     gid: u32,
     mask: u16,
 ) -> Result<(), FsError> {
-    if mask & 2 != 0
+    if mask & MAY_WRITE != 0
         && matches!(
             metadata.kind,
             InodeKind::Regular | InodeKind::Directory | InodeKind::Symlink
@@ -1802,19 +1822,22 @@ fn check_inode_mode_access(
     gid: u32,
     mask: u16,
 ) -> Result<(), FsError> {
-    if mask & !7 != 0 {
+    if mask & !(MAY_READ | MAY_WRITE | MAY_EXEC) != 0 {
         return Err(FsError::InvalidOperation);
     }
     if uid == 0 {
-        if mask & 1 != 0 && metadata.kind != InodeKind::Directory && metadata.mode & 0o111 == 0 {
+        if mask & MAY_EXEC != 0
+            && metadata.kind != InodeKind::Directory
+            && metadata.mode & S_IXUGO == 0
+        {
             return Err(FsError::Permission);
         }
         return Ok(());
     }
     let shift = if uid == metadata.uid {
-        6
+        OWNER_PERMISSION_SHIFT
     } else if gid == metadata.gid {
-        3
+        GROUP_PERMISSION_SHIFT
     } else {
         0
     };
@@ -1839,7 +1862,7 @@ fn check_parent_write(
     if metadata.kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
-    check_inode_mode_access(metadata, uid, gid, 3)
+    check_inode_mode_access(metadata, uid, gid, MAY_WRITE | MAY_EXEC)
 }
 
 /// 对已查到名字的父目录重查DAC，不重复读取或检查Mount状态。
@@ -1850,7 +1873,7 @@ fn check_parent_permissions(metadata: &InodeMetadata, uid: u32, gid: u32) -> Res
     if metadata.kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
-    check_inode_mode_access(metadata, uid, gid, 3)
+    check_inode_mode_access(metadata, uid, gid, MAY_WRITE | MAY_EXEC)
 }
 
 /// 粘滞目录只允许目录属主、目标属主或root删除目标名字。
@@ -1859,7 +1882,7 @@ fn check_sticky_directory(
     target: &InodeMetadata,
     uid: u32,
 ) -> Result<(), FsError> {
-    if parent.mode & 0o1000 != 0 && uid != 0 && uid != parent.uid && uid != target.uid {
+    if parent.mode & S_ISVTX != 0 && uid != 0 && uid != parent.uid && uid != target.uid {
         return Err(FsError::NotPermitted);
     }
     Ok(())
@@ -1881,7 +1904,7 @@ fn is_path_within(ancestor: &Path, path: &Path) -> bool {
 
 /// 一次性拥有原始末组件，后续 Path 和 dentry 只克隆 Arc。
 fn try_raw_name(name: &[u8]) -> Result<Arc<Vec<u8>>, FsError> {
-    if 255 < name.len() {
+    if NAME_MAX < name.len() {
         return Err(FsError::NameTooLong);
     }
     if name.is_empty() || name.contains(&0) || name.contains(&b'/') {

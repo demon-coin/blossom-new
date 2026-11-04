@@ -26,6 +26,20 @@ use registers::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 完整 ABAR 包含全局窗口和规范允许的全部端口窗口。
+pub(crate) const MMIO_BYTES: usize =
+    registers::PORT_BASE + registers::MAX_PORTS as usize * registers::PORT_BYTES;
+const COMMAND_SLOTS: usize = 32;
+const COMMAND_HEADER_BYTES: usize = 32;
+const COMMAND_LIST_BYTES: usize = COMMAND_SLOTS * COMMAND_HEADER_BYTES;
+const RECEIVED_FIS_BYTES: usize = 256;
+const COMMAND_TABLE_HEADER_BYTES: usize = 128;
+const PRDT_ENTRY_BYTES: usize = 16;
+const COMMAND_WRITE_SHIFT: u32 = 6;
+const PRDT_LENGTH_SHIFT: u32 = 16;
+const PRDBC_OFFSET: usize = core::mem::size_of::<u32>();
+const ACTIVE_COMMAND: u32 = 1;
+const DMA_CACHE_LINE_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StopPhase {
@@ -55,16 +69,19 @@ impl Controls {
     /// 所有可失败控制存储都在任何地址发表之前从唯一原页体系取得。
     fn allocate(domain: DmaDomain) -> Result<Self, BlockError> {
         let controls = Self {
-            list: CoherentDma::allocate(domain, 1024)?,
-            fis: CoherentDma::allocate(domain, 256)?,
-            table: CoherentDma::allocate(domain, 128 + ata::MAX_PRDT * 16)?,
-            identify: CoherentDma::allocate(domain, 512)?,
+            list: CoherentDma::allocate(domain, COMMAND_LIST_BYTES)?,
+            fis: CoherentDma::allocate(domain, RECEIVED_FIS_BYTES)?,
+            table: CoherentDma::allocate(
+                domain,
+                COMMAND_TABLE_HEADER_BYTES + ata::MAX_PRDT * PRDT_ENTRY_BYTES,
+            )?,
+            identify: CoherentDma::allocate(domain, ata::IDENTIFY_BYTES)?,
         };
         for (owner, alignment) in [
-            (&controls.list, 1024),
-            (&controls.fis, 256),
-            (&controls.table, 128),
-            (&controls.identify, 2),
+            (&controls.list, COMMAND_LIST_BYTES as u64),
+            (&controls.fis, RECEIVED_FIS_BYTES as u64),
+            (&controls.table, COMMAND_TABLE_HEADER_BYTES as u64),
+            (&controls.identify, core::mem::align_of::<u16>() as u64),
         ] {
             if owner.region().device.value() % alignment != 0 {
                 return Err(BlockError::Misaligned);
@@ -94,7 +111,7 @@ impl Controls {
                 .region()
                 .cpu
                 .as_ptr()
-                .add(128 + index * 16)
+                .add(COMMAND_TABLE_HEADER_BYTES + index * PRDT_ENTRY_BYTES)
                 .cast::<u32>();
             for (offset, word) in words.into_iter().enumerate() {
                 ptr::write_volatile(destination.add(offset), word.to_le());
@@ -104,13 +121,20 @@ impl Controls {
     }
 
     /// 已收权的固定控制页接受新命令，PRDT 数量只覆盖本次实际设备段。
-    fn command(&self, fis: &[u8; 20], write: bool, entries: usize) -> Result<(), BlockError> {
+    fn command(
+        &self,
+        fis: &[u8; ata::H2D_FIS_BYTES],
+        write: bool,
+        entries: usize,
+    ) -> Result<(), BlockError> {
         if ata::MAX_PRDT < entries {
             return Err(BlockError::InvalidRange);
         }
         let table = self.table.region().device.value();
         let header = [
-            5 | (u32::from(write) << 6) | ((entries as u32) << 16),
+            (ata::H2D_FIS_BYTES / core::mem::size_of::<u32>()) as u32
+                | (u32::from(write) << COMMAND_WRITE_SHIFT)
+                | ((entries as u32) << PRDT_LENGTH_SHIFT),
             0,
             table as u32,
             (table >> 32) as u32,
@@ -119,7 +143,7 @@ impl Controls {
         // 设备尚无本轮访问权，CPU 不建立活过交权的切片。
         unsafe {
             ptr::copy_nonoverlapping(fis.as_ptr(), self.table.region().cpu.as_ptr(), fis.len());
-            ptr::write_bytes(self.fis.region().cpu.as_ptr(), 0, 256);
+            ptr::write_bytes(self.fis.region().cpu.as_ptr(), 0, RECEIVED_FIS_BYTES);
             let destination = self.list.region().cpu.as_ptr().cast::<u32>();
             for (offset, word) in header.into_iter().enumerate() {
                 ptr::write_volatile(destination.add(offset), word.to_le());
@@ -143,7 +167,12 @@ impl Controls {
             self.fis
                 .sync_for_cpu(0, self.fis.byte_len(), DmaDirection::FromDevice)?;
             Ok(u32::from_le(ptr::read_volatile(
-                self.list.region().cpu.as_ptr().add(4).cast::<u32>(),
+                self.list
+                    .region()
+                    .cpu
+                    .as_ptr()
+                    .add(PRDBC_OFFSET)
+                    .cast::<u32>(),
             )) as usize)
         }
     }
@@ -188,14 +217,21 @@ impl Ahci {
         // SAFETY: 调用者保证本次资源为实际 ABAR，完整强序窗口和独占硬件的寿命覆盖控制器。
         let host = unsafe { Host::new(resources.registers) }?;
         let (cap, ports) = host.initialize(resources.ports_implemented)?;
-        let mask = device_mask.min(if cap & (1 << 31) != 0 {
+        let mask = device_mask.min(if cap & registers::CAP_64BIT != 0 {
             u64::MAX
         } else {
             u32::MAX as u64
         });
-        let domain = DmaDomain::new(mask, 0, usize::MAX, 0, 64, resources.dma_coherent)?;
+        let domain = DmaDomain::new(
+            mask,
+            0,
+            usize::MAX,
+            0,
+            DMA_CACHE_LINE_BYTES,
+            resources.dma_coherent,
+        )?;
         let mut selected = None;
-        for index in 0..32 {
+        for index in 0..registers::MAX_PORTS {
             if ports & (1 << index) == 0 {
                 continue;
             }
@@ -211,7 +247,7 @@ impl Ahci {
         let Some(port) = selected else {
             // power_up 只设置链路电源位；仍逐端口确认 CR/FR 停止后才能报告无介质。
             // 此时尚未分配或发表任何本驱动的控制和 IDENTIFY 页。
-            for index in 0..32 {
+            for index in 0..registers::MAX_PORTS {
                 if ports & (1 << index) == 0 {
                     continue;
                 }
@@ -256,7 +292,7 @@ impl Ahci {
             );
             return Err(BlockError::NotReady);
         }
-        if port.read(registers::SIG) != 0x0000_0101 {
+        if port.read(registers::SIG) != registers::ATA_SIGNATURE {
             if !port.stop_polled() {
                 core::mem::forget(controls);
                 panic!("AHCI signature stop unconfirmed; control pages retained");
@@ -565,7 +601,7 @@ impl Ahci {
         state.issued = true;
         self.port.write(IE, if interrupts { INTERRUPTS } else { 0 });
         arch::dma_write_barrier();
-        self.port.write(CI, 1);
+        self.port.write(CI, ACTIVE_COMMAND);
         let _ = self.port.read(CI);
     }
 
@@ -579,7 +615,7 @@ impl Ahci {
         if status & ERROR != 0 {
             return Some(Err(BlockError::Io));
         }
-        if state.issued && status & COMPLETION != 0 && self.port.read(CI) & 1 == 0 {
+        if state.issued && status & COMPLETION != 0 && self.port.read(CI) & ACTIVE_COMMAND == 0 {
             return Some(if self.port.read(TFD) & TASK_ERROR == 0 {
                 Ok(())
             } else {
@@ -659,8 +695,11 @@ impl Ahci {
 
     /// 稳定 Arc 和全部 owner 准备完成后才能发表 IDENTIFY 的控制与数据地址。
     fn identify_polled(&self) -> Result<ata::Identify, BlockError> {
-        self.controls
-            .prdt(0, self.controls.identify.region().device.value(), 512)?;
+        self.controls.prdt(
+            0,
+            self.controls.identify.region().device.value(),
+            ata::IDENTIFY_BYTES,
+        )?;
         // SAFETY: IDENTIFY owner 尚无设备访问，完整零页独占 cacheline，Arc 已稳定保活全部存储。
         unsafe {
             self.controls.identify.sync_for_device(
@@ -675,7 +714,7 @@ impl Ahci {
             self.issue(&mut state, false);
         }
         let completed = registers::poll(COMMAND_TIMEOUT, || {
-            self.port.read(PORT_IS) & ERROR != 0 || self.port.read(CI) & 1 == 0
+            self.port.read(PORT_IS) & ERROR != 0 || self.port.read(CI) & ACTIVE_COMMAND == 0
         });
         let failed_command = !completed
             || self.port.read(PORT_IS) & ERROR != 0
@@ -699,10 +738,10 @@ impl Ahci {
         if failed_command {
             return Err(BlockError::Io);
         }
-        if transferred != 512 {
+        if transferred != ata::IDENTIFY_BYTES {
             return Err(BlockError::ShortIo);
         }
-        let mut words = [0; 256];
+        let mut words = [0; ata::IDENTIFY_WORDS];
         // SAFETY: 完成同步且完整停止后独占读取 512B；CPU 不保留越过本作用域的 DMA 切片。
         unsafe {
             let source = self.controls.identify.region().cpu.as_ptr().cast::<u16>();

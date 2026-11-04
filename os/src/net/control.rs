@@ -4,8 +4,8 @@ use core::convert::TryInto;
 
 use crate::fs::{FileIoContext, FsError};
 use crate::mm::space::Mm;
-use crate::net::address::{AF_INET, AF_UNSPEC};
-use crate::net::route::{DefaultRouteRequest, InterfaceId};
+use crate::net::address::{AF_INET, AF_UNSPEC, INET_ADDRESS_LEN};
+use crate::net::route::{DefaultRouteRequest, InterfaceId, IPV4_ADDRESS_BITS, RTF_GATEWAY, RTF_UP};
 use crate::net::NetStackRef;
 
 const SIOCADDRT: u32 = 0x890b;
@@ -20,11 +20,20 @@ const IFF_UP: u16 = 0x1;
 const IFF_BROADCAST: u16 = 0x2;
 const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
-const RTF_UP: u16 = 0x1;
-const RTF_GATEWAY: u16 = 0x2;
 const IFREQ_LEN: usize = 40;
 const RTENTRY_LEN: usize = 120;
 const IFNAME_LEN: usize = 16;
+
+// 两目标均为小端 LP64，rtentry 的地址字段紧随首个机器字，尾部机器字按八字节对齐。
+const RT_DST_OFFSET: usize = core::mem::size_of::<u64>();
+const RT_GATEWAY_OFFSET: usize = RT_DST_OFFSET + INET_ADDRESS_LEN;
+const RT_GENMASK_OFFSET: usize = RT_GATEWAY_OFFSET + INET_ADDRESS_LEN;
+const RT_FLAGS_OFFSET: usize = RT_GENMASK_OFFSET + INET_ADDRESS_LEN;
+const RT_METRIC_OFFSET: usize = 80;
+const RT_DEVICE_OFFSET: usize = 88;
+const RT_MTU_OFFSET: usize = RT_DEVICE_OFFSET + core::mem::size_of::<u64>();
+const RT_WINDOW_OFFSET: usize = RT_MTU_OFFSET + core::mem::size_of::<u64>();
+const RT_IRTT_OFFSET: usize = RT_WINDOW_OFFSET + core::mem::size_of::<u64>();
 
 /// 普通任务以本次调用者权限配置 socket 所属网络域；全部用户访问发生在 Root 调用之前或之后。
 /// 未知命令返回 ENOTTY，Kernel 的已知指针命令不解引用裸地址。
@@ -101,7 +110,7 @@ fn interface_ioctl(
             copyout(mm, argument, &bytes)
         }
         SIOCSIFFLAGS => {
-            let flags = word(&bytes, 16);
+            let flags = word(&bytes, IFNAME_LEN);
             if flags & !(IFF_UP | IFF_LOOPBACK | IFF_BROADCAST | IFF_RUNNING) != 0 {
                 return Err(FsError::Unsupported);
             }
@@ -109,12 +118,12 @@ fn interface_ioctl(
             Ok(0)
         }
         SIOCSIFADDR => {
-            let address = ipv4_sockaddr(&bytes, 16)?;
+            let address = ipv4_sockaddr(&bytes, IFNAME_LEN)?;
             net.set_interface_address(id, address)?;
             Ok(0)
         }
         SIOCSIFNETMASK => {
-            let mask = ipv4_sockaddr(&bytes, 16)?;
+            let mask = ipv4_sockaddr(&bytes, IFNAME_LEN)?;
             net.set_interface_netmask(id, mask_prefix(mask)?)?;
             Ok(0)
         }
@@ -131,10 +140,10 @@ fn route_ioctl(
 ) -> Result<usize, FsError> {
     // 两目标均为小端 LP64：三个 sockaddr、flags、metric 与机器字字段按固定偏移读取。
     let bytes = copyin::<RTENTRY_LEN>(mm, argument)?;
-    let destination = ipv4_sockaddr(&bytes, 8)?;
-    let gateway = ipv4_sockaddr(&bytes, 24)?;
-    let mask = address_bytes(&bytes, 40);
-    match word(&bytes, 40) {
+    let destination = ipv4_sockaddr(&bytes, RT_DST_OFFSET)?;
+    let gateway = ipv4_sockaddr(&bytes, RT_GATEWAY_OFFSET)?;
+    let mask = address_bytes(&bytes, RT_GENMASK_OFFSET);
+    match word(&bytes, RT_GENMASK_OFFSET) {
         AF_INET => {}
         AF_UNSPEC if mask == [0; 4] => {}
         _ => return Err(FsError::InvalidOperation),
@@ -143,22 +152,22 @@ fn route_ioctl(
     if destination != [0; 4] || prefix != 0 {
         return Err(FsError::Unsupported);
     }
-    let flags = word(&bytes, 56);
+    let flags = word(&bytes, RT_FLAGS_OFFSET);
     if flags & !(RTF_UP | RTF_GATEWAY) != 0 {
         return Err(FsError::Unsupported);
     }
     if flags != RTF_UP | RTF_GATEWAY {
         return Err(FsError::InvalidOperation);
     }
-    let metric = word(&bytes, 80) as i16;
+    let metric = word(&bytes, RT_METRIC_OFFSET) as i16;
     if (metric != 0 && metric != 1)
-        || long(&bytes, 96) != 0
-        || long(&bytes, 104) != 0
-        || word(&bytes, 112) != 0
+        || long(&bytes, RT_MTU_OFFSET) != 0
+        || long(&bytes, RT_WINDOW_OFFSET) != 0
+        || word(&bytes, RT_IRTT_OFFSET) != 0
     {
         return Err(FsError::Unsupported);
     }
-    let device = long(&bytes, 88) as usize;
+    let device = long(&bytes, RT_DEVICE_OFFSET) as usize;
     let interface = if device == 0 {
         None
     } else {
@@ -223,7 +232,7 @@ fn prefix_mask(prefix: u8) -> [u8; 4] {
     let mask = if prefix == 0 {
         0
     } else {
-        u32::MAX << (32 - prefix)
+        u32::MAX << (IPV4_ADDRESS_BITS - prefix)
     };
     mask.to_be_bytes()
 }

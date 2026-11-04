@@ -1,5 +1,6 @@
 //! 真实 timer IRQ 的寄存器探针；手工栈帧同时保存原控制状态。
 
+use crate::arch::loongarch64::register as reg;
 use core::arch::naked_asm;
 use core::sync::atomic::AtomicUsize;
 
@@ -30,9 +31,9 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     st.d $ra, $sp, 0
     st.d $s0, $sp, 8
     st.d $s1, $sp, 16
-    csrrd $t2, 2
+    csrrd $t2, {csr_euen}
     st.d $t2, $sp, 24
-    csrrd $t2, 0
+    csrrd $t2, {csr_crmd}
     st.d $t2, $sp, 32
     st.d $a0, $sp, 40
     ld.d $t2, $a0, 0
@@ -40,15 +41,15 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     st.d $a1, $sp, 56
     st.d $a2, $sp, 64
     st.d $a3, $sp, 72
-    csrrd $t2, 0x30
+    csrrd $t2, {csr_ks0}
     st.d $t2, $sp, 80
     st.d $sp, $sp, 88
 "#,
             // FP 分支暂开标量单元并保存 f0/f24、FCSR 与全部 FCC，再布置独立图样。
             r#"
     beqz $a3, 2f
-    li.w $t2, 1
-    csrwr $t2, 2
+    li.w $t2, {reg_euen_fp}
+    csrwr $t2, {csr_euen}
     fst.d $f0, $sp, 96
     fst.d $f24, $sp, 104
     movfcsr2gr $t2, $fcsr0
@@ -101,7 +102,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     movgr2cf $fcc7, $t2
     b 3f
 2:
-    csrwr $zero, 2
+    csrwr $zero, {csr_euen}
 "#,
             // 布置整数图样并安装 timer，临时开 IE 等待真实计数变化后重新关 IE。
             r#"
@@ -112,18 +113,18 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     li.d $s1, 0xabc
     li.d $a2, 0xdef
     ld.d $t2, $sp, 56
-    ori $t2, $t2, 1
-    csrwr $t2, 0x41
-    li.w $t2, 4
-    li.w $t3, 4
-    csrxchg $t2, $t3, 0
+    ori $t2, $t2, {reg_tcfg_enable}
+    csrwr $t2, {csr_tcfg}
+    li.w $t2, {reg_crmd_ie}
+    li.w $t3, {reg_crmd_ie}
+    csrxchg $t2, $t3, {csr_crmd}
 4:
     ld.d $t2, $sp, 40
     ld.d $t2, $t2, 0
     ld.d $t3, $sp, 48
     beq $t2, $t3, 4b
-    li.w $t2, 4
-    csrxchg $zero, $t2, 0
+    li.w $t2, {reg_crmd_ie}
+    csrxchg $zero, $t2, {csr_crmd}
 "#,
             // 检查全部被测整数与扩展现场，未启用 FP 时只核 EUEN 保持关闭。
             r#"
@@ -139,7 +140,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     bne $a2, $t4, 7f
     ld.d $t4, $sp, 88
     bne $sp, $t4, 7f
-    csrrd $t4, 0x30
+    csrrd $t4, {csr_ks0}
     ld.d $t5, $sp, 80
     bne $t4, $t5, 7f
     ld.d $t4, $sp, 72
@@ -182,7 +183,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     bne $t4, $t5, 7f
     b 6f
 5:
-    csrrd $t4, 2
+    csrrd $t4, {csr_euen}
     bnez $t4, 7f
 6:
     li.w $a0, 1
@@ -195,8 +196,8 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
 8:
     ld.d $t2, $sp, 72
     beqz $t2, 9f
-    li.w $t2, 1
-    csrwr $t2, 2
+    li.w $t2, {reg_euen_fp}
+    csrwr $t2, {csr_euen}
     fld.d $f0, $sp, 96
     fld.d $f24, $sp, 104
     ld.d $t2, $sp, 112
@@ -219,18 +220,25 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     movgr2cf $fcc7, $t2
 9:
     ld.d $t2, $sp, 24
-    csrwr $t2, 2
+    csrwr $t2, {csr_euen}
     ld.d $t2, $sp, 80
-    csrwr $t2, 0x30
+    csrwr $t2, {csr_ks0}
     ld.d $t2, $sp, 32
-    li.w $t3, 4
-    csrxchg $t2, $t3, 0
+    li.w $t3, {reg_crmd_ie}
+    csrxchg $t2, $t3, {csr_crmd}
     ld.d $ra, $sp, 0
     ld.d $s0, $sp, 8
     ld.d $s1, $sp, 16
     addi.d $sp, $sp, 192
     jirl $zero, $ra, 0
 "#,
+            csr_crmd = const reg::CSR_CRMD,
+            csr_euen = const reg::CSR_EUEN,
+            csr_ks0 = const reg::CSR_KS0,
+            csr_tcfg = const reg::CSR_TCFG,
+            reg_crmd_ie = const reg::CRMD_IE,
+            reg_euen_fp = const reg::EUEN_FP,
+            reg_tcfg_enable = const reg::TCFG_ENABLE,
         );
     }
 }

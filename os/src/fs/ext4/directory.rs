@@ -3,14 +3,25 @@
 use alloc::vec::Vec;
 
 use super::mapping::PreparedDirectoryMappings;
+use crate::block::SECTOR_BYTES;
 use crate::cache::BufferRef;
 use crate::fs::ext4::codec::{self, INDEX, METADATA_CSUM};
 use crate::fs::ext4::{BlockMapping, Ext4Volume, Geometry};
 use crate::fs::inode::InodeMetadata;
+use crate::fs::types::NAME_MAX;
 use crate::fs::{DirectoryCursor, DirectoryEntry, DirectoryPosition, FsError, InodeKind};
 
 const DX_MAX_INDIRECT_LEVELS: usize = 2;
 const DX_EOF_COOKIE: u64 = 0x7fff_ffff_ffff_ffff;
+const DX_BLOCK_MASK: u32 = (1 << 28) - 1;
+const DIRENT_HEADER_BYTES: usize = 8;
+const DIRENT_ALIGNMENT: usize = 4;
+const DIRENT_ROUND: usize = DIRENT_ALIGNMENT - 1;
+const DIRENT_MIN_BYTES: usize = (DIRENT_HEADER_BYTES + 1 + DIRENT_ROUND) & !DIRENT_ROUND;
+const DX_ENTRY_BYTES: usize = 8;
+const DX_TAIL_BYTES: usize = 8;
+const DX_NODE_ENTRIES_OFFSET: usize = 8;
+const DX_ROOT_ENTRIES_OFFSET: usize = 32;
 
 /// 一次已准备目录修改对 canonical inode 发布的映射与计数。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,7 +222,9 @@ fn check_directory(volume: &Ext4Volume, inode: &InodeMetadata) -> Result<(), FsE
     if inode.size == 0 || inode.size % volume.geometry().block_size as u64 != 0 {
         return Err(FsError::Corrupt);
     }
-    if inode.flags & INDEX != 0 && volume.geometry().features_compat & 0x20 == 0 {
+    if inode.flags & INDEX != 0
+        && volume.geometry().features_compat & codec::FEATURE_COMPAT_DIR_INDEX == 0
+    {
         return Err(FsError::Corrupt);
     }
     Ok(())
@@ -253,8 +266,8 @@ struct DxPath {
 }
 /// 返回当前文件系统允许的最大 dx 间接层数。
 fn dx_max_indirect_levels(g: &Geometry) -> usize {
-    if g.features_incompat & 0x4000 != 0 {
-        2
+    if g.features_incompat & codec::FEATURE_INCOMPAT_LARGEDIR != 0 {
+        DX_MAX_INDIRECT_LEVELS
     } else {
         1
     }
@@ -266,9 +279,11 @@ fn dx_entry(data: &[u8], offset: usize, position: usize) -> Result<DxEntry, FsEr
         hash: if position == 0 {
             0
         } else {
-            codec::le32(data, offset + position * 8)?
+            codec::le32(data, offset + position * DX_ENTRY_BYTES)?
         },
-        block: u64::from(codec::le32(data, offset + position * 8 + 4)? & 0x0fff_ffff),
+        block: u64::from(
+            codec::le32(data, offset + position * DX_ENTRY_BYTES + 4)? & DX_BLOCK_MASK,
+        ),
     })
 }
 
@@ -278,7 +293,7 @@ fn dx_select(data: &[u8], offset: usize, count: usize, hash: u32) -> Result<usiz
     let mut high = count;
     while low < high {
         let middle = low + (high - low) / 2;
-        if codec::le32(data, offset + middle * 8)? <= hash {
+        if codec::le32(data, offset + middle * DX_ENTRY_BYTES)? <= hash {
             low = middle + 1;
         } else {
             high = middle;
@@ -303,7 +318,11 @@ fn read_dx_frame(
         if root && layout != DirectoryLayout::Root || !root && layout != DirectoryLayout::Index {
             return Err(FsError::Corrupt);
         }
-        let offset = if root { 32 } else { 8 };
+        let offset = if root {
+            DX_ROOT_ENTRIES_OFFSET
+        } else {
+            DX_NODE_ENTRIES_OFFSET
+        };
         let count = usize::from(codec::le16(data, offset + 2)?);
         let position = dx_select(data, offset, count, hash)?;
         let entry = dx_entry(data, offset, position)?;
@@ -340,7 +359,11 @@ fn read_dx_entry(
         if layout != expected {
             return Err(FsError::Corrupt);
         }
-        let offset = if frame.root { 32 } else { 8 };
+        let offset = if frame.root {
+            DX_ROOT_ENTRIES_OFFSET
+        } else {
+            DX_NODE_ENTRIES_OFFSET
+        };
         let count = usize::from(codec::le16(data, offset + 2)?);
         if count != frame.count || count <= position {
             return Err(FsError::Corrupt);
@@ -531,11 +554,11 @@ pub(crate) fn verify_directory(
         return Ok(DirectoryLayout::Index);
     }
     let end = if g.features_ro_compat & METADATA_CSUM != 0 {
-        let end = data.len() - 12;
+        let end = data.len() - codec::DIR_TAIL_BYTES;
         if codec::le32(data, end)? != 0
-            || codec::le16(data, end + 4)? != 12
+            || codec::le16(data, end + 4)? != codec::DIR_TAIL_BYTES as u16
             || data[end + 6] != 0
-            || data[end + 7] != 0xde
+            || data[end + 7] != codec::FT_DIR_CSUM
         {
             return Err(FsError::Corrupt);
         }
@@ -571,13 +594,13 @@ fn verify_dx(
         {
             return Err(FsError::Corrupt);
         }
-        if 5 < data[28] {
+        if codec::DX_HASH_TEA_UNSIGNED < data[28] {
             return Err(FsError::Unsupported);
         }
         if dx_max_indirect_levels(g) < usize::from(data[30]) {
             return Err(FsError::Corrupt);
         }
-        32
+        DX_ROOT_ENTRIES_OFFSET
     } else {
         if codec::le32(data, 0)? != 0
             || codec::le16(data, 6)? != 0
@@ -585,22 +608,22 @@ fn verify_dx(
         {
             return Err(FsError::Corrupt);
         }
-        8
+        DX_NODE_ENTRIES_OFFSET
     };
     let limit = usize::from(codec::le16(data, offset)?);
     let count = usize::from(codec::le16(data, offset + 2)?);
     let tail_len = if g.features_ro_compat & METADATA_CSUM != 0 {
-        8
+        DX_TAIL_BYTES
     } else {
         0
     };
-    if limit != (data.len() - offset - tail_len) / 8 || count == 0 || limit < count {
+    if limit != (data.len() - offset - tail_len) / DX_ENTRY_BYTES || count == 0 || limit < count {
         return Err(FsError::Corrupt);
     }
     let blocks = inode.size / g.block_size as u64;
     let mut previous_hash = 0u32;
     for index in 0..count {
-        let entry = offset + index * 8;
+        let entry = offset + index * DX_ENTRY_BYTES;
         if index != 0 {
             let hash = codec::le32(data, entry)?;
             if hash < previous_hash {
@@ -608,15 +631,15 @@ fn verify_dx(
             }
             previous_hash = hash;
         }
-        let block = u64::from(codec::le32(data, entry + 4)? & 0x0fff_ffff);
+        let block = u64::from(codec::le32(data, entry + 4)? & DX_BLOCK_MASK);
         if block == 0 || blocks <= block || block == logical {
             return Err(FsError::Corrupt);
         }
     }
     if tail_len != 0 {
-        let tail = offset + limit * 8;
+        let tail = offset + limit * DX_ENTRY_BYTES;
         // dx 尾的保留字节只参与 CRC，读取时不赋予零值约束。
-        codec::verify_dx_checksum(inode, data, offset + count * 8, tail)?;
+        codec::verify_dx_checksum(inode, data, offset + count * DX_ENTRY_BYTES, tail)?;
     }
     Ok(())
 }
@@ -625,25 +648,25 @@ fn verify_dx(
 fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record, FsError> {
     let number = u64::from(codec::le32(data, offset)?);
     let len = usize::from(codec::le16(data, offset + 4)?);
-    let filetype = g.features_incompat & 2 != 0;
-    let header = codec::bytes(data, offset, 8)?;
+    let filetype = g.features_incompat & codec::FEATURE_INCOMPAT_FILETYPE != 0;
+    let header = codec::bytes(data, offset, DIRENT_HEADER_BYTES)?;
     let name_len = if filetype {
         usize::from(header[6])
     } else {
         usize::from(codec::le16(data, offset + 6)?)
     };
     let next = offset.checked_add(len).ok_or(FsError::Corrupt)?;
-    if len < 12
-        || len & 3 != 0
-        || 255 < name_len
-        || len < ((8 + name_len + 3) & !3)
+    if len < DIRENT_MIN_BYTES
+        || len & DIRENT_ROUND != 0
+        || NAME_MAX < name_len
+        || len < ((DIRENT_HEADER_BYTES + name_len + DIRENT_ROUND) & !DIRENT_ROUND)
         || end < next
-        || (next < end && end - next < 12)
+        || (next < end && end - next < DIRENT_MIN_BYTES)
         || g.inodes_count < number
     {
         return Err(FsError::Corrupt);
     }
-    let name_offset = offset + 8;
+    let name_offset = offset + DIRENT_HEADER_BYTES;
     let name = codec::bytes(data, name_offset, name_len)?;
     if number != 0 && (name.is_empty() || name.contains(&0) || name.contains(&b'/')) {
         return Err(FsError::Corrupt);
@@ -772,7 +795,7 @@ fn find_entry(
     name: &[u8],
 ) -> Result<Option<FoundEntry>, FsError> {
     check_directory(volume, inode)?;
-    if name.is_empty() || 255 < name.len() || name.contains(&0) || name.contains(&b'/') {
+    if name.is_empty() || NAME_MAX < name.len() || name.contains(&0) || name.contains(&b'/') {
         return Err(FsError::InvalidName);
     }
     if inode.flags & INDEX == 0 {
@@ -1125,7 +1148,7 @@ impl<'a> DirectoryEditBuilder<'a> {
     /// 预留一个尚未映射的新目录逻辑块号。
     fn reserve_logical(&mut self) -> Result<u64, FsError> {
         let logical = self.next_logical;
-        if 0x0fff_ffff < logical {
+        if u64::from(DX_BLOCK_MASK) < logical {
             return Err(FsError::FileTooLarge);
         }
         self.next_logical = logical.checked_add(1).ok_or(FsError::FileTooLarge)?;
@@ -1188,7 +1211,7 @@ impl<'a> DirectoryEditBuilder<'a> {
         };
         let sectors = match mapping
             .added_blocks()
-            .checked_mul((volume.geometry().block_size / 512) as u64)
+            .checked_mul((volume.geometry().block_size / SECTOR_BYTES as usize) as u64)
         {
             Some(sectors) => sectors,
             None => {
@@ -1275,7 +1298,7 @@ fn empty_block(size: usize) -> Result<Vec<u8>, FsError> {
 
 /// 返回含名称和固定八字节头的最小四字节对齐 dirent 长度。
 fn minimum_record_len(name_len: usize) -> usize {
-    (8 + name_len + 3) & !3
+    (DIRENT_HEADER_BYTES + name_len + DIRENT_ROUND) & !DIRENT_ROUND
 }
 
 /// 将受支持 inode 类型编码成 ext4 的原生 file_type。
@@ -1304,7 +1327,7 @@ fn write_record(
 ) -> Result<(), FsError> {
     let minimum = minimum_record_len(name.len());
     if rec_len < minimum
-        || rec_len & 3 != 0
+        || rec_len & DIRENT_ROUND != 0
         || (u16::MAX as usize) < rec_len
         || (u32::MAX as u64) < number
     {
@@ -1314,7 +1337,7 @@ fn write_record(
     data.get_mut(offset..end).ok_or(FsError::Corrupt)?.fill(0);
     codec::put32(data, offset, number as u32);
     codec::put16(data, offset + 4, rec_len as u16);
-    if g.features_incompat & 2 != 0 {
+    if g.features_incompat & codec::FEATURE_INCOMPAT_FILETYPE != 0 {
         data[offset + 6] = name.len() as u8;
         data[offset + 7] = directory_file_type(kind);
     } else {
@@ -1371,7 +1394,7 @@ fn insert_record(
 fn empty_leaf(g: &Geometry, inode: &InodeMetadata) -> Result<Vec<u8>, FsError> {
     let mut data = empty_block(g.block_size)?;
     let end = if g.features_ro_compat & METADATA_CSUM != 0 {
-        g.block_size - 12
+        g.block_size - codec::DIR_TAIL_BYTES
     } else {
         g.block_size
     };
@@ -1383,7 +1406,7 @@ fn empty_leaf(g: &Geometry, inode: &InodeMetadata) -> Result<Vec<u8>, FsError> {
 /// 校验一个新增、删除或移动所使用的单个原始组件。
 fn check_edit_name(name: &[u8]) -> Result<(), FsError> {
     if name.is_empty()
-        || 255 < name.len()
+        || NAME_MAX < name.len()
         || name.contains(&0)
         || name.contains(&b'/')
         || name == b"."
@@ -1406,7 +1429,7 @@ fn check_inode_number(g: &Geometry, number: u64) -> Result<(), FsError> {
 fn leaf_end(g: &Geometry) -> usize {
     g.block_size
         - if g.features_ro_compat & METADATA_CSUM != 0 {
-            12
+            codec::DIR_TAIL_BYTES
         } else {
             0
         }
@@ -1458,7 +1481,7 @@ fn replace_record_inode(
         return Err(FsError::Corrupt);
     }
     codec::put32(data, target, number as u32);
-    if g.features_incompat & 2 != 0 {
+    if g.features_incompat & codec::FEATURE_INCOMPAT_FILETYPE != 0 {
         data[target + 7] = directory_file_type(kind);
     }
     codec::update_directory_checksum(g, inode, data)
@@ -1481,7 +1504,7 @@ fn hashed_records(
 ) -> Result<Vec<HashedRecord>, FsError> {
     let mut records = Vec::new();
     records
-        .try_reserve_exact(end / 12)
+        .try_reserve_exact(end / DIRENT_MIN_BYTES)
         .map_err(|_| FsError::NoMemory)?;
     let mut offset = 0usize;
     while offset < end {
@@ -1538,13 +1561,17 @@ fn pack_leaf(
 
 /// 计算 dx root 或普通 index-node 的可用条目容量。
 fn dx_limit(g: &Geometry, root: bool) -> usize {
-    let offset = if root { 32 } else { 8 };
+    let offset = if root {
+        DX_ROOT_ENTRIES_OFFSET
+    } else {
+        DX_NODE_ENTRIES_OFFSET
+    };
     let tail = if g.features_ro_compat & METADATA_CSUM != 0 {
-        8
+        DX_TAIL_BYTES
     } else {
         0
     };
-    (g.block_size - offset - tail) / 8
+    (g.block_size - offset - tail) / DX_ENTRY_BYTES
 }
 
 /// 将已准备的 dx 条目和真实容量写入局部块图像并重算尾 CRC。
@@ -1557,7 +1584,11 @@ fn write_dx_node(
 ) -> Result<(), FsError> {
     let g = builder.volume.geometry();
     let inode = builder.inode;
-    let offset = if root { 32 } else { 8 };
+    let offset = if root {
+        DX_ROOT_ENTRIES_OFFSET
+    } else {
+        DX_NODE_ENTRIES_OFFSET
+    };
     let limit = dx_limit(g, root);
     if entries.is_empty() || limit < entries.len() {
         return Err(FsError::NoSpace);
@@ -1573,24 +1604,28 @@ fn write_dx_node(
     codec::put16(&mut image.bytes, offset + 2, entries.len() as u16);
     for (position, entry) in entries.iter().enumerate() {
         if position != 0 {
-            codec::put32(&mut image.bytes, offset + position * 8, entry.hash);
+            codec::put32(
+                &mut image.bytes,
+                offset + position * DX_ENTRY_BYTES,
+                entry.hash,
+            );
         }
         codec::put32(
             &mut image.bytes,
-            offset + position * 8 + 4,
+            offset + position * DX_ENTRY_BYTES + 4,
             entry.block as u32,
         );
     }
     for position in entries.len()..limit {
-        let start = offset + position * 8;
+        let start = offset + position * DX_ENTRY_BYTES;
         image.bytes[start..start + 8].fill(0);
     }
     if g.features_ro_compat & METADATA_CSUM != 0 {
         codec::update_dx_checksum(
             inode,
             &mut image.bytes,
-            offset + entries.len() * 8,
-            offset + limit * 8,
+            offset + entries.len() * DX_ENTRY_BYTES,
+            offset + limit * DX_ENTRY_BYTES,
         )?;
     }
     Ok(())
@@ -1628,7 +1663,11 @@ fn load_dx_node(
     if layout != expected {
         return Err(FsError::Corrupt);
     }
-    let offset = if frame.root { 32 } else { 8 };
+    let offset = if frame.root {
+        DX_ROOT_ENTRIES_OFFSET
+    } else {
+        DX_NODE_ENTRIES_OFFSET
+    };
     let limit = usize::from(codec::le16(&image.bytes, offset)?);
     let count = usize::from(codec::le16(&image.bytes, offset + 2)?);
     if count != frame.count || count <= frame.position {
@@ -1904,7 +1943,8 @@ fn add_to_builder(
             return Ok(());
         }
     }
-    if inode.size == g.block_size as u64 && g.features_compat & 0x20 != 0 {
+    if inode.size == g.block_size as u64 && g.features_compat & codec::FEATURE_COMPAT_DIR_INDEX != 0
+    {
         return make_indexed_directory(builder, name, number, kind);
     }
     let logical = builder.reserve_logical()?;
@@ -2086,7 +2126,12 @@ pub(crate) fn prepare_dotdot(
     if inode.flags & INDEX != 0 && g.features_ro_compat & METADATA_CSUM != 0 {
         let limit = usize::from(codec::le16(&image.bytes, 32)?);
         let count = usize::from(codec::le16(&image.bytes, 34)?);
-        codec::update_dx_checksum(inode, &mut image.bytes, 32 + count * 8, 32 + limit * 8)?;
+        codec::update_dx_checksum(
+            inode,
+            &mut image.bytes,
+            DX_ROOT_ENTRIES_OFFSET + count * DX_ENTRY_BYTES,
+            DX_ROOT_ENTRIES_OFFSET + limit * DX_ENTRY_BYTES,
+        )?;
     } else {
         codec::update_directory_checksum(g, inode, &mut image.bytes)?;
     }
@@ -2201,7 +2246,7 @@ pub(crate) fn prepare_new_directory(
     check_inode_number(g, parent_number)?;
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     if inode.flags & INDEX != 0 {
-        if g.features_compat & 0x20 == 0 {
+        if g.features_compat & codec::FEATURE_COMPAT_DIR_INDEX == 0 {
             return Err(FsError::Corrupt);
         }
         let version = g.default_hash_version;

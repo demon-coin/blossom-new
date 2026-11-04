@@ -18,7 +18,10 @@ use virtio_drivers::{
 
 use crate::{
     drivers::{
-        virtio::{dma_protocol, qemu_dma_domain, VirtioIdentity, VirtioInitError},
+        virtio::{
+            dma_protocol, qemu_dma_domain, VirtioIdentity, VirtioInitError, VIRTIO_PCI_NET_LEGACY,
+            VIRTIO_PCI_NET_MODERN, VIRTIO_VENDOR_ID,
+        },
         DeviceInventory, ProbeError,
     },
     irq::{self, IrqNumber, IrqRegistration},
@@ -26,17 +29,19 @@ use crate::{
         self,
         dma::{CoherentDma, DmaDomain, KernelHal, MappedPages},
     },
-    net::{stats::InterfaceStats, NetStack, NetStackRef},
+    net::{stats::InterfaceStats, NetStack, NetStackRef, ETHERNET_FRAME_CAPACITY},
     sync::{SleepMutex, SpinLock},
     time::{self, Duration},
     timer, trace,
     workqueue::Work,
 };
 
-const FRAME_MAX: usize = 1514;
-const FRAME_MIN: usize = 14;
+const FRAME_MAX: usize = ETHERNET_FRAME_CAPACITY;
+const FRAME_MIN: usize = smoltcp::wire::ETHERNET_HEADER_LEN;
 const RX_BUDGET: usize = 16;
 const TX_BUDGET: usize = 32;
+const FRAME_DESCRIPTOR_COUNT: u16 = 2;
+const POOL_MAX_SLOTS: usize = 32;
 type Driver = VirtIONet<KernelHal, SomeTransport<'static>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -291,7 +296,7 @@ impl VirtioNet {
             }
             let inner: &mut Inner = state.inner.as_mut().unwrap();
             assert!(
-                2 <= inner.driver.available_tx_descriptors(),
+                usize::from(FRAME_DESCRIPTOR_COUNT) <= inner.driver.available_tx_descriptors(),
                 "TX preparation lost reserved descriptors"
             );
             let domain = inner.domain;
@@ -840,7 +845,7 @@ fn prepare_pool(
     direction: BufferDirection,
     status: DeviceStatus,
 ) -> Result<Vec<Slot>, VirtioInitError> {
-    let count = usize::from(depth / 2).min(32);
+    let count = usize::from(depth / FRAME_DESCRIPTOR_COUNT).min(POOL_MAX_SLOTS);
     let len = header_len
         .checked_add(FRAME_MAX)
         .ok_or(Error::InvalidParam)?;
@@ -956,8 +961,11 @@ unsafe fn select_transport(
     #[cfg(target_arch = "loongarch64")]
     {
         let mut candidates = inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == virtio_drivers::transport::pci::VIRTIO_VENDOR_ID
-                && matches!(device.device_id, 0x1000 | 0x1041)
+            device.vendor_id == VIRTIO_VENDOR_ID
+                && matches!(
+                    device.device_id,
+                    VIRTIO_PCI_NET_LEGACY | VIRTIO_PCI_NET_MODERN
+                )
         });
         let candidate = candidates
             .next()

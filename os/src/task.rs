@@ -53,6 +53,7 @@ impl TaskId {
 
 const RECLAIM_NOFS: u8 = 1;
 const RECLAIM_NOIO: u8 = 2;
+const KERNEL_STACK_ORDER: usize = 4;
 
 /// 当前普通任务直接回收可进入的依赖范围；显式业务 I/O 不受该模式禁止。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,7 +427,7 @@ fn prepare(
         completed: AtomicBool::new(false),
         waiters: WaitQueue::new(),
     })?;
-    let mut stack = alloc_pages(4, false).ok_or(AllocError)?;
+    let mut stack = alloc_pages(KERNEL_STACK_ORDER, false).ok_or(AllocError)?;
     let stack_top = stack.as_mut_ptr() as usize + stack.len();
     let id = NEXT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

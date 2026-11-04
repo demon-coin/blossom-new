@@ -9,8 +9,19 @@ use crate::fs::file::{require_read, require_write, set_nonblocking, set_status_f
 use crate::fs::memfs::{MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
-    ReadBuffer, SeekFrom, WriteBuffer,
+    ReadBuffer, SeekFrom, WriteBuffer, O_ACCMODE, O_WRONLY,
 };
+
+const NULL_RDEV: u64 = (1 << u8::BITS) | 3;
+const ZERO_RDEV: u64 = (1 << u8::BITS) | 5;
+const SERIAL_RDEV: u64 = (4 << u8::BITS) | 64;
+const CONSOLE_RDEV: u64 = (5 << u8::BITS) | 1;
+const CONTROLLING_TTY_RDEV: u64 = 5 << u8::BITS;
+const KMSG_RDEV: u64 = (1 << u8::BITS) | 11;
+const KTRACE_RDEV: u64 = (240 << u8::BITS) | 1;
+const TESTHOOK_RDEV: u64 = (240 << u8::BITS) | 2;
+const HOOK_MESSAGE_BYTES: usize = 512;
+const DEVICE_IO_CHUNK: usize = 512;
 
 /// 空设备每次打开只拥有路径与共享状态，不维护没有语义的字节位置。
 pub struct NullFile {
@@ -34,14 +45,38 @@ pub struct TestHookFile {
 pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     let fs = MemoryFs::try_new(MemoryFsKind::Devfs, root_mode)?;
     let root = fs.root();
-    fs.initialize_special(&root, b"null", MemorySpecial::Null, 0o666, 0x103)?;
-    fs.initialize_special(&root, b"zero", MemorySpecial::Zero, 0o666, 0x105)?;
-    fs.initialize_special(&root, b"ttyS0", MemorySpecial::TtySerial, 0o666, 0x440)?;
-    fs.initialize_special(&root, b"console", MemorySpecial::Console, 0o666, 0x501)?;
-    fs.initialize_special(&root, b"tty", MemorySpecial::ControllingTty, 0o666, 0x500)?;
-    fs.initialize_special(&root, b"kmsg", MemorySpecial::Kmsg, 0o444, 0x10b)?;
-    fs.initialize_special(&root, b"ktrace", MemorySpecial::Ktrace, 0o444, 0xf001)?;
-    fs.initialize_special(&root, b"testhook", MemorySpecial::TestHook, 0o200, 0xf002)?;
+    fs.initialize_special(&root, b"null", MemorySpecial::Null, 0o666, NULL_RDEV)?;
+    fs.initialize_special(&root, b"zero", MemorySpecial::Zero, 0o666, ZERO_RDEV)?;
+    fs.initialize_special(
+        &root,
+        b"ttyS0",
+        MemorySpecial::TtySerial,
+        0o666,
+        SERIAL_RDEV,
+    )?;
+    fs.initialize_special(
+        &root,
+        b"console",
+        MemorySpecial::Console,
+        0o666,
+        CONSOLE_RDEV,
+    )?;
+    fs.initialize_special(
+        &root,
+        b"tty",
+        MemorySpecial::ControllingTty,
+        0o666,
+        CONTROLLING_TTY_RDEV,
+    )?;
+    fs.initialize_special(&root, b"kmsg", MemorySpecial::Kmsg, 0o444, KMSG_RDEV)?;
+    fs.initialize_special(&root, b"ktrace", MemorySpecial::Ktrace, 0o444, KTRACE_RDEV)?;
+    fs.initialize_special(
+        &root,
+        b"testhook",
+        MemorySpecial::TestHook,
+        0o200,
+        TESTHOOK_RDEV,
+    )?;
     Ok(fs)
 }
 
@@ -64,7 +99,7 @@ pub fn open(
         })
         .map_err(|_| FsError::NoMemory)?),
         MemorySpecial::TestHook => {
-            if flags & 0o3 != 0o1 {
+            if flags & O_ACCMODE != O_WRONLY {
                 return Err(FsError::InvalidOperation);
             }
             require_hook_control(caller)?;
@@ -93,7 +128,7 @@ fn require_hook_control(caller: FileIoContext<'_>) -> Result<(), FsError> {
 /// 空消息及超过 512 字节的消息返回 InvalidOperation，均不访问输入地址。
 fn copy_hook_message(
     source: &mut WriteBuffer<'_>,
-    bytes: &mut [u8; 512],
+    bytes: &mut [u8; HOOK_MESSAGE_BYTES],
 ) -> Result<usize, FsError> {
     let length = source.len();
     if length == 0 || bytes.len() < length {
@@ -139,7 +174,7 @@ fn dispatch_hook_message(message: &[u8]) -> Result<(), FsError> {
 /// 丢弃设备仍从输入端取得真实字节，故障只返回已经消费的正前缀。
 fn discard(source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
     let start = source.copied();
-    let mut bytes = [0; 512];
+    let mut bytes = [0; DEVICE_IO_CHUNK];
     while source.copied() < source.len() {
         match source.pull(&mut bytes) {
             Ok(0) => break,
@@ -154,7 +189,7 @@ fn discard(source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
 /// 零片段不持任何内容锁，用户 fault 可以正常取得自己的 MM 和文件锁。
 fn zeros(target: &mut ReadBuffer<'_>) -> Result<usize, FsError> {
     let start = target.copied();
-    let bytes = [0; 512];
+    let bytes = [0; DEVICE_IO_CHUNK];
     while target.copied() < target.len() {
         match target.push(&bytes) {
             Ok(0) => break,
@@ -463,7 +498,7 @@ impl FileLike for TestHookFile {
     ) -> Result<usize, FsError> {
         require_write(self.flags())?;
         require_hook_control(caller)?;
-        let mut bytes = [0; 512];
+        let mut bytes = [0; HOOK_MESSAGE_BYTES];
         let length = copy_hook_message(source, &mut bytes)?;
         dispatch_hook_message(&bytes[..length])?;
         Ok(length)

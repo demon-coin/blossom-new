@@ -5,49 +5,31 @@ use core::convert::{TryFrom, TryInto};
 use crate::fs::{DescriptorFlags, FileIoContext, FileRef, ReadBuffer, UserIoVector, WriteBuffer};
 use crate::mm::space::Mm;
 use crate::net::address::{
-    AddressFamily, SocketAddress, AF_INET, AF_INET6, AF_UNIX, MAX_ADDRESS_LEN,
+    AddressFamily, SocketAddress, ADDRESS_FAMILY_LEN, AF_INET, AF_INET6, AF_UNIX, MAX_ADDRESS_LEN,
 };
-use crate::net::socket::SocketFile;
+use crate::net::socket::{
+    SocketFile, IPPROTO_IPV6, IPPROTO_MAX, IPPROTO_TCP, IPPROTO_UDP, MSG_TRUNC, SOCK_CLOEXEC,
+    SOCK_DGRAM, SOCK_MAX, SOCK_NONBLOCK, SOCK_SEQPACKET, SOCK_STREAM, SOCK_TYPE_MASK, SOL_SOCKET,
+    SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE, SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO,
+    SO_REUSEADDR, SO_SNDBUF, SO_SNDTIMEO, SO_TYPE,
+};
 use crate::net::UnixSocketType;
 use crate::syscall::error::{copyin, copyout, Errno, SysResult};
 use crate::syscall::file::{import_vectors, nofile, MAX_IOV_COUNT};
 use crate::syscall::{Outcome, Request, Restart};
 use crate::task::UserThread;
+use crate::time::{NSEC_PER_SEC, NSEC_PER_USEC, USEC_PER_SEC};
 use crate::timer::TICK_NS;
 use smoltcp::socket::tcp::CongestionControl;
 
-const SOCK_STREAM: u32 = 1;
-const SOCK_DGRAM: u32 = 2;
-const SOCK_SEQPACKET: u32 = 5;
-const SOCK_TYPE_MASK: u32 = 0xf;
-const SOCK_MAX: u32 = 11;
-const SOCK_NONBLOCK: u32 = 0o4000;
-const SOCK_CLOEXEC: u32 = 0o2000000;
 const SOCKET_FLAGS: u32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
-const IPPROTO_TCP: i32 = 6;
-const IPPROTO_UDP: i32 = 17;
 const TCP_NODELAY: i32 = 1;
 const TCP_MAXSEG: i32 = 2;
 const TCP_CONGESTION: i32 = 13;
-const IPPROTO_IPV6: i32 = 41;
 const IPV6_V6ONLY: i32 = 26;
 const CONGESTION_NAME_LEN: usize = 16;
-const MSG_TRUNC: u32 = 0x20;
-const IPPROTO_MAX: i32 = 263;
 const ADDRESS_STORAGE_LEN: usize = 128;
-const SOL_SOCKET: i32 = 1;
-const SO_REUSEADDR: i32 = 2;
-const SO_TYPE: i32 = 3;
-const SO_ERROR: i32 = 4;
-const SO_KEEPALIVE: i32 = 9;
-const SO_SNDBUF: i32 = 7;
-const SO_RCVBUF: i32 = 8;
-const SO_RCVTIMEO: i32 = 20;
-const SO_SNDTIMEO: i32 = 21;
 const TIMEVAL_LEN: usize = 16;
-const SO_ACCEPTCONN: i32 = 30;
-const SO_PROTOCOL: i32 = 38;
-const SO_DOMAIN: i32 = 39;
 
 /// 仅无限等待的内部中断标记进入信号重启出口，有限等待交付实际 EINTR。
 pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
@@ -212,7 +194,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
 /// 地址先复制为内核值，两种 IP 族的完整结构与 scope 由共同解码边界检查。
 fn input_address(mm: &Mm, address: usize, raw_length: usize) -> Result<SocketAddress, Errno> {
     let length = raw_length as i32;
-    if length < 2 || (ADDRESS_STORAGE_LEN as i32) < length {
+    if length < ADDRESS_FAMILY_LEN as i32 || (ADDRESS_STORAGE_LEN as i32) < length {
         return Err(Errno::InvalidArgument);
     }
     let mut bytes = [0u8; ADDRESS_STORAGE_LEN];
@@ -550,7 +532,7 @@ fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, 
     let seconds = i64::from_ne_bytes(bytes[..8].try_into().expect("fixed timeval seconds"));
     let microseconds =
         i64::from_ne_bytes(bytes[8..].try_into().expect("fixed timeval microseconds"));
-    if microseconds < 0 || 1_000_000 <= microseconds {
+    if microseconds < 0 || USEC_PER_SEC as i64 <= microseconds {
         return Err(Errno::Domain);
     }
     if seconds < 0 {
@@ -560,7 +542,8 @@ fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, 
         return Ok(None);
     }
     // 输入和上取整在宽整数域完成，超出内部纳秒范围沿无限 sentinel 返回。
-    let nanos = seconds as u128 * 1_000_000_000 + microseconds as u128 * 1_000;
+    let nanos = seconds as u128 * u128::from(NSEC_PER_SEC)
+        + microseconds as u128 * u128::from(NSEC_PER_USEC);
     let tick = u128::from(TICK_NS);
     let quantized = nanos.div_ceil(tick) * tick;
     Ok(u64::try_from(quantized).ok())
@@ -570,8 +553,8 @@ fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, 
 fn timeout_bytes(timeout: Option<u64>) -> [u8; TIMEVAL_LEN] {
     let nanos = timeout.unwrap_or(0);
     let mut bytes = [0u8; TIMEVAL_LEN];
-    bytes[..8].copy_from_slice(&((nanos / 1_000_000_000) as i64).to_ne_bytes());
-    bytes[8..].copy_from_slice(&((nanos % 1_000_000_000 / 1_000) as i64).to_ne_bytes());
+    bytes[..8].copy_from_slice(&((nanos / NSEC_PER_SEC) as i64).to_ne_bytes());
+    bytes[8..].copy_from_slice(&((nanos % NSEC_PER_SEC / NSEC_PER_USEC) as i64).to_ne_bytes());
     bytes
 }
 

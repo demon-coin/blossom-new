@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 use core::ops::Range;
 
+use crate::block::SECTOR_BYTES;
 use crate::cache::PreparedFile;
 use crate::fs::ext4::finish_error;
 use crate::fs::{writeback, FsError, InodeRef};
@@ -271,7 +272,7 @@ fn contiguous_page(
     index: u64,
     file_size: u64,
     block_size: usize,
-    targets: &[Option<u64>; PAGE_SIZE / 512],
+    targets: &[Option<u64>; PAGE_SIZE / SECTOR_BYTES as usize],
 ) -> Option<u64> {
     let end = index.checked_add(1)?.checked_mul(PAGE_SIZE as u64)?;
     if file_size < end {

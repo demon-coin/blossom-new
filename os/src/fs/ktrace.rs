@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::fs::file::{require_read, set_nonblocking, set_status_flags, stat_path};
 use crate::fs::{
     DirectoryEntry, FileIoContext, FileLike, FileRef, FileStat, FsError, InodeRef, Path,
-    ReadBuffer, SeekFrom, WriteBuffer,
+    ReadBuffer, SeekFrom, WriteBuffer, O_ACCMODE, O_RDONLY, O_TRUNC,
 };
 use crate::sync::SleepMutex;
 use crate::trace;
@@ -31,7 +31,7 @@ pub struct TraceFile {
 
 /// 普通可睡眠任务准备只读实例，打开本身不启动捕获或取得新快照。
 pub(crate) fn open(path: Path, flags: u32) -> Result<FileRef, FsError> {
-    if flags & 0o3 != 0 || flags & 0o1000 != 0 {
+    if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
         return Err(FsError::ReadOnly);
     }
     Ok(Arc::try_new(TraceFile {

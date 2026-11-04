@@ -26,7 +26,12 @@ const FCR: usize = 2;
 const IIR: usize = 2;
 const LCR: usize = 3;
 const LSR: usize = 5;
-const DATA_READY: u8 = 1;
+const MSR: usize = 6;
+pub(crate) const DATA_READY: u8 = 1;
+pub(crate) const UART_LSR_OVERRUN: u8 = 1 << 1;
+pub(crate) const UART_LSR_PARITY: u8 = 1 << 2;
+pub(crate) const UART_LSR_FRAME: u8 = 1 << 3;
+pub(crate) const UART_LSR_BREAK: u8 = 1 << 4;
 const TRANSMIT_READY: u8 = 0x20;
 const RECEIVE_INTERRUPT: u8 = 1;
 const TRANSMIT_INTERRUPT: u8 = 2;
@@ -45,6 +50,26 @@ const LOOPBACK: u8 = 1 << 4;
 const LCR_STICK_PARITY: u8 = 1 << 5;
 const DATA_TERMINAL_READY: u8 = 1;
 const REQUEST_TO_SEND: u8 = 2;
+pub(crate) const UART_LCR_WLEN5: u8 = 0;
+pub(crate) const UART_LCR_WLEN6: u8 = 1;
+pub(crate) const UART_LCR_WLEN7: u8 = 2;
+pub(crate) const UART_LCR_WLEN8: u8 = 3;
+pub(crate) const UART_LCR_STOP: u8 = 1 << 2;
+pub(crate) const UART_LCR_PARITY: u8 = 1 << 3;
+pub(crate) const UART_LCR_EPAR: u8 = 1 << 4;
+const FCR_ENABLE_FIFO: u8 = 1;
+const FCR_CLEAR_RECEIVER: u8 = 1 << 1;
+const FCR_CLEAR_TRANSMITTER: u8 = 1 << 2;
+// 保留 IIR 的 no-interrupt 位，DW busy-detect 的编码也使用最低位。
+const IIR_STATUS_MASK: u8 = 0x0f;
+const IIR_NO_INTERRUPT: u8 = 1;
+const IIR_MODEM_STATUS: u8 = 0;
+const IIR_BUSY: u8 = 7;
+const IIR_RX_TIMEOUT: u8 = 0x0c;
+const UART_CLOCK_DIVISOR: u64 = 16;
+const QEMU_RISCV_BAUD_BASE: u32 = 399_193;
+const QEMU_LOONGARCH_BAUD_BASE: u32 = 115_200;
+const RX_IRQ_BUDGET: usize = 16;
 
 // 整条应急消息最多读取这些次 LSR，不依赖时钟或其他 CPU 的进度。
 const EMERGENCY_POLL_BUDGET: usize = 10_000;
@@ -238,16 +263,16 @@ pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
     assert!(matches!(info.uart.reg_io_width, 1 | 4));
     let baud_base = if info.platform == crate::boot::Platform::QemuVirt {
         if cfg!(target_arch = "riscv64") {
-            399_193
+            QEMU_RISCV_BAUD_BASE
         } else {
-            115_200
+            QEMU_LOONGARCH_BAUD_BASE
         }
     } else {
         let clock = info
             .uart
             .clock_frequency
             .expect("UART input clock rate is unavailable");
-        u32::try_from(clock / 16).expect("UART baud base exceeds u32")
+        u32::try_from(clock / UART_CLOCK_DIVISOR).expect("UART baud base exceeds u32")
     };
     assert!(0 < baud_base, "UART input clock is zero");
     RESOURCES.call_once(|| PortResources {
@@ -503,9 +528,12 @@ pub fn initialize() {
     let _port = PORT.lock();
     write_register(IER, 0);
     if !dw_apb() {
-        write_line_control(3);
+        write_line_control(UART_LCR_WLEN8);
     }
-    write_register(FCR, 7);
+    write_register(
+        FCR,
+        FCR_ENABLE_FIFO | FCR_CLEAR_RECEIVER | FCR_CLEAR_TRANSMITTER,
+    );
 }
 
 /// 引导阶段同步输出，不获取任务/PID、分配内存或重新探测硬件。
@@ -726,7 +754,7 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
 /// 只作为当前 UART 的 IRQ action 调用；端口映射已建立，当前是非嵌套硬中断，
 /// 且调用者没有持有 PORT。此 handler 不使用 context。
 pub unsafe fn uart_handler(_context: *mut ()) -> bool {
-    handle_uart::<16, false>()
+    handle_uart::<RX_IRQ_BUDGET, false>()
 }
 
 /// 测试 action 仅消费一个真实 payload 字节，在同一端口锁内立即关闭 RX/TX 中断。
@@ -745,20 +773,20 @@ pub(crate) unsafe fn ktest_uart_handler_one(_context: *mut ()) -> bool {
 fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     let (produced, notify_tx) = {
         let mut port = PORT.lock();
-        let first_interrupt = read_register(IIR) & 0x0f;
-        if first_interrupt == 7 && dw_apb() {
+        let first_interrupt = read_register(IIR) & IIR_STATUS_MASK;
+        if first_interrupt == IIR_BUSY && dw_apb() {
             let _ = read_register(DW_USR);
             return true;
         }
-        if first_interrupt & 1 != 0 {
+        if first_interrupt & IIR_NO_INTERRUPT != 0 {
             return false;
         }
-        if first_interrupt == 0x0c && dw_apb() && read_register(LSR) & DATA_READY == 0 {
+        if first_interrupt == IIR_RX_TIMEOUT && dw_apb() && read_register(LSR) & DATA_READY == 0 {
             let _ = read_register(DATA);
             return true;
         }
-        if first_interrupt == 0 {
-            let _ = read_register(6);
+        if first_interrupt == IIR_MODEM_STATUS {
+            let _ = read_register(MSR);
         }
         let mut produced = 0;
         #[cfg(feature = "ktest")]
@@ -792,7 +820,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                 }
             }
         }
-        let last_interrupt = read_register(IIR) & 0x0f;
+        let last_interrupt = read_register(IIR) & IIR_STATUS_MASK;
         let ier = read_register(IER);
         let ready = read_register(LSR) & TRANSMIT_READY != 0;
         let notify_tx = ier & TRANSMIT_INTERRUPT != 0 && ready;

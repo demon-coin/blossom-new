@@ -7,12 +7,31 @@ use crate::mm::space::{Mm, VmError};
 use crate::mm::user_table::PagePermissions;
 use crate::mm::PAGE_SIZE;
 use crate::random;
+use crate::task::time::USER_HZ;
 
 use super::elf::Elf;
 use super::{Arguments, ExecError, RWX};
 
 const STARTUP_HEADROOM: usize = 128 * 1024;
 const AUXV_PAIRS: usize = 17;
+const AT_RANDOM_BYTES: usize = 16;
+const AT_NULL: usize = 0;
+const AT_PHDR: usize = 3;
+const AT_PHENT: usize = 4;
+const AT_PHNUM: usize = 5;
+const AT_PAGESZ: usize = 6;
+const AT_BASE: usize = 7;
+const AT_FLAGS: usize = 8;
+const AT_ENTRY: usize = 9;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_HWCAP: usize = 16;
+const AT_CLKTCK: usize = 17;
+const AT_SECURE: usize = 23;
+const AT_RANDOM: usize = 25;
+const AT_EXECFN: usize = 31;
 
 /// 保存纯计算的初始范围，不将运行中增长限额缓存进 Mm。
 struct Layout {
@@ -30,7 +49,7 @@ impl Layout {
             .ok_or(ExecError::ArgumentsTooBig)?;
         let random = arch::USER_STACK_TOP
             .checked_sub(args.string_bytes())
-            .and_then(|address| address.checked_sub(16))
+            .and_then(|address| address.checked_sub(AT_RANDOM_BYTES))
             .ok_or(ExecError::ArgumentsTooBig)?;
         let words = args
             .argv
@@ -42,7 +61,7 @@ impl Layout {
         let sp = random
             .checked_sub(words)
             .ok_or(ExecError::ArgumentsTooBig)?
-            & !15;
+            & !(arch::STACK_ALIGNMENT - 1);
         let actual_bottom = sp & !(PAGE_SIZE - 1);
         let actual = arch::USER_STACK_TOP - actual_bottom;
         let headroom = args
@@ -100,28 +119,28 @@ pub(super) fn make_stack(
         stack_word(mm, &mut pointers, address)?;
     }
     stack_word(mm, &mut pointers, 0)?;
-    debug_assert_eq!(strings - 16, layout.random);
-    let mut random_bytes = [0; 16];
+    debug_assert_eq!(strings - AT_RANDOM_BYTES, layout.random);
+    let mut random_bytes = [0; AT_RANDOM_BYTES];
     random::fill_insecure(&mut random_bytes);
     copyout_exact(mm, layout.random, &random_bytes)?;
     let auxv = [
-        (3, elf.phdr.unwrap_or(0)),
-        (4, elf.phent),
-        (5, elf.phnum),
-        (6, PAGE_SIZE),
-        (7, interpreter_base),
-        (8, 0),
-        (9, elf.entry),
-        (11, uid as usize),
-        (12, uid as usize),
-        (13, gid as usize),
-        (14, gid as usize),
-        (16, hwcap()),
-        (17, 100),
-        (23, 0),
-        (25, layout.random),
-        (31, layout.execfn),
-        (0, 0),
+        (AT_PHDR, elf.phdr.unwrap_or(0)),
+        (AT_PHENT, elf.phent),
+        (AT_PHNUM, elf.phnum),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, interpreter_base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, elf.entry),
+        (AT_UID, uid as usize),
+        (AT_EUID, uid as usize),
+        (AT_GID, gid as usize),
+        (AT_EGID, gid as usize),
+        (AT_HWCAP, hwcap()),
+        (AT_CLKTCK, USER_HZ as usize),
+        (AT_SECURE, 0),
+        (AT_RANDOM, layout.random),
+        (AT_EXECFN, layout.execfn),
+        (AT_NULL, 0),
     ];
     debug_assert_eq!(auxv.len(), AUXV_PAIRS);
     for (kind, value) in auxv {
@@ -165,9 +184,10 @@ fn copyout_exact(mm: &Mm, address: usize, bytes: &[u8]) -> Result<(), ExecError>
 /// 当前 RV64GC 平台与用户现场共同支持 IMAFDC；不保存的 V 不对用户声明。
 #[cfg(target_arch = "riscv64")]
 fn hwcap() -> usize {
+    const HWCAP_ISA_A: usize = 1;
     (1 << (b'I' - b'A'))
         | (1 << (b'M' - b'A'))
-        | 1
+        | HWCAP_ISA_A
         | (1 << (b'F' - b'A'))
         | (1 << (b'D' - b'A'))
         | (1 << (b'C' - b'A'))
@@ -176,6 +196,11 @@ fn hwcap() -> usize {
 /// 仅声明实际 CPU 存在且用户入口、复制与信号路径完整保存的浮点和向量扩展。
 #[cfg(target_arch = "loongarch64")]
 fn hwcap() -> usize {
+    const HWCAP_CPUCFG: usize = 1;
+    const EUEN_TO_HWCAP_SHIFT: u32 = 3;
     let euen = crate::arch::user_euen();
-    1 | ((euen & 1) << 3) | ((euen & 2) << 3) | ((euen & 4) << 3)
+    HWCAP_CPUCFG
+        | ((euen & arch::EUEN_FP) << EUEN_TO_HWCAP_SHIFT)
+        | ((euen & arch::EUEN_LSX) << EUEN_TO_HWCAP_SHIFT)
+        | ((euen & arch::EUEN_LASX) << EUEN_TO_HWCAP_SHIFT)
 }

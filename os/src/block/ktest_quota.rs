@@ -15,7 +15,9 @@ use super::{
     AccessMode, Bio, BioAllocator, BioCompletion, BlkOperation, BlockError, Disk, DiskRef, EndIo,
     FsClaim, IoResult,
 };
-use crate::drivers::virtio::VirtioDevice;
+use crate::drivers::virtio::{
+    VirtioDevice, VIRTIO_PCI_BLOCK_LEGACY, VIRTIO_PCI_BLOCK_MODERN, VIRTIO_VENDOR_ID,
+};
 use crate::drivers::DeviceInventory;
 use crate::mm::dma::MappedPages;
 use crate::sync::SpinLock;
@@ -203,10 +205,13 @@ fn devices(
     inventory: &DeviceInventory,
     count: usize,
 ) -> Result<Vec<(VirtioDevice, bool)>, TestError> {
-    let pci =
-        inventory.pci.devices().iter().filter(|device| {
-            device.vendor_id == 0x1af4 && matches!(device.device_id, 0x1001 | 0x1042)
-        });
+    let pci = inventory.pci.devices().iter().filter(|device| {
+        device.vendor_id == VIRTIO_VENDOR_ID
+            && matches!(
+                device.device_id,
+                VIRTIO_PCI_BLOCK_LEGACY | VIRTIO_PCI_BLOCK_MODERN
+            )
+    });
     if inventory.mmio_blocks.len() + pci.clone().count() != count {
         return Err(TestError(
             "quota requires exact declared root/extra raw device count",
@@ -269,7 +274,7 @@ fn bio(
 struct Pressure {
     pages: Vec<mm::OwnedPages>,
     // 原堆对象的首个 usize 仅在此唯一拥有者内保存下一节点，不需要压力期间扩容。
-    heap: [usize; 12],
+    heap: [usize; mm::SLUB_SIZES.len()],
 }
 
 impl Pressure {
@@ -281,7 +286,7 @@ impl Pressure {
             .map_err(|_| TestError("quota pressure owner capacity unavailable"))?;
         Ok(Self {
             pages,
-            heap: [0; 12],
+            heap: [0; mm::SLUB_SIZES.len()],
         })
     }
 
@@ -297,7 +302,8 @@ impl Pressure {
             self.pages.push(page);
         }
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
-            let layout = Layout::from_size_align(size, 8).expect("quota heap pressure layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("quota heap pressure layout");
             loop {
                 // SAFETY: 固定非零合法布局，真实全局堆入口；只消费真实成功分配。
                 let pointer = black_box(unsafe { alloc(layout) });
@@ -319,7 +325,8 @@ impl Pressure {
             .copied()
             .chain(core::iter::once(mm::PAGE_SIZE * 2))
         {
-            let layout = Layout::from_size_align(size, 8).expect("quota heap probe layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("quota heap probe layout");
             // SAFETY: 探测同一真实全局堆；若意外成功立即按原布局归还，不记录假 OOM。
             // 不让分配与立即归还被优化成假成功，保留真实 NULL 探测。
             let pointer = black_box(unsafe { alloc(layout) });
@@ -336,7 +343,8 @@ impl Pressure {
     /// 每个原堆节点按原布局归还一次，再释放原页压力，绝不手工改 allocator 状态。
     fn release(&mut self) {
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
-            let layout = Layout::from_size_align(size, 8).expect("quota heap release layout");
+            let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
+                .expect("quota heap release layout");
             while self.heap[index] != 0 {
                 let pointer = self.heap[index] as *mut u8;
                 // SAFETY: 节点来自本链的原 alloc，首字已初始化，布局与分配完全一致。
