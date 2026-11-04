@@ -328,10 +328,10 @@ pub(crate) mod context {
             core::array::from_fn::<_, 2, _>(|slot| state.bases[slot].load(Ordering::Acquire));
         let ids = core::array::from_fn::<_, 2, _>(|slot| state.ids[slot].load(Ordering::Acquire));
         assert_ne!(ids[0], ids[1]);
-        for slot in 0..2 {
+        for (slot, id) in ids.iter().enumerate() {
             assert_eq!(
                 fixture.handles[slot].as_ref().unwrap().task_id().as_usize(),
-                ids[slot]
+                *id
             );
         }
         assert!(

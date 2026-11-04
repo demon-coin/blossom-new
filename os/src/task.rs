@@ -7,9 +7,7 @@ pub(crate) mod process;
 pub(crate) mod signal;
 pub(crate) mod time;
 mod user;
-pub(crate) use user::{
-    prepare_program, Credentials, PreparedProgram, ProgramError, UserFs, UserRuntime, UserThread,
-};
+pub(crate) use user::{prepare_program, Credentials, ProgramError, UserRuntime, UserThread};
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

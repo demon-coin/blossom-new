@@ -5,9 +5,8 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::mem;
 use smoltcp::iface::{IpPayload, Packet};
-use smoltcp::socket::tcp::Socket as RawTcpSocket;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, IpRepr, TcpControl, TcpRepr, UdpRepr, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
+    IpAddress, IpProtocol, IpRepr, TcpRepr, UdpRepr, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
     UDP_HEADER_LEN,
 };
 
@@ -22,6 +21,7 @@ pub(crate) const MAX_IPV4_UDP_PAYLOAD_LEN: usize =
     MAX_IP_PACKET_LEN - IPV4_HEADER_LEN - UDP_HEADER_LEN;
 pub(crate) const IPV6_UDP_HEADER_LEN: usize = IPV6_HEADER_LEN + UDP_HEADER_LEN;
 pub(crate) const MAX_IPV6_UDP_PAYLOAD_LEN: usize = MAX_IP_PACKET_LEN - IPV6_UDP_HEADER_LEN;
+#[cfg(feature = "ktest")]
 const DEFAULT_HOP_LIMIT: u8 = 64;
 
 /// 每接口的一份捕获后备独立保活，loan 不引用网络域或端点。
@@ -83,6 +83,7 @@ impl OwnedPacket {
     }
 
     /// typed 消费者可构造合法 UDP repr，实际 UDP 发送由独立 raw Socket dispatch。
+    #[cfg(feature = "ktest")]
     pub fn try_from_udp(
         source: InetEndpoint,
         destination: InetEndpoint,
@@ -199,17 +200,8 @@ impl OwnedPacket {
         Packet::new(self.ip.clone(), payload)
     }
 
-    /// typed TCP 消费者沿成熟 rst_reply 生成正常拒绝，RST 输入不循环应答。
-    pub fn try_tcp_reset(&self, mtu: usize) -> Result<Option<Self>, FsError> {
-        let (ip, tcp) = self.tcp()?;
-        if tcp.control == TcpControl::Rst {
-            return Ok(None);
-        }
-        let (reply_ip, reply_tcp) = RawTcpSocket::rst_reply(&ip, &tcp);
-        Self::try_from_tcp(&reply_ip, &reply_tcp, mtu).map(Some)
-    }
-
     /// 协议号来自捕获的库 IP repr，不重复解析传输头。
+    #[cfg(feature = "ktest")]
     pub fn protocol(&self) -> IpProtocol {
         self.ip.next_header()
     }

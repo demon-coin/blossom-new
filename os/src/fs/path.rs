@@ -81,6 +81,7 @@ pub struct Vfs {
 
 impl Path {
     /// 借用稳定名字对象，名字缓存淘汰不改变当前路径身份。
+    #[cfg(feature = "ktest")]
     pub fn dentry(&self) -> &DentryRef {
         &self.dentry
     }
@@ -119,6 +120,7 @@ impl Path {
 
     /// 借用原挂载，为同一实际文件系统的零链接 inode 构造未入名字索引的路径。
     /// 调用者须在可睡眠任务中持合法 canonical inode；本操作不创建名字或替换挂载根。
+    #[cfg(feature = "ktest")]
     pub(crate) fn unhashed_inode(&self, inode: InodeRef) -> Result<Self, FsError> {
         if inode.device() != self.mount.filesystem.device() {
             return Err(FsError::InvalidOperation);
@@ -281,11 +283,13 @@ impl Vfs {
     }
 
     /// 借用当前 VFS 的有限名字缓存。
+    #[cfg(feature = "ktest")]
     pub fn dcache(&self) -> &DentryCache {
         self.dcache.as_ref()
     }
 
     /// 借用磁盘后端共用的唯一 inode 缓存域，RAM canonical 节点由实际实例持有。
+    #[cfg(feature = "ktest")]
     pub fn inodes(&self) -> &Arc<InodeCache> {
         &self.inodes
     }
@@ -1292,16 +1296,15 @@ impl Vfs {
         if !source_is_directory && source_current.links == 0 {
             return Err(FsError::NotFound);
         }
-        let target_current = match target_inode.as_ref() {
-            Some(_) => Some(match target_directory.as_ref() {
+        let target_current = target_inode
+            .as_ref()
+            .map(|_| match target_directory.as_ref() {
                 Some(directory) => directory.metadata_snapshot(),
                 None => target_file
                     .as_ref()
                     .expect("non-directory target has no inode write guard")
                     .metadata_snapshot(),
-            }),
-            None => None,
-        };
+            });
         if target_current
             .as_ref()
             .is_some_and(|metadata| metadata.links == 0)
@@ -1487,6 +1490,7 @@ impl Vfs {
     }
 
     /// 先核活路径和子挂载，再保原挂载锁外同步；同一实例重查通过后才摘表并释放。
+    #[cfg(feature = "ktest")]
     pub fn unmount(&self, covered: &Path) -> Result<(), FsError> {
         let mount = {
             let mounts = self.mounts.lock();

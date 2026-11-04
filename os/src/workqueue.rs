@@ -2,7 +2,9 @@
 
 pub(crate) mod delayed;
 mod pool;
-pub use delayed::{DelayedError, DelayedWork};
+#[cfg(feature = "ktest")]
+pub use delayed::DelayedError;
+pub use delayed::DelayedWork;
 pub(crate) use pool::{Worker, WorkerPool};
 
 use alloc::sync::Arc;
@@ -119,9 +121,8 @@ impl WorkQueue {
             prepared.try_reserve_exact(count).map_err(|_| AllocError)?;
             // SAFETY: 域尚未发表，此处是表的唯一构造者。
             unsafe {
-                (&mut *domain.rescuers.get())
-                    .try_reserve_exact(count)
-                    .map_err(|_| AllocError)?;
+                let rescuers = &mut *domain.rescuers.get();
+                rescuers.try_reserve_exact(count).map_err(|_| AllocError)?;
             }
             for cpu in 0..count {
                 prepared.push(pool::prepare_rescuer(cpu, &domain)?);
@@ -186,9 +187,8 @@ impl WorkQueue {
         for rescue in rescues.iter() {
             // SAFETY: close_serial 串行唯一关闭者，其他路径只借用不变 worker，不访问 join。
             let join = unsafe {
-                (&mut *rescue.join.get())
-                    .take()
-                    .expect("missing rescuer join")
+                let slot = &mut *rescue.join.get();
+                slot.take().expect("missing rescuer join")
             };
             assert_eq!(join.join(), 0);
         }
@@ -772,7 +772,7 @@ pub fn initialize_services() -> Result<(), AllocError> {
 pub(crate) mod testing {
     pub(crate) use super::pool::testing::{
         arm_pause, cancel_pause, is_paused, is_rescuer, manager_blocked, pool_stats, release_pause,
-        service_count, service_task, wait_services_blocked, PausePoint, PoolStats,
+        wait_services_blocked, PausePoint,
     };
     use super::*;
     /// 当前仍存活的真实 payload 数；不代表 Weak 控制块或 allocator backing 已归还。

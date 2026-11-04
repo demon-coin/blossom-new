@@ -48,7 +48,7 @@ impl TcpCore {
         if rx_len == 0 || tx_len == 0 || TCP_MAX_RECEIVE_CAPACITY < rx_len {
             return Err(FsError::InvalidOperation);
         }
-        if ip_mtu < IPV4_MIN_MTU || MAX_IP_PACKET_LEN < ip_mtu {
+        if !(IPV4_MIN_MTU..=MAX_IP_PACKET_LEN).contains(&ip_mtu) {
             return Err(FsError::InvalidOperation);
         }
         let mut socket = tcp::Socket::new(
@@ -258,6 +258,7 @@ impl TcpCore {
     }
 
     /// raw 通配监听不保存地址族，由端点的不可变族恢复对应未指定地址。
+    #[cfg(feature = "ktest")]
     pub fn listen_endpoint(&self, family: AddressFamily) -> InetEndpoint {
         let endpoint = self.socket.listen_endpoint();
         InetEndpoint {
@@ -324,7 +325,7 @@ impl TcpCore {
     /// 路由已选择实际源和介质后更新唯一发送环境。
     pub fn set_ip_mtu(&mut self, mtu: usize) {
         assert!(
-            IPV4_MIN_MTU <= mtu && mtu <= MAX_IP_PACKET_LEN,
+            (IPV4_MIN_MTU..=MAX_IP_PACKET_LEN).contains(&mtu),
             "invalid TCP route MTU"
         );
         self.context.set_ip_mtu(mtu);

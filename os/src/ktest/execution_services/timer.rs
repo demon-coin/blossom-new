@@ -1,6 +1,5 @@
 //! 在唯一生产定时器、真实 Task、硬中断与服务 BH 上核验睡眠及停止协议。
 
-use super::wait;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
@@ -12,7 +11,7 @@ use crate::task::{self, State, Task};
 use crate::time::{self as clock, Duration, MonotonicInstant};
 use crate::timer::{self as timers, testing, ArmError, CancelResult, Timer, TimerKind};
 use crate::wait::{Waiter, Waker};
-use crate::{arch, cpu, mm, sched};
+use crate::{arch, cpu, sched};
 
 /// 用真实硬件计数构造不可重置的有限观察期限。
 fn raw_deadline() -> u64 {
@@ -437,7 +436,7 @@ fn test_rearm_close() {
     );
     timer.as_ref().cancel_sync();
     let reused = usize::from(scenario().callbacks.load(Ordering::Acquire) == callbacks_before + 3);
-    let overlap = if 1 < cpu::count() {
+    let _overlap = if 1 < cpu::count() {
         let (running, blocked) = paused_stop(&timer, testing::PausePoint::Tail, true, true);
         assert_eq!(running, blocked);
         running

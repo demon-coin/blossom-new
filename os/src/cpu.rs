@@ -615,6 +615,7 @@ fn kick_mask() -> usize {
 /// 在生命周期停止生产者后永久停稳其它 online 核，返回的 guard 固定协调核直到整机动作。
 /// 调用者不得持业务锁，所有用户已离栈、FS 已退休且不再有必须继续运行的 CSD 责任；
 /// 本核必须能服务 IPI，CPU 集合不得继续上线，返回后不能恢复普通执行或重用停稳确认。
+#[cfg(not(feature = "ktest"))]
 pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
     assert!(crate::arch::irq_enabled(), "CPU stop requires IRQ enabled");
     let guard = crate::sync::PreemptGuard::new();

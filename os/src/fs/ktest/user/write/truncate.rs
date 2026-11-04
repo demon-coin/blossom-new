@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// 三类截断停点共用的观察回调拥有，原 inode 和阶段仍由调用者借入。
+type TruncateObserver = Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync>;
+
 /// 有效前缀和新尾由独立图样决定；普通读取、原共享 VMA 与冷 FS 读取采用相同逐页字节断言。
 fn truncate_contents(
     context: &mut TestContext<'_>,
@@ -279,22 +282,21 @@ pub(super) mod cases {
         let controls = TruncateControls::new()?;
         fixture.truncate_controls = Some(controls.clone());
         let stages = controls.clone();
-        let hook: Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync> =
-            Arc::try_new(move |_: &InodeRef, phase| {
-                let (value, gate) = match phase {
-                    TruncatePhase::AfterFirstUnmap => (1, Some(0)),
-                    TruncatePhase::BeforeSecondUnmap => (2, Some(1)),
-                    TruncatePhase::BeforeBlockRelease => (3, None),
-                    TruncatePhase::AfterStorageRelease => return,
-                };
-                stages.phase.store(value, Ordering::Release);
-                if let Some(gate) = gate {
-                    if !stages.cancelled.load(Ordering::Acquire) {
-                        stages.gates[gate].wait();
-                    }
+        let hook: TruncateObserver = Arc::try_new(move |_: &InodeRef, phase| {
+            let (value, gate) = match phase {
+                TruncatePhase::AfterFirstUnmap => (1, Some(0)),
+                TruncatePhase::BeforeSecondUnmap => (2, Some(1)),
+                TruncatePhase::BeforeBlockRelease => (3, None),
+                TruncatePhase::AfterStorageRelease => return,
+            };
+            stages.phase.store(value, Ordering::Release);
+            if let Some(gate) = gate {
+                if !stages.cancelled.load(Ordering::Acquire) {
+                    stages.gates[gate].wait();
                 }
-            })
-            .map_err(|_| TestError("truncate phase hook OOM"))?;
+            }
+        })
+        .map_err(|_| TestError("truncate phase hook OOM"))?;
         inode.ktest_set_truncate_hook(Some(hook));
         if !fork_snapshot {
             let retirement = controls.clone();
@@ -534,13 +536,12 @@ pub(super) mod cases {
         let first_unmap = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("W21 first unmap observation OOM"))?;
         let reached = first_unmap.clone();
-        let hook: Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync> =
-            Arc::try_new(move |_: &InodeRef, phase| {
-                if phase == TruncatePhase::AfterFirstUnmap {
-                    reached.store(true, Ordering::Release);
-                }
-            })
-            .map_err(|_| TestError("W21 truncate observer OOM"))?;
+        let hook: TruncateObserver = Arc::try_new(move |_: &InodeRef, phase| {
+            if phase == TruncatePhase::AfterFirstUnmap {
+                reached.store(true, Ordering::Release);
+            }
+        })
+        .map_err(|_| TestError("W21 truncate observer OOM"))?;
         inode.ktest_set_truncate_hook(Some(hook));
         if metadata {
             // 原节点条目和 CRC 保持合法；update 重新记其真实 Dirty，正式 metadata WB 写出旧树字节。
@@ -946,17 +947,16 @@ pub(super) mod cases {
             drop(cold_vfs);
             context.expect_eq(checked(context, file.stat())?.links, 0);
             let paused = controls.clone();
-            let hook: Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync> =
-                Arc::try_new(move |_: &InodeRef, phase| {
-                    if phase != TruncatePhase::AfterStorageRelease {
-                        return;
-                    }
-                    paused.phase.store(1, Ordering::Release);
-                    if !paused.cancelled.load(Ordering::Acquire) {
-                        paused.gate.wait();
-                    }
-                })
-                .map_err(|_| TestError("inode reuse truncate hook OOM"))?;
+            let hook: TruncateObserver = Arc::try_new(move |_: &InodeRef, phase| {
+                if phase != TruncatePhase::AfterStorageRelease {
+                    return;
+                }
+                paused.phase.store(1, Ordering::Release);
+                if !paused.cancelled.load(Ordering::Acquire) {
+                    paused.gate.wait();
+                }
+            })
+            .map_err(|_| TestError("inode reuse truncate hook OOM"))?;
             original.inode.ktest_set_truncate_hook(Some(hook));
             fixture.eviction = Some(cache.watch());
             drop((file, linked, linked_inode));

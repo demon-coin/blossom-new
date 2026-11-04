@@ -28,12 +28,12 @@ use smoltcp::iface::{
 };
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken};
 use smoltcp::time::Instant;
-#[cfg(feature = "ktest")]
-use smoltcp::wire::TcpControl;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Address, Ipv4Cidr,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpRepr, Ipv4Address, Ipv4Cidr,
     Ipv6Address, Ipv6Cidr, TcpRepr, UdpRepr, ETHERNET_HEADER_LEN,
 };
+#[cfg(feature = "ktest")]
+use smoltcp::wire::{IpProtocol, TcpControl};
 use spin::Once;
 
 use crate::cpu;
@@ -47,9 +47,11 @@ use crate::net::lifecycle::{EgressWaiting, RetiredEndpoint, RetiredEndpoints};
 use crate::net::packet::{
     return_capture_storage, zeroed_bytes, CaptureStorage, OwnedPacket, MAX_IP_PACKET_LEN,
 };
+#[cfg(feature = "ktest")]
+use crate::net::route::EthernetConfig;
 use crate::net::route::{
-    unicast, DefaultRouteRequest, EthernetConfig, InterfaceId, InterfaceSnapshot, Route,
-    RouteSnapshot, IPV4_ADDRESS_BITS,
+    unicast, DefaultRouteRequest, InterfaceId, InterfaceSnapshot, Route, RouteSnapshot,
+    IPV4_ADDRESS_BITS,
 };
 use crate::net::stats::InterfaceStats;
 use crate::net::table::{BindLease, NetTables, TcpTuple};
@@ -813,19 +815,8 @@ impl NetStack {
         self.nic.get()?.ktest_virtio()
     }
 
-    /// 返回当前 eth0 完整配置副本，不主动推进设备或协议。
-    pub fn ethernet_config(&self) -> Option<EthernetConfig> {
-        let ethernet = self.ethernet.get()?.lock();
-        let state = ethernet.as_ref()?;
-        let cidr = state.ipv4()?;
-        Some(EthernetConfig {
-            address: cidr.address().octets(),
-            prefix_len: cidr.prefix_len(),
-            gateway: state.default_gateway(),
-        })
-    }
-
     /// fixture 提交库 IPv4、默认项和 up 状态，已有 IPv6 与原 TCP 未 ACK 数据保持。
+    #[cfg(feature = "ktest")]
     pub fn configure_ethernet(&self, config: EthernetConfig) -> Result<(), FsError> {
         {
             let _admission = self.admission()?;

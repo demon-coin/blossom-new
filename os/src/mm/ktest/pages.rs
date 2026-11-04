@@ -171,7 +171,7 @@ mod pressure {
     fn global_oom(_: &mut TestContext<'_>, fixture: &mut FixedPressure) -> TestResult {
         fixture.run(|f| {
             f.exhaust();
-            assert!(0 < f.pressure.len());
+            assert!(!f.pressure.is_empty());
             assert!(black_box(mm::alloc_pages(0, false)).is_none());
         })
     }

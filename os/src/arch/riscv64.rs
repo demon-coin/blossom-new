@@ -120,6 +120,7 @@ const SBI_EXT_IPI_SEND_IPI: usize = 0;
 const SBI_EXT_HSM_HART_START: usize = 0;
 const SBI_EXT_SRST_RESET: usize = 0;
 const SBI_SRST_SHUTDOWN: usize = 0;
+#[cfg(not(feature = "ktest"))]
 const SBI_SRST_COLD_REBOOT: usize = 1;
 const SBI_SRST_REASON_NONE: usize = 0;
 /// 当前唯一编译目标的架构名称。
@@ -845,6 +846,7 @@ pub fn read_counter() -> u64 {
     value
 }
 /// 返回启动时解析的 timebase-frequency。
+#[cfg(feature = "ktest")]
 pub fn counter_frequency() -> u64 {
     crate::boot::info().counter_frequency
 }
@@ -1024,6 +1026,7 @@ pub unsafe fn external_complete(source: u32) {
 }
 /// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST poweroff。
 /// 仅限能服务 IRQ/IPI、无业务锁及待完成 CSD 责任的普通执行上下文。
+#[cfg(not(feature = "ktest"))]
 pub fn shutdown() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
@@ -1034,6 +1037,7 @@ pub fn shutdown() -> ! {
 }
 
 /// 板 HALT 在其它核确认停止后永久等待；QEMU 保留原 SBI 整机停止行为。
+#[cfg(not(feature = "ktest"))]
 pub fn halt() -> ! {
     if crate::platform::current() == crate::boot::Platform::QemuVirt {
         shutdown();
@@ -1048,6 +1052,7 @@ pub fn halt() -> ! {
 
 /// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST cold restart。
 /// 调用环境与 shutdown 相同，停核 guard 持有至固件执行整机动作。
+#[cfg(not(feature = "ktest"))]
 pub fn restart() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
@@ -1058,6 +1063,7 @@ pub fn restart() -> ! {
 }
 
 /// 板致命错误关闭当前核事件后永久停核，只发布 current-cpu 终点，不等待故障 AP/CSD。
+#[cfg(feature = "ktest")]
 pub fn emergency_shutdown() -> ! {
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
         disable_stop_sources();

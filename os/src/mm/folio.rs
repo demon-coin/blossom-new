@@ -143,8 +143,8 @@ impl FolioState {
             }
             FolioContents::Metadata { valid, errors } => {
                 let sectors = sector_mask(offset, len);
-                for sector in offset / SECTOR_SIZE..=(offset + len - 1) / SECTOR_SIZE {
-                    if let Some(error) = errors[sector] {
+                for error in &errors[offset / SECTOR_SIZE..=(offset + len - 1) / SECTOR_SIZE] {
+                    if let Some(error) = *error {
                         return Err(error);
                     }
                 }
@@ -350,6 +350,7 @@ impl FolioRef {
     }
 
     /// 读取用途锁内的真实引用数；并发快照不授予独占访问权。
+    #[cfg(feature = "ktest")]
     pub fn ref_count(&self) -> usize {
         FolioState::shared(&self.descriptor.usage()).references
     }
@@ -367,6 +368,7 @@ impl FolioRef {
 
     /// 文件的一次填充结束后为真（包括失败）；元数据须整页全部 sector 已终结。
     /// 检查特定视图的可读性必须使用 range_ready，不能据此忽略失败或部分有效范围。
+    #[cfg(feature = "ktest")]
     pub fn is_ready(&self) -> bool {
         let usage = self.descriptor.usage();
         if usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED != 0 {
@@ -542,16 +544,6 @@ impl FolioRef {
             locked: true,
             _task_local: PhantomData,
         })
-    }
-
-    /// 私有索引只能回收唯一引用且无内容锁、Dirty、WB 的静止页。
-    pub fn can_prune(&self) -> bool {
-        let usage = self.descriptor.usage();
-        let shared = FolioState::shared(&usage);
-        shared.references == 1
-            && shared.dirty == 0
-            && shared.writeback == 0
-            && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
     }
 
     /// canonical 索引准入只接受没有外部页引用、填充或 WB 的原页，Dirty 由后续同步处理。
@@ -1505,14 +1497,15 @@ impl FolioRead {
                         0,
                         "metadata read overwrites valid contents"
                     );
-                    for sector in self.offset / SECTOR_SIZE..(self.offset + self.len) / SECTOR_SIZE
+                    for stored_error in &mut errors
+                        [self.offset / SECTOR_SIZE..(self.offset + self.len) / SECTOR_SIZE]
                     {
                         assert!(
-                            errors[sector].is_none(),
+                            stored_error.is_none(),
                             "metadata read overwrites failed contents"
                         );
                         if let Err(error) = initialized {
-                            errors[sector] = Some(error);
+                            *stored_error = Some(error);
                         }
                     }
                     if initialized.is_ok() {

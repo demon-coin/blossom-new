@@ -11,8 +11,8 @@ use crate::sync::{Completion, SpinLock};
 use crate::task::{self, State, Task};
 use crate::time::Duration;
 use crate::timer::{self, Timer, TimerKind};
-use crate::workqueue::{self, Work, WorkQueue, WorkQueueConfig};
-use crate::{cpu, mm, sched};
+use crate::workqueue::{self, Work, WorkQueueConfig};
+use crate::{cpu, sched};
 
 /// 协调观察由原始硬件counter限制，不承担生产唤醒。
 fn until(predicate: impl FnMut() -> bool, name: &'static str) {
@@ -254,7 +254,7 @@ fn test_mixed() {
     assert_eq!(stopped, 2 * cpus);
     assert_eq!(pending, 0);
     queue.close_sync();
-    let waiters = empty_sources(cpus);
+    let _waiters = empty_sources(cpus);
     for handle in handles[..cpus].iter_mut() {
         assert_eq!(handle.take().unwrap().join().unwrap(), ROUNDS as i32);
     }

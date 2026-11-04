@@ -205,7 +205,7 @@ fn assert_capture(bytes: &[u8], worker_id: u64, covered: bool) {
             let object = number(&mut words, "object");
             let value = number(&mut words, "value");
             assert!(words.next().is_none());
-            assert!(1 <= kind && kind <= 6);
+            assert!((1..=6).contains(&kind));
             if kind == trace::Kind::TaskDispatch as u64 {
                 assert_eq!(object, task_id);
                 assert!(0 < task_id);

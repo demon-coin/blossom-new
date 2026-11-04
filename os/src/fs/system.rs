@@ -5,11 +5,12 @@ use alloc::sync::Arc;
 use crate::block::partition::DeviceSelector;
 use crate::block::{AccessMode, BlockView};
 use crate::boot::{self, Platform};
+#[cfg(feature = "ktest")]
 use crate::fs::ext4::crc::crc32c;
-use crate::fs::{
-    Ext4Volume, FileLike, FileTable, Filesystem, FsContext, FsError, InodeCache, OpenOptions,
-    ResolveMode, Vfs,
-};
+use crate::fs::{Ext4Volume, Filesystem, FsContext, FsError, InodeCache, ResolveMode, Vfs};
+#[cfg(feature = "ktest")]
+use crate::fs::{FileLike, FileTable, OpenOptions};
+#[cfg(feature = "ktest")]
 use crate::mm::PAGE_SIZE;
 
 const METADATA_CACHE_CAPACITY: usize = 64;
@@ -103,6 +104,7 @@ pub(crate) fn mount_disks(
 }
 
 /// 实际交付的完整文件长度与标准最终取反 CRC32C，空文件摘要为零。
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FileSummary {
     pub bytes: u64,
@@ -112,6 +114,7 @@ pub(crate) struct FileSummary {
 /// 在普通可睡眠 Task 中只读打开并完整读取文件，所有返回分支都关闭本次描述符。
 /// 调用者通过自有表独占本次新开编号直至关闭，期间不得由其他任务关闭或替换它。
 /// 本次取得的文件引用在表锁外使用和释放；读取错误优先于关闭错误。
+#[cfg(feature = "ktest")]
 pub(crate) fn read_summary(
     files: &FileTable,
     vfs: &Vfs,
@@ -136,6 +139,7 @@ pub(crate) fn read_summary(
 
 /// 用一页任务栈缓冲顺序读取同一打开实例，读到 EOF 后核对真实 inode 大小。
 /// 正前缀仍继续读取，后次错误原样返回，不把部分交付冒充完整文件。
+#[cfg(feature = "ktest")]
 fn summarize_file(file: &dyn FileLike) -> Result<FileSummary, FsError> {
     let size = file.stat()?.size;
     let mut buffer = [0; PAGE_SIZE];

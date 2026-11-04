@@ -355,11 +355,6 @@ impl Termios {
     pub fn output_baud(self) -> u32 {
         self.cflag & CBAUD
     }
-
-    /// 返回输入波特率的 CBAUD 编码，0 表示跟随输出。
-    pub fn input_baud(self) -> u32 {
-        (self.cflag & CIBAUD) >> IBSHIFT
-    }
 }
 
 /// 验证 cflag 的速度、字长、校验与流控位。

@@ -246,7 +246,7 @@ pub(super) fn descriptors(
     {
         return Err(BlockError::InvalidRange);
     }
-    let used = (bytes + DESCRIPTOR_DATA_BYTES - 1) / DESCRIPTOR_DATA_BYTES;
+    let used = bytes.div_ceil(DESCRIPTOR_DATA_BYTES);
     for (index, descriptor) in table.iter_mut().enumerate() {
         *descriptor = if index < used {
             let last = index + 1 == used;

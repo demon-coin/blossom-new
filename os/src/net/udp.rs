@@ -357,11 +357,6 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 查询本端发送关门，不取得根或接口短锁。
-    pub fn check_send(&self) -> Result<(), FsError> {
-        self.operation(OperationMode::Observe).check_send()
-    }
-
     /// 已正规化的核心地址仍须符合端点族、V6ONLY 和实际操作的错误边界。
     fn check_family(
         &self,
@@ -624,6 +619,7 @@ impl UdpEndpoint {
     }
 
     /// 观察真正租约地址，自动断开后不从旧在途包补回当前绑定。
+    #[cfg(feature = "ktest")]
     pub fn local(&self) -> Option<InetEndpoint> {
         self.operation(OperationMode::Observe)
             .binding
@@ -649,11 +645,6 @@ impl UdpEndpoint {
     /// 观察当前真实复用策略，不修改租约或协议索引。
     pub fn reuse_address(&self) -> bool {
         self.operation(OperationMode::Observe).reuse
-    }
-
-    /// 弱域身份判断不延长网络服务寿命。
-    pub fn belongs_to(&self, net: &NetStackRef) -> bool {
-        Weak::ptr_eq(&self.stack, &Arc::downgrade(net))
     }
 
     /// connected 名称使用实际路由源，其余保持当前租约的真实通配值。

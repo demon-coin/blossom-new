@@ -1,5 +1,6 @@
 //! 2K1000LA 的 LIOINTC、Loongson PCI 与原生外设绑定。
 
+#[cfg(target_arch = "loongarch64")]
 use core::convert::{TryFrom, TryInto};
 
 use super::resources;
@@ -15,27 +16,38 @@ use crate::boot::{
     PCI_FUNCTION_COUNT, PCI_FUNCTION_SHIFT, PCI_SPACE_CODE_MASK, PCI_SPACE_IO, PCI_SPACE_MEM32,
     PCI_SPACE_MEM64,
 };
+#[cfg(target_arch = "loongarch64")]
 use crate::platform::layout::{
     DMW_ADDRESS_END, DMW_ADDRESS_MASK, DMW_CACHED_VSEG, DMW_UNCACHED_VSEG, DMW_VSEG_SHIFT,
 };
 
 /// 固件交接中已归一化的物理地址，解析完成后不保留 EFI 表借用。
+#[cfg(target_arch = "loongarch64")]
 pub(super) struct FirmwareParameters {
     pub(super) dtb: usize,
     pub(super) command_line: Option<usize>,
 }
 
+#[cfg(target_arch = "loongarch64")]
 const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
+#[cfg(target_arch = "loongarch64")]
 const EFI_SYSTEM_TABLE_SIZE: usize = 0x78;
+#[cfg(target_arch = "loongarch64")]
 const EFI_HEADER_SIZE_OFFSET: usize = 0x0c;
+#[cfg(target_arch = "loongarch64")]
 const EFI_NR_TABLES_OFFSET: usize = 0x68;
+#[cfg(target_arch = "loongarch64")]
 const EFI_TABLES_OFFSET: usize = 0x70;
+#[cfg(target_arch = "loongarch64")]
 const EFI_CONFIG_TABLE_SIZE: usize = 24;
+#[cfg(target_arch = "loongarch64")]
 const EFI_CONFIG_TABLE_POINTER_OFFSET: usize = 16;
+#[cfg(target_arch = "loongarch64")]
 const EFI_FDT_GUID: [u8; 16] = [
     0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
 ];
 
+#[cfg(target_arch = "loongarch64")]
 const UHI_FDT_HANDOFF: usize = usize::MAX - 1;
 const LIOINTC_FIRST_PARENT_CAUSE: u32 = 2;
 const LIOINTC_LAST_PARENT_CAUSE: u32 = 3;
@@ -51,6 +63,7 @@ const PCI_BDF_MASK: u32 = ((u8::MAX as u32) << PCI_BUS_SHIFT)
 /// 固件须保证所选 ABI 引用的 EFI 系统表、其声明的完整头部与配置表数组在解析期间可读、
 /// 无并发修改，且对应 RAM 映射已经建立；内容校验不能证明指针可读。
 /// 返回的 DTB 与命令行仍由调用者保活，直到完整 FDT 解析和命令行复制结束。
+#[cfg(target_arch = "loongarch64")]
 pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParameters, &'static str> {
     if args[0] == UHI_FDT_HANDOFF {
         return Ok(FirmwareParameters {
@@ -79,6 +92,7 @@ pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParamet
 /// # Safety
 /// 调用者须保活系统表声明的完整头部与 nr_tables 个配置表项，保证解析期间可读且无并发修改；
 /// 所有物理地址的当前 RAM 映射须已建立，返回的 DTB 另由上层保活并校验。
+#[cfg(target_arch = "loongarch64")]
 unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
     // SAFETY: 调用者保证 EFI64 系统表的固定字段可读且不变；此处只借用最小布局。
     let header = unsafe { firmware_bytes(address, EFI_SYSTEM_TABLE_SIZE)? };
@@ -133,6 +147,7 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
 ///
 /// # Safety
 /// 调用者须保证指定范围在返回借用存续期间可读且无并发修改，并已建立当前 RAM 映射。
+#[cfg(target_arch = "loongarch64")]
 unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'static str> {
     let address = physical(address)?;
     let end = address
@@ -150,6 +165,7 @@ unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'
 }
 
 /// 固件可传物理地址或 cached/uncached DMW 地址；其他地址类别拒绝。
+#[cfg(target_arch = "loongarch64")]
 fn physical(address: usize) -> Result<usize, &'static str> {
     if !matches!(
         address >> DMW_VSEG_SHIFT,

@@ -528,24 +528,20 @@ impl Owner {
                             if ordinal == 1 { unit / 2 } else { 0 },
                         ),
                         Scenario::Scratch => (
-                            if ordinal < 2 {
-                                BlkOperation::Write
-                            } else if ordinal == 2 {
-                                BlkOperation::Read
-                            } else {
-                                BlkOperation::Flush
+                            match ordinal {
+                                0..=1 => BlkOperation::Write,
+                                2 => BlkOperation::Read,
+                                _ => BlkOperation::Flush,
                             },
                             if ordinal == 3 { 0 } else { 2048 },
                             if ordinal == 3 { 0 } else { unit },
                             0,
                         ),
                         Scenario::FsScratch => (
-                            if ordinal < 4 {
-                                BlkOperation::Write
-                            } else if ordinal == 4 {
-                                BlkOperation::Read
-                            } else {
-                                BlkOperation::Flush
+                            match ordinal {
+                                0..=3 => BlkOperation::Write,
+                                4 => BlkOperation::Read,
+                                _ => BlkOperation::Flush,
                             },
                             if ordinal == 5 { 0 } else { 2048 },
                             if ordinal == 5 { 0 } else { unit },
@@ -1489,7 +1485,7 @@ impl Owner {
             .take()
             .expect("controlled ledger Bio");
         self.model_live = Some(index);
-        bio.inner.begin();
+        let _ = bio.inner.begin();
         let expected = match mode {
             Ledger::Reverse => {
                 for index in 0..3 {
@@ -1625,7 +1621,7 @@ impl Owner {
         let parent = self.wb_active.as_ref().unwrap().inner.clone();
         let completion = self.wb_active.as_ref().unwrap().completion();
         let before = self.disk.test_snapshot();
-        parent.begin();
+        let _ = parent.begin();
         self.wb_folios[0]
             .lock_content()
             .copy_from(0, &[0x7e])

@@ -99,6 +99,7 @@ impl InputQueue {
     }
 
     /// 返回已保存字节数。
+    #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -733,8 +734,7 @@ impl NttyState {
 
     /// 处理规范模式的编辑与记录字符，返回是否已消费；回显满回压输入。
     fn receive_canonical(&mut self, termios: Termios, byte: u8) -> bool {
-        if byte == termios.cc[VERASE] && byte != DISABLED_CHAR
-            || byte == termios.cc[VKILL] && byte != DISABLED_CHAR
+        if (byte == termios.cc[VERASE] || byte == termios.cc[VKILL]) && byte != DISABLED_CHAR
             || (termios.lflag & IEXTEN != 0 && byte == termios.cc[VWERASE] && byte != DISABLED_CHAR)
         {
             self.erase_input(termios, byte);
@@ -821,7 +821,7 @@ impl NttyState {
                 1
             };
             // 结束符扩展自身占用终止槽，完整预留后无需再给下一字符留格。
-            if !(!self.input.pending_eof && self.input.len + count <= INPUT_CAPACITY) {
+            if self.input.pending_eof || INPUT_CAPACITY < self.input.len + count {
                 self.overrun += 1;
                 return true;
             }
@@ -1284,8 +1284,7 @@ impl NttyState {
                 self.output.push(BACKSPACE)
             }
             _ => {
-                if !byte.is_ascii_control() && !(termios.iflag & IUTF8 != 0 && byte & 0xc0 == 0x80)
-                {
+                if !(byte.is_ascii_control() || termios.iflag & IUTF8 != 0 && byte & 0xc0 == 0x80) {
                     self.column += 1;
                 }
                 self.output.push(byte)

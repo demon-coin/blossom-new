@@ -356,6 +356,7 @@ impl BioReserve {
     }
 
     /// 返回原 cache 已选定的真实 metadata 页容量。
+    #[cfg(feature = "ktest")]
     pub(crate) fn capacity(&self) -> usize {
         self.state.lock().metadata.len()
     }

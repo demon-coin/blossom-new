@@ -56,11 +56,6 @@ impl BindLease {
     pub fn id(&self) -> u64 {
         self.lease_id
     }
-
-    /// 同一 IPv6 通配租约可额外覆盖 IPv4 接收面，不创建第二份端口拥有。
-    pub fn dual_stack(&self) -> bool {
-        self.dual_stack
-    }
 }
 
 impl Drop for BindLease {
@@ -487,7 +482,7 @@ impl NetTables {
             .enumerate()
             .filter(|(_, entry)| {
                 matches_local(entry.1, entry.3, local)
-                    && entry.2.map_or(true, |expected| expected == peer)
+                    && entry.2.is_none_or(|expected| expected == peer)
             })
             .max_by_key(|(index, entry)| {
                 (
@@ -611,8 +606,8 @@ fn choose_ephemeral(
         } else {
             next_port + 1
         };
-        if !binding_conflicts(&state.bindings, protocol, local, false, dual_stack)
-            && !(protocol == TransportProtocol::Tcp
+        if !(binding_conflicts(&state.bindings, protocol, local, false, dual_stack)
+            || protocol == TransportProtocol::Tcp
                 && state
                     .listeners
                     .iter()

@@ -281,7 +281,7 @@ struct SectionGroup {
     backing: PageRange,
 }
 
-impl<'a> PageMap<'a> {
+impl PageMap<'_> {
     /// 按 section 和槽内偏移定位 PFN，不读取启动区间表。
     pub(crate) fn get(&self, pfn: usize) -> Option<&PageDesc> {
         self.sections
@@ -309,15 +309,16 @@ impl<'a> PageMap<'a> {
     pub(crate) fn free_ranges(&self) -> &[PageRange] {
         self.free
     }
+}
 
+#[cfg(feature = "ktest")]
+impl<'a> PageMap<'a> {
     /// 借用永久发布的 section 与 metadata 范围，供独立用例核对物理页分类。
-    #[cfg(feature = "ktest")]
     pub(crate) fn test_layout_parts(&self) -> (&[Section<'a>], &[PageRange]) {
         (self.sections, self.metadata)
     }
 
     /// 借用独立测试描述符与范围；不发布，也不授予物理页访问权限。
-    #[cfg(feature = "ktest")]
     pub(crate) fn test_map(sections: &'a [Section<'a>], free: &'a [PageRange]) -> Self {
         Self {
             sections,

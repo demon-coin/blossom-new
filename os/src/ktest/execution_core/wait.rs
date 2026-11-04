@@ -652,12 +652,7 @@ pub(crate) mod queue {
         let waiter = Waiter::new();
         let waker = waiter.waker();
         let mut node = core::pin::pin!(WaitNode::new(waker.clone()));
-        let accepted;
-        if !after {
-            accepted = waker.notify();
-        } else {
-            accepted = false;
-        }
+        let accepted = if !after { waker.notify() } else { false };
         // SAFETY: fixture保源且局部node固定，唯一registration显式撤链后才结束Waiter和栈帧。
         let registration = unsafe { fixture.state.queue.register(node.as_mut()) };
         let accepted = if after {

@@ -418,6 +418,7 @@ impl DentryRef {
     }
 
     /// 为零链接 inode 建立无父、空名字的正绑定；不登记名字或修改目录。
+    #[cfg(feature = "ktest")]
     pub(crate) fn try_unhashed(inode: InodeRef) -> Result<Self, FsError> {
         if inode.metadata_snapshot()?.links != 0 {
             return Err(FsError::InvalidOperation);

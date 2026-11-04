@@ -107,6 +107,7 @@ impl CoherentDma {
     }
 
     /// 返回页拥有者保存的原阶，归还时仍由同一 OwnedPages 消费。
+    #[cfg(feature = "ktest")]
     pub fn order(&self) -> usize {
         self.pages.order()
     }
@@ -392,12 +393,8 @@ impl MappedPages {
         self.length as usize
     }
 
-    /// 返回建立映射时固定的设备访问方向。
-    pub fn direction(&self) -> BufferDirection {
-        self.direction
-    }
-
     /// 返回原页块内的 payload 起始偏移，供父请求检查子范围。
+    #[cfg(feature = "ktest")]
     pub fn offset(&self) -> usize {
         self.offset
     }

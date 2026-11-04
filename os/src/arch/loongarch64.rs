@@ -6,7 +6,7 @@ use crate::sync::SpinLock;
 use crate::syscall::Errno;
 use core::arch::asm;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const NAME: &str = "loongarch64";
 
@@ -40,9 +40,11 @@ const IOCSR_EXTIOI_ENABLE: u64 = 1 << 48;
 
 const GED_BASE: usize = 0x100e001c;
 const GED_SLEEP_CONTROL: usize = 0;
+#[cfg(not(feature = "ktest"))]
 const GED_RESET: usize = 2;
 const GED_SLEEP_ENABLE: u8 = 1 << 5;
 const GED_SLEEP_S5: u8 = 5 << 2;
+#[cfg(not(feature = "ktest"))]
 const GED_RESET_VALUE: u8 = 0x42;
 
 pub mod ale;
@@ -56,11 +58,11 @@ mod register;
 mod register_test;
 mod rtc;
 use register as reg;
+#[cfg(feature = "ktest")]
+pub(crate) use register::{CRMD_IE, CSR_CRMD, CSR_DMW0, CSR_DMW1, CSR_EUEN, CSR_KS0};
 pub(crate) use register::{
-    CRMD_IE, CSR_CRMD, CSR_DMW0, CSR_DMW1, CSR_EUEN, CSR_KS0, ECODE_ADE, ECODE_ALE, ECODE_BCE,
-    ECODE_BRK, ECODE_BTDIS, ECODE_BTE, ECODE_FPDIS, ECODE_FPE, ECODE_INE, ECODE_IPE, ECODE_LASXDIS,
-    ECODE_LSXDIS, ECODE_PIF, ECODE_PIL, ECODE_PIS, ECODE_PME, ECODE_PNR, ECODE_PNX, ECODE_PPI,
-    ECODE_SYS, ECODE_WATCH, EUEN_FP, EUEN_LASX, EUEN_LSX, FCSR_CAUSE_SHIFT, FCSR_ENABLE_MASK,
+    ECODE_ADE, ECODE_ALE, ECODE_BCE, ECODE_BRK, ECODE_FPE, ECODE_PPI, EUEN_FP, EUEN_LASX, EUEN_LSX,
+    FCSR_CAUSE_SHIFT, FCSR_ENABLE_MASK,
 };
 mod signal;
 mod switch;
@@ -82,10 +84,12 @@ pub use mmu::{
 };
 pub(crate) use signal::SIGNAL_MIN_STACK;
 pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
-pub use user::{run_user, signal_return_code, FpRegister, UserContext};
+pub use user::{run_user, signal_return_code, UserContext};
 
 #[cfg(feature = "ktest")]
-pub(crate) use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
+pub(crate) use user::{
+    exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code, FpRegister,
+};
 
 #[repr(C, align(16))]
 struct KernelTrapFrame {
@@ -432,6 +436,7 @@ pub fn boot_counter_frequency() -> u64 {
     base * mul / div
 }
 /// 返回一次启动资源发现发布的 counter 频率。
+#[cfg(feature = "ktest")]
 pub fn counter_frequency() -> u64 {
     crate::boot::info().counter_frequency
 }
@@ -713,6 +718,7 @@ pub unsafe fn external_complete(source: u32) {
 }
 /// 用户与 FS 生命周期已停稳后停其它 online 核，再执行实际 PMC 或 virt GED 断电请求。
 /// 调用者在普通 IRQ 可服务上下文中，不持锁且没有需要继续运行的 CSD 责任。
+#[cfg(not(feature = "ktest"))]
 pub fn shutdown() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
@@ -723,6 +729,7 @@ pub fn shutdown() -> ! {
 
 /// 用户与 FS 生命周期已停稳后永久停全部核，不请求 PMC 或 GED 断电。
 /// 调用环境与 shutdown 相同，永久停核确认不能用于恢复 CPU。
+#[cfg(not(feature = "ktest"))]
 pub fn halt() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     disable_stop_sources();
@@ -732,6 +739,7 @@ pub fn halt() -> ! {
 
 /// 用户与 FS 生命周期已停稳后停其它 online 核，再执行实际 PMC 或 virt GED 重启请求。
 /// 调用环境与 shutdown 相同，寄存器宽度与 mask 由平台资源确定。
+#[cfg(not(feature = "ktest"))]
 pub fn restart() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
@@ -741,6 +749,7 @@ pub fn restart() -> ! {
 }
 
 /// 致命错误不等待 AP/CSD 或文件生命周期；板只停当前核，不发布全机清理终点。
+#[cfg(feature = "ktest")]
 pub fn emergency_shutdown() -> ! {
     if crate::platform::current() == crate::boot::Platform::Ls2k1000la {
         disable_stop_sources();
@@ -787,6 +796,7 @@ fn ged_action(offset: usize, value: u8) -> ! {
 }
 
 /// 执行实际 DT syscon 的最终 RMW；无对应动作时只停核，不声称物理断电。
+#[cfg(not(feature = "ktest"))]
 fn board_action(action: Option<crate::boot::SysconAction>) -> ! {
     disable_stop_sources();
     crate::console::board_stop();

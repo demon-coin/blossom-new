@@ -25,10 +25,15 @@ const QUANTUM: Duration = Duration::from_millis(10);
 /// TOY 只读日历字段与控制位，供共同时间层和板级 RTC 采样使用。
 #[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
 pub(crate) mod toy {
+    #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_READ0_REG: usize = 0x2c;
+    #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_READ1_REG: usize = 0x30;
+    #[cfg(target_arch = "loongarch64")]
     pub(crate) const RTC_CTRL_REG: usize = 0x40;
+    #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_ENABLE: u32 = 1 << 11;
+    #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_32KHZ_ENABLE: u32 = 1 << 8;
     pub(crate) const TOY_YEAR_BASE: u32 = 1900;
     pub(crate) const TOY_MONTH_SHIFT: u32 = 26;
@@ -738,7 +743,6 @@ pub(crate) mod testing {
         {
             let sequence = timekeeper.sequence.load(Ordering::Relaxed);
             assert_eq!(sequence & 1, 1);
-            #[cfg(feature = "ktest")]
             crate::ktest::fatal_event(
                 "timekeeper",
                 format_args!(
@@ -746,14 +750,6 @@ pub(crate) mod testing {
                     sequence, raw
                 ),
             );
-            #[cfg(not(feature = "ktest"))]
-            {
-                crate::console::testing::emergency_write(format_args!(
-                    "EXECUTION X27 state fault=timekeeper sequence={} sequence_odd=1 raw={}\n",
-                    sequence, raw
-                ));
-                panic!("execution timekeeper writer fault");
-            }
         }
     }
 

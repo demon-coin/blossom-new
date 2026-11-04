@@ -333,7 +333,7 @@ mod exhaustion {
             }
             let original = f.heap[1].as_ref().unwrap().pointer;
             f.exhaust();
-            assert!(0 < f.pressure.len());
+            assert!(!f.pressure.is_empty());
             assert!(!f.heap[1].as_mut().unwrap().resize(8193));
             let survivor = f.heap[1].as_ref().unwrap();
             assert_eq!(survivor.pointer, original);

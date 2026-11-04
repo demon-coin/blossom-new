@@ -1,14 +1,24 @@
 //! JH7110 所选 SDIO1、GMAC 与缓存资源绑定，不解释另一份设备树。
 
+#[cfg(target_arch = "riscv64")]
+use super::region_at;
+#[cfg(target_arch = "riscv64")]
 use super::resources;
+#[cfg(target_arch = "riscv64")]
 use super::{
     compatible, device_region, device_source, enabled, interrupt_parent, number, property,
-    region_at, single_region, word, Fdt, Node, FDT_CELL_BYTES,
+    single_region, word, FDT_CELL_BYTES,
 };
-use crate::boot::{BootInfo, GmacResources, GpioInputResource, MmcResources};
+use super::{Fdt, Node};
+use crate::boot::BootInfo;
+#[cfg(target_arch = "riscv64")]
+use crate::boot::{GmacResources, GpioInputResource, MmcResources};
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::sdmmc::{FIFO_MAX_DEPTH, FIFO_MIN_DEPTH};
 
+#[cfg(target_arch = "riscv64")]
 const GPIO_ACTIVE_LOW: u32 = 1;
+#[cfg(target_arch = "riscv64")]
 const MMC_POST_POWER_ON_DELAY_MS: u32 = 10;
 
 /// 从当前 OS DT 构造所用资源快照，未认领的完整硬件描述不取得运行期拥有。
@@ -78,6 +88,7 @@ pub(super) fn discover<'a>(
 }
 
 /// 只为明确选择且启用的 SDIO1 解析并登记资源，绑定错误保留原失败。
+#[cfg(target_arch = "riscv64")]
 fn discover_mmc<'a>(
     tree: &'a Fdt<'a>,
     controller: Node<'a>,
@@ -137,7 +148,7 @@ fn discover_mmc<'a>(
         || resource.max_frequency == 0
         || resource
             .fifo_depth
-            .is_some_and(|depth| depth < FIFO_MIN_DEPTH || FIFO_MAX_DEPTH < depth)
+            .is_some_and(|depth| !(FIFO_MIN_DEPTH..=FIFO_MAX_DEPTH).contains(&depth))
     {
         return Err("FDT SDIO1 card interface is unsupported");
     }
@@ -145,6 +156,7 @@ fn discover_mmc<'a>(
 }
 
 /// 保存独立卡检测输入；已声明的 GPIO 损坏时失败，不改走控制器的卡检测位。
+#[cfg(target_arch = "riscv64")]
 fn card_detect_gpio<'a>(
     tree: &'a Fdt<'a>,
     mmc: Node<'a>,
@@ -181,6 +193,7 @@ fn card_detect_gpio<'a>(
 }
 
 /// 只认领本板选用的 ethernet1，另一网口的描述和状态不决定本实例能否绑定。
+#[cfg(target_arch = "riscv64")]
 fn discover_gmac<'a>(
     tree: &'a Fdt<'a>,
     controller: Node<'a>,
@@ -223,6 +236,7 @@ fn discover_gmac<'a>(
 }
 
 /// 取得必须唯一的启用绑定，重复硬件不得静默择一。
+#[cfg(target_arch = "riscv64")]
 fn unique<'a>(tree: &'a Fdt<'a>, binding: &str) -> Result<Node<'a>, &'static str> {
     let mut nodes = tree
         .all_nodes()
@@ -237,6 +251,7 @@ fn unique<'a>(tree: &'a Fdt<'a>, binding: &str) -> Result<Node<'a>, &'static str
 }
 
 /// 所选设备必须连接同一实际 PLIC，不能套另一个域的 source。
+#[cfg(target_arch = "riscv64")]
 fn require_plic<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,

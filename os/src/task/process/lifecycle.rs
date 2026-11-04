@@ -391,10 +391,10 @@ impl TaskGraph {
                 assert!(ptr::eq(father.group.as_ref(), group));
                 assert_eq!(father.members, 0);
                 assert!(father.exit.is_none() && father.exec_owner.is_none());
-                if !slots[index]
+                if slots[index]
                     .process
                     .as_ref()
-                    .is_some_and(|child| child.parent == Some(group.tgid()))
+                    .is_none_or(|child| child.parent != Some(group.tgid()))
                 {
                     continue;
                 }

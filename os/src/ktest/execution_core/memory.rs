@@ -244,7 +244,7 @@ impl Fixture<SuiteBaseline> for Memory {
             || {
                 self.handle
                     .as_ref()
-                    .map_or(true, |handle| handle.try_join().is_some())
+                    .is_none_or(|handle| handle.try_join().is_some())
             },
             "memory consumer did not reach original off-stack completion",
         )

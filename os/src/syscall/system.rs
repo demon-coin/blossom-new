@@ -1,7 +1,5 @@
 //! 系统身份、挂载、同步与关机准入消费当前用户的真实 MM、VFS、凭据和身份图。
 
-use core::convert::TryFrom;
-
 use crate::block::partition::DeviceSelector;
 use crate::block::AccessMode;
 use crate::fs::memfs::{FilesystemStat, MemoryFs};
@@ -51,8 +49,7 @@ pub(super) fn uname(user: &UserThread, raw: &[usize; 6]) -> SysResult {
 pub(super) fn sysinfo(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     let memory = mm::stats();
     let elapsed = time::now().as_nanos();
-    let uptime = u64::try_from(elapsed.div_ceil(time::NSEC_PER_SEC))
-        .expect("sysinfo uptime exceeds Linux long");
+    let uptime = elapsed.div_ceil(time::NSEC_PER_SEC);
     let fields = [
         uptime,
         0,

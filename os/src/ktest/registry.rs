@@ -80,7 +80,7 @@ impl Registry {
                     case.expected_fatal,
                     case.fatal_message,
                 ]
-                .into_iter()
+                .iter()
                 .flatten()
                 {
                     value.text(text)?;

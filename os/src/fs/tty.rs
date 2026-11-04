@@ -255,7 +255,7 @@ fn run_work(_work: Pin<&Work>) {
                 }
             }
         }
-        if state.echo.len() != 0 {
+        if !state.echo.is_empty() {
             write_changed = true;
         }
         let echo_before = state.echo.len();
@@ -1322,11 +1322,13 @@ fn ioctl_set(
 }
 
 /// 返回当前 termios 一致快照。
+#[cfg(feature = "ktest")]
 pub fn termios() -> Termios {
     endpoint().state.lock().termios
 }
 
 /// typed setter 只在入口检查后台访问，再共用实际配置提交。
+#[cfg(feature = "ktest")]
 pub fn set_termios(
     termios: Termios,
     action: u32,
@@ -1443,6 +1445,7 @@ fn commit_termios(
 }
 
 /// 按选择器丢弃输入、输出或全部队列。
+#[cfg(feature = "ktest")]
 pub fn flush(selector: u32) -> Result<(), FsError> {
     endpoint_flush(selector, None)
 }
@@ -1529,11 +1532,13 @@ fn endpoint_flow(action: u32, file: Option<&TtyFile>) -> Result<usize, FsError> 
 }
 
 /// Kernel typed 流控与 raw 请求共用实际提交，不推断用户身份。
+#[cfg(feature = "ktest")]
 pub fn flow(action: u32) -> Result<(), FsError> {
     endpoint_flow(action, None).map(|_| ())
 }
 
 /// typed drain 在边界检查后台访问，实际输出等待与 raw ioctl 共用。
+#[cfg(feature = "ktest")]
 pub fn drain(caller: FileIoContext<'_>) -> Result<(), FsError> {
     check_access(caller, SIGTTOU)?;
     drain_output(caller, None)

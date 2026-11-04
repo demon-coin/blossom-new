@@ -115,6 +115,7 @@ impl EgressWaiting {
     }
 
     /// 身份查询只观察同一链，不把编号当作业务拥有。
+    #[cfg(feature = "ktest")]
     pub(crate) fn contains(&self, id: u64) -> bool {
         let mut current = self.head.clone();
         while let Some(node) = current {

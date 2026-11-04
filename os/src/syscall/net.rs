@@ -97,7 +97,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if SOCK_MAX <= kind {
         return Err(Errno::InvalidArgument);
     }
-    if protocol < 0 || IPPROTO_MAX <= protocol {
+    if !(0..IPPROTO_MAX).contains(&protocol) {
         return Err(Errno::InvalidArgument);
     }
     match kind {
@@ -144,7 +144,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !SOCKET_FLAGS != 0 || SOCK_MAX <= kind {
         return Err(Errno::InvalidArgument);
     }
-    if protocol < 0 || IPPROTO_MAX <= protocol {
+    if !(0..IPPROTO_MAX).contains(&protocol) {
         return Err(Errno::InvalidArgument);
     }
     if family == i32::from(AF_INET) || family == i32::from(AF_INET6) {

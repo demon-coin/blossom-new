@@ -10,7 +10,7 @@ pub(crate) mod socket_unix_owner {
     use super::support::{operation, socket_retired};
     use crate::fs::epoll::{EpollEvent, EpollFile, EPOLLET, EPOLL_CTL_ADD};
     use crate::fs::{
-        FileIoContext, FileLike, FileRef, FsError, PollMask, Pollable, ReadBuffer, WriteBuffer,
+        FileIoContext, FileLike, FileRef, FsError, PollMask, ReadBuffer, WriteBuffer,
     };
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::socket::{SocketFile, SHUT_WR};

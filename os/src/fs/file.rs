@@ -764,7 +764,7 @@ impl FileLike for InodeFile {
         // 只读卷没有可提交的写义务；只读 OFD 或挂载视图仍须同步 RW 卷上的共同内容。
         let writable = volume.mode() == AccessMode::ReadWrite;
         let data = if writable {
-            writeback::sync_inode_range(&inode, range)
+            writeback::sync_inode_range(inode, range)
         } else {
             Ok(())
         };
@@ -834,7 +834,7 @@ impl FileLike for InodeFile {
         drop(cursor);
         sync_written(self, flags, start, bytes)?;
         if 0 < bytes && !inode.is_memory() {
-            background::balance_dirty_pages(&inode);
+            background::balance_dirty_pages(inode);
         }
         Ok(bytes)
     }
@@ -858,7 +858,7 @@ impl FileLike for InodeFile {
         let (start, bytes) = access.write_from(offset, flags & O_APPEND != 0, source)?;
         sync_written(self, flags, start, bytes)?;
         if 0 < bytes && !inode.is_memory() {
-            background::balance_dirty_pages(&inode);
+            background::balance_dirty_pages(inode);
         }
         Ok(bytes)
     }

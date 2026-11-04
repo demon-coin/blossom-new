@@ -1532,10 +1532,12 @@ pub(crate) mod cases {
         fixture: &mut TtyOwner,
     ) -> TestResult {
         fixture.open_tty(context, b"/ttyS0", 2)?;
-        let mut config = Termios::default();
-        config.iflag = 0;
-        config.oflag = 0;
-        config.lflag = ICANON | ECHO | ECHOCTL;
+        let config = Termios {
+            iflag: 0,
+            oflag: 0,
+            lflag: ICANON | ECHO | ECHOCTL,
+            ..Termios::default()
+        };
         checked(
             context,
             crate::fs::tty::set_termios(config, 2, FileIoContext::Kernel),

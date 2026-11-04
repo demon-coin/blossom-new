@@ -107,10 +107,6 @@ impl PreparedDirectoryEdit {
         self.flags
     }
 
-    /// 暴露本次映射准备新增的逻辑目录块，不转移分配责任。
-    pub(crate) fn logical_blocks(&self) -> &[u64] {
-        &self.logical_blocks
-    }
     /// 判断本次是否实际改变了 dirent；同 inode rename 的 no-op 不改时间或链接数。
     pub(crate) fn changed(&self) -> bool {
         !self.images.is_empty()
@@ -450,7 +446,7 @@ fn next_dx_leaf(
         }
         let entry = read_dx_entry(volume, inode, map_root, frame, next)?;
         let lower_bound = path.lower_bound.max(entry.hash & !1);
-        if through_major.map_or(false, |major| major < lower_bound) {
+        if through_major.is_some_and(|major| major < lower_bound) {
             return Ok(Some(lower_bound));
         }
         path.frames[level].position = next;
@@ -893,10 +889,10 @@ fn keep_two_candidates(
     following: &mut Option<HashCandidate>,
     candidate: HashCandidate,
 ) {
-    if (*best).map_or(true, |current| precedes(candidate, current)) {
+    if (*best).is_none_or(|current| precedes(candidate, current)) {
         *following = *best;
         *best = Some(candidate);
-    } else if (*following).map_or(true, |current| precedes(candidate, current)) {
+    } else if (*following).is_none_or(|current| precedes(candidate, current)) {
         *following = Some(candidate);
     }
 }
@@ -999,7 +995,7 @@ fn next_indexed(
             break;
         };
         // continuation 位清除后仍等于候选 major，minor 与真实位置尚未排尽，须扫描整个哈希桶。
-        if following.map_or(false, |next| next.major < lower_bound) {
+        if following.is_some_and(|next| next.major < lower_bound) {
             break;
         }
     }

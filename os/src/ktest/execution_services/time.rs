@@ -346,7 +346,7 @@ fn test_timekeeper() {
                 && first.try_join().is_some()
                 && second
                     .as_ref()
-                    .map_or(true, |handle| handle.try_join().is_some())
+                    .is_none_or(|handle| handle.try_join().is_some())
         },
         "time-readers-return",
     );

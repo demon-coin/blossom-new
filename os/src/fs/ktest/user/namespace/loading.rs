@@ -85,7 +85,7 @@ fn observe_symlink_oom(
 
 /// 在原 DentryCache 的 InLookup 停点只阻塞指定原始组件。
 fn install_lookup_gate(
-    context: &TestContext<'_>,
+    _context: &TestContext<'_>,
     vfs: &Vfs,
     observer: Arc<Observation>,
     name: &'static [u8],

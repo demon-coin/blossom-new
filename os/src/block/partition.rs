@@ -534,8 +534,10 @@ mod tests {
                     discover_io(BlockIoAdapter::new(image.as_slice(), block_size)),
                     Ok(Vec::new()),
                 );
-                let mut mbr = MasterBootRecord::default();
-                mbr.signature = [0x55, 0xaa];
+                let mut mbr = MasterBootRecord {
+                    signature: [0x55, 0xaa],
+                    ..MasterBootRecord::default()
+                };
                 mbr.partitions[3].os_indicator = 0x83;
                 mbr.partitions[3].starting_lba = U32Le::from_u32(1);
                 mbr.partitions[3].size_in_lba = U32Le::from_u32(15);

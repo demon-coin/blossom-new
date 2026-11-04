@@ -66,12 +66,14 @@ impl CpuSet {
     }
 
     /// 移除编译范围内的逻辑 CPU。
+    #[cfg(feature = "ktest")]
     pub fn remove(&mut self, id: usize) {
         assert!(id < MAX_CPUS);
         self.words[id / WORD_BITS] &= !(1usize << (id % WORD_BITS));
     }
 
     /// 返回两集合的并集。
+    #[cfg(feature = "ktest")]
     pub fn union(mut self, other: Self) -> Self {
         for (word, rhs) in self.words.iter_mut().zip(other.words) {
             *word |= rhs;
@@ -88,6 +90,7 @@ impl CpuSet {
     }
 
     /// 返回只属于当前集合的成员。
+    #[cfg(feature = "ktest")]
     pub fn difference(mut self, other: Self) -> Self {
         for (word, rhs) in self.words.iter_mut().zip(other.words) {
             *word &= !rhs;
@@ -98,14 +101,6 @@ impl CpuSet {
     /// 判断集合是否没有成员。
     pub fn is_empty(self) -> bool {
         self.words.iter().all(|word| *word == 0)
-    }
-
-    /// 统计真实成员数，不包括最后一字的未用位。
-    pub fn len(self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
     }
 
     /// 按逻辑编号升序迭代，不分配存储。

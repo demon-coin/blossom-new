@@ -22,9 +22,9 @@ pub(crate) use crate::console::{
     early_write as control_write, emergency_write, ktest_read_byte as control_read_byte,
 };
 pub(crate) use context::{
-    active_case, child_failed, current_boundary, fatal, fatal_armed, prepare_result,
-    prepare_result_on, replace_boundary, spawn_on, spawn_result, spawn_result_on, ChildHandle,
-    ChildToken, PreparedChild,
+    active_case, child_failed, current_boundary, fatal, prepare_result, prepare_result_on,
+    replace_boundary, spawn_on, spawn_result, spawn_result_on, ChildHandle, ChildToken,
+    PreparedChild,
 };
 pub(crate) use registers::selftest_register_roundtrip;
 pub(crate) use runner::{early, requested_context, run_boot, spawn_thread, RunCommand};

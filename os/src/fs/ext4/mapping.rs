@@ -148,7 +148,7 @@ fn extent_step(
                 return Err(FsError::Corrupt);
             }
             let physical = u64::from(codec::le32(data, offset + 8)?)
-                | u64::from(codec::le16(data, offset + 6)?) << 32;
+                | (u64::from(codec::le16(data, offset + 6)?) << 32);
             g.validate_blocks(physical, len)?;
             if start <= logical && logical < end {
                 let physical = physical + logical - start;
@@ -167,7 +167,7 @@ fn extent_step(
             previous_end = end;
         } else {
             let physical = u64::from(codec::le32(data, offset + 4)?)
-                | u64::from(codec::le16(data, offset + 8)?) << 32;
+                | (u64::from(codec::le16(data, offset + 8)?) << 32);
             g.validate_blocks(physical, 1)?;
             if start <= logical {
                 selected = Some(Step::Child {
@@ -940,7 +940,7 @@ fn entry_key(entry: &[u8; 12]) -> u64 {
 /// 组合 extent index 的 48 位物理地址。
 fn index_physical(entry: &[u8; 12]) -> u64 {
     u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64
-        | (u16::from_le_bytes(entry[8..10].try_into().unwrap()) as u64) << 32
+        | ((u16::from_le_bytes(entry[8..10].try_into().unwrap()) as u64) << 32)
 }
 
 /// 构造正式 index 条目，保留两字节 unused 为零。
@@ -974,7 +974,7 @@ fn leaf_entry(logical: u64, physical: u64, len: u64, unwritten: bool) -> [u8; 12
 fn leaf_fields(entry: &[u8; 12]) -> Result<(u64, u64, bool), FsError> {
     let (len, unwritten) = codec::extent_length(codec::le16(entry, 4)?)?;
     Ok((
-        u64::from(codec::le32(entry, 8)?) | u64::from(codec::le16(entry, 6)?) << 32,
+        u64::from(codec::le32(entry, 8)?) | (u64::from(codec::le16(entry, 6)?) << 32),
         len,
         unwritten,
     ))

@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::cmp::Ordering as CmpOrdering;
 use core::mem::size_of;
 use core::ops::Range;
 use core::slice;
@@ -14,8 +15,10 @@ use crate::cpu;
 use crate::fs::{ExecAccess, FileRef, FsError, InodeKind, InodeRef, O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::mm::anon::SharedAnon;
 use crate::mm::reclaim::ReclaimAttempt;
+#[cfg(feature = "ktest")]
+use crate::mm::user_table::Mapping;
 use crate::mm::user_table::{
-    Mapping, PagePermissions, PageTableError, PreparedTables, RetiredTables, UserPageTable,
+    PagePermissions, PageTableError, PreparedTables, RetiredTables, UserPageTable,
 };
 use crate::mm::vma::{self, MmapState, Vma, VmaBacking};
 use crate::mm::{AnonPageRef, FolioRef, OwnedPages, PAGE_SIZE};
@@ -374,6 +377,14 @@ struct FaultSource {
     needed: usize,
 }
 
+/// 缺页和 fork 停点共用的单地址测试回调。
+#[cfg(feature = "ktest")]
+type AddressHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// 范围撤叶停点使用的双整数测试回调。
+#[cfg(feature = "ktest")]
+type VmaUnmapHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
 /// 同一 Mm 的范围读写锁与 PTE 短锁分责；活动根由 CPU 强拥有到切回内核根后。
 pub struct Mm {
     table: Arc<PteDomain>,
@@ -386,11 +397,11 @@ pub struct Mm {
     #[cfg(feature = "ktest")]
     mkwrite_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "ktest")]
-    fault_hook: SpinLock<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    fault_hook: SpinLock<Option<AddressHook>>,
     #[cfg(feature = "ktest")]
-    fork_hook: SpinLock<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    fork_hook: SpinLock<Option<AddressHook>>,
     #[cfg(feature = "ktest")]
-    vma_unmap_hook: SpinLock<Option<Arc<dyn Fn(usize, usize) + Send + Sync>>>,
+    vma_unmap_hook: SpinLock<Option<VmaUnmapHook>>,
     #[cfg(feature = "ktest")]
     mkwrites: AtomicUsize,
 }
@@ -969,31 +980,34 @@ impl Mm {
         };
         let mut retired = None;
         let mut inserted = None;
-        if previous < end {
-            let range = previous..end;
-            if !mmap.vacant_with_guard(&range) {
-                return old;
+        match previous.cmp(&end) {
+            CmpOrdering::Less => {
+                let range = previous..end;
+                if !mmap.vacant_with_guard(&range) {
+                    return old;
+                }
+                let permissions = PagePermissions {
+                    read: true,
+                    write: true,
+                    execute: false,
+                };
+                let maximum = PagePermissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                };
+                let candidate =
+                    Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous, None);
+                match candidate.and_then(|vma| self.insert_vma(&mut mmap, vma)) {
+                    Ok(old_vmas) => inserted = Some(old_vmas),
+                    Err(_) => return old,
+                }
             }
-            let permissions = PagePermissions {
-                read: true,
-                write: true,
-                execute: false,
-            };
-            let maximum = PagePermissions {
-                read: true,
-                write: true,
-                execute: true,
-            };
-            let candidate = Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous, None);
-            match candidate.and_then(|vma| self.insert_vma(&mut mmap, vma)) {
-                Ok(old_vmas) => inserted = Some(old_vmas),
-                Err(_) => return old,
-            }
-        } else if end < previous {
-            match self.replace_range(&mut mmap, &(end..previous), None) {
+            CmpOrdering::Greater => match self.replace_range(&mut mmap, &(end..previous), None) {
                 Ok(discarded) => retired = Some(discarded),
                 Err(_) => return old,
-            }
+            },
+            CmpOrdering::Equal => {}
         }
         mmap.heap_end = request;
         drop(mmap);
@@ -1346,24 +1360,21 @@ impl Mm {
 
     /// 在原范围替换已发表新 VMA、旧叶仍待摘取时观察；callback 只暂停真实操作。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_set_vma_unmap_hook(
-        &self,
-        hook: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
-    ) {
+    pub(crate) fn ktest_set_vma_unmap_hook(&self, hook: Option<VmaUnmapHook>) {
         let previous = core::mem::replace(&mut *self.vma_unmap_hook.lock(), hook);
         drop(previous);
     }
 
     /// 在真实文件候选持源内容锁并重核 EOF 后暂停，只观察原 fault，不构造叶或页。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_set_fault_hook(&self, hook: Option<Arc<dyn Fn(usize) + Send + Sync>>) {
+    pub(crate) fn ktest_set_fault_hook(&self, hook: Option<AddressHook>) {
         let previous = core::mem::replace(&mut *self.fault_hook.lock(), hook);
         drop(previous);
     }
 
     /// 在真实 fork 取得原驻留引用后暂停，候选仍须通过当前父叶和来源的最终检查。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_set_fork_hook(&self, hook: Option<Arc<dyn Fn(usize) + Send + Sync>>) {
+    pub(crate) fn ktest_set_fork_hook(&self, hook: Option<AddressHook>) {
         let previous = core::mem::replace(&mut *self.fork_hook.lock(), hook);
         drop(previous);
     }
@@ -1529,12 +1540,12 @@ impl Mm {
                     .map(|range| range.data().inode.mapping().lock_ranges());
                 let parent = self.table.lock();
                 let physical = page.backing.physical();
-                if !parent.pages.find(address).is_some_and(|resident| {
+                if !(parent.pages.find(address).is_some_and(|resident| {
                     resident.backing.physical() == physical && resident.source.as_ptr() == source
-                }) || !parent
+                }) && parent
                     .table
                     .lookup(address)
-                    .is_some_and(|leaf| leaf.physical == physical)
+                    .is_some_and(|leaf| leaf.physical == physical))
                 {
                     break;
                 }
@@ -1782,6 +1793,7 @@ impl Mm {
     }
 
     /// 返回非拥有的硬件叶快照，仅用于诊断；不能凭物理整数继续访问或归页。
+    #[cfg(feature = "ktest")]
     pub fn mapping(&self, address: usize) -> Option<Mapping> {
         self.table.lock().table.lookup(address)
     }
@@ -1795,12 +1807,6 @@ impl Mm {
         mmap.heap_start = start;
         mmap.heap_end = end;
         Ok(())
-    }
-
-    /// 返回 mmap 读侧保护的实际堆边界，地址单位为字节。
-    pub(crate) fn heap(&self) -> (usize, usize) {
-        let mmap = self.mmap.read();
-        (mmap.heap_start, mmap.heap_end)
     }
 
     /// 返回由本对象保活的根物理地址，不移交页表或叶页的访问权。

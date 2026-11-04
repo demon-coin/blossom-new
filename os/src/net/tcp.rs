@@ -251,6 +251,7 @@ impl TcpEndpoint {
     }
 
     /// 返回普通 Work 和精确 Timer 共同固定的执行 CPU。
+    #[cfg(feature = "ktest")]
     pub fn work_cpu(&self) -> usize {
         self.work.get().unwrap().cpu()
     }
@@ -263,13 +264,6 @@ impl TcpEndpoint {
     /// 普通任务取得本连接拥有，结束后由 guard 安排积存输入和发送责任。
     pub fn lock(&self) -> TcpOperationGuard<'_> {
         self.operation(self.core.lock(), OperationMode::Modify)
-    }
-
-    /// 不等待另一操作拥有者，失败也不消耗输入或安排重复后台票。
-    pub fn try_lock(&self) -> Option<TcpOperationGuard<'_>> {
-        self.core
-            .try_lock()
-            .map(|core| self.operation(core, OperationMode::Modify))
     }
 
     /// 只观察成熟状态；释放时仅移交已经因本操作拥有受阻的真实 Work，不主动开始协议进度。
@@ -682,7 +676,7 @@ impl TcpEndpoint {
         {
             let mut children = self.children.lock();
             if 0 < capacity {
-                pending.extend(children.pending.drain(..));
+                pending.append(&mut children.pending);
                 ready.extend(children.ready.drain(..));
                 core::mem::swap(&mut pending, &mut children.pending);
                 core::mem::swap(&mut ready, &mut children.ready);

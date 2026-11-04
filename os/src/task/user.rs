@@ -918,6 +918,9 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 } else {
                     false
                 };
+                #[cfg(target_arch = "riscv64")]
+                let context = user.context();
+                #[cfg(target_arch = "loongarch64")]
                 let mut context = user.context();
                 let pc = context.pc;
                 let fcsr = context.fcsr;

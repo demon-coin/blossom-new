@@ -130,7 +130,6 @@ pub(super) mod cases {
         }
         bytes_at(context, &mapped, 8192, &expected)?;
         context.expect_eq(checked(context, mapped.stat())?.size, 9219);
-        drop(source);
         drop(mm);
         drop(mapped);
         fixture.run(context, b"w")

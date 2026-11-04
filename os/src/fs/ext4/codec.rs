@@ -2,7 +2,9 @@
 
 use crate::block::SECTOR_BYTES;
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
-pub(crate) use crate::fs::ext4::directory::{verify_directory, DirectoryLayout};
+#[cfg(feature = "ktest")]
+pub(crate) use crate::fs::ext4::directory::verify_directory;
+pub(crate) use crate::fs::ext4::directory::DirectoryLayout;
 use crate::fs::ext4::{Geometry, InodeData};
 use crate::fs::inode::InodeMetadata;
 use crate::fs::types::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
@@ -747,8 +749,8 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         mode,
         rdev,
         size,
-        uid: u32::from(le16(data, 2)?) | u32::from(le16(data, 120)?) << 16,
-        gid: u32::from(le16(data, 24)?) | u32::from(le16(data, 122)?) << 16,
+        uid: u32::from(le16(data, 2)?) | (u32::from(le16(data, 120)?) << 16),
+        gid: u32::from(le16(data, 24)?) | (u32::from(le16(data, 122)?) << 16),
         links: u32::from(le16(data, 26)?),
         blocks,
         atime: decode_time(data, 8, INODE_ATIME_EXTRA_OFFSET, extra_isize)?,
@@ -1109,6 +1111,7 @@ pub(crate) fn bitmap_checksum(g: &Geometry, bitmap: &[u8], inode: bool) -> u32 {
 }
 
 /// 已初始化位图先校验正式 CRC，UNINIT 的构造路径由分配器单独负责。
+#[cfg(feature = "ktest")]
 pub(crate) fn verify_bitmap(
     g: &Geometry,
     record: &[u8],

@@ -1,12 +1,16 @@
 //! 所选设备的标准属性在唯一 FDT 发现期间转成有界值。
 
+#[cfg(target_arch = "riscv64")]
+use super::interrupt_parent;
 use super::{
-    cells, compatible, cstr, enabled, interrupt_parent, number, parent, property, single_region,
-    word, Fdt, Node, FDT_CELL_BYTES,
+    cells, compatible, cstr, enabled, number, parent, property, single_region, word, Fdt, Node,
+    FDT_CELL_BYTES,
 };
+#[cfg(target_arch = "riscv64")]
+use crate::boot::BoardClockInputs;
 use crate::boot::{
-    BoardClockInputs, BootInfo, ClockResource, DeviceClocks, DeviceSetup, GmacResources, PhyMode,
-    PinResource, Platform, Region, ResourceReference,
+    BootInfo, ClockResource, DeviceClocks, DeviceSetup, GmacResources, PhyMode, PinResource,
+    Platform, Region, ResourceReference,
 };
 use core::convert::{TryFrom, TryInto};
 
@@ -27,6 +31,7 @@ pub(super) fn alias<'a>(tree: &'a Fdt<'a>, name: &str) -> Result<Node<'a>, &'sta
 }
 
 /// 只选择已声明且启用的 alias；明确禁用不取资源，损坏声明仍返回错误。
+#[cfg(target_arch = "riscv64")]
 pub(super) fn optional_alias<'a>(
     tree: &'a Fdt<'a>,
     name: &str,
@@ -200,6 +205,7 @@ fn provider_region<'a>(tree: &'a Fdt<'a>, provider: Node<'a>) -> Result<Region, 
 }
 
 /// 按 clock-names 与 clocks 的相同索引取得实际输入，禁止以遍历首项代替具名父源。
+#[cfg(target_arch = "riscv64")]
 pub(super) fn named_clock<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,
@@ -220,6 +226,7 @@ pub(super) fn named_clock<'a>(
 }
 
 /// 沿所选 UART 的实际 SYS CRG 父链保存共享 PLL 输入，频率仍由设备动作读取。
+#[cfg(target_arch = "riscv64")]
 pub(super) fn jh7110_clock_inputs<'a>(
     tree: &'a Fdt<'a>,
     uart: Node<'a>,
@@ -545,6 +552,7 @@ pub(super) fn gmac<'a>(
 }
 
 /// 从一个所选节点取得控制器绑定的首个中断，附加事件保留在设备硬件内处理。
+#[cfg(target_arch = "riscv64")]
 pub(super) fn first_irq<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<u32, &'static str> {
     let controller = interrupt_parent(tree, node)?;
     let raw = property(node, "interrupts")?;
@@ -576,6 +584,7 @@ pub(super) fn require_names(
 }
 
 /// 对已选择设备的时钟或复位引用验证真实控制器类型，数值 ID 不能跨 provider 使用。
+#[cfg(target_arch = "riscv64")]
 pub(super) fn require_provider<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,

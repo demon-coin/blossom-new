@@ -37,6 +37,7 @@ impl PollContext {
     }
 
     /// 观察通知事实，不查询 provider，也不建立一次等待。
+    #[cfg(feature = "ktest")]
     pub fn triggered(&self) -> bool {
         self.state.lock().triggered
     }
@@ -334,13 +335,6 @@ pub struct PollRegistration {
     node: Pin<Arc<PollNode>>,
 }
 
-impl PollRegistration {
-    /// 同步撤销登记；返回前源链不再访问该节点。
-    pub fn unregister(self) {
-        drop(self);
-    }
-}
-
 impl Drop for PollRegistration {
     /// 先在源锁内摘链，再在锁外释放源链 ticket 和节点拥有。
     fn drop(&mut self) {
@@ -390,11 +384,13 @@ impl PollTable {
     }
 
     /// 返回本表中已经登记的不同源头数量。
+    #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.registrations.len()
     }
 
     /// 返回本表是否尚未登记任何源头。
+    #[cfg(feature = "ktest")]
     pub fn is_empty(&self) -> bool {
         self.registrations.is_empty()
     }

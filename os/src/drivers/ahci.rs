@@ -113,7 +113,7 @@ impl Controls {
                 .as_ptr()
                 .add(COMMAND_TABLE_HEADER_BYTES + index * PRDT_ENTRY_BYTES)
                 .cast::<u32>();
-            for (offset, word) in words.into_iter().enumerate() {
+            for (offset, word) in words.iter().enumerate() {
                 ptr::write_volatile(destination.add(offset), word.to_le());
             }
         }
@@ -145,7 +145,7 @@ impl Controls {
             ptr::copy_nonoverlapping(fis.as_ptr(), self.table.region().cpu.as_ptr(), fis.len());
             ptr::write_bytes(self.fis.region().cpu.as_ptr(), 0, RECEIVED_FIS_BYTES);
             let destination = self.list.region().cpu.as_ptr().cast::<u32>();
-            for (offset, word) in header.into_iter().enumerate() {
+            for (offset, word) in header.iter().enumerate() {
                 ptr::write_volatile(destination.add(offset), word.to_le());
             }
             self.table

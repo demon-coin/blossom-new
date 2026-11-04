@@ -565,15 +565,6 @@ impl Tree {
         links.kind = LruKind::Detached;
         Some(RetiredNode { node, member: None })
     }
-
-    /// 关闭新取得后移走完整原树，原 LRU 成员由返回树逐个正式 detach。
-    pub fn take_all(&mut self) -> Self {
-        Self {
-            root: self.root.take(),
-            len: core::mem::replace(&mut self.len, 0),
-            closed: true,
-        }
-    }
 }
 
 impl Drop for Tree {

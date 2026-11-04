@@ -18,14 +18,17 @@ pub(crate) mod vma;
 
 pub use anon::AnonPageRef;
 pub(crate) use bootmem::{PAGE_SHIFT, PAGE_SIZE};
+#[cfg(feature = "ktest")]
 pub(crate) use buddy::MAX_ORDER;
 pub use folio::{FolioRead, FolioRef, FolioWriteback};
 pub use frame_allocator::{alloc_pages, alloc_pages_in, OwnedPages};
 #[cfg(feature = "ktest")]
 pub(crate) use heap_allocator::allocation_attempts;
+#[cfg(feature = "ktest")]
 pub use pcp::drain_all_pages;
 #[cfg(feature = "ktest")]
 pub(crate) use slub::SIZES as SLUB_SIZES;
+#[cfg(feature = "ktest")]
 pub use slub::{flush_all, shrink_all};
 
 use crate::boot::BootInfo;

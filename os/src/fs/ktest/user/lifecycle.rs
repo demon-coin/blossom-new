@@ -5,6 +5,9 @@ use crate::task::futex;
 
 const PROGRAM: &[u8] = b"/test/bin/user-lifecycle";
 
+/// 生命周期准备和 exec 观察共同保活的实际映像与用户线程。
+type LifecycleImage = (Arc<Mm>, Arc<task::UserThread>);
+
 impl UserOwner {
     /// 真实请求完成尚未消费时只请求组退出，恢复原完成后再wait和离栈join。
     pub(super) fn cancel_inflight_file_read(
@@ -72,7 +75,7 @@ impl UserOwner {
         &mut self,
         context: &TestContext<'_>,
         mode: &[u8],
-    ) -> Result<(Arc<Mm>, Arc<task::UserThread>), TestError> {
+    ) -> Result<LifecycleImage, TestError> {
         let image = self.load_named(context, PROGRAM, mode)?;
         let mm = Arc::clone(&image.mm);
         self.start_program(
@@ -120,7 +123,7 @@ impl UserOwner {
     fn lifecycle_image(
         old: &Arc<Mm>,
         users: &[&Arc<task::UserThread>],
-    ) -> Result<Option<(Arc<Mm>, Arc<task::UserThread>)>, TestError> {
+    ) -> Result<Option<LifecycleImage>, TestError> {
         let mut image = None;
         until("exec未提交新映像或真实退出", || {
             let mut alive = false;

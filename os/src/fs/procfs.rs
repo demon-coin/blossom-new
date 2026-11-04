@@ -307,9 +307,9 @@ fn uptime() -> Result<Vec<u8>, FsError> {
         .map(|owner| u128::from(accounting::snapshot(owner).idle_ns))
         .sum::<u128>();
     let mut text = SnapshotText::try_new()?;
-    let result = write!(
+    let result = writeln!(
         text,
-        "{}.{:02} {}.{:02}\n",
+        "{}.{:02} {}.{:02}",
         elapsed / time::NSEC_PER_SEC,
         elapsed / UPTIME_TICK_NANOS % UPTIME_TICKS_PER_SEC,
         idle / u128::from(time::NSEC_PER_SEC),

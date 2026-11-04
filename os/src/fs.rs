@@ -25,25 +25,27 @@ mod types;
 pub(crate) mod writeback;
 
 pub use dentry::{DentryCache, DentryRef};
-pub use ext4::{BlockMapping, Ext4Volume, Geometry, InodeData};
+pub use ext4::{BlockMapping, Ext4Volume};
 pub use file::{
-    open_path, open_path_with_flags, stat_path, DirectoryFile, FileIoContext, FileLike, FileRef,
-    FileStat, InodeFile, SeekFrom,
+    open_path, open_path_with_flags, stat_path, FileIoContext, FileLike, FileRef, FileStat,
+    SeekFrom,
 };
 pub(crate) use file::{
     set_nonblocking, set_status_flags, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
-    O_DSYNC, O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC,
-    O_TRUNC, O_WRONLY,
+    O_EXCL, O_LARGEFILE, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC,
+    O_WRONLY,
 };
 pub use file::{ReadBuffer, UserIoVector, WriteBuffer};
-pub use file_table::{DescriptorFlags, FileReservation, FileTable, OpenOptions};
-pub(crate) use inode::{
-    initialize_inode_eviction, DirectoryWriteGuard, InodeCacheWatch, InodeWeak, PreparedMkwrite,
-};
+#[cfg(feature = "ktest")]
+pub use file_table::OpenOptions;
+pub use file_table::{DescriptorFlags, FileTable};
+pub(crate) use inode::{initialize_inode_eviction, DirectoryWriteGuard, InodeWeak};
 pub use inode::{ExecAccess, InodeCache, InodeMetadata, InodeRef, WriteAccess};
-pub use memfs::{Filesystem, MemoryFs, MemoryFsKind};
-pub use path::{FsContext, LastComponent, LookupParent, Path, ResolveMode, Vfs};
-pub use poll::{PollMask, Pollable};
+pub use memfs::Filesystem;
+pub use path::{FsContext, Path, ResolveMode, Vfs};
+#[cfg(feature = "ktest")]
+pub use poll::PollMask;
+pub use poll::Pollable;
 pub(crate) use types::{DirectoryCursor, DirectoryPosition};
 pub use types::{DirectoryEntry, InodeKind, InodeTime};
 pub(crate) use types::{

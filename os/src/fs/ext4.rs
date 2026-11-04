@@ -77,7 +77,7 @@ impl Geometry {
         if self.features_ro_compat & codec::FEATURE_RO_COMPAT_SPARSE_SUPER == 0 || group == 1 {
             return true;
         }
-        [3u64, 5, 7].into_iter().any(|base| {
+        [3u64, 5, 7].iter().any(|base| {
             let mut value = group;
             while value % base == 0 {
                 value /= base;
@@ -458,6 +458,7 @@ impl Ext4Volume {
     }
 
     /// 借用保活且被实际 FS 占用保护的磁盘。
+    #[cfg(feature = "ktest")]
     pub fn disk(&self) -> &DiskRef {
         &self.disk
     }
@@ -1054,6 +1055,7 @@ impl Ext4Volume {
     }
 
     /// 先准备 inode-table 真实窗口，再在同一页锁内仅修改当前 inode 的字段和校验和。
+    #[cfg(feature = "ktest")]
     pub(crate) fn update_inode_metadata(
         &self,
         claim: &FsClaim,

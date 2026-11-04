@@ -193,10 +193,10 @@ fn interface_name(name: &[u8]) -> Result<InterfaceId, FsError> {
 /// 可选 rt_dev 在首个 NUL 停止，最多读取十五字节并保留零填内核终止位。
 fn copy_device_name(mm: &Mm, argument: usize) -> Result<[u8; IFNAME_LEN], FsError> {
     let mut name = [0u8; IFNAME_LEN];
-    for offset in 0..IFNAME_LEN - 1 {
+    for (offset, byte) in name.iter_mut().enumerate().take(IFNAME_LEN - 1) {
         let address = argument.checked_add(offset).ok_or(FsError::BadAddress)?;
-        name[offset] = copyin::<1>(mm, address)?[0];
-        if name[offset] == 0 {
+        *byte = copyin::<1>(mm, address)?[0];
+        if *byte == 0 {
             break;
         }
     }

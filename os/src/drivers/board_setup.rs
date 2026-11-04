@@ -404,7 +404,7 @@ fn crg(base: usize) -> Result<Region, &'static str> {
         board.mmc.as_ref().map(|r| &r.setup),
         board.gmac.as_ref().map(|r| &r.setup),
     ]
-    .into_iter()
+    .iter()
     .flatten()
     {
         for reference in setup.clocks.entries[..setup.clocks.count]

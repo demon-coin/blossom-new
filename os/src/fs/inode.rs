@@ -724,6 +724,7 @@ pub(crate) struct InodeCacheWatch(Arc<InodeDomain>);
 
 impl InodeCacheWatch {
     /// 等待调用边界已接受的 Work 全尾，仍有外部使用时不宣称其 inode 已回收。
+    #[cfg(feature = "ktest")]
     pub(crate) fn wait(&self) -> Result<(), FsError> {
         self.0.flush()
     }
@@ -1555,11 +1556,13 @@ impl InodeCache {
     }
 
     /// 返回 Loading、缓存以及待回收对象共同占用的槽数。
+    #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.domain.index.lock().slots.iter().flatten().count()
     }
 
     /// 观察本缓存域是否没有已发表的 inode。
+    #[cfg(feature = "ktest")]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1804,6 +1807,7 @@ impl InodeRef {
     }
 
     /// 普通名字查找通过目录读侧返回首个结果，缺失仍由调用者收到 NotFound。
+    #[cfg(feature = "ktest")]
     pub fn lookup(&self, cache: &InodeCache, name: &[u8]) -> Result<InodeRef, FsError> {
         self.directory_read()?
             .lookup(cache, name)?
@@ -1993,9 +1997,7 @@ impl InodeRef {
         #[cfg(feature = "ktest")]
         self.truncate_phase(TruncatePhase::BeforeSecondUnmap);
         self.mapping.unmap_range(first..u64::MAX, true);
-        if let Err(error) = pages {
-            return Err(error);
-        }
+        pages?;
         let mut root = state.disk_root().write();
         assert_eq!(
             *root, old_root,
@@ -2066,7 +2068,7 @@ impl InodeRef {
                         g,
                         &mut bytes[offset..offset + g.inode_size],
                         &next,
-                        &*root,
+                        &root,
                     )
                 })
                 .expect("prepared fast symlink size record");
@@ -2079,9 +2081,7 @@ impl InodeRef {
         // symlink target 从不进入 FileMapping，mapping 仅清理意外保留的旧页并等待真实 I/O 尾。
         let pages = unsafe { self.mapping.truncate_pages(self, 0, g.block_size) };
         self.mapping.unmap_range(0..u64::MAX, true);
-        if let Err(error) = pages {
-            return Err(error);
-        }
+        pages?;
         if !self.mapping.is_empty() {
             return Err(FsError::Busy);
         }
@@ -2533,6 +2533,7 @@ impl InodeRef {
         Ok((start, accepted))
     }
     /// 内核按位置读取与用户接收端使用同一页交付循环。
+    #[cfg(feature = "ktest")]
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
         self.read_into(offset, &mut ReadBuffer::kernel(dst), None)
     }
@@ -2867,6 +2868,7 @@ impl Inode {
     }
 
     /// 在块映射读保护下执行真实后端查询，不导出永久块根借用。
+    #[cfg(feature = "ktest")]
     pub fn map_block(&self, logical: u64) -> Result<BlockMapping, FsError> {
         self.with_map_read(|metadata, root| {
             self.disk_volume()?.map_block(metadata, root, logical, None)
@@ -2875,6 +2877,7 @@ impl Inode {
 
     /// inode 写序列化与 data-sem 写侧保护受控属性修改，并字段级更新共同盘面记录。
     /// 此入口不分配块、不截断文件；大小和块布局变更须由对应内容协议实现。
+    #[cfg(feature = "ktest")]
     pub fn update_metadata<T>(
         &self,
         claim: &FsClaim,
@@ -3366,16 +3369,6 @@ impl DirectoryWriteGuard<'_> {
                 edit.cancel(&volume);
                 Err(error)
             }
-        }
-    }
-}
-
-impl PreparedDirectoryMutation {
-    /// 判断本次准备是否修改了名字或父目录元数据。
-    pub(crate) fn changed(&self) -> bool {
-        match self {
-            Self::Disk(prepared) => prepared.changed,
-            Self::Memory { directory, .. } => directory.is_some(),
         }
     }
 }

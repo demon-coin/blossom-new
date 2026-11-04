@@ -961,13 +961,13 @@ pub(super) mod cases {
             after.flush_submitted - data.flush_submitted, after.completed - data.completed,
             domain_before, domain_after, dma, returned));
         let readback = disk.test_snapshot();
-        for index in 0..16 {
+        for (index, target) in targets[..16].iter().enumerate() {
             let expected = [0x70 + index as u8; PAGE_SIZE];
             for part in 0..PAGE_SIZE / block {
                 disk_block_bytes(
                     context,
                     volume.claim(),
-                    targets[index][part],
+                    target[part],
                     &expected[part * block..(part + 1) * block],
                 )?;
             }

@@ -917,10 +917,10 @@ pub(crate) mod native {
         let nic = fixture.nic();
         let net = fixture.net.as_ref().unwrap();
         let udp = fixture.udp.as_ref().unwrap();
-        let destination = Some(InetEndpoint {
+        let destination = InetEndpoint {
             address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)),
             port: fixture.port,
-        });
+        };
         let before = nic.snapshot()?;
         if before.tx.count != 32 {
             return Err(TestError("native TX hardware pool is not 32 slots"));
@@ -957,7 +957,7 @@ pub(crate) mod native {
             let [low, high] = index.to_le_bytes();
             let packet = OwnedPacket::try_from_udp(
                 udp.local().unwrap(),
-                destination.unwrap(),
+                destination,
                 &[b'N', b'P', low, high],
                 1500,
             )
@@ -967,7 +967,7 @@ pub(crate) mod native {
         }
         let packet = OwnedPacket::try_from_udp(
             udp.local().unwrap(),
-            destination.unwrap(),
+            destination,
             &[b'N', b'P', 32, 0],
             1500,
         )
@@ -1014,7 +1014,7 @@ pub(crate) mod native {
                 ));
             }
             let [low, high] = index.to_le_bytes();
-            if bytes != &[b'N', b'Q', low, high] {
+            if bytes != [b'N', b'Q', low, high] {
                 return Err(TestError(
                     "native full software response full record differs",
                 ));

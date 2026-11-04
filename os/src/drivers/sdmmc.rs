@@ -417,7 +417,7 @@ impl Sdmmc {
         Ok(if divisor == 0 {
             input
         } else {
-            input / (CLOCK_DIVIDER_FACTOR * divisor as u64)
+            input / (CLOCK_DIVIDER_FACTOR * divisor)
         })
     }
 

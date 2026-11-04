@@ -253,14 +253,6 @@ impl Storage {
         self.disks.lock().iter().flatten().count()
     }
 
-    /// 控制调用者按存在顺序取得物理 owner；空槽不占序号，根和挂载使用精确名字 lookup。
-    pub(crate) fn disk(&self, index: usize) -> Option<DiskRef> {
-        if !self.ready.load(Ordering::Acquire) {
-            return None;
-        }
-        self.disks.lock().iter().flatten().nth(index).cloned()
-    }
-
     /// 只返回已发现的完全相同设备与分区，不把缺失分区替换为整盘。
     pub(crate) fn lookup(&self, selector: DeviceSelector) -> Option<BlockView> {
         if !self.ready.load(Ordering::Acquire) {

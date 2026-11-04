@@ -5,11 +5,13 @@ use alloc::vec::Vec;
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(feature = "ktest")]
 use crate::fs::file::{O_DIRECTORY, O_NOFOLLOW};
+#[cfg(feature = "ktest")]
 use crate::fs::{
-    open_path_with_flags, DirectoryEntry, FileIoContext, FileRef, FileStat, FsContext, FsError,
-    ResolveMode, SeekFrom, Vfs, WriteBuffer,
+    open_path_with_flags, DirectoryEntry, FileIoContext, FsContext, ResolveMode, Vfs, WriteBuffer,
 };
+use crate::fs::{FileRef, FileStat, FsError, SeekFrom};
 use crate::sync::SpinLock;
 
 /// 描述符自己的属性，不随共享文件位置传播。
@@ -19,6 +21,7 @@ pub struct DescriptorFlags {
 }
 
 /// 只读打开的路径约束与新描述符属性。
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OpenOptions {
     pub directory: bool,
@@ -163,7 +166,7 @@ impl FileTable {
                     continue;
                 }
                 if capacity < needed {
-                    directory.extend(slots.pages.drain(..));
+                    directory.append(&mut slots.pages);
                     mem::swap(&mut slots.pages, &mut directory);
                 }
                 slots.pages.append(&mut added);
@@ -282,6 +285,7 @@ impl FileTable {
     }
 
     /// 普通可睡眠 Task 先预留，再解析真实路径并构造完整文件；任何失败由预留析构取消。
+    #[cfg(feature = "ktest")]
     pub fn open(
         &self,
         vfs: &Vfs,
@@ -309,12 +313,14 @@ impl FileTable {
     }
 
     /// 在表锁外读取原文件并推进其共享位置，关闭或复用 fd 不改变本次文件身份。
+    #[cfg(feature = "ktest")]
     pub fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FsError> {
         let file = self.lookup(fd)?;
         file.read(buffer)
     }
 
     /// 在表锁外按 byte offset 读取原文件，不修改其共享位置。
+    #[cfg(feature = "ktest")]
     pub fn read_at(&self, fd: usize, offset: u64, buffer: &mut [u8]) -> Result<usize, FsError> {
         let file = self.lookup(fd)?;
         file.read_at(offset, buffer)
@@ -333,27 +339,32 @@ impl FileTable {
     }
 
     /// 在表锁外消费目录的下一项，共享枚举位置由具体目录文件保护。
+    #[cfg(feature = "ktest")]
     pub fn readdir(&self, fd: usize) -> Result<Option<DirectoryEntry>, FsError> {
         let file = self.lookup(fd)?;
         file.readdir()
     }
 
     /// 内核顺序写只绑定输入，不在描述符表内复制 inode 写循环。
+    #[cfg(feature = "ktest")]
     pub fn write(&self, fd: usize, buffer: &[u8]) -> Result<usize, FsError> {
         self.write_from(fd, &mut WriteBuffer::kernel(buffer))
     }
 
     /// 内核按位置写经过同一核心，不取得 OFD 共享位置锁。
+    #[cfg(feature = "ktest")]
     pub fn write_at(&self, fd: usize, offset: u64, buffer: &[u8]) -> Result<usize, FsError> {
         self.write_at_from(fd, offset, &mut WriteBuffer::kernel(buffer))
     }
 
     /// 表短锁外持原 OFD 执行顺序写，关闭复用 fd 不改变本次文件身份。
+    #[cfg(feature = "ktest")]
     pub fn write_from(&self, fd: usize, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
         self.lookup(fd)?.write_from(source, FileIoContext::Kernel)
     }
 
     /// 表短锁外按明确位置写入，实际追加和错误均由原 OFD 提供。
+    #[cfg(feature = "ktest")]
     pub fn write_at_from(
         &self,
         fd: usize,
@@ -429,6 +440,7 @@ impl FileTable {
     }
 
     /// 精确复制允许同号保留原属性，其余复制清除 CLOEXEC。
+    #[cfg(feature = "ktest")]
     pub fn dup_exact(&self, source: usize, target: usize, limit: usize) -> Result<usize, FsError> {
         self.replace_duplicate(source, target, DescriptorFlags::default(), true, limit)
     }

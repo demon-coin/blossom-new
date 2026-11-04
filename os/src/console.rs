@@ -361,6 +361,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
 }
 
 /// 已停其它核和本核事件后关闭 UART 中断并排空末尾停止诊断；不确认物理断电，返回后不得再启动输出者。
+#[cfg(not(feature = "ktest"))]
 pub(crate) fn board_stop() {
     let platform = match crate::platform::current() {
         crate::boot::Platform::QemuVirt => return,
@@ -381,6 +382,7 @@ pub(crate) fn board_stop() {
 }
 
 /// 当前核的事件源已关闭时输出有界致命停止诊断；不等待端口锁，也不声称其它核或设备已停止。
+#[cfg(feature = "ktest")]
 pub(crate) fn board_stop_current_cpu() {
     let platform = match crate::platform::current() {
         crate::boot::Platform::QemuVirt => return,
@@ -669,11 +671,6 @@ pub fn discard_received() {
     port.len = 0;
 }
 
-/// 返回软件接收环已满后真实丢弃的字节数。
-pub fn rx_overrun() -> usize {
-    PORT.lock().overrun
-}
-
 /// 在 PORT 内提交预验证的串口参数，恢复实际 MCR/IER 后才允许普通 DATA/IER 访问；配置窗采样在锁外通知原行规程工作。
 pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     assert_eq!(
@@ -851,11 +848,13 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
 }
 
 /// 返回由真实接收中断消费的字节数量。
+#[cfg(feature = "ktest")]
 pub fn received() -> usize {
     RECEIVED.load(Ordering::Acquire)
 }
 
 /// 返回最后一个已经由中断消费的原始字节。
+#[cfg(feature = "ktest")]
 pub fn last_byte() -> u8 {
     LAST_BYTE.load(Ordering::Relaxed)
 }
@@ -868,6 +867,7 @@ pub fn receive_pending() -> bool {
 }
 
 /// 在共享轮询预算内记录真实致命异常现场并停止，不等待故障核持有的锁。
+#[cfg(not(feature = "ktest"))]
 pub fn fatal(pc: usize, sp: usize, cause: usize, bad_address: usize) -> ! {
     let _ = crate::arch::irq_save();
     let _ = emergency_writer().write_fmt(format_args!(
@@ -880,6 +880,7 @@ pub fn fatal(pc: usize, sp: usize, cause: usize, bad_address: usize) -> ! {
 }
 
 /// 在共享轮询预算内打印内部不变量失败的原始位置和原因，随后永久停止当前核。
+#[cfg(not(feature = "ktest"))]
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let _ = crate::arch::irq_save();
     let _ = emergency_writer().write_fmt(format_args!("FAIL panic: {}\n", info));
@@ -900,11 +901,6 @@ macro_rules! early_println {
 /// 测试观察唯一真实端口活动；ktest 另保存可移动的 default action 责任，不建立第二套驱动。
 #[cfg(feature = "ktest")]
 pub mod testing {
-    /// 测试故障现场复用原始应急消息预算，不取端口锁、时间或任务信息。
-    pub fn emergency_write(arguments: fmt::Arguments<'_>) {
-        super::emergency_write(arguments);
-    }
-
     use super::*;
 
     #[cfg(feature = "ktest")]

@@ -208,7 +208,7 @@ impl Backend {
     ) -> Result<Option<(Self, QueueLimits)>, BlockError> {
         let pending = pending_queue()?;
         // SAFETY: 外层调用者传递资源独占、永久映射及 IRQ/停止的完整寿命义务。
-        let Some(controller) = (unsafe { Sdmmc::prepare(resources) }?) else {
+        let Some(controller) = unsafe { Sdmmc::prepare(resources) }? else {
             return Ok(None);
         };
         let limits = controller.limits();
@@ -233,7 +233,7 @@ impl Backend {
     ) -> Result<Option<(Self, QueueLimits)>, BlockError> {
         let pending = pending_queue()?;
         // SAFETY: 外层调用者证明已解析资源、永久映射、独占功能和停止寿命。
-        let Some(controller) = (unsafe { Ahci::prepare(resources) }?) else {
+        let Some(controller) = unsafe { Ahci::prepare(resources) }? else {
             return Ok(None);
         };
         let limits = controller.limits();

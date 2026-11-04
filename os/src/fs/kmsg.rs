@@ -60,7 +60,7 @@ impl RecordText {
         .expect("kmsg header exceeded fixed capacity");
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for &byte in record.text().as_bytes() {
-            if byte < 32 || 127 <= byte || byte == b'\\' {
+            if !(32..127).contains(&byte) || byte == b'\\' {
                 let escaped = [
                     b'\\',
                     b'x',

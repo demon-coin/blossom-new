@@ -1,7 +1,7 @@
 // UNIX seqpacket 的记录边界、背压与半关闭保持在同一行为套件。
 #[ktest::suite(fixture = StackOwner, suite_resources = SuiteBaseline, context = "Thread", tags("network-socket", "network-unix-seqpacket"), timeout_ms = 45000)]
 pub(crate) mod socket_unix_seqpacket {
-    use ::ktest::{TestContext, TestError, TestResult};
+    use ::ktest::{TestContext, TestResult};
     use alloc::sync::Arc;
 
     use super::owner::StackOwner;

@@ -267,15 +267,6 @@ impl SocketFile {
         }
     }
 
-    /// IP 族始终来自稳定端点，匿名 UNIX 不具有 IP 族。
-    pub fn family(&self) -> Result<AddressFamily, FsError> {
-        match &self.endpoint {
-            Endpoint::Tcp(endpoint) => Ok(endpoint.family()),
-            Endpoint::Udp(endpoint) => Ok(endpoint.family()),
-            Endpoint::Unix(_) => Err(FsError::Unsupported),
-        }
-    }
-
     /// 查询同一端点的双面绑定策略。
     pub fn v6_only(&self) -> Result<bool, FsError> {
         match &self.endpoint {
@@ -310,11 +301,6 @@ impl SocketFile {
             Endpoint::Udp(endpoint) => endpoint.id(),
             Endpoint::Unix(endpoint) => endpoint.id(),
         }
-    }
-
-    /// 返回构造时的同一网络域；dup 和 fork 共享打开实例及这个引用。
-    pub fn net(&self) -> &NetStackRef {
-        &self.net
     }
 
     /// 访问模式固定为双向流，非阻塞状态属于真正的 OFD。
@@ -491,9 +477,8 @@ impl SocketFile {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
-            match self.receive_once(target, flags & MSG_PEEK != 0)? {
-                Some(result) => return Ok(result),
-                None => {}
+            if let Some(result) = self.receive_once(target, flags & MSG_PEEK != 0)? {
+                return Ok(result);
             }
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);

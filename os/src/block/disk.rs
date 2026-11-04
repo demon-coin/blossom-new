@@ -335,7 +335,7 @@ impl Disk {
         workqueue: &WorkQueue,
     ) -> Result<Option<DiskRef>, BlockError> {
         // SAFETY: 调用者传递真实资源独占、映射和 IRQ/停止的完整寿命义务。
-        let Some((backend, limits)) = (unsafe { Backend::sdmmc(resources) }?) else {
+        let Some((backend, limits)) = unsafe { Backend::sdmmc(resources) }? else {
             return Ok(None);
         };
         Self::prepare_backend(backend, workqueue, limits).map(Some)
@@ -351,7 +351,7 @@ impl Disk {
         workqueue: &WorkQueue,
     ) -> Result<Option<DiskRef>, BlockError> {
         // SAFETY: 调用者证明解析后的真实功能资源和完整拥有寿命。
-        let Some((backend, limits)) = (unsafe { Backend::ahci(resources) }?) else {
+        let Some((backend, limits)) = unsafe { Backend::ahci(resources) }? else {
             return Ok(None);
         };
         Self::prepare_backend(backend, workqueue, limits).map(Some)
@@ -607,6 +607,7 @@ impl Disk {
     }
 
     /// raw 准入没有文件系统授权，与 FS 提交共用原生成者和 slot 核心。
+    #[cfg(feature = "ktest")]
     pub(super) fn admit<'a>(
         self: &'a DiskRef,
         bio: Bio,
@@ -1054,7 +1055,7 @@ impl Disk {
         let slot = &self.slots[usize::from(tag)];
         // SAFETY: 调用者唯一拥有 Submitted→Finishing 的认领，本槽不可准备或二次派发。
         let needs_task = unsafe {
-            (&*slot.resources.get())
+            (*slot.resources.get())
                 .parts
                 .iter()
                 .flatten()

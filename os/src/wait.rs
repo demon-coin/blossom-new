@@ -2,7 +2,7 @@
 
 pub mod queue;
 
-pub use queue::{QueueRegistration, WaitNode, WaitQueue};
+pub use queue::{WaitNode, WaitQueue};
 
 use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;

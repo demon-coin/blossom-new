@@ -318,7 +318,7 @@ pub(super) mod cases {
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
         let mut verify_attempt = ReclaimAttempt::new();
-        for index in 0..16 {
+        for (index, folio) in folios[..16].iter().enumerate() {
             bytes_at(
                 context,
                 &file,
@@ -326,7 +326,7 @@ pub(super) mod cases {
                 &[0xc4; 4096],
             )?;
             context.expect_eq(
-                folios[index].as_ref().unwrap().phys_addr(),
+                folio.as_ref().unwrap().phys_addr(),
                 checked(
                     context,
                     file.mapping_inode()

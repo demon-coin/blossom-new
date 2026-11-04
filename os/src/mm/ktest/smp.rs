@@ -380,7 +380,7 @@ mod pages {
                     state.done[id].store(phase, Ordering::Release);
                     state.wait(&token, || {
                         state.phase.load(Ordering::Acquire) == phase + 1
-                            && phase + 1 <= state.drain_epoch.load(Ordering::Acquire)
+                            && phase < state.drain_epoch.load(Ordering::Acquire)
                     })?;
                     for index in 0..high {
                         let pages = state.pages[id * WORK + index].lock().take();

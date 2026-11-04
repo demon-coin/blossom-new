@@ -3,6 +3,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::cmp::Ordering as CmpOrdering;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::ptr;
@@ -497,22 +498,27 @@ pub fn wake(
     }
 }
 
+/// 按桶索引固定加锁顺序；同桶只取一次，回调返回前保持相关 guard。
 fn with_buckets<R>(
     source: usize,
     destination: usize,
     visit: impl FnOnce(&mut Bucket, Option<&mut Bucket>) -> R,
 ) -> R {
-    if source == destination {
-        let mut bucket = TABLE[source].lock();
-        visit(&mut bucket, None)
-    } else if source < destination {
-        let mut source_bucket = TABLE[source].lock();
-        let mut destination_bucket = TABLE[destination].lock();
-        visit(&mut source_bucket, Some(&mut destination_bucket))
-    } else {
-        let mut destination_bucket = TABLE[destination].lock();
-        let mut source_bucket = TABLE[source].lock();
-        visit(&mut source_bucket, Some(&mut destination_bucket))
+    match source.cmp(&destination) {
+        CmpOrdering::Equal => {
+            let mut bucket = TABLE[source].lock();
+            visit(&mut bucket, None)
+        }
+        CmpOrdering::Less => {
+            let mut source_bucket = TABLE[source].lock();
+            let mut destination_bucket = TABLE[destination].lock();
+            visit(&mut source_bucket, Some(&mut destination_bucket))
+        }
+        CmpOrdering::Greater => {
+            let mut destination_bucket = TABLE[destination].lock();
+            let mut source_bucket = TABLE[source].lock();
+            visit(&mut source_bucket, Some(&mut destination_bucket))
+        }
     }
 }
 

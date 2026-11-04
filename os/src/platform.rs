@@ -408,6 +408,7 @@ fn single_region<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<Region, &'stat
 }
 
 /// 取得绑定指定的寄存器资源，不要求设备只描述这一段窗口。
+#[cfg(target_arch = "riscv64")]
 fn region_at<'a>(tree: &'a Fdt<'a>, node: Node<'a>, index: usize) -> Result<Region, &'static str> {
     identity_address(tree, node)?;
     regions(node)?

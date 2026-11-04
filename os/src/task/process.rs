@@ -2,8 +2,10 @@
 
 use self::numbers::Numbers;
 pub(crate) use self::numbers::MAX_PID;
+#[cfg(feature = "ktest")]
+pub(crate) use self::resources::DEFAULT_NOFILE;
 use self::resources::{Limits, ProcessCharge, UserAccount};
-pub(crate) use self::resources::{Resource, ResourceLimit, SignalCharge, DEFAULT_NOFILE};
+pub(crate) use self::resources::{Resource, ResourceLimit, SignalCharge};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 

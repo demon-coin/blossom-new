@@ -7,7 +7,9 @@ mod wheel;
 pub(crate) use sleep::sleep_until_interruptible;
 #[cfg(feature = "ktest")]
 pub(crate) use sleep::test_sleep_until;
-pub use sleep::{after, periodic_deadline, sleep, sleep_until};
+#[cfg(feature = "ktest")]
+pub use sleep::{after, periodic_deadline};
+pub use sleep::{sleep, sleep_until};
 pub(crate) use wheel::TICK_NS;
 
 use alloc::sync::Arc;
@@ -126,13 +128,9 @@ impl Timer {
     }
 
     /// 返回节点固定归属的逻辑 CPU。
+    #[cfg(feature = "ktest")]
     pub fn cpu(&self) -> usize {
         self.cpu
-    }
-
-    /// 返回节点固定采用的定时机制。
-    pub fn kind(&self) -> TimerKind {
-        self.kind
     }
 
     /// 拥有节点返回构造时保留的 into_raw 指针；借用节点只返回 payload 地址，不赋予 Arc 拥有权。

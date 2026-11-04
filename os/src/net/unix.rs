@@ -321,11 +321,6 @@ impl UnixEndpoint {
         self.pair.kind
     }
 
-    /// 比较真实弱域归属，不以地址族或匿名名称猜测网络域。
-    pub fn belongs_to(&self, net: &NetStackRef) -> bool {
-        Weak::ptr_eq(&self.pair.net, &Arc::downgrade(net))
-    }
-
     /// 接收只占 incoming 方向，共同 FIFO 按实际差量消费；PEEK 不产生容量通知。
     pub fn receive(&self, target: &mut ReadBuffer<'_>, peek: bool) -> Result<IoProgress, FsError> {
         let direction = &self.pair.directions[1 - self.side];

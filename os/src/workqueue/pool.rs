@@ -294,7 +294,8 @@ pub(super) unsafe fn assigned_worker(
             }
             cursor = (*(*cursor).state.get()).next;
         }
-        let rescue = (&*domain.rescuers.get())
+        let rescuers = &*domain.rescuers.get();
+        let rescue = rescuers
             .get(cpu)
             .expect("associated worker missing from pool and rescue table");
         assert_eq!(Arc::as_ptr(&rescue.worker), assigned);
@@ -496,7 +497,8 @@ fn wake_rescuers(cpu: usize) {
                     let domain = &(*cursor).domain;
                     let rescue = if domain.config.reclaim {
                         let state = &*pool(cpu).state.get();
-                        (&*domain.rescuers.get()).get(cpu).and_then(|r| {
+                        let rescuers = &*domain.rescuers.get();
+                        rescuers.get(cpu).and_then(|r| {
                             if candidate(
                                 state.head,
                                 Arc::as_ptr(&r.worker),
@@ -1153,7 +1155,6 @@ pub(super) mod testing {
     const RELEASED: usize = 3;
     const PAUSE_TIMEOUT_SECONDS: u64 = 10;
     const SERVICE_TIMEOUT_SECONDS: u64 = 10;
-    const SERVICES_PER_CPU: usize = 2;
     static PAUSE: [[AtomicUsize; PAUSE_POINTS]; crate::boot::MAX_CPUS] =
         [const { [const { AtomicUsize::new(0) }; PAUSE_POINTS] }; crate::boot::MAX_CPUS];
     /// 真实当前与累积池计数，sleeping/running 是成对 scheduler 反馈而非模型值。
@@ -1199,42 +1200,6 @@ pub(super) mod testing {
         observation
             .and_then(|manager| manager.upgrade())
             .is_some_and(|manager| crate::sched::test_state(&manager) == task::State::Blocked)
-    }
-    /// 返回每 CPU 的原 manager 与基础 worker 数，不计动态执行者或域救援者。
-    /// 仅在服务初始化、入口登记及停稳之后用于常驻基线，不创建另一份任务统计。
-    pub(crate) fn service_count() -> usize {
-        SERVICES_PER_CPU * cpu::count()
-    }
-    /// 取得常驻服务的真实弱观察：2*CPU 为 manager，2*CPU+1 为基础 worker。
-    /// 入口尚未登记或索引越界返回 None；只在状态锁内复制 Weak，升级和最终 Drop 均在锁外。
-    /// Thread 控制者须在基线采样后归还观察强引用，不能将它当作执行栈的 join 责任。
-    pub(crate) fn service_task(index: usize) -> Option<Arc<task::Task>> {
-        if service_count() <= index {
-            return None;
-        }
-        let observation = {
-            let _lock = STATE_LOCK.lock();
-            // SAFETY: 索引对应真实永久池，活链的池强票保活节点；锁只保护遍历和复制原弱观察。
-            unsafe {
-                let state = &*pool(index / SERVICES_PER_CPU).state.get();
-                if index % SERVICES_PER_CPU == 0 {
-                    state.manager_task.clone()
-                } else {
-                    let mut cursor = state.workers_head;
-                    let mut base = None;
-                    while !cursor.is_null() {
-                        let worker = &*cursor;
-                        if worker.base {
-                            base = (*worker.state.get()).task.clone();
-                            break;
-                        }
-                        cursor = (*worker.state.get()).next;
-                    }
-                    base
-                }
-            }
-        };
-        observation.and_then(|weak| weak.upgrade())
     }
     /// 观察真实角色，受控回收必须由预备域救援 Task 执行。
     pub(crate) fn is_rescuer() -> bool {

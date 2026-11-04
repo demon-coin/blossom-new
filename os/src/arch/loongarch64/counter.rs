@@ -50,8 +50,3 @@ pub unsafe fn apply_counter_epoch() {
     // SAFETY: 调用者保证本核尚未依赖旧补偿。
     unsafe { write_counter_compensation(offset) };
 }
-
-/// 读取最近一次异常保存的指令字；仅用于同步异常的现场诊断。
-pub fn bad_instruction() -> usize {
-    csr_read::<{ register::CSR_BADI }>()
-}

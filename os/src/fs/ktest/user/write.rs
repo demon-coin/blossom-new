@@ -42,7 +42,6 @@ const SHARED_FILE_OFFSET: usize = 24;
 pub(super) const SHARED_ALIAS: usize = 0x4a00_0000;
 
 /// 普通测试消费者的真实 Task 状态与同步结果观察，不承担 join 或文件拥有。
-
 pub(super) struct SyncObservation {
     executor: SpinLock<Option<alloc::sync::Weak<Task>>>,
     result: SpinLock<Option<Result<(), FsError>>>,
@@ -88,7 +87,6 @@ impl TruncateControls {
 }
 
 /// 复用原用户、任务、卷及异步消费者拥有边界的可写文件夹具。
-
 pub(super) struct WriteOwner {
     pub(super) user: UserOwner,
     pub(super) inodes: Vec<InodeRef>,

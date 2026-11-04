@@ -254,7 +254,7 @@ impl Pipe {
     /// 状态提交后发布查询快照并通知真正的读写源；通知不取得 ring 锁。
     fn publish(&self, ring: &PipeBuffer<SLOTS>, read_changed: bool, write_changed: bool) {
         self.observation.store(
-            (ring.len() as u64) | (ring.empty_slot_capacity() as u64) << SPACE_SHIFT,
+            (ring.len() as u64) | ((ring.empty_slot_capacity() as u64) << SPACE_SHIFT),
             Ordering::Release,
         );
         if read_changed {

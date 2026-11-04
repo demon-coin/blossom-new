@@ -756,9 +756,9 @@ impl Owner {
             joins
                 .try_reserve_exact(3)
                 .map_err(|_| TestError("filesystem native join slots OOM"))?;
-            for index in 0..3 {
+            for (index, slot) in prepared.iter_mut().enumerate() {
                 let observer = observation.clone();
-                prepared[index] = Some(
+                *slot = Some(
                     task::prepare_kernel_on(index % cpu::count(), move || {
                         observer.tasks.lock()[index] = Some(task::current_task());
                         let job = observer.jobs.lock()[index].take();

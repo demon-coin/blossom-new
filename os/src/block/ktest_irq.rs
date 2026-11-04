@@ -433,10 +433,10 @@ impl MultiIrq {
         self.requests[0].reclaim(context)?;
         self.requests[1].reclaim(context)?;
         self.uart.receive(context, b'I')?;
-        for index in 0..2 {
+        for (index, previous) in dispatch[..2].iter().enumerate() {
             context.expect_eq(0 < self.disks[index].test_snapshot().irq_queue, true);
             context.expect_eq(
-                dispatch[index] < irq::testing::dispatch_count(self.sources[index]),
+                *previous < irq::testing::dispatch_count(self.sources[index]),
                 true,
             );
         }

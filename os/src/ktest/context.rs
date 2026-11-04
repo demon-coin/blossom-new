@@ -121,20 +121,6 @@ pub(crate) fn active_case() -> Option<u32> {
     });
     (id != NO_CASE).then_some(id)
 }
-/// 仅表示当前 body 已完成 armed 声明，真实控制者仍必须独立确定故障类型。
-pub(crate) fn fatal_armed() -> bool {
-    with_task(|task| {
-        if let Some(task) = task {
-            let pointer = task.ktest_scope.load(Ordering::Acquire).cast::<ArcScope>();
-            // SAFETY: 当前 Task 的安装 guard/子入口保活，IRQ-off 回调期间不能撤槽。
-            !pointer.is_null() && unsafe { (*pointer).armed.load(Ordering::Acquire) }
-        } else {
-            crate::cpu::current().id == 0
-                && BOOT_ENABLED.load(Ordering::Acquire)
-                && BOOT_ARMED.load(Ordering::Acquire)
-        }
-    })
-}
 /// 展开内部不变量故障按实际原因归类，不读取 armed 期望。
 pub(crate) fn fatal(reason: &'static str) -> ! {
     let kind = if reason.contains("double panic") || reason.contains("nested catch") {
@@ -529,6 +515,7 @@ impl Services for RuntimeServices<'_> {
     fn diagnostic(&self, message: core::fmt::Arguments<'_>) {
         report::diagnostic(message);
     }
+    /// 在原阶段顺序中发布当前阶段，并只在主体期间保留既有 fatal 武装状态。
     fn phase(&self, phase: Phase) {
         if self.finished.get() {
             fatal("case phase after final");
@@ -555,12 +542,10 @@ impl Services for RuntimeServices<'_> {
                     BOOT_ARMED.store(true, Ordering::Release);
                 }
             }
+        } else if let Some(scope) = self.scope {
+            scope.armed.store(false, Ordering::Release);
         } else {
-            if let Some(scope) = self.scope {
-                scope.armed.store(false, Ordering::Release);
-            } else {
-                BOOT_ARMED.store(false, Ordering::Release);
-            }
+            BOOT_ARMED.store(false, Ordering::Release);
         }
     }
     fn stop_children(&self) {

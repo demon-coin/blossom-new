@@ -895,7 +895,7 @@ pub(crate) mod bounded {
         context.expect_eq(file.ptr_eq(&hard), true);
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         let mut held = [const { None }; 2];
-        for page in 0..2 {
+        for (page, slot) in held.iter_mut().enumerate() {
             context.expect_eq(
                 checked(context, file.read_at(page as u64 * 4096, &mut bytes))?,
                 4096,
@@ -905,7 +905,7 @@ pub(crate) mod bounded {
                 .mapping()
                 .cached_folio(page as u64)
                 .ok_or(TestError("live bounded folio missing"))?;
-            held[page] = Some(folio);
+            *slot = Some(folio);
         }
         context.expect_eq(checked(context, file.read_at(8192, &mut bytes))?, 4096);
         context.expect_eq(patterned(&bytes, 8192), true);

@@ -16,12 +16,12 @@ use virtio_drivers::{
     BufferDirection, Error, Hal,
 };
 
+#[cfg(target_arch = "loongarch64")]
+use crate::drivers::virtio::{VIRTIO_PCI_NET_LEGACY, VIRTIO_PCI_NET_MODERN, VIRTIO_VENDOR_ID};
+
 use crate::{
     drivers::{
-        virtio::{
-            dma_protocol, qemu_dma_domain, VirtioIdentity, VirtioInitError, VIRTIO_PCI_NET_LEGACY,
-            VIRTIO_PCI_NET_MODERN, VIRTIO_VENDOR_ID,
-        },
+        virtio::{dma_protocol, qemu_dma_domain, VirtioIdentity, VirtioInitError},
         DeviceInventory, ProbeError,
     },
     irq::{self, IrqNumber, IrqRegistration},
@@ -234,11 +234,13 @@ impl VirtioNet {
     }
 
     /// 返回库存确认的完整硬件身份，不重新访问设备配置。
+    #[cfg(feature = "ktest")]
     pub fn identity(&self) -> VirtioIdentity {
         self.identity
     }
 
     /// 返回本设备 action 所属的真实共享 IRQ 源。
+    #[cfg(feature = "ktest")]
     pub fn interrupt(&self) -> IrqNumber {
         self.interrupt
     }
@@ -509,10 +511,9 @@ impl VirtioNet {
         }
         let mut received = 0;
         while received < RX_BUDGET {
-            let Some((index, page, len)) = self.take_rx().map_err(|error| {
+            let Some((index, page, len)) = self.take_rx().inspect_err(|_| {
                 let mut state = self.state.lock();
                 state.statistics.rx_errors = state.statistics.rx_errors.wrapping_add(1);
-                error
             })?
             else {
                 break;

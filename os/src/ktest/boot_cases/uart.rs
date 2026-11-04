@@ -51,7 +51,7 @@ impl Action {
         // SAFETY: &mut owner排除同时安装，唯一强引用且本模块不产生Weak；
         // token尚未安装，不存在IRQ/child访问，检查只读已初始化Option。
         assert!(
-            unsafe { (&*state.registration.get()).is_none() },
+            unsafe { (*state.registration.get()).is_none() },
             "UART action already installed"
         );
         let number = irq::map_source(boot::info().interrupts.uart_source)
@@ -75,7 +75,7 @@ impl Action {
     fn token(&self) -> &IrqRegistration {
         // SAFETY: 只在register成功后调用，槽不再改写；token本身用内部锁同步。
         unsafe {
-            (&*self.registration.get())
+            (*self.registration.get())
                 .as_ref()
                 .expect("UART token not installed")
         }
@@ -238,10 +238,8 @@ impl Uart {
             }
             stage.handshake = true;
         }
-        if console::received() == stage.before {
-            if control_byte()? != stage.byte {
-                return Err(TestError("UART cleanup payload mismatch"));
-            }
+        if console::received() == stage.before && control_byte()? != stage.byte {
+            return Err(TestError("UART cleanup payload mismatch"));
         }
         let mut line = [0u8; 64];
         let mut length = 0;

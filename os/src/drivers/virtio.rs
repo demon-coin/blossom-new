@@ -43,6 +43,7 @@ pub(crate) const VIRTIO_MIN_QUEUE_DEPTH: u16 = 4;
 pub(crate) const VIRTIO_MAX_QUEUE_DEPTH: u16 = 128;
 pub(crate) const VIRTIO_CONTROL_SEGMENTS: u16 = 2;
 pub(crate) const VIRTIO_STATUS_BYTES: usize = core::mem::size_of::<u8>();
+#[cfg(feature = "ktest")]
 pub(crate) const SPLIT_RING_DESCRIPTOR_BYTES: usize = 16;
 const VIRTIO_PCI_MODERN_DEVICE_BASE: u16 = 0x1040;
 const PCI_CONFIG_SPACE_BYTES: usize = 256;

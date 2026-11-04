@@ -1,6 +1,8 @@
 //! 路由只携带库接口当次选择的小值，地址、Routes 与邻居状态留在原 Interface。
 
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::IpAddress;
+#[cfg(feature = "ktest")]
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
 use crate::fs::FsError;
 
@@ -63,6 +65,7 @@ pub struct DefaultRouteRequest {
 }
 
 /// 控制入口的一次 IPv4 配置值，提交后由库接口保存真实配置。
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EthernetConfig {
     pub address: [u8; 4],
@@ -70,6 +73,7 @@ pub struct EthernetConfig {
     pub gateway: Option<[u8; 4]>,
 }
 
+#[cfg(feature = "ktest")]
 impl EthernetConfig {
     /// 在写入库接口前核静态配置边界，不创建第二个路由或地址集合。
     pub fn validate(self) -> Result<(), FsError> {

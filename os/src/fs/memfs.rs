@@ -533,6 +533,7 @@ impl MemoryFs {
     }
 
     /// 只观察本实例尚未归还的实际原页票，外部 folio 也继续占额。
+    #[cfg(feature = "ktest")]
     pub fn used_pages(&self) -> usize {
         self.index.lock().pages
     }

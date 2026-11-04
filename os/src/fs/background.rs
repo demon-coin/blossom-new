@@ -144,6 +144,10 @@ struct State {
     waiting_writers: usize,
 }
 
+/// 有限 WB 轮完成后的同一只读观察合同。
+#[cfg(feature = "ktest")]
+type RoundHook = Arc<dyn Fn(WritebackSnapshot) + Send + Sync>;
+
 /// 卷强持服务，服务只为已接受的一次 pending/running 保卷票，不永久反持卷。
 pub(crate) struct WritebackDomain {
     work: Once<Pin<Arc<DelayedWork>>>,
@@ -157,7 +161,7 @@ pub(crate) struct WritebackDomain {
     submitted_bytes: AtomicU64,
     waiters: WaitQueue,
     #[cfg(feature = "ktest")]
-    round_hook: SpinLock<Option<Arc<dyn Fn(WritebackSnapshot) + Send + Sync>>>,
+    round_hook: SpinLock<Option<RoundHook>>,
 }
 
 /// 值边界只记录真实域事实，不保活后继轮或把开始计数当完成。
@@ -222,6 +226,7 @@ impl Drop for WbStorageLease {
 }
 
 /// 同卷真实状态快照；本轮实际完成者发布 accepted 账，提交瞬间与在途数仍由原 Disk/Bio 观察。
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WritebackSnapshot {
     pub dirty_pages: usize,
@@ -257,6 +262,7 @@ pub(crate) struct WritebackSnapshot {
 }
 
 /// 全局页账与当前文件页近似阈值；metadata 参与脏账但不计文件可回收页。
+#[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirtySnapshot {
     pub file_pages: usize,
@@ -698,6 +704,7 @@ impl WritebackDomain {
     }
 
     /// 只读真实计数及最后一个有限 round 的事实，不驱动 WB 或合成完成。
+    #[cfg(feature = "ktest")]
     pub(crate) fn snapshot(&self) -> WritebackSnapshot {
         let state = self.state.lock();
         WritebackSnapshot {
@@ -736,10 +743,7 @@ impl WritebackDomain {
 
     /// 观察有限轮次已结束、后继尚未由本回调安排的真实边界，旧回调在短锁外释放。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_set_round_hook(
-        &self,
-        hook: Option<Arc<dyn Fn(WritebackSnapshot) + Send + Sync>>,
-    ) {
+    pub(crate) fn ktest_set_round_hook(&self, hook: Option<RoundHook>) {
         let previous = core::mem::replace(&mut *self.round_hook.lock(), hook);
         drop(previous);
     }
@@ -961,6 +965,7 @@ fn dirty_limit() -> (usize, usize) {
 }
 
 /// 只读取本 VM 当前原页账和真实完成样本，跨锁快照不提供停稳证明。
+#[cfg(feature = "ktest")]
 pub(crate) fn global_snapshot() -> DirtySnapshot {
     let (dirtyable, limit) = dirty_limit();
     let completion = GLOBAL_COMPLETION.lock();

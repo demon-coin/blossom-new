@@ -52,7 +52,7 @@ mod pressure {
     #[should_panic(expected = "pressure body unwind")]
     fn panic_keeps_owner(_: &mut TestContext<'_>, f: &mut PressureFixture) {
         f.exhaust();
-        assert!(0 < f.pressure.len());
+        assert!(!f.pressure.is_empty());
         panic!("pressure body unwind");
     }
 }

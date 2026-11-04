@@ -291,7 +291,7 @@ pub(super) mod cases {
         } else {
             let cursor = observed_cursor.load(Ordering::Acquire);
             context.expect_eq(
-                2 * PAGE_SIZE <= cursor && cursor <= PRESSURE_PAGES * PAGE_SIZE,
+                (2 * PAGE_SIZE..=PRESSURE_PAGES * PAGE_SIZE).contains(&cursor),
                 true,
             );
             context.expect_eq(cursor % PAGE_SIZE, 0);

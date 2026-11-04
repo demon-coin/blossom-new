@@ -1,6 +1,5 @@
 //! 以真实任务、工作域、定时器与唯一 MM 验证工作进度和一次停止责任。
 
-use super::wait;
 use alloc::alloc::{alloc, dealloc};
 use alloc::sync::Arc;
 use core::alloc::Layout;
@@ -842,7 +841,7 @@ fn exhaust_objects() -> (usize, usize) {
 
 /// 已发表压力前缀只交给一个回收 callback 或独立 Task，归还时不持池锁。
 fn release_pressure(page_count: usize, object_count: usize) {
-    let actual = core::mem::replace(&mut *scenario().pressure_counts.lock(), (0, 0));
+    let actual = core::mem::take(&mut *scenario().pressure_counts.lock());
     if actual == (0, 0) && scenario().stop.load(Ordering::Acquire) {
         return;
     }
@@ -933,7 +932,7 @@ fn test_reclaim() {
     );
     mm::shrink_all();
     let page_count = exhaust_pages();
-    let (objects, heap_null) = exhaust_objects();
+    let (objects, _heap_null) = exhaust_objects();
     let page_null = usize::from(mm::alloc_pages(0, false).is_none());
     assert_eq!(page_null, 1);
     probe.pages.store(page_count, Ordering::Release);
@@ -1212,7 +1211,7 @@ fn test_flush_boundary() {
     });
     assert!(works[0].as_ref().queue().unwrap());
     until(|| probe.blocked(0), "earlier work sleeping on bound CPU");
-    let earlier_blocked = usize::from(probe.blocked(0));
+    let _earlier_blocked = usize::from(probe.blocked(0));
     let remote = usize::from(works[0].cpu() != cpu::current().id);
     assert_eq!(remote, usize::from(1 < cpu::count()));
     assert!(works[1].as_ref().queue().unwrap());
@@ -1220,7 +1219,7 @@ fn test_flush_boundary() {
         || probe.counts[1].load(Ordering::Acquire) == 1,
         "later work completed",
     );
-    let later_done = probe.counts[1].load(Ordering::Acquire);
+    let _later_done = probe.counts[1].load(Ordering::Acquire);
     let flush_probe = probe.clone();
     let queue_address = Arc::as_ptr(&queue) as usize;
     let flusher = crate::ktest::spawn_result_on(0, move |_| {
@@ -1251,7 +1250,7 @@ fn test_flush_boundary() {
         || probe.counts[6].load(Ordering::Acquire) == 4,
         "finite future callback production",
     );
-    future_submitted += probe.counts[6].load(Ordering::Acquire);
+    let _future_submitted = future_submitted + probe.counts[6].load(Ordering::Acquire);
     probe.source.store(false, Ordering::Release);
     until(
         || {
@@ -1771,7 +1770,7 @@ impl ::ktest::Fixture for ServiceFixture {
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
-        let counts = core::mem::replace(&mut *self.state.pressure_counts.lock(), (0, 0));
+        let counts = core::mem::take(&mut *self.state.pressure_counts.lock());
         release_owned_pressure(counts.0, counts.1);
         let count = self.state.owners.lock().len();
         for index in 0..count {

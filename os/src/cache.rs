@@ -898,6 +898,7 @@ impl MetadataCache {
     }
 
     /// 返回本范围相交的实际物理页数，相邻视图共享的边界页只占一个物理预算。
+    #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         let (mut cursor, end) = self.page_bounds();
         let mut count = 0;
@@ -917,6 +918,7 @@ impl MetadataCache {
     }
 
     /// 检查物理页索引是否为空。
+    #[cfg(feature = "ktest")]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1008,9 +1010,7 @@ impl MetadataCache {
                     .filter(|node| node.key < end)
                     .map(|node| (node.key, node.folio.clone()))
             };
-            let Some((key, folio)) = next else {
-                return None;
-            };
+            let (key, folio) = next?;
             let mask = self.page_mask(key);
             let matches = match mark {
                 FolioMark::Dirty => folio.dirty_sectors() & mask != 0,
@@ -1071,6 +1071,7 @@ impl MetadataCache {
     ///
     /// # Safety
     /// 调用者已停止本范围全部生产者、IO、WB 和外部视图；其中没有已接受的真实 FS 修改。
+    #[cfg(feature = "ktest")]
     pub unsafe fn discard_private(self: &Arc<Self>) -> Result<usize, BlockError> {
         let reserve = self.reserve();
         let (first, end) = self.page_bounds();
@@ -1258,21 +1259,25 @@ impl BufferRef {
     }
 
     /// 返回视图自己的字节长度。
+    #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// 元数据块视图不接受零长度请求。
+    #[cfg(feature = "ktest")]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// 返回视图在真实 4KiB 页中的起点。
+    #[cfg(feature = "ktest")]
     pub fn offset(&self) -> usize {
         self.offset
     }
 
     /// 借用首物理页身份供原页诊断；跨页块的内容和等待必须使用 Buffer 接口。
+    #[cfg(feature = "ktest")]
     pub fn folio(&self) -> &FolioRef {
         &self.folio
     }
@@ -1355,15 +1360,22 @@ pub(crate) enum PreparedFile {
     New { node: NodeRef, read: FolioRead },
 }
 
+/// 同一文件来源按偏移和稳定 Arc 地址排序，弱引用不延长 VMA 寿命。
+type FileRanges = Vec<((u64, usize), Weak<FileRangeData>)>;
+
+/// 同一撤叶观察回调仅借同步边界的标量，不取得页或表的拥有。
+#[cfg(feature = "ktest")]
+type FileUnmapHook = Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>;
+
 /// canonical inode 的稀疏页与弱文件范围索引；来源独立于当前驻留 backing。
 pub struct FileMapping {
     index: FolioIndex,
-    ranges: SpinLock<Vec<((u64, usize), Weak<FileRangeData>)>>,
+    ranges: SpinLock<FileRanges>,
     // 锁内保存下轮后台扫描的文件页号，显式同步不改变它。
     writeback: SleepMutex<u64>,
     wb_error: SpinLock<WritebackError>,
     #[cfg(feature = "ktest")]
-    unmap_hook: SpinLock<Option<Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>>>,
+    unmap_hook: SpinLock<Option<FileUnmapHook>>,
 }
 
 impl FileMapping {
@@ -1519,9 +1531,7 @@ impl FileMapping {
     }
 
     /// 与全范围失效串行来源换身份及 fork 叶提交；持此 guard 时只允许原 PTE 短锁操作。
-    pub(crate) fn lock_ranges(
-        &self,
-    ) -> SpinLockGuard<'_, Vec<((u64, usize), Weak<FileRangeData>)>> {
+    pub(crate) fn lock_ranges(&self) -> SpinLockGuard<'_, FileRanges> {
         self.ranges.lock()
     }
 
@@ -1691,10 +1701,7 @@ impl FileMapping {
 
     /// 观察真实撤叶与 CSD 边界，callback 不改变叶或替代硬件同步；旧 callback 锁外释放。
     #[cfg(feature = "ktest")]
-    pub(crate) fn ktest_set_unmap_hook(
-        &self,
-        hook: Option<Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>>,
-    ) {
+    pub(crate) fn ktest_set_unmap_hook(&self, hook: Option<FileUnmapHook>) {
         let previous = core::mem::replace(&mut *self.unmap_hook.lock(), hook);
         drop(previous);
     }
@@ -2078,12 +2085,6 @@ fn reclaim_node(
         freed_file,
         ..ReclaimStats::default()
     });
-}
-
-/// 实际两条 file LRU 的当前长度，不筛目标页、清账或修改状态。
-#[cfg(feature = "ktest")]
-pub(crate) fn ktest_file_lru() -> (usize, usize) {
-    index::lru_lengths()
 }
 
 /// 返回本架构实际 Node payload 布局，不猜 Arc 控制头或额外预留控制对象。

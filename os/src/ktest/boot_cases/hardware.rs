@@ -193,7 +193,7 @@ pub(crate) mod mapping {
                 }
             }
             for region in [Some(boot::kernel_region()), Some(info.dtb), info.initrd]
-                .into_iter()
+                .iter()
                 .flatten()
             {
                 for address in [region.start, region.end - 1] {

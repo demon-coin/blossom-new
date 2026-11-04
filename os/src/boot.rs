@@ -387,16 +387,6 @@ pub struct BootInfo {
 }
 
 impl BootInfo {
-    /// 创建测试或独立解析拥有的空快照；生产发现直接初始化永久槽。
-    pub fn empty(raw_args: [usize; 4], bsp_hardware_id: usize) -> Self {
-        let mut info = MaybeUninit::uninit();
-        // SAFETY: 独占且对齐的局部槽足以容纳Self；initialize_at写完全部字段后才取已初始化值。
-        unsafe {
-            Self::initialize_at(info.as_mut_ptr(), raw_args, bsp_hardware_id);
-            info.assume_init()
-        }
-    }
-
     /// 逐字段初始化独占槽，不在早期栈构造或复制整个CPU容量相关快照。
     ///
     /// # Safety
