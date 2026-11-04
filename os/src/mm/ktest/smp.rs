@@ -280,12 +280,13 @@ mod pages {
         Ok(())
     }
     /// 每个在线 CPU 依次到真实 high 阈值，恰返回一个 batch，停止后排空。
+    /// 固定参数在创建参与者前读取，避免晚启动参与者的 getter 竞争 PCP0 归还路径。
     #[test]
     fn every_cpu_high(_: &mut TestContext<'_>, f: &mut SmpFixture) -> TestResult {
+        let (batch, high) = pcp::parameters();
         for id in 0..cpu::count() {
-            f.spawn(id, |state, token| {
+            f.spawn(id, move |state, token| {
                 let id = cpu::current().id;
-                let (batch, high) = pcp::parameters();
                 state.wait(&token, || {
                     state.phase.load(Ordering::Acquire) == 1
                         && state.turn.load(Ordering::Acquire) == id
@@ -320,14 +321,15 @@ mod pages {
         f.all_done(1)
     }
     /// 远端留真实 batch 缓存并停稳，控制者直接 drain 不依赖 IPI。
+    /// 固定 batch 在创建参与者前读取，参与者只捕获数值，避免参数 getter 竞争 PCP0。
     #[test]
     #[ktest(min_cpus = 2)]
     fn remote_cache_drain(_: &mut TestContext<'_>, f: &mut SmpFixture) -> TestResult {
+        let (batch, _) = pcp::parameters();
         for id in 0..cpu::count() {
-            f.spawn(id, |state, token| {
+            f.spawn(id, move |state, token| {
                 let id = cpu::current().id;
                 state.wait(&token, || state.phase.load(Ordering::Acquire) == 1)?;
-                let (batch, _) = pcp::parameters();
                 for index in 0..batch {
                     *state.pages[id * WORK + index].lock() =
                         Some(mm::alloc_pages(0, false).unwrap());
@@ -347,7 +349,6 @@ mod pages {
         let initial = free();
         f.state.phase.store(1, Ordering::Release);
         f.all_done(1)?;
-        let (batch, _) = pcp::parameters();
         for id in 0..cpu::count() {
             assert_eq!(pcp::cpu_cached_pages(id), batch);
         }

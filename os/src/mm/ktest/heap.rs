@@ -69,6 +69,25 @@ fn layout_check(object: &HeapObject, class: usize) -> usize {
     }
 }
 
+/// 在按地址排序的 live 拥有前缀中寻找当前 CPU active slab 的三个连续槽。
+fn active_neighbor_start(held: &[Option<HeapObject>]) -> Option<usize> {
+    let cache = slub::slab_snapshot(held.first()?.as_ref()?.pointer).cache;
+    let stride = slub::geometry(cache).stride;
+    let active = slub::cpu_snapshot(cache, crate::cpu::current().id).active;
+    held.windows(3).position(|slots| {
+        let [Some(left), Some(middle), Some(right)] = slots else {
+            return false;
+        };
+        let left_address = left.pointer.as_ptr() as usize;
+        let middle_address = middle.pointer.as_ptr() as usize;
+        let right_address = right.pointer.as_ptr() as usize;
+        middle_address - left_address == stride
+            && right_address - middle_address == stride
+            && slub::slab_snapshot(left.pointer).head_pfn == active
+            && slub::slab_snapshot(right.pointer).head_pfn == active
+    })
+}
+
 #[ktest::suite(fixture = FixedHeap, tags("mm", "heap"), timeout_ms = 30000)]
 mod layouts {
     use super::*;
@@ -167,7 +186,7 @@ mod layouts {
             assert_eq!(free(), before);
         })
     }
-    /// 复用中间槽的 zeroed 只清自己的完整请求，左右 live 字节与原相邻几何不变。
+    /// 首次取得 active slab 的三邻接槽即停止采样，zeroed 只清中间请求且保留左右 live 字节与几何。
     #[test]
     #[case("size65_align8", 65, 8)]
     #[case("size129_align8", 129, 8)]
@@ -180,35 +199,24 @@ mod layouts {
     ) -> TestResult {
         fixture.run(move |f| {
             let layout = Layout::from_size_align(size, align).unwrap();
-            // ponytail: 固定 32 个拥有槽构造相邻输入；常驻对象更碎时再扩大 fixture 容量。
             let count = if align <= PAGE_SIZE { f.held.len() } else { 3 };
+            let mut start = None;
             for index in 0..count {
                 f.held[index] = Some(HeapObject::allocate(layout, false));
+                if align <= PAGE_SIZE {
+                    let held = &mut f.held[..=index];
+                    held.sort_unstable_by_key(|slot| {
+                        slot.as_ref()
+                            .map_or(usize::MAX, |object| object.pointer.as_ptr() as usize)
+                    });
+                    start = active_neighbor_start(held);
+                    if start.is_some() {
+                        break;
+                    }
+                }
             }
             if align <= PAGE_SIZE {
-                f.held.sort_unstable_by_key(|slot| {
-                    slot.as_ref()
-                        .map_or(usize::MAX, |object| object.pointer.as_ptr() as usize)
-                });
-                let cache = slub::slab_snapshot(f.held[0].as_ref().unwrap().pointer).cache;
-                let stride = slub::geometry(cache).stride;
-                let active = slub::cpu_snapshot(cache, crate::cpu::current().id).active;
-                let start = f
-                    .held
-                    .windows(3)
-                    .position(|slots| {
-                        let pointers = [
-                            slots[0].as_ref().unwrap().pointer,
-                            slots[1].as_ref().unwrap().pointer,
-                            slots[2].as_ref().unwrap().pointer,
-                        ];
-                        pointers[1].as_ptr() as usize - pointers[0].as_ptr() as usize == stride
-                            && pointers[2].as_ptr() as usize - pointers[1].as_ptr() as usize
-                                == stride
-                            && slub::slab_snapshot(pointers[0]).head_pfn == active
-                            && slub::slab_snapshot(pointers[2]).head_pfn == active
-                    })
-                    .expect("owned heap sample has no adjacent live neighbors");
+                let start = start.expect("owned heap sample has no adjacent live neighbors");
                 f.held.rotate_left(start);
             }
             for (index, byte) in [0x35, 0xac, 0x79].iter().copied().enumerate() {
