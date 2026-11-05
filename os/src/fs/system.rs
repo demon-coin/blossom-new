@@ -50,6 +50,7 @@ pub(crate) fn boot_devices(arguments: &[u8]) -> Result<BootDevices<'_>, FsError>
             root_mode = AccessMode::ReadWrite;
         }
     }
+
     let board = boot::info().platform != Platform::QemuVirt;
     let root = match root {
         Some(root) => root,
@@ -90,11 +91,13 @@ pub(crate) fn mount_disks(
         MOUNT_CAPACITY,
         root_mode,
     )?;
+
     let physical_root = vfs.root();
     let physical_context = FsContext::new(physical_root.clone(), physical_root)?;
     let root = vfs.resolve(&physical_context, rootdir, ResolveMode::Follow)?;
     let context = FsContext::new(root.clone(), root)?;
     drop(physical_context);
+
     if let Some(extra) = extra {
         let covered = vfs.resolve(&context, b"/mnt/extra", ResolveMode::Follow)?;
         let volume = Ext4Volume::open(extra, AccessMode::ReadOnly, METADATA_CACHE_CAPACITY)?;
@@ -128,10 +131,12 @@ pub(crate) fn read_summary(
         OpenOptions::default(),
         crate::task::process::DEFAULT_NOFILE.current as usize,
     )?;
+
     let result = files
         .lookup(fd)
         .and_then(|file| summarize_file(file.as_ref()));
     let closed = files.close(fd);
+
     let summary = result?;
     closed?;
     Ok(summary)
@@ -153,6 +158,7 @@ fn summarize_file(file: &dyn FileLike) -> Result<FileSummary, FsError> {
         bytes = bytes.checked_add(count as u64).ok_or(FsError::Corrupt)?;
         crc = crc32c(crc, &buffer[..count]);
     }
+
     if bytes != size {
         return Err(FsError::Corrupt);
     }

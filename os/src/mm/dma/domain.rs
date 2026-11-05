@@ -53,6 +53,7 @@ impl DmaDomain {
         {
             return Err(DmaError::InvalidDomain);
         }
+
         let domain = Self {
             mask,
             physical_start,
@@ -88,6 +89,7 @@ impl DmaDomain {
         if !self.coherent && (physical % self.cache_line != 0 || len % self.cache_line != 0) {
             return Err(DmaError::Alignment);
         }
+
         let address = self
             .device_start
             .checked_add((physical - self.physical_start) as u64)

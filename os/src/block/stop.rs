@@ -72,6 +72,7 @@ impl Disk {
                 _ => {}
             }
         }
+
         self.available.wake_all();
         self.unplug();
         loop {
@@ -99,6 +100,7 @@ impl Disk {
                 self.fault_reset()?;
             }
         }
+
         self.wait_quiescent_until(accepted_finished);
         let registration = { self.irq.lock().take() };
         if let Some(registration) = registration {
@@ -112,6 +114,7 @@ impl Disk {
                 work.as_ref().close_sync();
             }
         }
+
         let device = { self.queue.lock().device.take() };
         drop(device);
         let result = {
@@ -192,6 +195,7 @@ impl Disk {
                 queue.ktest_stop.reset_requests += 1;
             }
         }
+
         let deadline = time::now()
             .checked_add(RESET_TIMEOUT)
             .expect("block reset deadline overflows monotonic time");
@@ -269,6 +273,7 @@ impl Disk {
         if mode == AccessMode::ReadWrite && disk.limits.readonly {
             return Err(BlockError::ReadOnly);
         }
+
         let mut owner = Arc::try_new(FsClaimInner {
             view: view.clone(),
             mode,
@@ -276,6 +281,7 @@ impl Disk {
             next: UnsafeCell::new(ptr::null()),
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         {
             let inner = Arc::get_mut(&mut owner).expect("unpublished FS claim is shared");
             let mut queue = disk.queue.lock();

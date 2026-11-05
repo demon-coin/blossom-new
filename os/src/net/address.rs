@@ -9,6 +9,7 @@ pub const AF_UNSPEC: u16 = 0;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+
 pub const INET_ADDRESS_LEN: usize = 16;
 pub const INET6_ADDRESS_LEN: usize = 28;
 pub const MAX_ADDRESS_LEN: usize = INET6_ADDRESS_LEN;
@@ -105,6 +106,7 @@ impl SocketAddress {
         if bytes.len() < ADDRESS_FAMILY_LEN {
             return Err(FsError::InvalidOperation);
         }
+
         match u16::from_ne_bytes([bytes[0], bytes[1]]) {
             AF_UNSPEC => Ok(Self::Unspecified),
             AF_INET => {
@@ -216,6 +218,7 @@ impl SocketAddress {
             }
             _ => return Err(FsError::AddressFamilyNotSupported),
         };
+
         if family == AddressFamily::Ipv6
             && v6_only
             && matches!(endpoint.address, IpAddress::Ipv4(_))
@@ -225,6 +228,7 @@ impl SocketAddress {
                 AddressOperation::Connect | AddressOperation::Send => FsError::NetworkUnreachable,
             });
         }
+
         if operation != AddressOperation::Bind
             && endpoint.address == IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
         {
@@ -262,6 +266,7 @@ impl SocketAddress {
                 (AF_INET6, INET6_ADDRESS_LEN)
             }
         };
+
         bytes[..2].copy_from_slice(&family.to_ne_bytes());
         let copied = target.len().min(length);
         target[..copied].copy_from_slice(&bytes[..copied]);

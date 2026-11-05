@@ -12,6 +12,7 @@ pub(super) const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
 pub(super) const MAX_PORTS: u32 = 32;
 pub(super) const PORT_BASE: usize = 0x100;
 pub(super) const PORT_BYTES: usize = 0x80;
+
 pub(super) const CAP_PORTS_MASK: u32 = 0x1f;
 pub(super) const CAP_64BIT: u32 = 1 << 31;
 const CAP_STAGGERED_SPINUP: u32 = 1 << 27;
@@ -22,12 +23,14 @@ const HOST_RESET: u32 = 1;
 const BIOS_OWNED: u32 = 1;
 const OS_OWNED: u32 = 1 << 1;
 const BIOS_BUSY: u32 = 1 << 4;
+
 const CMD_AGGRESSIVE_SLUMBER: u32 = 1 << 27;
 const CMD_LINK_POWER_MANAGEMENT: u32 = 1 << 26;
 const CMD_ICC_MASK: u32 = 0xf << 28;
 const CMD_ICC_ACTIVE: u32 = 1 << 28;
 const CMD_POWER_ON: u32 = 1 << 2;
 const CMD_SPIN_UP: u32 = 1 << 1;
+
 pub(super) const ATA_SIGNATURE: u32 = 0x0000_0101;
 const SATA_DET_MASK: u32 = 0xf;
 const SATA_SPD_MASK: u32 = 0xf << 4;
@@ -38,6 +41,7 @@ const SATA_IPM_ACTIVE: u32 = 1 << 8;
 const SATA_DISABLE_LOW_POWER: u32 = 3 << 8;
 const LINK_RESET_HOLD: Duration = Duration::from_millis(1);
 const LINK_RESUME_DELAY: Duration = Duration::from_millis(200);
+
 pub(super) const CAP: usize = 0x00;
 pub(super) const GHC: usize = 0x04;
 pub(super) const HOST_IS: usize = 0x08;
@@ -45,6 +49,7 @@ pub(super) const PI: usize = 0x0c;
 pub(super) const VERSION: usize = 0x10;
 pub(super) const CAP2: usize = 0x24;
 pub(super) const BOHC: usize = 0x28;
+
 pub(super) const CLB: usize = 0x00;
 pub(super) const CLBU: usize = 0x04;
 pub(super) const FB: usize = 0x08;
@@ -60,6 +65,7 @@ pub(super) const SERR: usize = 0x30;
 pub(super) const SACT: usize = 0x34;
 pub(super) const CI: usize = 0x38;
 pub(super) const FBS: usize = 0x40;
+
 pub(super) const AE: u32 = 1 << 31;
 pub(super) const HOST_IE: u32 = 1 << 1;
 pub(super) const ST: u32 = 1;
@@ -68,6 +74,7 @@ pub(super) const FR: u32 = 1 << 14;
 pub(super) const CR: u32 = 1 << 15;
 pub(super) const TASK_BUSY: u32 = super::ata::STATUS_BUSY | super::ata::STATUS_DRQ;
 pub(super) const TASK_ERROR: u32 = super::ata::STATUS_ERROR | super::ata::STATUS_DEVICE_FAULT;
+
 const IRQ_TASK_ERROR: u32 = 1 << 30;
 const IRQ_HOST_BUS_ERROR: u32 = 1 << 29;
 const IRQ_HOST_BUS_DATA_ERROR: u32 = 1 << 28;
@@ -159,6 +166,7 @@ impl Host {
         if self.read(GHC) & AE == 0 {
             return Err(BlockError::DeviceFault);
         }
+
         let cap = self.read(CAP);
         if cap == u32::MAX {
             return Err(BlockError::DeviceFault);
@@ -178,6 +186,7 @@ impl Host {
             None if actual != 0 && actual & !legal == 0 => actual,
             None => return Err(BlockError::NotReady),
         };
+
         if VERSION_1_2 <= self.read(VERSION) && self.read(CAP2) & CAP2_BIOS_HANDOFF != 0 {
             self.write(BOHC, self.read(BOHC) | OS_OWNED);
             if !poll(Duration::from_secs(2), || {
@@ -186,6 +195,7 @@ impl Host {
                 return Err(BlockError::Busy);
             }
         }
+
         self.write(GHC, AE | HOST_RESET);
         if !poll(Duration::from_secs(1), || self.read(GHC) & HOST_RESET == 0) {
             return Err(BlockError::DeviceFault);
@@ -196,6 +206,7 @@ impl Host {
         if self.read(GHC) & AE == 0 || self.read(PI) != ports {
             return Err(BlockError::DeviceFault);
         }
+
         for index in 0..=last_port {
             if ports & (1 << index) == 0 {
                 continue;
@@ -270,6 +281,7 @@ impl Port {
         );
         let _ = self.read(SCTL);
         timer::sleep(LINK_RESET_HOLD);
+
         // 写入 DET=0 后需等待 200ms 再读回；个别控制器会忽略首次写入。
         let mut restored = sctl;
         for _ in 0..LINK_RESUME_TRIES {
@@ -283,6 +295,7 @@ impl Port {
         if restored & (SATA_IPM_MASK | SATA_DET_MASK) != SATA_DISABLE_LOW_POWER {
             return Err(BlockError::NotReady);
         }
+
         if !poll(Duration::from_secs(1), || {
             self.read(SSTS) & SATA_DET_MASK == SATA_DET_PRESENT
         }) {

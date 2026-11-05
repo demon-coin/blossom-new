@@ -21,6 +21,7 @@ const POLLFD_SIZE: usize = 8;
 const INLINE_POLL_BYTES: usize = 128 * POLLFD_SIZE;
 const EVENT_SIZE: usize = 16;
 const CLOEXEC: u32 = crate::fs::O_CLOEXEC;
+
 const DEFAULT_POLL: PollMask = PollMask(
     PollMask::POLLIN.0 | PollMask::POLLOUT.0 | PollMask::POLLRDNORM.0 | PollMask::POLLWRNORM.0,
 );
@@ -87,9 +88,11 @@ fn create(user: &UserThread, raw: usize) -> SysResult {
     if flags & !CLOEXEC != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("epoll_create1 has no runtime");
     let reservation = runtime.files.reserve(nofile(user))?;
     let file: FileRef = EpollFile::try_new(flags)?;
+
     Ok(reservation.publish(
         file,
         DescriptorFlags {
@@ -112,6 +115,7 @@ fn control(user: &UserThread, raw: [usize; 6]) -> SysResult {
     } else {
         None
     };
+
     let runtime = user.runtime().expect("epoll_ctl has no runtime");
     let owner = runtime.files.lookup(descriptor(raw[0])?)?;
     let fd = raw[2] as i32;
@@ -126,6 +130,7 @@ fn control(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if target.watch_head().is_none() {
         return Err(Errno::NotPermitted);
     }
+
     epoll.control(&owner, operation, &target, fd, event)?;
     Ok(0)
 }
@@ -157,6 +162,7 @@ fn core_ppoll(
     if nofile(user) < nfds {
         return Err(Errno::InvalidArgument);
     }
+
     let length = nfds * POLLFD_SIZE;
     let mut inline = [0u8; INLINE_POLL_BYTES];
     let mut allocated = Vec::new();
@@ -170,6 +176,7 @@ fn core_ppoll(
         allocated.as_mut_slice()
     };
     copyin(mm, bytes, address)?;
+
     let result = wait_fds(user, &runtime.files, &mut Interests::Poll(bytes), deadline);
     // 中断也交付本轮 revents；数组交付错误优先于等待结果，timeout 收尾另行处理。
     for (index, entry) in bytes.chunks_exact(POLLFD_SIZE).enumerate() {
@@ -215,6 +222,7 @@ fn core_pselect(
     if n < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("pselect6 has no runtime");
     let nfds = (n as usize).min(runtime.files.allocated_slots());
     let span = nfds.div_ceil(u64::BITS as usize) * core::mem::size_of::<u64>();
@@ -231,6 +239,7 @@ fn core_pselect(
         nfds,
         span,
     };
+
     for index in 0..3 {
         if sets.addresses[index] != 0 {
             copyin(
@@ -240,12 +249,14 @@ fn core_pselect(
             )?;
         }
     }
+
     let count = wait_fds(
         user,
         &runtime.files,
         &mut Interests::Select(&mut sets),
         deadline,
     )?;
+
     for index in 0..3 {
         if sets.addresses[index] != 0 {
             copyout(mm, sets.addresses[index], &sets.output[index][..sets.span])?;
@@ -371,6 +382,7 @@ impl RegisteredPoll {
             _table: table,
             files: retained,
         };
+
         for index in 0..interests.len() {
             let Some(fd) = interests.descriptor(index) else {
                 continue;
@@ -388,6 +400,7 @@ impl RegisteredPoll {
                 }
             }
         }
+
         Ok(registered)
     }
 
@@ -432,6 +445,7 @@ fn wait_fds(
         if deadline.is_some_and(|limit| limit <= time::now()) {
             return Ok(0);
         }
+
         match &registered {
             Some(waiting) => {
                 waiting.context.park_until(true, deadline);
@@ -457,6 +471,7 @@ fn epoll_pwait(user: &UserThread, request: Request) -> Outcome {
     if let Err(error) = install_mask(user, &mm, raw[4], raw[5]) {
         return Outcome::Return(error.result());
     }
+
     let result = core_epoll_wait(user, &mm, raw, deadline);
     if result != Err(Errno::Interrupted) {
         user.restore_saved_mask();
@@ -486,11 +501,13 @@ fn core_epoll_wait(
     if arch::USER_ADDRESS_END < end {
         return Err(Errno::BadAddress);
     }
+
     let runtime = user.runtime().expect("epoll_pwait has no runtime");
     let owner = runtime.files.lookup(descriptor(raw[0])?)?;
     let epoll = owner.epoll().ok_or(Errno::InvalidArgument)?;
     let signals = user.signals().expect("epoll wait has no signals");
     let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
+
     loop {
         if let Some((context, _)) = &waiting {
             context.clear_triggered();
@@ -514,6 +531,7 @@ fn core_epoll_wait(
         if deadline.is_some_and(|limit| limit <= time::now()) {
             return Ok(0);
         }
+
         match &waiting {
             Some((context, _)) => {
                 context.park_until(true, deadline);
@@ -548,6 +566,7 @@ fn install_mask(user: &UserThread, mm: &Mm, address: usize, size: usize) -> Resu
     if size != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
+
     let mut bytes = [0u8; SIGSET_BYTES];
     copyin(mm, &mut bytes, address)?;
     let signals = user.signals().expect("temporary mask has no signals");
@@ -567,6 +586,7 @@ fn finish_select(
     if !interrupted {
         user.restore_saved_mask();
     }
+
     let mut restart = interrupted;
     if let (Some(address), Some(deadline)) = (timeout.remaining, timeout.deadline) {
         let ns = deadline.as_nanos().saturating_sub(time::now().as_nanos());
@@ -577,6 +597,7 @@ fn finish_select(
             restart = false;
         }
     }
+
     if restart {
         Outcome::Restart(Restart::NoHandler { request })
     } else {
@@ -596,6 +617,7 @@ fn relative_timeout(mm: &Mm, address: usize) -> Result<Timeout, Errno> {
             remaining: None,
         });
     }
+
     let mut bytes = [0u8; 16];
     copyin(mm, &mut bytes, address)?;
     let ns = time_abi::decode_time(&bytes, NSEC_PER_SEC, 1)?;

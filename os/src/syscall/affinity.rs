@@ -13,6 +13,7 @@ fn target(user: &UserThread, pid: usize, changing: bool) -> Result<Arc<Task>, Er
     if pid < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let target = if pid == 0 {
         user.executor().ok_or(Errno::NoProcess)?
     } else {
@@ -44,6 +45,7 @@ pub(super) fn set(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if allowed.is_empty() {
         return Err(Errno::InvalidArgument);
     }
+
     let task = target(user, raw[0], true)?;
     sched::set_affinity(&task, allowed);
     Ok(0)
@@ -57,11 +59,13 @@ pub(super) fn get(user: &UserThread, raw: [usize; 6]) -> SysResult {
     {
         return Err(Errno::InvalidArgument);
     }
+
     let task = target(user, raw[0], false)?;
     let allowed = sched::affinity(&task).intersection(cpu::actual_set());
     let length = length.min(CpuSet::byte_len());
     let mut bytes = [0u8; CpuSet::byte_len()];
     allowed.write_bytes(&mut bytes[..length]);
+
     let mm = user.mm().ok_or(Errno::NoProcess)?;
     copyout(&mm, raw[2], &bytes[..length])?;
     Ok(length as isize)

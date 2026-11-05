@@ -133,6 +133,7 @@ impl IdentitySnapshot {
 pub fn write(level: Level, arguments: fmt::Arguments<'_>) -> u64 {
     let mut text = StackText::<TEXT_CAPACITY>::new();
     fmt::write(&mut text, arguments).expect("klog formatter failed");
+
     let identity = IdentitySnapshot::capture();
     let monotonic_ns = crate::time::now().as_nanos();
     let record = Record {
@@ -145,6 +146,7 @@ pub fn write(level: Level, arguments: fmt::Arguments<'_>) -> u64 {
         task: identity.task,
         bytes: text.bytes,
     };
+
     let sequence = ring::store(record).expect("klog sequence exhausted");
     crate::cpu::kick(0, crate::cpu::KICK_LOG_PRINTER);
     sequence

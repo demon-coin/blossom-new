@@ -18,12 +18,14 @@ pub(crate) const S_IFDIR: u16 = 0o040000;
 pub(crate) const S_IFCHR: u16 = 0o020000;
 /// 管道 inode 类型。
 pub(crate) const S_IFIFO: u16 = 0o010000;
+
 /// 执行时设置属主身份。
 pub(crate) const S_ISUID: u16 = 0o4000;
 /// 执行时设置属组身份。
 pub(crate) const S_ISGID: u16 = 0o2000;
 /// 目录粘滞删除位。
 pub(crate) const S_ISVTX: u16 = 0o1000;
+
 /// 属主读写执行权限。
 pub(crate) const S_IRWXU: u16 = 0o700;
 /// 属组读写执行权限。
@@ -38,12 +40,14 @@ pub(crate) const S_IALLUGO: u16 = S_ISUID | S_ISGID | S_ISVTX | S_IRWXUGO;
 pub(crate) const S_IXUGO: u16 = 0o111;
 /// 属组执行权限位。
 pub(crate) const S_IXGRP: u16 = 0o010;
+
 /// 访问检查的读权限。
 pub(crate) const MAY_READ: u16 = 4;
 /// 访问检查的写权限。
 pub(crate) const MAY_WRITE: u16 = 2;
 /// 访问检查的执行权限。
 pub(crate) const MAY_EXEC: u16 = 1;
+
 /// 单个路径组件的最大字节数。
 pub(crate) const NAME_MAX: usize = 255;
 /// 完整路径的最大字节数，包含结尾 NUL。

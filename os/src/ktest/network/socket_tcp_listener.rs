@@ -20,6 +20,7 @@ pub(crate) mod socket_tcp_listener {
     use crate::net::table::TcpTuple;
     use crate::net::IoProgress;
     use crate::{time, timer};
+
     /// 已领取 child 正常退休不得重发旧 ready 的 ET；后继握手仍须产生新事件并正常归还全部端点。
     #[test]
     fn accepted_child_retirement_does_not_rearm_listener_edge(
@@ -90,6 +91,7 @@ pub(crate) mod socket_tcp_listener {
                 ),
             )?;
         }
+
         let client_b = operation(
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
@@ -243,6 +245,7 @@ pub(crate) mod socket_tcp_listener {
             operation(context, listener.poll(None))?,
             PollMask::default(),
         );
+
         for (client, server) in [(&client_b, &server_b), (&client_c, &server_c)] {
             operation(context, client.shutdown(SHUT_WR))?;
             context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
@@ -325,6 +328,7 @@ pub(crate) mod socket_tcp_listener {
             .ok_or(TestError(
                 "passive handshake child is missing from actual TCP tuple table",
             ))?;
+
         let initial_state = child.state();
         context.diagnostic(format_args!(
             "network-socket handshake_ack_dropped={} child_id={} initial_state={:?} listener_state={:?}",
@@ -372,6 +376,7 @@ pub(crate) mod socket_tcp_listener {
         context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
         context.expect_eq(server.tcp_endpoint().unwrap().state(), State::CloseWait);
+
         socket_write_all(&server, b"accepted after FIN")?;
         let mut output = [0u8; 18];
         socket_read_exact(&client, &mut output)?;
@@ -379,6 +384,7 @@ pub(crate) mod socket_tcp_listener {
         operation(context, server.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, client.read(&mut [0u8; 1]))?, 0);
         context.expect_eq(listener.tcp_endpoint().unwrap().state(), State::Listen);
+
         let child_weak = Arc::downgrade(&child);
         let client_weak = Arc::downgrade(client.tcp_endpoint().unwrap());
         let server_file_weak = Arc::downgrade(&server);
@@ -429,11 +435,13 @@ pub(crate) mod socket_tcp_listener {
             listeners.push(endpoint);
         }
         context.expect_eq(fixture.net.ktest_live_endpoints(), 129);
+
         for endpoint in &listeners {
             endpoint.close();
         }
         drop(listeners);
         socket_retired(&fixture.net)?;
+
         for ordinal in 0..129 {
             let local = InetEndpoint {
                 port: 46000 + ordinal,
@@ -490,6 +498,7 @@ pub(crate) mod socket_tcp_listener {
             clients.push(client);
         }
         context.expect_eq(fixture.net.ktest_live_endpoints(), 259);
+
         fixture.net.work_queue().flush();
         let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let evidence = pressure.exhaust();
@@ -504,6 +513,7 @@ pub(crate) mod socket_tcp_listener {
         if evidence != (true, true) || repeated.is_err() || shrunk.is_err() || restored.is_err() {
             return Err(TestError("repeated listen allocated or discarded backlog"));
         }
+
         for client in &clients {
             servers.push(super::stack_helpers::accepted(context, &listener, client)?);
         }
@@ -511,6 +521,7 @@ pub(crate) mod socket_tcp_listener {
             operation(context, listener.poll(None))?,
             PollMask::default(),
         );
+
         for (ordinal, (client, server)) in clients.iter().zip(&servers).enumerate() {
             let input: [u8; 97] =
                 ::core::array::from_fn(|offset| super::support::pattern(ordinal * 97 + offset));
@@ -541,6 +552,7 @@ pub(crate) mod socket_tcp_listener {
                 timer::sleep(time::Duration::from_millis(1));
             }
             context.expect_eq(output, input);
+
             client.close();
             observe(
                 || server.state() == State::CloseWait,
@@ -561,6 +573,7 @@ pub(crate) mod socket_tcp_listener {
                 "growth client did not enter actual TIME_WAIT",
             )?;
         }
+
         let first = Arc::downgrade(&clients[0]);
         let last = Arc::downgrade(&servers[128]);
         listener.close();

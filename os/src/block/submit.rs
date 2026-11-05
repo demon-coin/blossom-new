@@ -155,6 +155,7 @@ impl ReadBatchObservation {
             source += pages;
         }
         self.snapshot.captured_pages = output;
+
         let mut last = READ_BATCH.lock();
         self.snapshot.sequence = last
             .as_ref()
@@ -203,6 +204,7 @@ impl FsClaim {
                 return Err(error);
             }
         };
+
         let (completion, result) =
             self.disk()
                 .read_folio_bio(absolute, read, None, memory, Some(self))?;
@@ -231,6 +233,7 @@ impl FsClaim {
                 return Err(error);
             }
         };
+
         let (completion, result) = self.disk().read_folio_bio(
             absolute,
             read,
@@ -273,6 +276,7 @@ impl FsClaim {
                     }
                 }
             }
+
             #[cfg(feature = "ktest")]
             let observation = ReadBatchObservation::new(self, &bios);
             self.submit_batch(bios);
@@ -312,6 +316,7 @@ impl FsClaim {
         if count == 0 {
             return Err(BlockError::InvalidRange);
         }
+
         let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(count)
@@ -332,6 +337,7 @@ impl FsClaim {
         if memory.is_empty() {
             return Err(preparation_error.expect("empty read batch has no preparation error"));
         }
+
         // SAFETY: 每份 read 独占一个原页内容锁且保原 inode，CPU 初始化别名均已结束。
         // 连续磁盘范围直接映射这些原页；无回调，Bio 在全部真实 child 和生成者结束后
         // 才收权并发布各页结果，FS claim 由同一正式准入保存到原队列全尾。
@@ -418,6 +424,7 @@ impl FsClaim {
                     }
                 }
             }
+
             self.submit_batch(bios.iter_mut().filter_map(Option::take));
             let mut first_error = None;
             for entry in completions.iter_mut() {
@@ -439,6 +446,7 @@ impl FsClaim {
                 }
                 drop(completion);
             }
+
             if let Some(error) = first_error.or(preparation_error) {
                 return Err(error);
             }
@@ -497,6 +505,7 @@ impl FsClaim {
         if memory.is_empty() {
             return Err(preparation_error.expect("empty writeback prefix has no error"));
         }
+
         // SAFETY: 凭证来自已初始化原页，已完成共享撤权及 CSD，不导出内容切片。
         // 每映射只记录自己的真实接受和未接受恢复；全部 child 与生成者收权前不结束 WB。
         let bio = unsafe {
@@ -687,6 +696,7 @@ impl Disk {
             plan.count = 1;
             return Ok(plan);
         }
+
         let limits = self.limits();
         let mut bytes = 0;
         let mut index = first;
@@ -795,6 +805,7 @@ impl Disk {
             };
             return Err(error);
         }
+
         let mapped = match range {
             Some((offset, len)) => MappedPages::from_folio_range(read, offset, len),
             None => MappedPages::from_folio(read),
@@ -813,6 +824,7 @@ impl Disk {
                 return Err(error);
             }
         };
+
         memory.push(mapped);
         // SAFETY: 唯一 read owner 保活并独占内容锁，全部 CPU 借用已经结束；
         // Read 无回调且不要求初始内容有效，Bio 全尾真实收权后才结束本段责任。
@@ -867,6 +879,7 @@ impl Disk {
         if offset % logical != 0 || (dst.len() as u64) % logical != 0 {
             return Err(BlockError::Misaligned);
         }
+
         let total = dst.len();
         let page_count = total / PAGE_SIZE + usize::from(total % PAGE_SIZE != 0);
         let mut memory = Vec::new_in(BioAllocator::Heap);
@@ -882,6 +895,7 @@ impl Disk {
             memory.push(mapped);
             remaining -= length;
         }
+
         // SAFETY: 每个映射持有独占原零页，全部 CPU 别名在移入前结束；读请求无回调，
         // 页在 Bio 最终完成前不被 CPU 使用，失败与短读也不将未成功数据复制到 dst。
         let bio = unsafe {
@@ -905,6 +919,7 @@ impl Disk {
         if result.completed != total {
             return Err(BlockError::ShortIo);
         }
+
         let mut copied = 0;
         for mapped in &memory {
             // SAFETY: 原页分配时整页清零，整个读取范围已全长成功；wait/take_memory
@@ -1013,6 +1028,7 @@ fn append_prefix(
         scan.advance(bio, length)?;
         bytes += length;
     }
+
     let logical = limits.logical_block_size as usize;
     let prefix = bytes / logical * logical;
     trim_tail(sg, bytes - prefix);

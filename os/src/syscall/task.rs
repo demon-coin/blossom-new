@@ -26,6 +26,7 @@ const RLIMIT_NPROC: u32 = 6;
 const RLIMIT_NOFILE: u32 = 7;
 const RLIMIT_SIGPENDING: u32 = 11;
 const RLIM_NLIMITS: u32 = 16;
+
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
 const P_PGID: i32 = 2;
@@ -44,6 +45,7 @@ pub(super) fn execve(user: &UserThread, request: Request) -> Outcome {
         Ok(prepared) => prepared,
         Err(error) => return Outcome::Return(error.result()),
     };
+
     let identity = user.identity().expect("exec has no identity");
     if identity.graph().de_thread(&identity).is_err() {
         return abort_exec(user);
@@ -52,6 +54,7 @@ pub(super) fn execve(user: &UserThread, request: Request) -> Outcome {
         Ok(runtime) => runtime,
         Err(_) => return abort_exec(user),
     };
+
     user.install_image(image, runtime);
     if identity.graph().complete_exec(&identity).is_err() {
         return abort_exec(user);
@@ -72,6 +75,7 @@ fn prepare_exec(user: &UserThread, raw: [usize; 6]) -> Result<(LoadedImage, User
         .current;
     let arguments =
         Arguments::from_user(&mm, pathname, raw[1], raw[2], stack_limit).map_err(exec_error)?;
+
     let (vfs, context) = {
         let fs = runtime.fs.lock();
         (fs.vfs.clone(), fs.context.clone())
@@ -131,6 +135,7 @@ fn resource_limit(
         RLIMIT_SIGPENDING => Resource::SigPending,
         _ => return Err(Errno::NoSyscall),
     };
+
     let mm = user.mm().expect("rlimit has no MM");
     let new = match new_address {
         Some(address) => {
@@ -146,10 +151,12 @@ fn resource_limit(
     if pid < 0 {
         return Err(Errno::NoProcess);
     }
+
     let identity = user.identity().expect("rlimit has no identity");
     let old = identity
         .graph()
         .prlimit(&identity, pid as usize, resource, new)?;
+
     if let Some(address) = old_address {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&old.current.to_le_bytes());
@@ -172,6 +179,7 @@ pub(super) fn identity(user: &UserThread, number: usize, raw: [usize; 6]) -> Sys
             _ => unreachable!("credential dispatch outside range"),
         });
     }
+
     let identity = user.identity().expect("identity syscall has no identity");
     let graph = identity.graph();
     match number {
@@ -204,6 +212,7 @@ pub(super) fn waitid(user: &UserThread, request: Request) -> Outcome {
     {
         return Outcome::Return(Errno::InvalidArgument.result());
     }
+
     let identity = user.identity().expect("waitid has no identity");
     let selector = match raw[0] as i32 {
         P_ALL => Ok(WaitSelector::Any),
@@ -224,10 +233,12 @@ pub(super) fn waitid(user: &UserThread, request: Request) -> Outcome {
         Ok(selector) => selector,
         Err(error) => return Outcome::Return(error.result()),
     };
+
     let event = match wait_event(user, request, &selector, options) {
         Ok(event) => event,
         Err(outcome) => return outcome,
     };
+
     let result: SysResult = (|| {
         let mm = user.mm().expect("waitid has no MM");
         let mut bytes = [0u8; SIGINFO_BYTES];
@@ -264,6 +275,7 @@ pub(super) fn wait4(user: &UserThread, request: Request) -> Outcome {
     if options & !(NOHANG | STOPPED | CONTINUED | WALL | WCLONE) != 0 {
         return Outcome::Return(Errno::InvalidArgument.result());
     }
+
     let identity = user.identity().expect("wait4 has no identity");
     let pid = raw[0] as i32;
     let selector = match pid {
@@ -285,11 +297,13 @@ pub(super) fn wait4(user: &UserThread, request: Request) -> Outcome {
         Ok(selector) => selector,
         Err(error) => return Outcome::Return(error.result()),
     };
+
     let event = match wait_event(user, request, &selector, options | EXITED) {
         Ok(Some(event)) => event,
         Ok(None) => return Outcome::Return(0),
         Err(outcome) => return outcome,
     };
+
     let result: SysResult = (|| {
         let mm = user.mm().expect("wait4 has no MM");
         let status = match event.code {
@@ -328,6 +342,7 @@ fn wait_event(
             Ok(None) if options & NOHANG != 0 => return Ok(None),
             Ok(None) => {}
         }
+
         let waiter = Waiter::new_interruptible();
         let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
         // SAFETY: identity保活通知源；node固定本栈，registration先于node/Waiter撤除。

@@ -22,6 +22,7 @@ pub use options::TmpfsOptions;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const DEVFS_MAGIC: u64 = 0x1373;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+
 const MEMORY_DEVICE_BASE: u64 = 1u64 << u32::BITS;
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(MEMORY_DEVICE_BASE);
 
@@ -238,6 +239,7 @@ impl MemoryFs {
             }),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let metadata = InodeMetadata::memory(
             InodeKind::Directory,
             S_IFDIR | (root_mode & S_IALLUGO),
@@ -328,6 +330,7 @@ impl MemoryFs {
                 return Err(FsError::InvalidOperation);
             }
         }
+
         if let Some(limit) = options.blocks {
             index.max_pages = limit;
         }
@@ -470,6 +473,7 @@ impl MemoryFs {
             index.next_number = number.checked_add(1).ok_or(FsError::NoSpace)?;
             (position, number, growth)
         };
+
         let mut prepared = Vec::new();
         if let Some(length) = growth {
             prepared
@@ -484,6 +488,7 @@ impl MemoryFs {
             number,
             inode: weak,
         };
+
         let (retired_slot, retired_buffer) = {
             let mut index = self.index.lock();
             if let Some(position) = position {
@@ -502,6 +507,7 @@ impl MemoryFs {
                 (None, retired)
             }
         };
+
         drop((retired_slot, retired_buffer));
         Ok(inode)
     }
@@ -559,6 +565,7 @@ impl MemoryFs {
                 return Err(FsError::InvalidOperation);
             }
         }
+
         let cache = match cache {
             Some(cache) => cache,
             None => DentryCache::try_new(capacity)?,
@@ -567,6 +574,7 @@ impl MemoryFs {
             Some(root) => root,
             None => DentryRef::try_root(self.root())?,
         };
+
         let mut index = self.index.lock();
         index.namespace = Arc::downgrade(&cache);
         index.root_dentry = root.downgrade();

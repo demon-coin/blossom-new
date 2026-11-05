@@ -35,8 +35,10 @@ const RO: PagePermissions = PagePermissions {
     write: false,
     execute: false,
 };
+
 const SOURCE: usize = 0x4800_0000;
 const PROGRAM_WRITE: &[u8] = b"/test/bin/user-write";
+
 const SHARED_CONTROL: usize = 0x4900_0000;
 const SHARED_FILE_OFFSET: usize = 24;
 pub(super) const SHARED_ALIAS: usize = 0x4a00_0000;
@@ -56,6 +58,7 @@ impl SyncObservation {
             .and_then(alloc::sync::Weak::upgrade)
             .is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
+
     /// 返回真实同步调用已经写下的结果，不用观察任务退出代替底层结果。
     pub(super) fn result(&self) -> Option<Result<(), FsError>> {
         *self.result.lock()
@@ -108,6 +111,7 @@ impl WriteOwner {
             .map_err(|_| TestError("write inode owner OOM"))?;
         self.user.prepare_mode(context, AccessMode::ReadWrite, 4)
     }
+
     /// 原生 namespace 消费者沿同一 RW PathOwner 准备，并让原清理无论 graph 状态都同步此卷。
     pub(super) fn prepare_namespace(&mut self, context: &TestContext<'_>) -> TestResult {
         self.prepare(context)?;
@@ -115,6 +119,7 @@ impl WriteOwner {
         self.cold_volume = Some(self.volume());
         Ok(())
     }
+
     /// 准备可由测试组写入的 setgid 目录与只允许 root 搜索的负例子目录。
     fn prepare_namespace_parent(&mut self, context: &TestContext<'_>) -> TestResult {
         let vfs = self.user.path.vfs().clone();
@@ -126,6 +131,7 @@ impl WriteOwner {
         )?;
         let workspace = self.open(context, b"/test/ns-work", 0x10000)?;
         let inode = checked(context, workspace.path().unwrap().inode())?.clone();
+
         // mkdir 不接受 SGID 模式位；父目录的继承属性通过受保护元数据更新设置。
         checked(
             context,
@@ -135,6 +141,7 @@ impl WriteOwner {
             }),
         )?;
         drop(workspace);
+
         checked(
             context,
             vfs.mkdir_from(
@@ -149,6 +156,7 @@ impl WriteOwner {
         drop(self.open(context, b"/test/ns-work/ns-permission", 0x10000)?);
         Ok(())
     }
+
     /// 删除普通用户无权移除的预置权限目录与最后一层测试目录。
     fn remove_namespace_parent(&self, context: &TestContext<'_>) -> TestResult {
         let vfs = self.user.path.vfs();
@@ -186,11 +194,13 @@ impl WriteOwner {
             }
             self.inodes.push(inode);
         }
+
         checked(
             context,
             open_path_with_flags(self.user.path.vfs(), path, flags, FileIoContext::Kernel),
         )
     }
+
     /// 保留末组件本身的 canonical inode，symlink 不跟随到其目标。
     fn hold_nofollow(
         &mut self,
@@ -236,6 +246,7 @@ impl WriteOwner {
         ] {
             drop(self.open(context, pathname, 0)?);
         }
+
         let image = self.user.load_named(context, PROGRAM_WRITE, mode)?;
         self.user.start_program(
             context,
@@ -245,6 +256,7 @@ impl WriteOwner {
             false,
             Credentials::ROOT,
         )?;
+
         let event = self.user.wait(context)?;
         if event.status != 0 {
             self.user.graph().request_root_exit(9);
@@ -271,6 +283,7 @@ impl WriteOwner {
                 source: MmapSource::SharedAnonymous,
             }),
         )?;
+
         if image.mm.copyout(SHARED_CONTROL, &[0; 32]).copied != 32 {
             return Err(TestError("shared control initialization failed"));
         }
@@ -289,6 +302,7 @@ impl WriteOwner {
             Credentials::ROOT,
         )
     }
+
     /// 按指定的真实用户身份启动同一普通 ELF，并保留原 UserOwner 的 wait/join。
     fn start_shared_as(
         &mut self,
@@ -317,12 +331,14 @@ impl WriteOwner {
                 .try_join()
                 .is_some()
         })?;
+
         let event = self.user.wait(context)?;
         if event.status != 0 {
             self.user.graph().request_root_exit(9);
         }
         self.user.reap_children(context, event.status != 0)?;
         context.expect_eq(event.status, 0);
+
         self.shared_mm.take();
         Ok(())
     }
@@ -384,6 +400,7 @@ impl WriteOwner {
             0
         })
         .map_err(|_| TestError("sync consumer prepare failed"))?;
+
         self.consumers[index] = Some(prepared.publish());
         Ok(observation)
     }
@@ -406,6 +423,7 @@ impl WriteOwner {
         let cache = Arc::try_new(checked(context, InodeCache::try_new(64))?)
             .map_err(|_| TestError("cold cache owner OOM"))?;
         self.cold_cache = Some(cache.clone());
+
         let vfs = checked(
             context,
             Vfs::try_new(
@@ -446,6 +464,7 @@ impl WriteOwner {
         let weak_cache = Arc::downgrade(self.cold_cache.as_ref().unwrap());
         assert!(self.eviction.is_none());
         self.eviction = Some(self.cold_cache.as_ref().unwrap().watch());
+
         drop((mm, file, inode, volume));
         self.inodes.clear();
         drop(self.cold_cache.take());
@@ -453,6 +472,7 @@ impl WriteOwner {
         drop(self.eviction.take());
         drop(self.cold_volume.take());
         disk.test_flush_completions();
+
         context.expect_eq(disk.test_snapshot().inflight, 0);
         context.expect_eq(weak_mm.upgrade().is_none(), true);
         context.expect_eq(weak_file.upgrade().is_none(), true);
@@ -467,9 +487,11 @@ impl WriteOwner {
         {
             return Err(TestError("cold reload still has old FS owners"));
         }
+
         let reads_before = disk.test_snapshot().submitted;
         Ok((self.cold_open(context)?.0, reads_before))
     }
+
     /// 未离栈句柄留在 fixture，错误返回仍先恢复设备完成再进行有限 join。
     pub(super) fn join_consumers(&mut self) -> TestResult {
         for join in self.consumers.iter().flatten() {
@@ -477,6 +499,7 @@ impl WriteOwner {
                 join.try_join().is_some()
             })?;
         }
+
         let mut first = None;
         for join in &mut self.consumers {
             if let Some(join) = join.take() {
@@ -531,6 +554,7 @@ impl Fixture<UserSuite> for WriteOwner {
             gate.complete();
             gate.complete();
         }
+
         self.user
             .path
             .owner
@@ -544,6 +568,7 @@ impl Fixture<UserSuite> for WriteOwner {
         if let Some(graph) = &self.user.graph {
             graph.request_root_exit(9);
         }
+
         let mut first = self.join_consumers().err();
         if self.consumers.iter().any(Option::is_some) {
             return Err(first.unwrap_or(TestError("consumer still owns original stack")));
@@ -569,6 +594,7 @@ impl Fixture<UserSuite> for WriteOwner {
             self.user.reap_children(context, true)?;
         }
         self.user.release_pressure();
+
         for inode in &self.inodes {
             let result = crate::fs::writeback::sync_inode(inode);
             if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
@@ -589,6 +615,7 @@ impl Fixture<UserSuite> for WriteOwner {
         {
             return Err(first.unwrap_or(TestError("write cleanup retains actual Dirty or WB")));
         }
+
         if self.eviction.is_none() {
             self.eviction = self.cold_cache.as_ref().map(|cache| cache.watch());
         }
@@ -606,6 +633,7 @@ impl Fixture<UserSuite> for WriteOwner {
             }
             drop(self.eviction.take());
         }
+
         let volume = self
             .cold_volume
             .clone()
@@ -630,6 +658,7 @@ impl Fixture<UserSuite> for WriteOwner {
         } else if self.user.graph.is_some() && metadata_pending(&self.volume()) {
             return Err(first.unwrap_or(TestError("write cleanup retains metadata Dirty or WB")));
         }
+
         self.inodes.clear();
         drop(core::mem::take(&mut self.inodes));
         drop(self.cold_cache.take());
@@ -729,6 +758,7 @@ pub(super) fn allocation_counts(
     )?;
     let super_free = checked(context, decoded)?;
     drop(superblock);
+
     let mut sum = (0, 0);
     for group in 0..g.groups_count {
         let byte = group * g.descriptor_size as u64;
@@ -753,6 +783,7 @@ pub(super) fn allocation_counts(
                 .map_err(FsError::Io),
         )?;
         drop(descriptor);
+
         let layout = checked(
             context,
             codec::group_layout(g, group, &record[..g.descriptor_size]),
@@ -760,6 +791,7 @@ pub(super) fn allocation_counts(
         let state = checked(context, codec::group_state(g, &record[..g.descriptor_size]))?;
         sum.0 += u64::from(state.free_blocks);
         sum.1 += u64::from(state.free_inodes);
+
         for (inode, physical, uninitialized, expected, total) in [
             (
                 false,
@@ -829,11 +861,13 @@ pub(super) fn inode_allocation_bit(volume: &Ext4Volume, number: u64) -> Result<b
         record[..g.descriptor_size].copy_from_slice(&bytes[offset..offset + g.descriptor_size]);
     })?;
     drop(descriptor);
+
     let layout = codec::group_layout(g, group, &record[..g.descriptor_size])?;
     let state = codec::group_state(g, &record[..g.descriptor_size])?;
     if state.flags & 1 != 0 {
         return Err(FsError::Corrupt);
     }
+
     let bitmap = volume
         .metadata_cache()
         .get(layout.inode_bitmap, g.block_size, None)?;
@@ -862,6 +896,7 @@ pub(super) fn block_allocation_bit(
     if g.validate_blocks(physical, 1).is_err() {
         return Ok(Some(true));
     }
+
     let group = (physical - g.first_data_block) / g.blocks_per_group;
     let bit = (physical - g.first_data_block) % g.blocks_per_group;
     let byte = group * g.descriptor_size as u64;
@@ -876,6 +911,7 @@ pub(super) fn block_allocation_bit(
         record[..g.descriptor_size].copy_from_slice(&bytes[at..at + g.descriptor_size]);
     })?;
     drop(descriptor);
+
     let layout = codec::group_layout(g, group, &record[..g.descriptor_size])?;
     let state = codec::group_state(g, &record[..g.descriptor_size])?;
     if state.flags & 2 != 0 {
@@ -885,6 +921,7 @@ pub(super) fn block_allocation_bit(
         // 未初始化 bitmap 不含权威位；正式 free_blocks=0 时 allocator 会跳过整组。
         return Ok((state.free_blocks == 0).then_some(true));
     }
+
     let bitmap = volume
         .metadata_cache()
         .get(layout.block_bitmap, g.block_size, None)?;
@@ -935,6 +972,7 @@ fn extent_tree(
                 .with_read(|data| bytes[..data.len()].copy_from_slice(data))
                 .map_err(FsError::Io)?;
             drop(buffer);
+
             let child = codec::extent_header(
                 &bytes[..volume.geometry().block_size],
                 Some(header.depth - 1),
@@ -968,11 +1006,13 @@ fn indirect_tree(
     if physical == 0 {
         return Ok(());
     }
+
     account_block(volume, physical, tree)?;
     if depth == 0 {
         tree.data += 1;
         return Ok(());
     }
+
     let buffer = volume.metadata_block(physical)?;
     let mut bytes = [0u8; 4096];
     buffer
@@ -996,6 +1036,7 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
             (data.blocks * SECTOR_BYTES / volume.geometry().block_size as u64) as usize,
         )
         .map_err(|_| TestError("write tree observations OOM"))?;
+
     if data.flags & codec::EXTENTS != 0 {
         let header = checked(context, codec::extent_header(&data.block, None))?;
         tree.depth = header.depth;
@@ -1016,6 +1057,7 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
             )?;
         }
     }
+
     tree.blocks.sort_unstable();
     context.expect_eq(tree.blocks.windows(2).all(|pair| pair[0] != pair[1]), true);
     context.expect_eq(
@@ -1042,6 +1084,7 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
 struct PagePressure {
     pages: Vec<mm::OwnedPages>,
 }
+
 impl PagePressure {
     /// 固定容量记录原页凭证，压力期间不分配控制对象。
     fn prepare() -> Result<Self, TestError> {
@@ -1051,6 +1094,7 @@ impl PagePressure {
             .map_err(|_| TestError("write page pressure slots OOM"))?;
         Ok(Self { pages })
     }
+
     /// 原 allocator 的真实 None 是页耗尽证据；放压由原凭证 Drop 归还。
     fn exhaust(&mut self) -> bool {
         mm::shrink_all();
@@ -1061,6 +1105,7 @@ impl PagePressure {
                 self.pages.push(page);
             }
         }
+
         mm::drain_all_pages();
         mm::alloc_pages(0, false).is_none()
     }
@@ -1104,6 +1149,7 @@ fn prepare_unlinked_original_writeback(
     ranges
         .try_reserve_exact(PAGE_SIZE / block_size)
         .map_err(|_| FsError::NoMemory)?;
+
     let mut content = folio.lock_content();
     inode.mapping().mkclean(0, &folio, &mut content);
     let dirty = folio.dirty_sectors();
@@ -1122,6 +1168,7 @@ fn prepare_unlinked_original_writeback(
             ));
         }
     }
+
     drop(content);
     drop(folio);
     if ranges.is_empty() {
@@ -1140,6 +1187,7 @@ fn inode_record_snapshot(
     if size != 128 && size != 256 {
         return Err(TestError("inode reuse record size is unsupported"));
     }
+
     let (buffer, offset) = checked(context, volume.inode_record(number, None))?;
     let mut record = [0; 256];
     checked(

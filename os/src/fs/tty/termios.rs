@@ -168,6 +168,7 @@ pub const CBAUD: u32 = 0x0000_100f;
     reason = "保留 termios UAPI 自定义波特率编码，当前标准速率表不接受 BOTHER"
 )]
 pub const BOTHER: u32 = 0x0000_1000;
+
 /// CSIZE 字长掩码。
 pub const CSIZE: u32 = 0x0000_0030;
 /// CS5 字长。
@@ -190,6 +191,7 @@ pub const PARODD: u32 = 0x0000_0200;
 pub const HUPCL: u32 = 0x0000_0400;
 /// CLOCAL 本地连接。
 pub const CLOCAL: u32 = 0x0000_0800;
+
 /// CIBAUD 输入波特率掩码。
 pub const CIBAUD: u32 = CBAUD << IBSHIFT;
 /// IBSHIFT 输入波特率移位。
@@ -254,12 +256,14 @@ pub const TCSANOW: u32 = 0;
 pub const TCSADRAIN: u32 = 1;
 /// 排空输出并清输入后提交 termios。
 pub const TCSAFLUSH: u32 = 2;
+
 /// 丢弃未读输入。
 pub const TCIFLUSH: u32 = 0;
 /// 丢弃未发输出。
 pub const TCOFLUSH: u32 = 1;
 /// 同时丢弃输入和输出。
 pub const TCIOFLUSH: u32 = 2;
+
 /// 暂停本地输出。
 pub const TCOOFF: u32 = 0;
 /// 恢复本地输出。
@@ -268,6 +272,7 @@ pub const TCOON: u32 = 1;
 pub const TCIOFF: u32 = 2;
 /// 向远端发送开始字符。
 pub const TCION: u32 = 3;
+
 /// 默认波特率的目标 CBAUD 编码。
 pub const B38400: u32 = 0x0f;
 
@@ -383,6 +388,7 @@ impl Termios {
                 bytes[31], bytes[32], bytes[33], bytes[34], bytes[35],
             ],
         };
+
         termios.validate()?;
         Ok(termios)
     }
@@ -430,6 +436,7 @@ fn validate_cflag(cflag: u32) -> Result<(), FsError> {
     if cflag & (CRTSCTS | CMSPAR) != 0 {
         return Err(FsError::InvalidOperation);
     }
+
     let output = cflag & CBAUD;
     if baud_rate(output).is_none() {
         return Err(FsError::InvalidOperation);
@@ -441,6 +448,7 @@ fn validate_cflag(cflag: u32) -> Result<(), FsError> {
     if input != 0 && baud_rate(input).is_none() {
         return Err(FsError::InvalidOperation);
     }
+
     let known = CSIZE | CSTOPB | CREAD | PARENB | PARODD | HUPCL | CLOCAL | CBAUD | CIBAUD;
     if cflag & !known != 0 {
         return Err(FsError::InvalidOperation);
@@ -469,6 +477,7 @@ pub fn divisor_for_baud(baud_base: u32, baud: u32) -> Option<u16> {
     if baud == 0 || baud_base == 0 {
         return None;
     }
+
     let numerator = u64::from(baud_base);
     let denominator = u64::from(baud);
     let quotient = (numerator + denominator / 2) / denominator;
@@ -511,6 +520,7 @@ pub fn serial_config(
     } else {
         divisor_for_baud(crate::console::baud_base(), baud)?
     };
+
     let hung_up = baud == 0;
     Some(SerialConfig {
         divisor,
@@ -527,6 +537,7 @@ pub fn character_nanos(divisor: u16, baud_base: u32, cflag: u32) -> Option<u64> 
     if divisor == 0 || baud_base == 0 {
         return None;
     }
+
     let mut bits = 2u64 + u64::from(char_size(cflag));
     if cflag & CSTOPB != 0 {
         bits += 1;
@@ -534,6 +545,7 @@ pub fn character_nanos(divisor: u16, baud_base: u32, cflag: u32) -> Option<u64> 
     if cflag & PARENB != 0 {
         bits += 1;
     }
+
     let numerator = bits
         .checked_mul(u64::from(divisor))?
         .checked_mul(crate::time::NSEC_PER_SEC)?;

@@ -22,6 +22,7 @@ use crate::time::NSEC_PER_SEC;
 
 const AT_FDCWD: i32 = -100;
 const FIONBIO: u32 = 0x5421;
+
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_EACCESS: u32 = 0x200;
@@ -32,6 +33,7 @@ const STATX_RESERVED: u32 = 0x8000_0000;
 const AT_REMOVEDIR: u32 = 0x200;
 const AT_SYMLINK_FOLLOW: u32 = 0x400;
 const RENAME_NOREPLACE: u32 = 1;
+
 const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
 const F_SETFD: u32 = 2;
@@ -40,24 +42,30 @@ const F_SETFL: u32 = 4;
 const F_LINUX_SPECIFIC_BASE: u32 = 1024;
 const F_DUPFD_CLOEXEC: u32 = F_LINUX_SPECIFIC_BASE + 6;
 const FD_CLOEXEC: usize = 1;
+
 const SEEK_SET: u32 = 0;
 const SEEK_CUR: u32 = 1;
 const SEEK_END: u32 = 2;
+
 const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SPLICE_F_MORE: u32 = 0x04;
 const SPLICE_F_GIFT: u32 = 0x08;
 const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+
 const UTIME_NOW: i64 = (1 << 30) - 1;
 const UTIME_OMIT: i64 = UTIME_NOW - 1;
 const MAX_NANOSECONDS: i64 = NSEC_PER_SEC as i64 - 1;
+
 const UIO_FASTIOV: usize = 8;
+
 const DIRENT64_NAME_OFFSET: usize = 19;
 const DIRENT64_ALIGNMENT: usize = core::mem::size_of::<u64>();
 const DIRENT64_MAX_SIZE: usize =
     (DIRENT64_NAME_OFFSET + NAME_MAX + 1 + DIRENT64_ALIGNMENT - 1) & !(DIRENT64_ALIGNMENT - 1);
 const STAT_SIZE: usize = 128;
 const STATX_SIZE: usize = 256;
+
 const S_DT_SHIFT: u32 = 12;
 const DT_UNKNOWN: u8 = 0;
 const DT_FIFO: u8 = (S_IFIFO >> S_DT_SHIFT) as u8;
@@ -67,6 +75,7 @@ const DT_BLK: u8 = (S_IFBLK >> S_DT_SHIFT) as u8;
 const DT_REG: u8 = (S_IFREG >> S_DT_SHIFT) as u8;
 const DT_LNK: u8 = (S_IFLNK >> S_DT_SHIFT) as u8;
 const DT_SOCK: u8 = (S_IFSOCK >> S_DT_SHIFT) as u8;
+
 const OPENAT_SUPPORTED: u32 = O_ACCMODE
     | O_CREAT
     | O_EXCL
@@ -79,6 +88,7 @@ const OPENAT_SUPPORTED: u32 = O_ACCMODE
     | O_NOFOLLOW
     | O_NOCTTY
     | O_CLOEXEC;
+
 pub(super) const MAX_RW_COUNT: usize = i32::MAX as usize & !(PAGE_SIZE - 1);
 pub(super) const MAX_IOV_COUNT: usize = 1024;
 
@@ -97,16 +107,19 @@ pub(super) fn pipe2(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("pipe2 has no runtime");
     let reader_slot = runtime.files.reserve(nofile(user))?;
     let writer_slot = runtime.files.reserve(nofile(user))?;
     let (reader, writer) =
         fs::pipe::try_new(flags, runtime.credentials.uid, runtime.credentials.gid)?;
+
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(reader_slot.fd() as u32).to_le_bytes());
     bytes[4..].copy_from_slice(&(writer_slot.fd() as u32).to_le_bytes());
     let mm = user.mm().expect("pipe2 has no MM");
     copyout(&mm, raw[0], &bytes)?;
+
     let descriptor_flags = DescriptorFlags {
         close_on_exec: flags & O_CLOEXEC != 0,
     };
@@ -144,6 +157,7 @@ pub(super) fn copy_file_range(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[5] as u32 != 0 || (raw[4] as isize) < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let accepted = fs::transfer::copy_file_range(
         &source,
         source_offset.as_mut(),
@@ -152,6 +166,7 @@ pub(super) fn copy_file_range(user: &UserThread, raw: [usize; 6]) -> SysResult {
         raw[4].min(MAX_RW_COUNT),
         FileIoContext::User(user),
     )?;
+
     if 0 < accepted {
         // 两个 copyback 都按真实进度尝试，第一端故障不阻止第二端更新。
         let input = store_transfer_offset(&mm, raw[1], source_offset);
@@ -171,6 +186,7 @@ pub(super) fn splice(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !SPLICE_F_ALL != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("splice has no runtime");
     let source = runtime.files.lookup(descriptor(raw[0])?)?;
     let target = runtime.files.lookup(descriptor(raw[2])?)?;
@@ -178,12 +194,14 @@ pub(super) fn splice(user: &UserThread, raw: [usize; 6]) -> SysResult {
     {
         return Err(Errno::IllegalSeek);
     }
+
     let mm = user.mm().expect("splice has no MM");
     let mut target_offset = transfer_offset(&mm, raw[3])?;
     let mut source_offset = transfer_offset(&mm, raw[1])?;
     if (raw[4] as isize) < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let accepted = fs::transfer::splice(
         &source,
         source_offset.as_mut(),
@@ -193,6 +211,7 @@ pub(super) fn splice(user: &UserThread, raw: [usize; 6]) -> SysResult {
         flags,
         FileIoContext::User(user),
     )?;
+
     store_transfer_offset(&mm, raw[3], target_offset)?;
     store_transfer_offset(&mm, raw[1], source_offset)?;
     Ok(accepted as isize)
@@ -212,6 +231,7 @@ pub(super) fn import_vectors<'a>(
     if count == 0 {
         return Ok(Cow::Borrowed(&fast[..0]));
     }
+
     let mut heap = Vec::new();
     let vectors = if count <= fast.len() {
         &mut fast[..count]
@@ -226,6 +246,7 @@ pub(super) fn import_vectors<'a>(
         );
         heap.as_mut_slice()
     };
+
     assert_eq!(core::mem::size_of::<UserIoVector>(), 16);
     // SAFETY: repr(C) 两个64位usize与目标iovec布局相同，所有位模式均有效；
     // vectors独占且已初始化count项，字节切片长度恰覆盖这些项，copyin不保留借用。
@@ -242,6 +263,7 @@ pub(super) fn import_vectors<'a>(
     if vectors.iter().any(|vector| (vector.length as isize) < 0) {
         return Err(Errno::InvalidArgument);
     }
+
     let mut total = 0usize;
     for vector in vectors.iter_mut() {
         // 单段在裁剪后检查范围，多段检查原始范围；空段不解引用base。
@@ -262,6 +284,7 @@ pub(super) fn import_vectors<'a>(
         vector.length = vector.length.min(MAX_RW_COUNT - total);
         total += vector.length;
     }
+
     if count <= fast.len() {
         Ok(Cow::Borrowed(&fast[..count]))
     } else {
@@ -276,6 +299,7 @@ pub(super) fn readv(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_WRONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("readv has no MM");
     let mut fast = [UserIoVector {
         address: 0,
@@ -286,6 +310,7 @@ pub(super) fn readv(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if target.len() == 0 {
         return Ok(0);
     }
+
     Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
 }
 
@@ -296,6 +321,7 @@ pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_RDONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("writev has no MM");
     let mut fast = [UserIoVector {
         address: 0,
@@ -306,6 +332,7 @@ pub(super) fn writev(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if source.len() == 0 && file.socket().is_none() {
         return Ok(0);
     }
+
     Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
 }
 
@@ -323,11 +350,13 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY) {
         return Err(Errno::InvalidArgument);
     }
+
     let reservation = runtime.files.reserve(nofile(user))?;
     let pathname = mm.read_c_string(raw[1], PATH_MAX)?;
     let (vfs, context) = fs_snapshot(&runtime);
     let start = resolve_start(&runtime, &context, raw[0], &pathname)?;
     let credentials = (runtime.credentials.uid, runtime.credentials.gid);
+
     let file = if flags & O_CREAT != 0 {
         vfs.open_with(
             &context,
@@ -364,6 +393,7 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
             FileIoContext::User(user),
         )?
     };
+
     Ok(reservation.publish(
         file,
         DescriptorFlags {
@@ -371,6 +401,7 @@ pub(super) fn openat(user: &UserThread, raw: [usize; 6]) -> SysResult {
         },
     ) as isize)
 }
+
 /// 按最终 inode 决定 DAC 与 OFD；刚创建的空对象不重新核自身 mode，也不执行 O_TRUNC。
 fn prepare_open(
     vfs: &Vfs,
@@ -391,6 +422,7 @@ fn prepare_open(
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
         return Err(fs::FsError::NotDirectory);
     }
+
     if !created {
         let access = match access {
             O_RDONLY => MAY_READ,
@@ -405,9 +437,11 @@ fn prepare_open(
         };
         path.check_access(credentials.0, credentials.1, access)?;
     }
+
     let flags = flags & !(O_CREAT | O_EXCL | if created { O_TRUNC } else { 0 });
     fs::open_path_with_flags(vfs, path, flags, caller)
 }
+
 /// mkdirat 按本次 FsContext umask 建目录，路径逐组件从当前目录或真实 dirfd 开始。
 pub(super) fn mkdirat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let runtime = user.runtime().expect("mkdirat has no runtime");
@@ -433,6 +467,7 @@ pub(super) fn unlinkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("unlinkat has no runtime");
     let mm = user.mm().expect("unlinkat has no MM");
     let pathname = mm.read_c_string(raw[1], PATH_MAX)?;
@@ -466,6 +501,7 @@ pub(super) fn linkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("linkat has no runtime");
     let mm = user.mm().expect("linkat has no MM");
     let old_pathname = mm.read_c_string(raw[1], PATH_MAX)?;
@@ -480,6 +516,7 @@ pub(super) fn linkat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     };
     let credentials = (runtime.credentials.uid, runtime.credentials.gid);
     let source = vfs.resolve_from(&context, &old_start, &old_pathname, mode, Some(credentials))?;
+
     vfs.link_from(&source, &context, &new_start, &new_pathname, credentials)?;
     Ok(0)
 }
@@ -490,6 +527,7 @@ pub(super) fn renameat2(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if flags & !RENAME_NOREPLACE != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("renameat2 has no runtime");
     let mm = user.mm().expect("renameat2 has no MM");
     let old_pathname = mm.read_c_string(raw[1], PATH_MAX)?;
@@ -523,6 +561,7 @@ pub(super) fn truncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if length < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("truncate has no runtime");
     let mm = user.mm().expect("truncate has no MM");
     let path = resolve(
@@ -539,6 +578,7 @@ pub(super) fn truncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
         _ => return Err(Errno::InvalidArgument),
     }
     path.check_access(runtime.credentials.uid, runtime.credentials.gid, MAY_WRITE)?;
+
     let access = inode.acquire_write()?;
     access.truncate(length as u64)?;
     Ok(0)
@@ -550,6 +590,7 @@ pub(super) fn ftruncate(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if length < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("ftruncate has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
     file.truncate(length as u64)?;
@@ -563,6 +604,7 @@ pub(super) fn read(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_WRONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("read has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
     Ok(file.read_into(&mut target, FileIoContext::User(user))? as isize)
@@ -573,6 +615,7 @@ pub(super) fn pread(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if (raw[3] as i64) < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("pread has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
     if !file.positioned_io() {
@@ -581,6 +624,7 @@ pub(super) fn pread(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_WRONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("pread has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
     Ok(file.read_at_into(raw[3] as u64, &mut target, FileIoContext::User(user))? as isize)
@@ -593,6 +637,7 @@ pub(super) fn write(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_RDONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("write has no MM");
     let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
     Ok(file.write_from(&mut source, FileIoContext::User(user))? as isize)
@@ -603,6 +648,7 @@ pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if (raw[3] as i64) < 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("pwrite has no runtime");
     let file = runtime.files.lookup(descriptor(raw[0])?)?;
     if !file.positioned_io() {
@@ -611,6 +657,7 @@ pub(super) fn pwrite(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if file.flags() & O_ACCMODE == O_RDONLY {
         return Err(Errno::BadFd);
     }
+
     let mm = user.mm().expect("pwrite has no MM");
     let mut source = WriteBuffer::user(&mm, raw[1], raw[2].min(MAX_RW_COUNT))?;
     Ok(file.write_at_from(raw[3] as u64, &mut source, FileIoContext::User(user))? as isize)
@@ -658,6 +705,7 @@ pub(super) fn seek(user: &UserThread, raw: [usize; 6]) -> SysResult {
         SEEK_END => SeekFrom::End(delta),
         _ => return Err(Errno::InvalidArgument),
     };
+
     let runtime = user.runtime().expect("lseek has no runtime");
     let position = runtime.files.seek(descriptor(raw[0])?, from)?;
     isize::try_from(position).map_err(|_| Errno::Overflow)
@@ -686,6 +734,7 @@ pub(super) fn dup3(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[2] as u32 & !O_CLOEXEC != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("dup3 has no runtime");
     Ok(runtime.files.dup_exact_flags(
         descriptor(raw[0])?,
@@ -749,6 +798,7 @@ pub(super) fn statat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[3] & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT as usize) != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("statat has no runtime");
     let mm = user.mm().expect("statat has no MM");
     let stat = query_stat(&runtime, &mm, raw[0], raw[1], raw[3])?;
@@ -768,6 +818,7 @@ pub(super) fn statx(user: &UserThread, raw: [usize; 6]) -> SysResult {
     {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("statx has no runtime");
     let mm = user.mm().expect("statx has no MM");
     let path_flags = (flags & !(AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) as usize;
@@ -792,6 +843,7 @@ fn query_stat(
     } else {
         mm.read_c_string(address, PATH_MAX)?
     };
+
     if pathname.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd as i32 == AT_FDCWD {
             let (_, context) = fs_snapshot(runtime);
@@ -818,6 +870,7 @@ pub(super) fn getdents(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mm = user.mm().expect("getdents has no MM");
     let mut target = ReadBuffer::user(&mm, raw[1], raw[2].min(u32::MAX as usize))?;
     let mut complete = 0usize;
+
     let result = file.for_each_dirent(&mut |entry| {
         let length = (DIRENT64_NAME_OFFSET + entry.name.len() + 1 + DIRENT64_ALIGNMENT - 1)
             & !(DIRENT64_ALIGNMENT - 1);
@@ -828,6 +881,7 @@ pub(super) fn getdents(user: &UserThread, raw: [usize; 6]) -> SysResult {
                 Ok(false)
             };
         }
+
         let mut bytes = [0u8; DIRENT64_MAX_SIZE];
         bytes[0..8].copy_from_slice(&entry.number.to_le_bytes());
         bytes[8..16].copy_from_slice(&entry.next_cookie.to_le_bytes());
@@ -840,6 +894,7 @@ pub(super) fn getdents(user: &UserThread, raw: [usize; 6]) -> SysResult {
         complete += length;
         Ok(true)
     });
+
     if 0 < complete {
         Ok(complete as isize)
     } else {
@@ -853,12 +908,14 @@ pub(super) fn readlink(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if count <= 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("readlink has no runtime");
     let mm = user.mm().expect("readlink has no MM");
     let path = resolve(&runtime, &mm, raw[0], raw[1], ResolveMode::NoFollow)?;
     if path.inode()?.metadata_snapshot()?.kind != InodeKind::Symlink {
         return Err(Errno::InvalidArgument);
     }
+
     let target = path.inode()?.read_link()?;
     let count = target.len().min(count as usize);
     copyout(&mm, raw[2], &target[..count])?;
@@ -880,6 +937,7 @@ pub(super) fn chdir(user: &UserThread, address: usize) -> SysResult {
         return Err(Errno::NotDirectory);
     }
     path.check_access(runtime.credentials.uid, runtime.credentials.gid, MAY_EXEC)?;
+
     let retired = runtime.fs.lock().context.exchange_cwd(path);
     drop(retired);
     Ok(0)
@@ -904,6 +962,7 @@ pub(super) fn chroot(user: &UserThread, address: usize) -> SysResult {
     if runtime.credentials.uid != 0 {
         return Err(Errno::NotPermitted);
     }
+
     let retired = runtime.fs.lock().context.exchange_root(path);
     drop(retired);
     Ok(0)
@@ -918,6 +977,7 @@ pub(super) fn getcwd(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[1] < bytes.len() + 1 {
         return Err(Errno::Range);
     }
+
     // cwd_bytes 已准备包含 NUL 的容量，此处不增加分配或读取第二次路径。
     bytes.push(0);
     copyout(&mm, raw[0], &bytes)?;
@@ -933,6 +993,7 @@ pub(super) fn fchdir(user: &UserThread, raw: [usize; 6]) -> SysResult {
         return Err(Errno::NotDirectory);
     }
     path.check_access(runtime.credentials.uid, runtime.credentials.gid, MAY_EXEC)?;
+
     let retired = runtime.fs.lock().context.exchange_cwd(path);
     drop(retired);
     Ok(0)
@@ -962,6 +1023,7 @@ pub(super) fn faccessat(user: &UserThread, raw: [usize; 6], flags: u32) -> SysRe
     {
         return Err(Errno::InvalidArgument);
     }
+
     let runtime = user.runtime().expect("faccessat has no runtime");
     let mm = user.mm().expect("faccessat has no MM");
     let pathname = mm.read_c_string(raw[1], PATH_MAX)?;
@@ -980,6 +1042,7 @@ pub(super) fn faccessat(user: &UserThread, raw: [usize; 6], flags: u32) -> SysRe
         };
         resolve_bytes(&runtime, raw[0], &pathname, follow)?
     };
+
     path.check_access(
         runtime.credentials.uid,
         runtime.credentials.gid,
@@ -1043,6 +1106,7 @@ fn import_file_times(mm: &Mm, address: usize) -> Result<[FileTimeUpdate; 2], Err
     if address == 0 {
         return Ok([FileTimeUpdate::Now; 2]);
     }
+
     let mut bytes = [0u8; 32];
     copyin(mm, &mut bytes, address)?;
     Ok([
@@ -1069,6 +1133,7 @@ fn file_times_path(
     if flags & !(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let pathname = mm.read_c_string(address, PATH_MAX)?;
     if pathname.is_empty() && flags & AT_EMPTY_PATH as u32 != 0 {
         if dirfd as i32 == AT_FDCWD {
@@ -1093,6 +1158,7 @@ pub(super) fn utimensat(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if times == [FileTimeUpdate::Omit; 2] {
         return Ok(0);
     }
+
     let runtime = user.runtime().expect("utimensat has no runtime");
     let path = file_times_path(&runtime, &mm, raw[0], raw[1], raw[3] as u32)?;
     path.check_writable()?;
@@ -1106,6 +1172,7 @@ pub(super) fn utimensat(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         path.check_access(uid, runtime.credentials.gid, MAY_WRITE)?;
     }
+
     let now_ns = crate::time::realtime();
     let now = InodeTime {
         seconds: (now_ns / NSEC_PER_SEC) as i64,
@@ -1131,6 +1198,7 @@ fn fs_snapshot(runtime: &UserRuntime) -> (Arc<Vfs>, FsContext) {
     let current = runtime.fs.lock();
     (current.vfs.clone(), current.context.clone())
 }
+
 /// 绝对路径从本次 root 开始，其他路径复用 cwd 或已打开目录的真实 Path。
 fn resolve_start(
     runtime: &UserRuntime,
@@ -1147,6 +1215,7 @@ fn resolve_start(
     if dirfd as i32 == AT_FDCWD {
         return Ok(context.cwd().clone());
     }
+
     let file = runtime.files.lookup(descriptor(dirfd)?)?;
     if file.stat()?.kind != InodeKind::Directory {
         return Err(Errno::NotDirectory);

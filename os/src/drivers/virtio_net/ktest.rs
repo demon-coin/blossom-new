@@ -37,25 +37,31 @@ const GATE_UNSET: u8 = 0;
 const GATE_ARMED: u8 = 1;
 const GATE_ENTERED: u8 = 2;
 const GATE_RELEASED: u8 = 3;
+
 /// 一个原子保存未设、已设、已进入和已释放事实，默认不阻塞生产 Work。
 pub(super) struct Gate(AtomicU8);
+
 impl Gate {
     /// 停点初态不改变原有执行路径。
     const fn new() -> Self {
         Self(AtomicU8::new(GATE_UNSET))
     }
+
     /// 普通测试控制者为下一次实际执行设置一次停点。
     fn arm(&self) {
         self.0.store(GATE_ARMED, Ordering::Release);
     }
+
     /// 仅在实际停点执行后返回 true。
     fn entered(&self) -> bool {
         self.0.load(Ordering::Acquire) == GATE_ENTERED
     }
+
     /// 清理和正文共用此释放动作，不触碰生产队列票。
     fn release(&self) {
         self.0.store(GATE_RELEASED, Ordering::Release);
     }
+
     /// 调用点没有短锁，等待沿真实 timer 与 scheduler，设备继续生产 used。
     pub(super) fn stop(&self) {
         if self
@@ -92,6 +98,7 @@ pub(super) struct Observation {
     pub(super) unregistered: AtomicBool,
     pub(super) pages_returned: AtomicBool,
 }
+
 impl Observation {
     /// 计数只由真实事件增加，不设置期待值或影子完成。
     pub(super) const fn new() -> Self {
@@ -113,6 +120,7 @@ impl Observation {
             pages_returned: AtomicBool::new(false),
         }
     }
+
     /// 当前原 Work 已开始执行，退出凭证覆盖 Entry 等待及全部处理尾部。
     pub(super) fn enter_work(&self) -> WorkTail<'_> {
         self.work_entered.fetch_add(1, Ordering::Relaxed);
@@ -120,6 +128,7 @@ impl Observation {
         self.entry.stop();
         tail
     }
+
     /// 只记录 ISR 已真实确认本设备原因后的执行路径。
     pub(super) fn interrupt(&self, live: bool) {
         self.interrupts.fetch_add(1, Ordering::Relaxed);
@@ -127,10 +136,12 @@ impl Observation {
             self.stopping_interrupts.fetch_add(1, Ordering::Relaxed);
         }
     }
+
     /// 仅从 status0 读回及完整设备屏障之后调用。
     pub(super) fn reset_confirmed(&self) {
         self.reset_barrier.store(true, Ordering::Release);
     }
+
     /// 所有错误清理都先解除原 Work 与 reset 尾部的停点。
     fn release_all(&self) {
         self.entry.release();
@@ -138,7 +149,9 @@ impl Observation {
         self.after_reset.release();
     }
 }
+
 pub(super) struct WorkTail<'a>(&'a Observation);
+
 impl Drop for WorkTail<'_> {
     /// 原回调正常返回或展开后才发表本轮执行尾部。
     fn drop(&mut self) {
@@ -158,6 +171,7 @@ struct Pool {
     device_pages: usize,
     addresses: [u64; super::POOL_MAX_SLOTS],
 }
+
 #[derive(Debug)]
 struct Snapshot {
     rx: Pool,
@@ -186,6 +200,7 @@ struct Snapshot {
     unregistered: bool,
     returned: bool,
 }
+
 /// 统计同锁内的真实固定槽、页与独立 head 表，并核一一归属。
 fn pool(slots: &[super::Slot], heads: &[Option<usize>], domain: DmaDomain) -> Result<Pool, Error> {
     let mut result = Pool {
@@ -228,6 +243,7 @@ fn pool(slots: &[super::Slot], heads: &[Option<usize>], domain: DmaDomain) -> Re
             }
         }
     }
+
     for (head, index) in heads.iter().enumerate() {
         if let Some(index) = index {
             if slots.get(*index).is_none_or(|slot| {
@@ -240,6 +256,7 @@ fn pool(slots: &[super::Slot], heads: &[Option<usize>], domain: DmaDomain) -> Re
     }
     Ok(result)
 }
+
 impl VirtioNet {
     /// 锁内读取真实队列和槽；已停止时不再访问已析构的 driver 或原页。
     fn snapshot(&self) -> Result<Snapshot, TestError> {
@@ -302,6 +319,7 @@ struct Inventory {
     baseline: SuiteBaseline,
     udp_port: u16,
 }
+
 impl Fixture for Inventory {
     /// 套件只发现一次库存，随后保存同 VM 的原 suite 六域与三字段基线。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -315,11 +333,13 @@ impl Fixture for Inventory {
             udp_port,
         })
     }
+
     /// 最后 case 拥有和子任务结束后核同一个 suite 的原资源账。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         self.baseline.tear_down(context)
     }
 }
+
 /// 此 fixture 只消费宿主的明确 UDP token，不构造或猜测服务端口。
 fn peer_port() -> Result<u16, TestError> {
     let mut port = None;
@@ -358,6 +378,7 @@ struct Owner {
     queues: Vec<WorkQueue>,
     disk_sources: [Option<irq::IrqNumber>; 3],
 }
+
 impl Fixture<Inventory> for Owner {
     /// 本例基线之后准备独立真实 Root/NIC，局部 owner 保证任意设置失败仍真正停止。
     fn set_up(_: &mut TestContext<'_>, resources: &Inventory) -> Result<Self, TestError> {
@@ -379,6 +400,7 @@ impl Fixture<Inventory> for Owner {
         fixture.prepare(&resources.devices)?;
         Ok(fixture)
     }
+
     /// 先释放所有真实停点，框架随后 join 原子任务；不先停止仍被子任务使用的 owner。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         if let Some(nic) = &self.nic {
@@ -386,6 +408,7 @@ impl Fixture<Inventory> for Owner {
         }
         Ok(())
     }
+
     /// 框架真实 join 之后停止全部 producer，释放最后强拥有，再核完整 MM6/metadata3。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         let before = self.before;
@@ -402,6 +425,7 @@ impl Fixture<Inventory> for Owner {
             queue.close_sync();
         }
         self.queues.clear();
+
         drop(self);
         let after = baseline();
         context.diagnostic(format_args!(
@@ -416,6 +440,7 @@ impl Fixture<Inventory> for Owner {
         Ok(())
     }
 }
+
 impl Owner {
     /// 独占同库存硬件，生产 Root 保存停止责任；本 fixture 只接受真实 VirtIO 变体。
     fn prepare(&mut self, inventory: &DeviceInventory) -> TestResult {
@@ -451,6 +476,7 @@ impl Owner {
         *self.owner.lock() = Some(owner);
         Ok(())
     }
+
     /// 正常停止顺序与失败清理相同；旧强拥有完全释放后才允许重准备同硬件。
     fn stop_network(&mut self) {
         if let Some(nic) = &self.nic {
@@ -462,10 +488,12 @@ impl Owner {
         self.net.take();
         self.nic.take();
     }
+
     /// 只借本例真实 NIC，不生成新的 owning 设备。
     fn nic(&self) -> &Arc<VirtioNet> {
         self.nic.as_ref().expect("native NIC absent")
     }
+
     /// 完整消息交原 UDP TX record，返回只表示接纳，不推测宿主已经收到。
     fn send(&self, bytes: &[u8]) -> TestResult {
         let progress = self
@@ -487,6 +515,7 @@ impl Owner {
         }
         Ok(())
     }
+
     /// 等正式 POLLIN 后领取同条 source/长度/字节，等待不 pump NIC 或协议。
     fn receive(&self) -> Result<([u8; 68], usize), TestError> {
         let udp = self.udp.as_ref().unwrap();
@@ -513,6 +542,7 @@ impl Owner {
         }
         Ok((bytes, record.copied))
     }
+
     /// P/Q 使用普通 UDP 与同一真实宿主 socket，逐字节验证一个完整记录。
     fn probe(&self) -> TestResult {
         self.send(b"P")?;
@@ -532,6 +562,7 @@ impl Owner {
         )
     }
 }
+
 /// 只等待原始状态转换，有限时间不作已经进入、完成或收权的证明。
 fn observe(mut ready: impl FnMut() -> bool, error: &'static str) -> TestResult {
     let end = time::now()
@@ -545,6 +576,7 @@ fn observe(mut ready: impl FnMut() -> bool, error: &'static str) -> TestResult {
     }
     Ok(())
 }
+
 /// 编码一个合法广播 ARP reply；宿主无需应答，没有测试专用设备输入。
 fn arp_reply(nic: &VirtioNet) -> Result<bool, TestError> {
     let mac = nic.info().mac;
@@ -567,6 +599,7 @@ fn arp_reply(nic: &VirtioNet) -> Result<bool, TestError> {
     })
     .map_err(|_| TestError("native ARP TX failed"))
 }
+
 /// 全部记录必须有唯一 index、真实 68 字节和每个正文 byte，顺序不作假定。
 fn burst(fixture: &Owner, count: usize) -> TestResult {
     let mut seen = 0u32;
@@ -619,6 +652,7 @@ pub(crate) mod native {
             .unwrap()
             .statistics(InterfaceId::Ethernet)
             .map_err(|_| TestError("native TX statistics unavailable"))?;
+
         nic.observation.entry.arm();
         if !arp_reply(nic)? {
             return Err(TestError("native first ARP had no TX slot"));
@@ -642,6 +676,7 @@ pub(crate) mod native {
         let stats_held = nic.statistics();
         context.expect_eq(stats_held.tx_bytes, stats_before.tx_bytes);
         context.expect_eq(stats_held.tx_packets, stats_before.tx_packets);
+
         nic.observation.entry.release();
         observe(
             || {
@@ -687,6 +722,7 @@ pub(crate) mod native {
     ) -> TestResult {
         fixture.probe()?;
         let before = fixture.nic().snapshot()?;
+
         fixture.nic().observation.entry.arm();
         fixture.send(&[b'N', b'B', 32, 0])?;
         observe(
@@ -706,6 +742,7 @@ pub(crate) mod native {
             "network-nic burst-held={:?}",
             fixture.nic().snapshot()?
         ));
+
         fixture.nic().observation.entry.release();
         burst(fixture, 32)?;
         let after = fixture.nic().snapshot()?;
@@ -737,6 +774,7 @@ pub(crate) mod native {
     ) -> TestResult {
         fixture.probe()?;
         let before = fixture.nic().snapshot()?;
+
         fixture.nic().observation.before_rearm.arm();
         if !arp_reply(fixture.nic())? {
             return Err(TestError("native rearm trigger full"));
@@ -748,6 +786,7 @@ pub(crate) mod native {
         let empty = fixture.nic().snapshot()?;
         context.expect_eq(empty.pending_rx, 0);
         context.expect_eq(empty.pending_tx, 0);
+
         fixture.send(&[b'N', b'B', 1, 0])?;
         observe(
             || {
@@ -762,6 +801,7 @@ pub(crate) mod native {
             "network-nic rearm-held={:?}",
             fixture.nic().snapshot()?
         ));
+
         fixture.nic().observation.before_rearm.release();
         burst(fixture, 1)?;
         let after = fixture.nic().snapshot()?;
@@ -801,6 +841,7 @@ pub(crate) mod native {
             fixture.disks[2].identity(),
             fixture.nic().identity()
         ));
+
         let nic = Arc::clone(fixture.nic());
         let source = nic.interrupt();
         let actions = irq::test_action_count(source);
@@ -840,6 +881,7 @@ pub(crate) mod native {
             || nic.snapshot().is_ok_and(|snapshot| 0 < snapshot.pending_tx),
             "native stop TX used missing",
         )?;
+
         let task_slot = Arc::try_new(SpinLock::new(None))
             .map_err(|_| TestError("native stop Task observer OOM"))?;
         let task_writer = Arc::clone(&task_slot);
@@ -872,6 +914,7 @@ pub(crate) mod native {
         context.expect_eq(held.tx.device_pages, held.tx.owned);
         context.expect_eq(held.rx.device_pages, held.rx.owned);
         context.expect_eq(held.entered, held.exited + 1);
+
         nic.observation.entry.release();
         observe(
             || nic.observation.after_reset.entered(),
@@ -896,6 +939,7 @@ pub(crate) mod native {
             "network-nic stop-held={:?} reset-held={:?}",
             held, reset
         ));
+
         nic.observation.after_reset.release();
         context.expect_eq(child.join()?, 0);
         let stopped = nic.snapshot()?;
@@ -930,6 +974,7 @@ pub(crate) mod native {
         if before.tx.count != 32 {
             return Err(TestError("native TX hardware pool is not 32 slots"));
         }
+
         nic.observation.entry.arm();
         if !arp_reply(nic)? {
             return Err(TestError("native full first TX rejected"));
@@ -1069,6 +1114,7 @@ pub(crate) mod native {
             return Err(TestError("native old NIC strong owner survived stop"));
         }
         drop((old_net, old_nic));
+
         let actions = irq::test_action_count(source);
         let inventory = Arc::clone(&fixture.inventory);
         let root =
@@ -1093,6 +1139,7 @@ pub(crate) mod native {
         mm::drain_all_pages();
         let after = mm::stats();
         let actions_after = irq::test_action_count(source);
+
         drop(pressure);
         drop(root);
         context.expect_eq(exhausted.0, true);
@@ -1105,6 +1152,7 @@ pub(crate) mod native {
             "network-nic real-OOM={:?} status={:?} unpublished-before={:?} unpublished-after={:?}",
             exhausted, status, before, after
         ));
+
         fixture.prepare(&inventory)?;
         fixture.probe()?;
         fixture.stop_network();
@@ -1125,6 +1173,7 @@ impl Owner {
         devices
             .try_reserve_exact(3)
             .map_err(|_| TestError("native device slots OOM"))?;
+
         for candidate in &inventory.mmio_blocks {
             // SAFETY: 同 suite 原库存，三个不同窗口各由此 fixture 独占，永久映射覆盖所有盘尾部。
             devices.push(
@@ -1148,6 +1197,7 @@ impl Owner {
         if devices.len() != 3 {
             return Err(TestError("native coexistence requires exactly three disks"));
         }
+
         for (index, device) in devices.into_iter().enumerate() {
             self.disk_sources[index] = Some(device.interrupt());
             let queue = WorkQueue::try_new(WorkQueueConfig {
@@ -1161,12 +1211,14 @@ impl Owner {
                 .map_err(|_| TestError("native Disk preparation failed"))?;
             self.disks.push(disk);
         }
+
         for disk in &self.disks {
             disk.start()
                 .map_err(|_| TestError("native Disk start failed"))?;
         }
         Ok(())
     }
+
     /// 核原槽位及同库存身份；LA 必须与 root 共享真实 INTx，不以资源标签代身份。
     fn check_identities(
         &self,
@@ -1262,6 +1314,7 @@ impl Owner {
         ));
         Ok(())
     }
+
     /// 一页真实 Bio 的读写都在原完成/收权后领取，成功必须完整512字节。
     fn io(
         &self,
@@ -1291,6 +1344,7 @@ impl Owner {
                 target.write(*source);
             }
         }
+
         let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(1)
@@ -1302,6 +1356,7 @@ impl Owner {
         let completion = bio.completion();
         disk.submit_bio(bio);
         let result = completion.wait();
+
         if result
             != (IoResult {
                 completed: 512,
@@ -1318,10 +1373,12 @@ impl Owner {
         output.copy_from_slice(unsafe { memory[0].bytes() });
         Ok(output)
     }
+
     /// 只读 root/extra 实际 sector，不写它们的盘面。
     fn read_disk(&self, index: usize, sector: u64) -> Result<[u8; 512], TestError> {
         self.io(index, BlkOperation::Read, sector, None)
     }
+
     /// scratch 原512字节全文图样经过实际 Write 与独立 Read 核对。
     fn scratch_roundtrip(&self, context: &mut TestContext<'_>) -> TestResult {
         let expected = core::array::from_fn(|index| (index * 29 + (index >> 3) + 61) as u8);

@@ -29,6 +29,7 @@ const PCI_HEADER_BYTES: u8 = 0x40;
 const PCI_BAR_COUNT: usize = 6;
 const PCI_CAPABILITY_CAPACITY: usize =
     (PCI_CFG_SPACE_BYTES as usize - PCI_HEADER_BYTES as usize) / PCI_REGISTER_BYTES;
+
 const PCI_VENDOR_WORD: u8 = 0x00;
 const PCI_CLASS_REVISION_WORD: u8 = 0x08;
 const PCI_CACHE_LINE_WORD: u8 = 0x0c;
@@ -42,11 +43,13 @@ const PCI_BAR_MEMORY_TYPE_MASK: u32 = 6;
 const PCI_BAR_MEMORY_TYPE_32: u32 = 0;
 const PCI_BAR_MEMORY_TYPE_64: u32 = 4;
 const PCI_BAR_MEMORY_ADDRESS_MASK: u32 = !15;
+
 const PCI_VENDOR_LOONGSON: u16 = 0x0014;
 const PCI_DEVICE_LOONGSON_AHCI: u16 = 0x7a08;
 const PCI_DEVICE_LOONGSON_GMAC: u16 = 0x7a03;
 const PCI_DEVICE_LOONGSON_GMAC2: u16 = 0x7a23;
 const PCI_CLASS_AHCI: u32 = 0x010601;
+
 const LOONGSON_ROOT_PORT_FIRST: u8 = 9;
 const LOONGSON_ROOT_PORT_LAST: u8 = 20;
 const LOONGSON_CFG_REGISTER_MASK: usize = 0xff;
@@ -54,6 +57,7 @@ const LOONGSON_CFG_EXT_REGISTER_MASK: usize = 0xf00;
 const LOONGSON_CFG_EXT_REGISTER_SHIFT: u32 = 16;
 const LOONGSON_CFG0_TYPE1: usize = 1 << 24;
 const LOONGSON_CFG1_TYPE1: usize = 1 << 28;
+
 const IO_DOMAIN: u8 = 1;
 const MEMORY_DOMAIN: u8 = 2;
 
@@ -158,6 +162,7 @@ fn loongson_offset(bdf: DeviceFunction, offset: u16, extended: bool) -> Option<u
     {
         return None;
     }
+
     let devfn =
         ((bdf.device as usize) << (PCI_DEVICE_SHIFT - PCI_FUNCTION_SHIFT)) | bdf.function as usize;
     let mut address =
@@ -266,6 +271,7 @@ impl PciInventory {
         if info.pci.bus_start != 0 {
             return Err(ProbeError::Resource("PCI root bus must start at zero"));
         }
+
         let configuration = match info.pci.kind {
             PciConfiguration::Ecam => info.pci.configuration,
             PciConfiguration::Loongson => info.pci.configuration_extended,
@@ -290,6 +296,7 @@ impl PciInventory {
             },
             PciConfiguration::Absent => unreachable!(),
         };
+
         let mut root = PciRoot::new(cam);
         let mut pending = collect_devices(&root, info)?;
         let mut devices = Vec::new();
@@ -304,10 +311,12 @@ impl PciInventory {
         occupied
             .try_reserve_exact(capacity)
             .map_err(|_| ProbeError::NoMemory)?;
+
         if let Err(error) = configure_resources(&mut root, &mut pending, &mut occupied, info) {
             restore_configuration(&mut root, &pending);
             return Err(error);
         }
+
         for entry in pending {
             devices.push(entry.device);
         }
@@ -446,6 +455,7 @@ fn resolve_registers<'a>(
             "native MMIO register window is missing",
         ));
     }
+
     let mut found = None;
     for device in devices {
         let index = if let Some(identity) = selected {
@@ -480,6 +490,7 @@ fn resolve_registers<'a>(
         }
         found = Some(physical);
     }
+
     let physical = match found {
         Some(physical) => physical,
         None if selected.is_some() => {
@@ -514,6 +525,7 @@ fn collect_devices(
                 "PCI bridge or unsupported header is outside root-bus discovery",
             ));
         }
+
         pending.try_reserve(1).map_err(|_| ProbeError::NoMemory)?;
         let header_type = (root.read_config_word(bdf, PCI_CACHE_LINE_WORD) >> u16::BITS) as u8;
         let pin = (root.read_config_word(bdf, PCI_INTERRUPT_WORD) >> u8::BITS) as u8;
@@ -528,6 +540,7 @@ fn collect_devices(
                 .map_err(ProbeError::Resource)?;
             Some(irq::map_source(source)?)
         };
+
         let mut capabilities = [None; PCI_CAPABILITY_CAPACITY];
         let mut capability_count = 0;
         for capability in root.capabilities(bdf) {
@@ -542,6 +555,7 @@ fn collect_devices(
             });
             capability_count += 1;
         }
+
         let original_bars = core::array::from_fn(|index| {
             root.read_config_word(bdf, PCI_BAR0 + index as u8 * PCI_REGISTER_BYTES as u8)
         });
@@ -566,6 +580,7 @@ fn collect_devices(
             bar_info: core::array::from_fn(|_| None),
         });
     }
+
     if info.pci.kind == PciConfiguration::Loongson {
         for selected in info
             .board
@@ -701,9 +716,11 @@ fn configure_resources(
             ));
         }
     }
+
     for entry in pending.iter_mut() {
         entry.bar_info = root.bars(entry.device.bdf())?;
     }
+
     for entry in pending.iter() {
         for bar in entry.bar_info.iter().flatten() {
             let (domain, address, size) = bar_address(bar);
@@ -719,6 +736,7 @@ fn configure_resources(
             }
         }
     }
+
     for entry in pending.iter_mut() {
         for (index, bar) in entry.bar_info.iter().enumerate() {
             let Some(bar) = bar else { continue };
@@ -754,6 +772,7 @@ fn configure_resources(
             });
         }
     }
+
     if let Some(resources) = info.board.ahci {
         resolve_registers(
             pending.iter().map(|entry| &entry.device),
@@ -774,6 +793,7 @@ fn configure_resources(
             gmac_bar,
         )?;
     }
+
     // 全部地址和占用已成功验证，之后的配置写入不分配。
     for entry in pending.iter() {
         for (index, selected) in entry.device.bars.iter().enumerate() {
@@ -805,6 +825,7 @@ fn configure_resources(
             }
         }
     }
+
     for entry in pending.iter() {
         let mut command = entry.command & !decode;
         if entry.device.bars.iter().any(Option::is_some) {
@@ -828,6 +849,7 @@ fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice])
             entry.command & !(Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER),
         );
     }
+
     for entry in pending {
         let mut index = 0;
         while index < PCI_BAR_COUNT {
@@ -845,6 +867,7 @@ fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice])
             }
         }
     }
+
     for entry in pending {
         root.set_command(entry.device.bdf(), entry.command);
     }
@@ -1019,6 +1042,7 @@ mod configuration_checks {
         assert_eq!(loongson_offset(sata, 0x10, false), Some(0x4010));
         assert_eq!(loongson_offset(sata, 0x310, true), Some(0x0300_4010));
         assert_eq!(loongson_offset(sata, 0x310, false), None);
+
         let secondary = DeviceFunction {
             bus: 2,
             device: 0,
@@ -1026,6 +1050,7 @@ mod configuration_checks {
         };
         assert_eq!(loongson_offset(secondary, 0x10, false), Some(0x0102_0010));
         assert_eq!(loongson_offset(secondary, 0x310, true), Some(0x1302_0010));
+
         let hidden = DeviceFunction {
             bus: 0,
             device: 9,
@@ -1041,6 +1066,7 @@ mod configuration_checks {
         assert_eq!(ahci_bar(0x8086, 0x2922, 0x010601).unwrap(), 5);
         assert!(ahci_bar(0x0014, 0x7a03, 0x020000).is_err());
         assert!(ahci_bar(0x8086, 0x2922, 0x010600).is_err());
+
         assert_eq!(gmac_bar(0x0014, 0x7a03, 0x020000).unwrap(), 0);
         assert_eq!(gmac_bar(0x0014, 0x7a23, 0x020000).unwrap(), 0);
         assert!(gmac_bar(0x0014, 0x7a13, 0x020000).is_err());

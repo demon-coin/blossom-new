@@ -107,6 +107,7 @@ impl Arguments {
             .checked_add(inserted)
             .filter(|bytes| *bytes <= self.budget())
             .ok_or(ExecError::ArgumentsTooBig)?;
+
         let interpreter = copy_bytes(interpreter)?;
         let optional = optional.map(copy_bytes).transpose()?;
         let script = if original && self.argv[0] != self.filename {
@@ -117,6 +118,7 @@ impl Arguments {
         self.argv
             .try_reserve_exact(argc - self.argv.len())
             .map_err(|_| ExecError::NoMemory)?;
+
         let script = script.unwrap_or_else(|| core::mem::take(&mut self.argv[0]));
         self.argv[0] = interpreter;
         self.argv.push(script);
@@ -193,6 +195,7 @@ impl Arguments {
             &mut self.envp
         };
         vector.try_reserve(1).map_err(|_| ExecError::NoMemory)?;
+
         self.bytes += string.len() + 1 + pointer;
         vector.push(string);
         Ok(())
@@ -211,6 +214,7 @@ impl Arguments {
         if address == 0 {
             return Ok(());
         }
+
         let mut slot = address;
         loop {
             let pointer = mm.read_usize(slot)?;

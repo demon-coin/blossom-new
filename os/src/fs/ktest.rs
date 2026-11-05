@@ -92,12 +92,14 @@ fn until(label: &'static str, mut ready: impl FnMut() -> bool) -> TestResult {
     let deadline = time::now()
         .checked_add(time::Duration::from_secs(10))
         .ok_or(TestError("filesystem observation deadline overflow"))?;
+
     while !ready() {
         if deadline <= time::now() {
             return Err(TestError(label));
         }
         timer::sleep(time::Duration::from_millis(1));
     }
+
     Ok(())
 }
 
@@ -107,6 +109,7 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
         (0..cpu::count())
             .all(|id| id == cpu::current().id || cpu::get(id).idle.load(Ordering::Acquire))
     })?;
+
     mm::flush_all();
     mm::shrink_all();
     mm::drain_all_pages();
@@ -193,6 +196,7 @@ fn devices(
             "filesystem attached disks differ from declared roles",
         ));
     }
+
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(count)
@@ -207,6 +211,7 @@ fn devices(
             })?,
         );
     }
+
     for device in pci {
         prepared.push(
             // SAFETY: BDF 借自本组真实库存；前例已归还设备访问权，本例独占传输并保活
@@ -479,6 +484,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             for _ in 1..initial_slots {
                 growth.dup(base, 4097)?;
             }
+
             let evidence = pressure.exhaust();
             let growth_errors = [
                 growth.reserve(4097).err(),
@@ -498,6 +504,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
             let reservation = table.reserve(1024)?;
             let reused_fd = reservation.fd();
             drop(reservation);
+
             drop(pressure);
             let growth_reused_fd = growth.reserve(4097)?.fd();
             let returned = Returned::FileOom {
@@ -603,6 +610,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
                         FsError::Io(BlockError::QueueStopped),
                     ));
                 }
+
                 fill_file_page(&inode, page, read, &invalidate)?;
                 folio.wait_ready()?;
                 let mut bytes = [0xa7; mm::PAGE_SIZE];
@@ -614,6 +622,7 @@ fn perform(job: Job, observer: &Observation) -> Result<Returned, FsError> {
                     valid,
                 })
             })();
+
             drop(prepared);
             result
         }
@@ -694,6 +703,7 @@ impl Owner {
             reclaim: true,
         })
         .map_err(|_| TestError("filesystem completion domain OOM"))?;
+
         let mut disks = Vec::new();
         let disk_result = (|| {
             disks
@@ -715,6 +725,7 @@ impl Owner {
             queue.close_sync();
             return Err(error);
         }
+
         let resources = (|| {
             let filesystem_baseline = settled()?;
             let pressure = if context.case.attributes.tags.contains(&"fs-oom") {
@@ -751,6 +762,7 @@ impl Owner {
             })
             .map_err(|_| TestError("inode load observer OOM"))?;
             cache.ktest_set_load_hook(Some(hook));
+
             let mut prepared = [const { None }; 3];
             let mut joins = Vec::new();
             joins
@@ -797,6 +809,7 @@ impl Owner {
                 return Err(error);
             }
         };
+
         let activation_error = disks.iter().find_map(|disk| disk.start().err());
         Ok(Self {
             initial,
@@ -878,6 +891,7 @@ impl Owner {
                 join.try_join().is_some()
             })?;
         }
+
         for join in self.joins.drain(..) {
             if join.join() != 0 {
                 return Err(TestError("filesystem native producer failed"));
@@ -898,6 +912,7 @@ impl Owner {
             disk.test_resume_completions();
         }
         self.join_tasks()?;
+
         for disk in &self.disks {
             disk.test_flush_completions();
         }
@@ -907,6 +922,7 @@ impl Owner {
         drop(jobs);
         drop(results);
         drop(tasks);
+
         if let Some(cache) = self.cache.take() {
             cache.ktest_set_load_hook(None);
             assert!(self.cache_watch.is_none());
@@ -931,17 +947,20 @@ impl Owner {
             checked(context, result)?;
             drop(self.cache_watch.take());
         }
+
         recovered(
             context,
             "filesystem-before-disk-stop",
             self.filesystem_baseline,
         )?;
+
         for disk in &self.disks {
             disk.stop().map_err(|_| {
                 TestError("filesystem stop cannot converge; retaining original DMA owner")
             })?;
             context.expect_eq(disk.test_snapshot().inflight, 0);
         }
+
         self.queue.close_sync();
         Ok(())
     }

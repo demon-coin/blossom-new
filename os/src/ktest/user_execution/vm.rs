@@ -41,6 +41,7 @@ pub(crate) mod vm {
                     0
                 );
             }
+
             assert_eq!(
                 access(
                     &user,
@@ -67,6 +68,7 @@ pub(crate) mod vm {
             let progress = mm.copyin(&mut crossing, TARGET + mm::PAGE_SIZE - 16);
             assert_eq!((progress.copied, progress.error), (32, None));
             assert_eq!(crossing, [0; 32]);
+
             mm.unmap(TARGET, 3 * mm::PAGE_SIZE).unwrap();
             user.context().pc = CODE + arch::fault_offset(UserAccess::Read);
             user.context().gpr[A5] = TARGET;
@@ -94,6 +96,7 @@ pub(crate) mod vm {
             let copied = parent.copyout(address, &0x9851u64.to_le_bytes());
             assert_eq!((copied.copied, copied.error), (8, None));
         }
+
         let child = parent.fork().unwrap();
         assert_eq!(
             parent.mapping(TARGET).unwrap().physical,
@@ -101,6 +104,7 @@ pub(crate) mod vm {
         );
         assert!(!parent.mapping(TARGET).unwrap().permissions.write);
         assert!(!child.mapping(TARGET).unwrap().permissions.write);
+
         let copied = child.copyout(TARGET, &0x9852u64.to_le_bytes());
         assert_eq!((copied.copied, copied.error), (8, None));
         assert_eq!(word(&parent, TARGET), 0x9851);
@@ -113,6 +117,7 @@ pub(crate) mod vm {
             parent.mapping(TARGET + mm::PAGE_SIZE).unwrap().physical,
             child.mapping(TARGET + mm::PAGE_SIZE).unwrap().physical
         );
+
         let parent = Arc::try_new(parent).map_err(|_| TestError("NoMemory: COW parent"))?;
         let child = Arc::try_new(child).map_err(|_| TestError("NoMemory: COW child"))?;
         let thread = UserThread::try_new(Arc::clone(&parent), context)
@@ -162,6 +167,7 @@ pub(crate) mod vm {
             if !same_mm {
                 untouched.protect(TARGET, mm::PAGE_SIZE, RW).unwrap();
             }
+
             for slot in 0..2 {
                 let owner = if slot == 0 || same_mm {
                     Arc::clone(&parent)
@@ -198,6 +204,7 @@ pub(crate) mod vm {
                     Ok(43)
                 })?;
             }
+
             until(
                 || {
                     controls.ready[..2]
@@ -210,6 +217,7 @@ pub(crate) mod vm {
             controls.gates[1].complete();
             fixture.joined(0, 43)?;
             fixture.joined(1, 43)?;
+
             assert_eq!(word(&parent, TARGET), 0);
             assert_ne!(parent.mapping(TARGET).unwrap().physical, shared);
             assert_eq!(word(&untouched, TARGET), if same_mm { 0x9851 } else { 0 });
@@ -248,11 +256,13 @@ pub(crate) mod vm {
                     assert_eq!(&result[length..], &[0xa5; 24][length..]);
                 }
             }
+
             let number = 0x0102030405060708u64;
             assert_eq!(mm.copyout(boundary - 3, &number.to_le_bytes()).error, None);
             assert_eq!(mm.read_u64(boundary - 3), Ok(number));
             assert_eq!(mm.read_u32(boundary - 3), Ok(0x05060708));
             assert_eq!(mm.read_usize(boundary - 3), Ok(number as usize));
+
             assert_eq!(mm.copyout(boundary - 2, &[0xff, 0xfe, 0x80, 0]).error, None);
             assert_eq!(
                 mm.read_c_string(boundary - 2, 4).unwrap(),
@@ -270,12 +280,14 @@ pub(crate) mod vm {
                 mm.read_c_string(usize::MAX, 2),
                 Err(CStringError::Vm(VmError::InvalidRange))
             );
+
             let high = arch::USER_ADDRESS_END - 2;
             assert_eq!(mm.copyout(high, &[0xfe, 0]).error, None);
             assert_eq!(mm.read_c_string(high, 32).unwrap(), [0xfe]);
             let mut high_bytes = [0; 2];
             assert_eq!(mm.copyin(&mut high_bytes, high).error, None);
             assert_eq!(high_bytes, [0xfe, 0]);
+
             assert_eq!(mm.copyout(usize::MAX, &[]).copied, 0);
             assert_eq!(mm.copyout(usize::MAX, &[]).error, None);
             assert_eq!(mm.copyin(&mut [], usize::MAX).error, None);
@@ -291,11 +303,13 @@ pub(crate) mod vm {
                 (0, Some(VmError::InvalidRange))
             );
             assert_eq!(overflow_bytes, [0xa5; 3]);
+
             for address in [TARGET, boundary - 4, boundary] {
                 mm.store_user_u32(address, 0x81234567).unwrap();
                 assert_eq!(mm.load_user_u32(address), Ok(0x81234567));
                 assert_eq!(mm.read_u32(address), Ok(0x81234567));
             }
+
             let child = mm.fork().unwrap();
             child.store_user_u32(TARGET + 128, 0x78563412).unwrap();
             assert_eq!(mm.load_user_u32(TARGET + 128), Ok(0));
@@ -303,6 +317,7 @@ pub(crate) mod vm {
             assert_eq!(child.load_user_u32(TARGET + 128), Ok(0x78563412));
             assert_eq!(mm.load_user_u32(TARGET + 128), Ok(0x12345678));
             drop(child);
+
             for address in [TARGET + 1, TARGET + 2, TARGET + 3, boundary - 2, usize::MAX] {
                 assert_eq!(mm.load_user_u32(address), Err(VmError::InvalidRange));
                 assert_eq!(mm.store_user_u32(address, 7), Err(VmError::InvalidRange));
@@ -311,6 +326,7 @@ pub(crate) mod vm {
                 access(&user, &token, &stop, boundary, UserAccess::Read)?.1 & 0xffffffff,
                 0x81234567
             );
+
             mm.protect(boundary, mm::PAGE_SIZE, RO).unwrap();
             let partial = mm.copyout(boundary - 2, &[11, 12, 13, 14]);
             assert_eq!(
@@ -321,6 +337,7 @@ pub(crate) mod vm {
             assert_eq!(mm.copyin(&mut prefix, boundary - 2).error, None);
             assert_eq!(prefix, [11, 12, 0x67, 0x45]);
             assert_eq!(mm.store_user_u32(boundary, 7), Err(VmError::Permission));
+
             mm.unmap(boundary, mm::PAGE_SIZE).unwrap();
             let mut result = [0xa5; 4];
             let partial = mm.copyin(&mut result, boundary - 2);
@@ -392,6 +409,7 @@ pub(crate) mod vm {
             },
             "rwlock readers did not sleep while sharing the guard",
         )?;
+
         let writer = Arc::clone(&controls);
         fixture.start_task(2, move |token, stop| {
             writer.record(2);
@@ -419,6 +437,7 @@ pub(crate) mod vm {
         )?;
         assert!(controls.lock.try_read().is_none());
         assert!(controls.lock.try_write().is_none());
+
         let later = Arc::clone(&controls);
         fixture.start_task(3, move |token, stop| {
             later.record(3);
@@ -435,11 +454,13 @@ pub(crate) mod vm {
             || controls.blocked(3),
             "late rwlock reader bypassed a waiting writer",
         )?;
+
         controls.gates[0].complete();
         fixture.joined(0, 11)?;
         assert_eq!(controls.phase.load(Ordering::Acquire), 1);
         assert!(controls.blocked(2));
         assert!(controls.blocked(3));
+
         controls.gates[1].complete();
         fixture.joined(1, 12)?;
         until(
@@ -448,6 +469,7 @@ pub(crate) mod vm {
         )?;
         assert!(controls.blocked(3));
         assert_eq!(controls.phase.load(Ordering::Acquire), 3);
+
         controls.gates[2].complete();
         fixture.joined(2, 13)?;
         fixture.joined(3, 14)?;
@@ -491,6 +513,7 @@ pub(crate) mod vm {
         )?;
         controls.gates[0].complete();
         fixture.joined(0, 43)?;
+
         let resident = baseline()?;
         assert!(mm.mapping(address).is_some());
         mm.unmap(address, mm::PAGE_SIZE).unwrap();
@@ -500,6 +523,7 @@ pub(crate) mod vm {
             empty.0.buddy_free_pages + empty.0.slab_backing_pages,
             resident.0.buddy_free_pages + resident.0.slab_backing_pages + arch::USER_LEVELS,
         );
+
         mm.map_anonymous(address, mm::PAGE_SIZE, RW, RW).unwrap();
         mm.fault(address, UserAccess::Read).unwrap();
         let refilled = baseline()?;
@@ -507,6 +531,7 @@ pub(crate) mod vm {
             refilled.0.buddy_free_pages + refilled.0.slab_backing_pages,
             resident.0.buddy_free_pages + resident.0.slab_backing_pages,
         );
+
         mm.unmap(address, mm::PAGE_SIZE).unwrap();
         assert!(mm.mapping(address).is_none());
         // SLUB 的空页归还可改变临时分布，独占数据页与表页的归还总数须恢复。
@@ -602,6 +627,7 @@ pub(crate) mod vm {
                 UserTrap::Syscall
             );
             assert_eq!(user.context().gpr[T0], 0);
+
             control.ready[0].store(true, Ordering::Release);
             phase(&control, 1, &token, &stop)?;
             assert_eq!(
@@ -616,6 +642,7 @@ pub(crate) mod vm {
                 Err(VmError::Permission)
             );
             control.ready[1].store(true, Ordering::Release);
+
             phase(&control, 2, &token, &stop)?;
             assert_eq!(
                 live_access(&user, &token, &stop, UserAccess::Read)?,
@@ -627,6 +654,7 @@ pub(crate) mod vm {
                 UserTrap::Syscall
             );
             control.ready[2].store(true, Ordering::Release);
+
             phase(&control, 3, &token, &stop)?;
             assert_eq!(
                 live_access(&user, &token, &stop, UserAccess::Read)?,
@@ -641,6 +669,7 @@ pub(crate) mod vm {
                 }
             );
             control.ready[3].store(true, Ordering::Release);
+
             phase(&control, 4, &token, &stop)?;
             assert_eq!(
                 live_access(&user, &token, &stop, UserAccess::Read)?,
@@ -660,6 +689,7 @@ pub(crate) mod vm {
             || controls.ready[0].load(Ordering::Acquire),
             "remote user did not warm its translation",
         )?;
+
         sched::test_migrate_to(0);
         mm.protect(TARGET, mm::PAGE_SIZE, RO).unwrap();
         controls.phase.store(1, Ordering::Release);
@@ -667,6 +697,7 @@ pub(crate) mod vm {
             || controls.ready[1].load(Ordering::Acquire),
             "remote user retained stale write permission",
         )?;
+
         sched::test_migrate_to(0);
         mm.protect(TARGET, mm::PAGE_SIZE, RW).unwrap();
         let old = mm.fork().unwrap();
@@ -682,6 +713,7 @@ pub(crate) mod vm {
             || controls.ready[2].load(Ordering::Acquire),
             "remote user retained stale page contents",
         )?;
+
         sched::test_migrate_to(0);
         let replaced = mm.fork().unwrap();
         mm.unmap(TARGET, mm::PAGE_SIZE).unwrap();
@@ -698,10 +730,12 @@ pub(crate) mod vm {
             || controls.ready[3].load(Ordering::Acquire),
             "remote user did not observe rebuilt read-only leaf",
         )?;
+
         sched::test_migrate_to(0);
         mm.unmap(TARGET, mm::PAGE_SIZE).unwrap();
         controls.phase.store(4, Ordering::Release);
         fixture.joined(0, 43)?;
+
         drop(replaced);
         drop(old);
         drop(mm);

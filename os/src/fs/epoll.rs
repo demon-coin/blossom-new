@@ -18,10 +18,13 @@ mod index;
 pub const EPOLL_CTL_ADD: u32 = 1;
 pub const EPOLL_CTL_DEL: u32 = 2;
 pub const EPOLL_CTL_MOD: u32 = 3;
+
 pub const EPOLLONESHOT: u32 = 1 << 30;
 pub const EPOLLET: u32 = 1 << 31;
+
 const RETIRE_BATCH: usize = 16;
 const PROVIDER_SOURCES: usize = 2;
+
 const ORDINARY_EVENTS: u32 = PollMask::POLLIN.0
     | PollMask::POLLPRI.0
     | PollMask::POLLOUT.0
@@ -33,6 +36,7 @@ const ORDINARY_EVENTS: u32 = PollMask::POLLIN.0
     | PollMask::POLLWRBAND.0
     | PollMask::POLLRDHUP.0;
 const ALWAYS_EVENTS: u32 = PollMask::POLLERR.0 | PollMask::POLLHUP.0;
+
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
 
 /// 两个目标架构使用自然 C 布局；data 是原样保存的位模式，不是内核指针。
@@ -96,6 +100,7 @@ impl WatchHead {
             state.released = true;
             state.chain.take()
         };
+
         while let Some(node) = chain {
             chain = node.next.lock().take();
             // 弱身份升级与其最后 put 都在反链短锁外；控制入口返回前已结束 guard。
@@ -144,6 +149,7 @@ impl WatchHead {
                 removed
             }
         };
+
         drop(detached);
     }
 }
@@ -561,6 +567,7 @@ impl ReadyCore {
                 state.overflow.remove(entry, &mut write),
             )
         };
+
         drop(detached);
     }
 }
@@ -688,6 +695,7 @@ impl EpollFile {
             EPOLL_CTL_DEL => None,
             _ => return Err(FsError::InvalidOperation),
         };
+
         let mut retired = None;
         let result = {
             let mut tree = self.control.lock();
@@ -728,6 +736,7 @@ impl EpollFile {
                 _ => unreachable!(),
             }
         };
+
         drop(retired);
         result
     }
@@ -751,6 +760,7 @@ impl EpollFile {
         if tree.get(key).is_some() {
             return Err(FsError::Exists);
         }
+
         let entry = Entry::prepare(owner, target, fd, &self.core, watches)?;
         let sink: Arc<dyn PollNotify> = Arc::try_new(EntrySink {
             entry: Arc::clone(&entry),
@@ -763,10 +773,12 @@ impl EpollFile {
             *retired = Some(RetiredEntry { sources, entry });
             return Err(error);
         }
+
         entry.install_sources(sources, tree);
         tree.insert(Arc::clone(&entry));
         watches.attach(&entry.reverse);
         self.core.publish(&entry, event);
+
         match provider.poll(None) {
             Ok(mask) => {
                 if mask.0 & event.events & ORDINARY_EVENTS != 0 {
@@ -816,6 +828,7 @@ impl EpollFile {
         if maxevents == 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let mut deferred = DeferredFiles::new(self.scan.lock());
         let result = {
             let _control = self.control.lock();
@@ -852,6 +865,7 @@ impl EpollFile {
                 count += 1;
                 self.core.delivered(&mut retained, entry, event);
             }
+
             self.core.finish(local, retained);
             if count == 0 {
                 error.map_or(Ok(0), Err)
@@ -859,6 +873,7 @@ impl EpollFile {
                 Ok(count)
             }
         };
+
         // 末 OFD put 可能回到 WatchHead.release 再取此控制锁，必须在 guard 已结束后执行。
         drop(deferred);
         result
@@ -944,6 +959,7 @@ impl FileLike for EpollFile {
     ) -> Result<usize, FsError> {
         Err(FsError::InvalidOperation)
     }
+
     /// 显式位置读取沿默认 positioned_io=false 返回 ESPIPE。
     fn read_at_into(
         &self,
@@ -953,46 +969,57 @@ impl FileLike for EpollFile {
     ) -> Result<usize, FsError> {
         Err(FsError::IllegalSeek)
     }
+
     /// 匿名事件对象没有可作 dirfd 的路径。
     fn path(&self) -> Option<&Path> {
         None
     }
+
     /// 事件对象没有文件映射来源。
     fn mapping_inode(&self) -> Option<&InodeRef> {
         None
     }
+
     /// 事件 OFD 提供自己的实际持续源，供临时 poll/select 使用。
     fn pollable(&self) -> Option<&dyn Pollable> {
         Some(self)
     }
+
     /// raw 事件入口借用本具体对象，不检查虚构类型标签。
     fn epoll(&self) -> Option<&EpollFile> {
         Some(self)
     }
+
     /// 初始 O_RDWR 与可变状态属于同 OFD，CLOEXEC 不进入对象。
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Relaxed)
     }
+
     /// 沿共同 fcntl 状态位边界更新，不改访问模式。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
     }
+
     /// 只原子修改事件 OFD 的非阻塞位，复制描述符观察同一状态。
     fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
         set_nonblocking(&self.flags, enabled)
     }
+
     /// 事件对象没有可截断内容。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
     }
+
     /// 事件对象没有文件或设备同步义务。
     fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
     }
+
     /// noop seek 返回固定零位置，位移参数不改变事件状态。
     fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
         Ok(0)
     }
+
     /// 无磁盘匿名身份使用 Other 和 0600，不补普通文件类型位。
     fn stat(&self) -> Result<FileStat, FsError> {
         let zero = InodeTime {
@@ -1016,10 +1043,12 @@ impl FileLike for EpollFile {
             ctime: zero,
         })
     }
+
     /// 事件对象不提供目录枚举。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         Err(FsError::NotDirectory)
     }
+
     /// 事件对象不提供目录交付能力。
     fn for_each_dirent(
         &self,
@@ -1027,6 +1056,7 @@ impl FileLike for EpollFile {
     ) -> Result<(), FsError> {
         Err(FsError::NotDirectory)
     }
+
     /// 普通字节 write 不会修改事件对象。
     fn write_from(
         &self,
@@ -1035,6 +1065,7 @@ impl FileLike for EpollFile {
     ) -> Result<usize, FsError> {
         Err(FsError::InvalidOperation)
     }
+
     /// 显式位置写入沿默认 positioned_io=false 返回 ESPIPE。
     fn write_at_from(
         &self,

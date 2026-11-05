@@ -28,6 +28,7 @@ pub(crate) use error::Errno;
 const ARGUMENT_REGISTER: usize = 10;
 #[cfg(target_arch = "loongarch64")]
 const ARGUMENT_REGISTER: usize = 4;
+
 #[cfg(target_arch = "riscv64")]
 const NUMBER_REGISTER: usize = 17;
 #[cfg(target_arch = "loongarch64")]
@@ -114,6 +115,7 @@ pub(crate) fn resolve_restart(user: &UserThread, state: Restart, handler_flags: 
         | Restart::Sleep { request, .. }
         | Restart::Futex { request, .. } => (request, handler_flags.is_none()),
     };
+
     if restart {
         if matches!(state, Restart::NoHandler { .. }) {
             user.restore_saved_mask();
@@ -185,6 +187,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
             other => Outcome::Return(other.unwrap_or_else(Errno::result)),
         };
     }
+
     let result: SysResult = match request.number {
         93 => {
             return Outcome::Exit(
@@ -278,6 +281,7 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     const GRND_NONBLOCK: u32 = 1;
     const GRND_RANDOM: u32 = 2;
     const GRND_INSECURE: u32 = 4;
+
     let flags = raw[2] as u32;
     if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
         || flags & (GRND_RANDOM | GRND_INSECURE) == (GRND_RANDOM | GRND_INSECURE)
@@ -292,6 +296,7 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
             Errno::NoSyscall
         });
     }
+
     let mm = user.mm().expect("getrandom has no MM");
     let mut target = ReadBuffer::user(&mm, raw[0], raw[1].min(file::MAX_RW_COUNT))?;
     let mut bytes = [0; 256];
@@ -306,6 +311,7 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
             };
         }
     }
+
     Ok(target.copied() as isize)
 }
 
@@ -313,6 +319,7 @@ fn getrandom(user: &UserThread, raw: [usize; 6]) -> SysResult {
 fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
     const SYSLOG_ACTION_READ_ALL: i32 = 3;
     const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
     let action = raw[0] as i32;
     if action == SYSLOG_ACTION_SIZE_BUFFER {
         return Ok((klog::CAPACITY * klog::TEXT_CAPACITY) as isize);
@@ -331,6 +338,7 @@ fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if capacity == 0 {
         return Ok(0);
     }
+
     let end = klog::next_sequence();
     let mut cursor = klog::Cursor::oldest();
     let mut text = Vec::new();
@@ -363,6 +371,7 @@ fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
         lengths[count] = text.len() - begin;
         count += 1;
     }
+
     let mut start = 0;
     for length in &lengths[..count] {
         if text.len() - start <= capacity as usize {
@@ -370,6 +379,7 @@ fn syslog(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         start += length;
     }
+
     let output = &text[start..];
     let mm = user.mm().expect("syslog has no MM");
     copyout(&mm, raw[1], output)?;

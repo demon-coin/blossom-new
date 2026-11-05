@@ -47,19 +47,23 @@ pub(super) const CRMD_ADDRESS_MODE: usize = CRMD_DA | CRMD_PG;
 pub(super) const CRMD_DATF_CACHED: usize = 1 << 5;
 pub(super) const CRMD_DATM_CACHED: usize = 1 << 7;
 pub(super) const CRMD_BOOT: usize = CRMD_PG | CRMD_DATF_CACHED | CRMD_DATM_CACHED;
+
 pub(super) const DMW_PLV0: usize = 1;
 pub(super) const DMW_CACHED: usize = 1 << 4;
 pub(super) const DMW_KERNEL_RAM: usize = DMW_PLV0 | DMW_CACHED;
+
 pub(crate) const EUEN_FP: usize = 1;
 pub(crate) const EUEN_LSX: usize = 1 << 1;
 pub(crate) const EUEN_LASX: usize = 1 << 2;
 pub(super) const EUEN_SCALAR: usize = EUEN_FP;
 pub(super) const EUEN_SIMD: usize = EUEN_FP | EUEN_LSX;
 pub(super) const EUEN_WIDE_SIMD: usize = EUEN_SIMD | EUEN_LASX;
+
 pub(super) const CPUCFG_FEATURES: usize = 2;
 pub(super) const CPUCFG_FP: u64 = 1;
 pub(super) const CPUCFG_LSX: u64 = 1 << 6;
 pub(super) const CPUCFG_LASX: u64 = 1 << 7;
+
 pub(super) const CPUCFG_COUNTER_BASE: usize = 4;
 pub(super) const CPUCFG_COUNTER_RATIO: usize = 5;
 pub(super) const CPUCFG_COUNTER_MUL_MASK: u64 = 0xffff;
@@ -69,15 +73,18 @@ pub(super) const CPUCFG_COUNTER_DIV_SHIFT: usize = 16;
 pub(super) const HARDWARE_CPU_ID_BITS: usize = 10;
 pub(super) const HARDWARE_CPU_ID_COUNT: usize = 1 << HARDWARE_CPU_ID_BITS;
 pub(super) const HARDWARE_CPU_ID_MASK: usize = HARDWARE_CPU_ID_COUNT - 1;
+
 pub(super) const ESTAT_ECODE_SHIFT: usize = 16;
 pub(super) const ESTAT_ECODE_MASK: usize = 0x3f;
 pub(super) const ESTAT_IRQ_MASK: usize = (1 << 13) - 1;
+
 pub(crate) const CPU_HWI0: u32 = 2;
 pub(crate) const CPU_HWI1: u32 = CPU_HWI0 + 1;
 pub(super) const IRQ_HWI0: usize = 1 << CPU_HWI0;
 pub(super) const IRQ_HWI1: usize = 1 << CPU_HWI1;
 pub(super) const IRQ_TIMER: usize = 1 << 11;
 pub(super) const IRQ_IPI: usize = 1 << 12;
+
 pub(crate) const ECODE_PIL: usize = 1;
 pub(crate) const ECODE_PIS: usize = 2;
 pub(crate) const ECODE_PIF: usize = 3;
@@ -87,7 +94,9 @@ pub(crate) const ECODE_PNX: usize = 6;
 pub(crate) const ECODE_SYS: usize = 11;
 #[cfg(feature = "ktest")]
 pub(crate) const ECODE_INE: usize = 13;
+
 pub(super) const TLBRERA_IS_TLBR: usize = 1;
+
 pub(super) const TCFG_ENABLE: usize = 1;
 pub(super) const TICLR_CLEAR: usize = 1;
 pub(super) const TIMER_QUANTUM: u64 = 1 << 2;
@@ -101,6 +110,7 @@ pub(super) const IOCSR_MAILBOX1: usize = 0x1028;
 pub(super) const IOCSR_MAILBOX2: usize = 0x1030;
 pub(super) const IOCSR_IPI_SEND: usize = 0x1040;
 pub(super) const IOCSR_MAIL_SEND: usize = 0x1048;
+
 pub(super) const IPI_SEND_BLOCKING: u32 = 1 << 31;
 pub(super) const IPI_SEND_CPU_SHIFT: usize = 16;
 pub(super) const MAILBOX_COUNT: usize = 4;

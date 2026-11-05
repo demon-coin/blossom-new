@@ -8,6 +8,7 @@ const REG2I14_OPCODE_SHIFT: usize = 24;
 const REG3_OPCODE_SHIFT: usize = 15;
 const REGISTER_MASK: u32 = (1 << 5) - 1;
 const INSTRUCTION_BYTES: usize = core::mem::size_of::<u32>();
+
 const LD_H: u32 = 0xa1;
 const LD_W: u32 = 0xa2;
 const LD_D: u32 = 0xa3;
@@ -20,10 +21,12 @@ const FLD_S: u32 = 0xac;
 const FST_S: u32 = 0xad;
 const FLD_D: u32 = 0xae;
 const FST_D: u32 = 0xaf;
+
 const LDPTR_W: u32 = 0x24;
 const STPTR_W: u32 = 0x25;
 const LDPTR_D: u32 = 0x26;
 const STPTR_D: u32 = 0x27;
+
 const LDX_H: u32 = 0x7008;
 const LDX_W: u32 = 0x7010;
 const LDX_D: u32 = 0x7018;
@@ -99,6 +102,7 @@ impl Instruction {
                 },
             },
         };
+
         Some(Self {
             register: (word & REGISTER_MASK) as usize,
             width,
@@ -132,6 +136,7 @@ impl Instruction {
             .checked_add(self.width - 1)
             .ok_or(VmError::InvalidRange)?;
         let mut value = 0;
+
         for offset in 0..self.width {
             if self.write {
                 memory.write_byte(
@@ -143,6 +148,7 @@ impl Instruction {
                     (memory.read_byte(address + offset)? as u64) << (offset * u8::BITS as usize);
             }
         }
+
         Ok(value)
     }
 
@@ -155,12 +161,14 @@ impl Instruction {
             } else {
                 value
             };
+
             if self.floating {
                 context.fpr[self.register].lanes[0] = value;
             } else if self.register != 0 {
                 context.gpr[self.register] = value as usize;
             }
         }
+
         context.pc = context.pc.wrapping_add(INSTRUCTION_BYTES);
     }
 }

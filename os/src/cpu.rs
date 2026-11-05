@@ -273,6 +273,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         CPU_LOCALS.iter().all(|local| local.get().is_none()),
         "CPU table is already initialized"
     );
+
     let bsp_stack_top = ptr::addr_of!(BOOT_STACK) as usize + STACK_SIZE;
     for (id, slot) in CPU_LOCALS[..info.cpu_count].iter().enumerate() {
         let stack_top = if id == 0 { bsp_stack_top } else { 0 };
@@ -288,6 +289,7 @@ pub unsafe fn initialize(info: &BootInfo) {
                 });
         }
     }
+
     // SAFETY: 逻辑 0 是 BSP；Once 中的对象已完成构造且永久存在，IRQ 尚未开启。
     unsafe { crate::arch::install_cpu_local(get(0)) };
 }
@@ -381,6 +383,7 @@ pub(crate) fn wait_until_started(ready: &AtomicBool) {
             && local.preempt_depth.load(Ordering::Relaxed) == 0,
         "CPU startup wait requires online boot context"
     );
+
     while !ready.load(Ordering::Acquire) {
         let saved = crate::arch::irq_save();
         if !ready.load(Ordering::Acquire) {
@@ -425,6 +428,7 @@ pub unsafe fn start_secondaries() {
                 local.hardware_id, error
             );
         }
+
         let deadline = crate::arch::read_counter()
             + crate::boot::info().counter_frequency * AP_ONLINE_TIMEOUT_SECS;
         while !local.online.load(Ordering::Acquire) {
@@ -526,6 +530,7 @@ pub fn handle_ipi() {
     if reasons & KICK_LOG_PRINTER != 0 {
         crate::klog::wake_printer();
     }
+
     loop {
         // SAFETY: 队列短锁覆盖 pop；入队协议保证所有未完成节点仍然存活。
         let request = unsafe { local.calls.lock().pop() };
@@ -542,6 +547,7 @@ pub fn handle_ipi() {
             (*request).done.store(true, Ordering::Release);
         }
     }
+
     if reasons & KICK_STOP != 0 {
         crate::arch::stop_current_cpu(&local.stopped);
     }
@@ -562,6 +568,7 @@ pub unsafe fn call(target: usize, callback: unsafe fn(*mut ()), argument: *mut (
         unsafe { callback(argument) };
         return;
     }
+
     let local = get(target);
     let pinned = core::pin::pin!(Call {
         callback,
@@ -634,6 +641,7 @@ pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
         0,
         "CPU stop in bottom half"
     );
+
     let mut targets = CpuSet::empty();
     for id in 0..count() {
         let local = get(id);
@@ -645,14 +653,17 @@ pub(crate) fn stop_other_online_cpus() -> crate::sync::PreemptGuard {
             targets.insert(id);
         }
     }
+
     for id in targets.iter() {
         kick(id, KICK_STOP);
     }
+
     for id in targets.iter() {
         while !get(id).stopped.load(Ordering::Acquire) {
             spin_loop();
         }
     }
+
     crate::early_println!(
         "CPU stop complete: coordinator={} acknowledged={:?}",
         coordinator.id,

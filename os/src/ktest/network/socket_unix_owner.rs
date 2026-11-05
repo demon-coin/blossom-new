@@ -15,6 +15,7 @@ pub(crate) mod socket_unix_owner {
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::socket::{SocketFile, SHUT_WR};
     use crate::net::{IoProgress, UnixSocketType};
+
     /// UNIX 末 OFD 撤真实 watch，别名保活到最后 put，两个 slot 在根未停止时归还。
     #[test]
     fn unix_last_ofd_watch_weak_and_slots_retire_normally(
@@ -51,6 +52,7 @@ pub(crate) mod socket_unix_owner {
                 ),
             )?;
         }
+
         drop(first);
         context.expect_eq(file_weak.upgrade().is_some(), true);
         context.expect_eq(
@@ -74,10 +76,12 @@ pub(crate) mod socket_unix_owner {
         let mut output = [0u8; 16];
         socket_read_exact(&alias, &mut output)?;
         context.expect_eq(&output, b"last alias bytes");
+
         operation(context, alias.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, second.read(&mut [0u8; 1]))?, 0);
         operation(context, second.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, alias.read(&mut [0u8; 1]))?, 0);
+
         drop(alias);
         context.expect_eq(file_weak.upgrade().is_none(), true);
         context.expect_eq(watch_weak.upgrade().is_none(), true);
@@ -87,6 +91,7 @@ pub(crate) mod socket_unix_owner {
         );
         drop((second, epoll));
         socket_retired(&fixture.net)?;
+
         let [first, second] = operation(
             context,
             fixture.net.try_new_unix_pair(UnixSocketType::Stream),
@@ -113,6 +118,7 @@ pub(crate) mod socket_unix_owner {
         context.expect_eq(first_weak.upgrade().is_none(), true);
         context.expect_eq(second_weak.upgrade().is_none(), true);
         socket_retired(&fixture.net)?;
+
         // pair 准备面对真实堆耗尽时不得留下任一未发表端点；放压后原根继续创建。
         let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let evidence = pressure.exhaust();
@@ -129,6 +135,7 @@ pub(crate) mod socket_unix_owner {
             return Err(TestError("UNIX pair OOM left partial endpoint ownership"));
         }
         socket_retired(&fixture.net)?;
+
         let [first, second] = operation(
             context,
             fixture.net.try_new_unix_pair(UnixSocketType::Stream),
@@ -167,6 +174,7 @@ pub(crate) mod socket_unix_owner {
             )?);
         }
         context.expect_eq(fixture.net.ktest_live_endpoints(), count * 2);
+
         let alias = pairs[0][0].clone();
         let weak = Arc::downgrade(&alias);
         for (index, [sender, receiver]) in pairs.into_iter().enumerate() {
@@ -178,6 +186,7 @@ pub(crate) mod socket_unix_owner {
             context.expect_eq(output, input);
             drop((sender, receiver));
         }
+
         context.expect_eq(weak.upgrade().is_some(), true);
         context.expect_eq(fixture.net.ktest_live_endpoints(), 1);
         context.expect_eq(
@@ -189,6 +198,7 @@ pub(crate) mod socket_unix_owner {
             ),
             Err(FsError::BrokenPipe),
         );
+
         drop(alias);
         context.expect_eq(weak.upgrade().is_none(), true);
         socket_retired(&fixture.net)?;

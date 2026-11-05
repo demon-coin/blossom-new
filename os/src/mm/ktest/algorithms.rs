@@ -290,6 +290,7 @@ mod controlled_buddy {
             assert_eq!(head % (1 << order), 0);
             assert!(head + (1 << order) <= 1024);
             assert_eq!(zone.free(), 1024 - (1 << order));
+
             zone.release(0);
             assert!(zone.allocate(0, 10));
             assert_eq!(zone.block(0), (0, 10));
@@ -308,6 +309,7 @@ mod controlled_buddy {
             assert_eq!(zone.block(0), (0, 10));
             assert_eq!(zone.free(), 0);
             zone.release(0);
+
             for index in 0..=10 {
                 let order = if index == 10 { 0 } else { index };
                 let before = zone.free();
@@ -324,6 +326,7 @@ mod controlled_buddy {
             }
             assert_eq!(zone.free(), 0);
             assert!(!zone.allocate(11, 0));
+
             for index in [9, 0, 7, 2, 10, 4, 1, 8, 3, 6, 5] {
                 zone.release(index);
             }
@@ -354,6 +357,7 @@ mod controlled_buddy {
             }
             assert_eq!(zone.free(), 0);
             assert!(!zone.allocate(14, 0));
+
             for step in 0..14 {
                 zone.release((step * 5) % 14);
             }
@@ -365,6 +369,7 @@ mod controlled_buddy {
             }
             assert!(!zone.allocate(5, 1));
             assert_eq!(zone.free(), 4);
+
             for index in 0..5 {
                 zone.release(index);
             }
@@ -405,6 +410,7 @@ mod controlled_buddy {
             }
             assert!(!zone.allocate_in(12, 0, 0, 16));
             assert_eq!(zone.free(), 2);
+
             for index in 0..12 {
                 zone.release(index);
             }
@@ -449,6 +455,7 @@ fn ram_page(info: &BootInfo, pfn: usize) -> bool {
     }
     true
 }
+
 /// 检查真实不可变启动范围包含 PFN，不赋予物理访问权。
 fn contains(ranges: &[PageRange], pfn: usize) -> bool {
     ranges.iter().any(|r| r.start <= pfn && pfn < r.end)
@@ -501,6 +508,7 @@ mod real_page_map {
             assert_eq!(has_ram, section.is_some());
             present_sections += usize::from(section.is_some());
         }
+
         let stats = map.stats();
         assert_eq!(
             counts,
@@ -513,6 +521,7 @@ mod real_page_map {
         );
         assert_eq!(counts[0], counts[1] + counts[2] + counts[3]);
         assert_eq!(present_sections, map.present_sections());
+
         let mut previous = 0;
         let mut listed = 0;
         for range in map.free_ranges() {

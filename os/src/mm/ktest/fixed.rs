@@ -34,6 +34,7 @@ fn execute<T: Send + 'static>(
         body(returned.state.as_mut().unwrap());
         Ok(())
     })?;
+
     let deadline = crate::arch::read_counter().wrapping_add(crate::arch::counter_frequency() * 20);
     while handle.try_join().is_none() {
         if deadline <= crate::arch::read_counter() {

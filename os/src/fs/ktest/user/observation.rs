@@ -23,6 +23,7 @@ impl UserOwner {
         if mode == b"trace" && self.net.is_none() {
             return Err(TestError("observation trace suite has no network"));
         }
+
         self.observation_trace = mode == b"trace";
         let result = self.observation_run(context, mode);
         if result.is_err() {
@@ -32,6 +33,7 @@ impl UserOwner {
             }
             self.reap_children(context, true)?;
         }
+
         let observer_status = self.observer.take().map(|observer| observer.join());
         if self.observation_trace {
             checked(context, crate::trace::stop())?;
@@ -56,6 +58,7 @@ impl UserOwner {
                 return Err(TestError("observation coordinator failed"));
             }
         }
+
         result
     }
 
@@ -91,6 +94,7 @@ impl UserOwner {
         if command_fd != 3 || reply_fd != 4 {
             return Err(TestError("observation private pipe descriptors changed"));
         }
+
         let image = self.load_named(context, PROGRAM, mode)?;
         let prepared = task::prepare_program(self.graph(), None, image, runtime, Placement::Any)
             .map_err(|_| TestError("observation user task preparation failed"))?;
@@ -109,6 +113,7 @@ impl UserOwner {
             0
         })
         .map_err(|_| TestError("observation coordinator preparation failed"))?;
+
         let pid = prepared.pid();
         let join = prepared
             .publish()
@@ -121,6 +126,7 @@ impl UserOwner {
             join,
         });
         self.observer = Some(coordinator.publish());
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {

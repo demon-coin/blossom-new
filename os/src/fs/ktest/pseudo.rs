@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 const ADDRESS: usize = 0x4800_0000;
+
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -221,6 +222,7 @@ pub(crate) mod filesystems {
                 AccessMode::ReadOnly,
             ),
         )?;
+
         context.expect_eq(tmp.kind(), MemoryFsKind::Tmpfs);
         context.expect_eq(dev.kind(), MemoryFsKind::Devfs);
         context.expect_eq(proc.kind(), MemoryFsKind::Procfs);
@@ -248,6 +250,7 @@ pub(crate) mod filesystems {
                 || disk.device == tmp.device(),
             false,
         );
+
         let old_inode = null.path().unwrap().inode().unwrap().clone();
         drop(null);
         fixture.vfs().prune_unused();
@@ -265,6 +268,7 @@ pub(crate) mod filesystems {
             }
         }
         context.expect_eq(names, 3);
+
         context.expect_eq(
             fixture
                 .vfs()
@@ -315,6 +319,7 @@ pub(crate) mod filesystems {
         let mut actual = [0; mm::PAGE_SIZE + 17];
         context.expect_eq(checked(context, file.read(&mut actual))?, actual.len());
         context.expect_eq(actual, bytes);
+
         checked(context, file.truncate(13))?;
         context.expect_eq(tmp.used_pages(), 1);
         checked(context, file.truncate(100))?;
@@ -322,6 +327,7 @@ pub(crate) mod filesystems {
         context.expect_eq(checked(context, file.read_at(0, &mut tail))?, tail.len());
         context.expect_eq(&tail[..13], &[0x6d; 13]);
         context.expect_eq(&tail[13..], &[0; 87]);
+
         checked(
             context,
             fixture.vfs().unlink_from(
@@ -340,6 +346,7 @@ pub(crate) mod filesystems {
         );
         context.expect_eq(checked(context, file.stat())?.links, 0);
         context.expect_eq(checked(context, file.write_at(7, b"open"))?, 4);
+
         let mut attempt = ReclaimAttempt::new();
         let page = checked(
             context,
@@ -355,6 +362,7 @@ pub(crate) mod filesystems {
             page.copy_to(7, &mut retained).map_err(FsError::from),
         )?;
         context.expect_eq(&retained, b"open");
+
         drop(page);
         fixture.vfs().prune_unused();
         context.expect_eq(tmp.used_pages(), 0);
@@ -383,6 +391,7 @@ pub(crate) mod filesystems {
                 AccessMode::ReadOnly,
             ),
         )?;
+
         let first = open(context, fixture, b"/plain/proc/mounts", 0)?;
         let before = text(context, &first)?;
         context.expect_eq(
@@ -408,6 +417,7 @@ pub(crate) mod filesystems {
         context.expect_eq(before == after, false);
         checked(context, first.seek(SeekFrom::Start(0)))?;
         context.expect_eq(&text(context, &first)?, &before);
+
         checked(context, fixture.vfs().unmount(&change_cover))?;
         context.expect_eq(
             &text(context, &open(context, fixture, b"/plain/proc/mounts", 0)?)?,
@@ -419,6 +429,7 @@ pub(crate) mod filesystems {
             first.ioctl(0, 0, FileIoContext::Kernel),
             Err(FsError::NotTty),
         );
+
         let mut prefix = [0; 8];
         context.expect_eq(
             checked(context, first.read_at(0, &mut prefix))?,
@@ -438,6 +449,7 @@ pub(crate) mod filesystems {
             first.seek(SeekFrom::Start(u64::MAX)),
             Err(FsError::InvalidOperation),
         );
+
         checked(context, first.seek(SeekFrom::Start(0)))?;
         let shared = first.clone();
         context.expect_eq(checked(context, shared.read(&mut prefix))?, prefix.len());
@@ -447,6 +459,7 @@ pub(crate) mod filesystems {
         );
         let independent = open(context, fixture, b"/plain/proc/mounts", 0)?;
         context.expect_eq(checked(context, independent.seek(SeekFrom::Current(0)))?, 0);
+
         let memory_before = text(context, &open(context, fixture, b"/plain/proc/meminfo", 0)?)?;
         let stats = mm::stats();
         context.expect_eq(
@@ -472,6 +485,7 @@ pub(crate) mod filesystems {
             field(&memory_after, "MemFree:")? < field(&memory_before, "MemFree:")?,
             true,
         );
+
         let uptime_before = text(context, &open(context, fixture, b"/plain/proc/uptime", 0)?)?;
         timer::sleep(time::Duration::from_millis(25));
         let uptime_after = text(context, &open(context, fixture, b"/plain/proc/uptime", 0)?)?;
@@ -516,6 +530,7 @@ pub(crate) mod filesystems {
             context,
             open_path_with_flags(fixture.vfs(), path.clone(), 0, FileIoContext::Kernel),
         )?;
+
         let bootargs = boot::info().bootargs();
         let length = bootargs
             .len()
@@ -562,6 +577,7 @@ pub(crate) mod filesystems {
         );
         context.expect_eq(&window[..count], &expected[tail..]);
         context.expect_eq(checked(context, first.seek(SeekFrom::Current(0)))?, 0);
+
         let table = checked(context, FileTable::try_new())?;
         let fd =
             checked(context, table.reserve(2))?.publish(first.clone(), DescriptorFlags::default());
@@ -580,6 +596,7 @@ pub(crate) mod filesystems {
             checked(context, first.seek(SeekFrom::Current(0)))?,
             count as u64,
         );
+
         let independent = checked(
             context,
             open_path_with_flags(fixture.vfs(), path, 0, FileIoContext::Kernel),
@@ -590,6 +607,7 @@ pub(crate) mod filesystems {
             checked(context, first.seek(SeekFrom::Current(0)))?,
             count as u64,
         );
+
         drop(table);
         drop(independent);
         drop(first);
@@ -656,6 +674,7 @@ pub(crate) mod filesystems {
             covers.push(resolve(context, fixture, &path)?);
             path.truncate(base_length);
         }
+
         let mut devices = [0; 8];
         for (index, cover) in covers.iter().enumerate() {
             let fs = checked(context, MemoryFs::try_tmpfs(b"mode=0777"))?;
@@ -713,6 +732,7 @@ pub(crate) mod filesystems {
         );
         context.expect_eq(window.as_slice(), &before[..window.len()]);
         context.expect_eq(checked(context, first.seek(SeekFrom::Current(0)))?, 65648);
+
         context.expect_eq(
             checked(context, first.seek(SeekFrom::End(-17)))?,
             before.len() as u64 - 17,
@@ -771,6 +791,7 @@ pub(crate) mod filesystems {
         );
         let data = create(context, fixture, b"/plain/rw")?;
         context.expect_eq(checked(context, data.write(b"ram"))?, 3);
+
         mkdir(context, fixture, b"/plain/dev")?;
         let cover = resolve(context, fixture, b"/plain/dev")?;
         checked(
@@ -806,6 +827,7 @@ pub(crate) mod filesystems {
         context.expect_eq(read_only.write(b""), Err(FsError::BadFd));
         let write_only = open(context, fixture, b"/plain/dev/zero", 1)?;
         context.expect_eq(write_only.read(&mut []), Err(FsError::BadFd));
+
         let mm = address_space()?;
         context.expect_eq(
             mm.copyout(ADDRESS + mm::PAGE_SIZE - 17, &[0x72; 17]).copied,
@@ -832,6 +854,7 @@ pub(crate) mod filesystems {
                 0,
             );
         }
+
         let mut target = checked(
             context,
             ReadBuffer::user(&mm, ADDRESS + mm::PAGE_SIZE - 17, 64),
@@ -884,6 +907,7 @@ pub(crate) mod filesystems {
                 drop(create(context, fixture, &name)?);
                 fixture.vfs().prune_unused();
             }
+
             context.expect_eq(
                 fixture
                     .vfs()
@@ -902,6 +926,7 @@ pub(crate) mod filesystems {
                     .err(),
                 Some(FsError::NoSpace),
             );
+
             checked(
                 context,
                 fixture.vfs().unlink_from(
@@ -942,6 +967,7 @@ pub(crate) mod filesystems {
                 Ok(4),
             );
             context.expect_eq(last, [0x3d; 4]);
+
             checked(context, file.truncate(0))?;
             context.expect_eq(tmp.used_pages(), 0);
             context.expect_eq(file.write_at(0, b"again"), Ok(5));
@@ -961,6 +987,7 @@ pub(crate) mod filesystems {
     ) -> TestResult {
         let tmp = prepare_tmp(context, fixture, b"mode=0777")?;
         let file = create(context, fixture, b"/plain/oom")?;
+
         let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let probes = pressure.exhaust();
         let result = file.write_at(0, b"lost");
@@ -969,6 +996,7 @@ pub(crate) mod filesystems {
         context.expect_eq(result, Err(FsError::NoMemory));
         context.expect_eq(tmp.used_pages(), 0);
         context.expect_eq(checked(context, file.stat())?.size, 0);
+
         context.expect_eq(file.write_at(0, b"kept"), Ok(4));
         let mut bytes = [0; 4];
         context.expect_eq(file.read_at(0, &mut bytes), Ok(4));

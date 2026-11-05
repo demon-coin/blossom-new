@@ -1,4 +1,5 @@
 //! 最终 ELF 中的只读注册槽；目录发现不依赖 MM、Task 或堆。
+
 use super::report::{self, Json, Nullable};
 use ::ktest::{CaseDesc, Context, Defaults, Isolation, SuiteDesc, SuiteSlot, TestError};
 use core::mem::{align_of, size_of};
@@ -22,6 +23,7 @@ pub(crate) struct Registry {
     ro_start: usize,
     ro_end: usize,
 }
+
 impl Registry {
     /// 无分配核验注册槽、永久只读元数据和可执行回调；完整名称冲突由宿主目录集合检查。
     pub(crate) fn load() -> Result<Self, TestError> {
@@ -36,6 +38,7 @@ impl Registry {
             ro_start: core::ptr::addr_of!(__rodata_start) as usize,
             ro_end: core::ptr::addr_of!(__rodata_end) as usize,
         };
+
         if value.ro_end <= value.ro_start
             || start < value.ro_start
             || value.ro_end < end
@@ -49,6 +52,7 @@ impl Registry {
                 "registry boundary/alignment outside permanent RO mapping",
             ));
         }
+
         for index in 0..value.count {
             let suite = value.suite(index as u32)?;
             value.text(suite.name)?;
@@ -60,12 +64,14 @@ impl Registry {
             if suite.cases.is_empty() || (u32::MAX as usize) < suite.cases.len() {
                 return Err(TestError("invalid suite case count"));
             }
+
             let run = suite.run as usize;
             if run < core::ptr::addr_of!(__executable_start) as usize
                 || core::ptr::addr_of!(__etext) as usize <= run
             {
                 return Err(TestError("suite callback outside executable mapping"));
             }
+
             for case in suite.cases {
                 value.text(case.name)?;
                 value.text(case.source)?;
@@ -96,6 +102,7 @@ impl Registry {
                 {
                     return Err(TestError("control character in test name"));
                 }
+
                 if let Some(kind) = case.expected_fatal {
                     if !matches!(
                         kind,
@@ -121,6 +128,7 @@ impl Registry {
         }
         Ok(value)
     }
+
     /// 核验任意有界永久 RO 区间，包括空 slice 的 Rust 对齐悬空地址。
     fn contains(&self, pointer: usize, bytes: usize) -> bool {
         bytes == 0
@@ -129,6 +137,7 @@ impl Registry {
                     .checked_add(bytes)
                     .is_some_and(|end| end <= self.ro_end))
     }
+
     /// 核验静态 slice 的真实长度和映射。
     fn slice<T>(&self, values: &'static [T]) -> Result<(), TestError> {
         if (values.as_ptr() as usize) % align_of::<T>() != 0
@@ -141,6 +150,7 @@ impl Registry {
         }
         Ok(())
     }
+
     /// 字符串无目录容量上限，只要求真实静态 UTF-8 RO 存储。
     fn text(&self, value: &'static str) -> Result<(), TestError> {
         if !self.contains(value.as_ptr() as usize, value.len()) {
@@ -148,6 +158,7 @@ impl Registry {
         }
         Ok(())
     }
+
     /// 有效默认值必须来自正式 API 的固定资源枚举。
     fn defaults(&self, value: &Defaults) -> Result<(), TestError> {
         self.slice(value.tags)?;
@@ -160,11 +171,13 @@ impl Registry {
         }
         Ok(())
     }
+
     /// 只从已校验槽区间读取一个原指针，先验证目标再建立永久借用。
     pub(crate) fn suite(&self, id: u32) -> Result<&'static SuiteDesc, TestError> {
         if id as usize >= self.count {
             return Err(TestError("unknown suite ID"));
         }
+
         let slot = self.start + id as usize * size_of::<SuiteSlot>();
         // SAFETY: load 核验槽区间、对齐和步长；指针位模式先按 usize 读取，尚不建立描述符引用。
         let pointer = unsafe { (slot as *const usize).read() };
@@ -175,6 +188,7 @@ impl Registry {
         // SAFETY: 槽由 repr(C) SuiteSlot 的真实 Rust 静态引用生成；目标已核永久 RO 映射和对齐。
         Ok(unsafe { &*(pointer as *const SuiteDesc) })
     }
+
     /// 流式输出最终 ELF 的完整目录，不建立中央 case 表。
     pub(crate) fn catalog(&self, arch: &str, cpus: u32, mode: &str, panic: &str) -> ! {
         report::write(format_args!("{{\"type\":\"catalog\",\"version\":1,\"arch\":\"{}\",\"cpus\":{},\"mode\":\"{}\",\"panic\":\"{}\"}}\n", arch, cpus, mode, panic));
@@ -201,7 +215,9 @@ impl Registry {
         crate::arch::test_shutdown()
     }
 }
+
 struct Attributes<'a>(&'a Defaults);
+
 impl core::fmt::Display for Attributes<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write;
@@ -240,6 +256,7 @@ impl core::fmt::Display for Attributes<'_> {
         f.write_char(']')
     }
 }
+
 /// 输出每个实例真实有效属性与 fatal 正文合同。
 fn emit_case(suite: usize, id: usize, c: &CaseDesc) {
     report::write(format_args!("{{\"type\":\"case\",\"suite\":{},\"case\":{},\"name\":{},\"parameter\":{},\"source\":{},\"line\":{}, {},\"ignore\":{},\"expected_fatal\":{},\"fatal_message\":{}}}\n", suite, id, Json(c.name), Nullable(c.parameter), Json(c.source), c.line, Attributes(&c.attributes), Nullable(c.ignore), Nullable(c.expected_fatal), Nullable(c.fatal_message)));

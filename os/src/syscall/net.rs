@@ -23,10 +23,12 @@ use crate::timer::TICK_NS;
 use smoltcp::socket::tcp::CongestionControl;
 
 const SOCKET_FLAGS: u32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
+
 const TCP_NODELAY: i32 = 1;
 const TCP_MAXSEG: i32 = 2;
 const TCP_CONGESTION: i32 = 13;
 const IPV6_V6ONLY: i32 = 26;
+
 const CONGESTION_NAME_LEN: usize = 16;
 const ADDRESS_STORAGE_LEN: usize = 128;
 const TIMEVAL_LEN: usize = 16;
@@ -53,6 +55,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
         242 => accept(user, raw, raw[3] as u32),
         _ => Err(Errno::NoSyscall),
     };
+
     match result {
         Err(Errno::RestartSyscall) => Outcome::Restart(Restart::Syscall { request }),
         other => Outcome::Return(other.unwrap_or_else(Errno::result)),
@@ -106,6 +109,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
         SOCK_STREAM | SOCK_DGRAM => return Err(Errno::ProtocolNotSupported),
         _ => return Err(Errno::SocketTypeNotSupported),
     }
+
     let runtime = user.runtime().expect("socket has no runtime");
     let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
     let reservation = runtime.files.reserve(nofile(user))?;
@@ -126,6 +130,7 @@ fn socket(user: &UserThread, raw: [usize; 6]) -> SysResult {
             runtime.credentials.gid,
         )?
     };
+
     Ok(reservation.publish(
         file,
         DescriptorFlags {
@@ -167,6 +172,7 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if protocol != 0 {
         return Err(Errno::ProtocolNotSupported);
     }
+
     let runtime = user.runtime().expect("socketpair has no runtime");
     let net = runtime.net.ok_or(Errno::NetworkUnreachable)?;
     let first_slot = runtime.files.reserve(nofile(user))?;
@@ -178,11 +184,13 @@ fn socketpair(user: &UserThread, raw: [usize; 6]) -> SysResult {
         runtime.credentials.uid,
         runtime.credentials.gid,
     )?;
+
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(first_slot.fd() as u32).to_ne_bytes());
     bytes[4..].copy_from_slice(&(second_slot.fd() as u32).to_ne_bytes());
     let mm = user.mm().expect("socketpair has no MM");
     copyout(&mm, raw[3], &bytes)?;
+
     let descriptor_flags = DescriptorFlags {
         close_on_exec: flags & SOCK_CLOEXEC != 0,
     };
@@ -197,6 +205,7 @@ fn input_address(mm: &Mm, address: usize, raw_length: usize) -> Result<SocketAdd
     if length < ADDRESS_FAMILY_LEN as i32 || (ADDRESS_STORAGE_LEN as i32) < length {
         return Err(Errno::InvalidArgument);
     }
+
     let mut bytes = [0u8; ADDRESS_STORAGE_LEN];
     copyin(mm, &mut bytes[..length as usize], address)?;
     Ok(SocketAddress::decode(&bytes[..length as usize])?)
@@ -252,6 +261,7 @@ fn accept(user: &UserThread, raw: [usize; 6], flags: u32) -> SysResult {
     if flags & !SOCKET_FLAGS != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let file = socket_file(user, raw[0])?;
     let runtime = user.runtime().expect("accept has no runtime");
     let reservation = runtime.files.reserve(nofile(user))?;
@@ -261,10 +271,12 @@ fn accept(user: &UserThread, raw: [usize; 6], flags: u32) -> SysResult {
         runtime.credentials.gid,
         FileIoContext::User(user),
     )?;
+
     if raw[1] != 0 {
         let mm = user.mm().expect("accept has no MM");
         output_address(&mm, raw[1], raw[2], Some(child.peer_address()?))?;
     }
+
     let child: FileRef = child;
     Ok(reservation.publish(
         child,
@@ -294,6 +306,7 @@ fn name(user: &UserThread, raw: [usize; 6], peer: bool) -> SysResult {
     } else {
         socket.local_address()?
     };
+
     let mm = user.mm().expect("socket name has no MM");
     output_address(&mm, raw[1], raw[2], Some(address))?;
     Ok(0)
@@ -314,6 +327,7 @@ fn sendto(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         send_address(&mm, socket, raw[4], length as usize)?
     };
+
     let count = socket.send(
         &mut source,
         destination,
@@ -374,6 +388,7 @@ fn message_header(mm: &Mm, address: usize) -> Result<MessageHeader, Errno> {
     if control_length != 0 {
         return Err(Errno::Unsupported);
     }
+
     Ok(MessageHeader {
         name,
         name_capacity,
@@ -402,12 +417,14 @@ fn sendmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     } else {
         send_address(&mm, socket, header.name, header.name_capacity)?
     };
+
     let mut fast = [UserIoVector {
         address: 0,
         length: 0,
     }; 8];
     let vectors = import_vectors(&mm, header.vectors, header.vector_count, &mut fast)?;
     let mut source = WriteBuffer::user_vector(&mm, &vectors)?;
+
     Ok(socket.send(
         &mut source,
         destination,
@@ -430,12 +447,14 @@ fn recvmsg(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mut target = ReadBuffer::user_vector(&mm, &vectors)?;
     let flags = raw[2] as u32;
     let message = socket.receive(&mut target, flags, FileIoContext::User(user))?;
+
     if header.name != 0 {
         let length = output_name(&mm, header.name, header.name_capacity, message.source)?;
         output_message_field(&mm, raw[1], 8, &(length as u32).to_ne_bytes())?;
     }
     output_message_field(&mm, raw[1], 48, &message.flags.to_ne_bytes())?;
     output_message_field(&mm, raw[1], 40, &0u64.to_ne_bytes())?;
+
     let count =
         if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET) && flags & MSG_TRUNC != 0 {
             message.original_len
@@ -466,6 +485,7 @@ fn output_name(
     }
     Ok(length)
 }
+
 /// 接收消费真实消息；输入 TRUNC 选择报文原长，名称仍来自同条记录。
 fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let mm = user.mm().expect("recvfrom has no MM");
@@ -476,9 +496,11 @@ fn recvfrom(user: &UserThread, raw: [usize; 6]) -> SysResult {
         raw[3] as u32,
         FileIoContext::User(user),
     )?;
+
     if raw[4] != 0 {
         output_address(&mm, raw[4], raw[5], message.source)?;
     }
+
     let socket = file.socket().expect("checked socket capability");
     let count = if matches!(socket.socket_type(), SOCK_DGRAM | SOCK_SEQPACKET)
         && raw[3] as u32 & MSG_TRUNC != 0
@@ -527,6 +549,7 @@ fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, 
     if length < TIMEVAL_LEN {
         return Err(Errno::InvalidArgument);
     }
+
     let mut bytes = [0u8; TIMEVAL_LEN];
     copyin(mm, &mut bytes, address)?;
     let seconds = i64::from_ne_bytes(bytes[..8].try_into().expect("fixed timeval seconds"));
@@ -541,6 +564,7 @@ fn input_timeout(mm: &Mm, address: usize, length: usize) -> Result<Option<u64>, 
     if seconds == 0 && microseconds == 0 {
         return Ok(None);
     }
+
     // 输入和上取整在宽整数域完成，超出内部纳秒范围沿无限 sentinel 返回。
     let nanos = seconds as u128 * u128::from(NSEC_PER_SEC)
         + microseconds as u128 * u128::from(NSEC_PER_USEC);
@@ -569,6 +593,7 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     let level = raw[1] as i32;
     let option = raw[2] as i32;
     check_option(socket, level, option, true)?;
+
     let mm = user.mm().expect("setsockopt has no MM");
     if level == SOL_SOCKET && matches!(option, SO_RCVTIMEO | SO_SNDTIMEO) {
         let timeout = input_timeout(&mm, raw[3], length as usize)?;
@@ -590,6 +615,7 @@ fn setsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if length < 4 {
         return Err(Errno::InvalidArgument);
     }
+
     let mut bytes = [0u8; 4];
     copyin(&mm, &mut bytes, raw[3])?;
     let value = i32::from_ne_bytes(bytes);
@@ -642,6 +668,7 @@ fn getsockopt(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if level == IPPROTO_TCP && option == TCP_CONGESTION {
         return output_option(&mm, raw, capacity, &congestion_name(socket)?);
     }
+
     let value = match (level, option) {
         (IPPROTO_TCP, TCP_NODELAY) => i32::from(socket.nodelay()?),
         (IPPROTO_TCP, TCP_MAXSEG) => {

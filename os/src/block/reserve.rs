@@ -310,6 +310,7 @@ impl BioReserve {
         if capacity == 0 {
             return Err(BlockError::InvalidRange);
         }
+
         let mut metadata = Vec::new();
         metadata
             .try_reserve_exact(capacity)
@@ -328,6 +329,7 @@ impl BioReserve {
         if hot.next().is_some() {
             return Err(BlockError::InvalidRange);
         }
+
         let reserve = Arc::try_new(Self {
             state: SpinLock::new(ReserveState {
                 bios: core::array::from_fn(|_| BioSlot::new()),
@@ -338,6 +340,7 @@ impl BioReserve {
             available: WaitQueue::new(),
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         for slot in 0..BIO_SLOTS {
             let allocator = BioAllocator::Reserved {
                 reserve: reserve.clone(),
@@ -418,6 +421,7 @@ impl BioReserve {
             metadata.control.active = true;
             building
         };
+
         assert!(building);
         let allocation = RawBlock::allocate(layout);
         let mut state = self.state.lock();
@@ -595,6 +599,7 @@ impl BioReserve {
             }
             allocation.active = true;
         }
+
         let allocation = RawBlock::allocate(layout);
         let mut state = self.state.lock();
         let record = bio_allocation(&mut state.bios[slot], block);
@@ -713,6 +718,7 @@ impl BioLane {
         if stopped() {
             return Err(BlockError::QueueStopped);
         }
+
         let slot = self.slots[index];
         let mut state = self.reserve.state.lock();
         let bio = &mut state.bios[slot];

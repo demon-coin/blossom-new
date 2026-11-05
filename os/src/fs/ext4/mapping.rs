@@ -77,6 +77,7 @@ fn extent_map(
     if codec::EXTENT_LOGICAL_BLOCKS <= logical {
         return Err(FsError::Corrupt);
     }
+
     let g = volume.geometry();
     let mut step = extent_step(
         g,
@@ -129,6 +130,7 @@ fn extent_step(
     if depth.is_some() {
         codec::verify_extent_checksum(g, inode, data, header)?;
     }
+
     let mut previous_end = low.unwrap_or(0);
     let mut selected = None;
     let mut next_start = high;
@@ -189,6 +191,7 @@ fn extent_step(
             next_start = next_start.min(start);
         }
     }
+
     Ok(selected.unwrap_or(Step::Mapping(BlockMapping::Hole {
         len: next_start - logical,
     })))
@@ -225,6 +228,7 @@ fn indirect_map(
             BlockMapping::Mapped { physical, len: 1 }
         });
     }
+
     let pointers = (g.block_size / 4) as u64;
     let mut remaining = logical - codec::DIRECT_BLOCKS as u64;
     let mut span = pointers;
@@ -237,6 +241,7 @@ fn indirect_map(
     if span <= remaining {
         return Err(FsError::Corrupt);
     }
+
     let mut physical = u64::from(codec::le32(
         &inode.block,
         (codec::DIRECT_BLOCKS - 1 + depth) * 4,
@@ -363,6 +368,7 @@ impl PreparedMapping {
                     .expect("new indirect alias invalidation");
             }
         }
+
         self.nodes.clear();
         self.indirect.clear();
         self.retired.clear();
@@ -385,6 +391,7 @@ impl PreparedMapping {
                     .expect("prepared writable extent node");
             }
         }
+
         // 新间接链先初始化，最后才连接已有父指针；读者仍受 inode root 写侧排斥。
         for edit in &self.indirect {
             edit.buffer
@@ -396,6 +403,7 @@ impl PreparedMapping {
                 })
                 .expect("prepared writable indirect node");
         }
+
         while let Some(block) = self.allocated.pop() {
             block.publish();
         }
@@ -437,12 +445,14 @@ pub(crate) fn prepare(
     if limit <= logical {
         return Err(FsError::FileTooLarge);
     }
+
     let existing = map(volume, inode, logical, logical + 1, None)?;
     let mut prepared = empty_mapping(inode.block);
     if let BlockMapping::Mapped { physical, .. } = existing {
         prepared.physical = physical;
         return Ok(prepared);
     }
+
     prepared.zero = true;
     let result = if inode.flags & EXTENTS != 0 {
         prepare_extent(volume, inode, logical, existing, &mut prepared, true)
@@ -494,6 +504,7 @@ fn prepare_mapping_batch(
     if inode.block != *root {
         return Err(FsError::InvalidOperation);
     }
+
     let mut logical = Vec::new();
     logical
         .try_reserve_exact(logical_blocks.len())
@@ -615,6 +626,7 @@ fn prepare_extent(
             .try_reserve_exact(depth * 2)
             .map_err(|_| FsError::NoMemory)?;
     }
+
     if prepared.nodes.is_empty() {
         prepared.nodes.push(read_node(
             &inode.block,
@@ -763,6 +775,7 @@ fn prepare_extent(
         }
         level -= 1;
     }
+
     if consolidate && !split_nodes {
         consolidate_path(volume, inode, prepared, &mut slots, depth)?;
     }
@@ -796,6 +809,7 @@ fn new_node(
         .allocated
         .try_reserve(1)
         .map_err(|_| FsError::NoMemory)?;
+
     let block = volume.allocate_block((inode.number - 1) / g.inodes_per_group)?;
     let physical = block.physical();
     prepared.allocated.push(block);
@@ -866,6 +880,7 @@ fn consolidate_path(
         if left.max < count {
             continue;
         }
+
         let detached = if slot < sibling_slot {
             sibling_physical
         } else {
@@ -893,6 +908,7 @@ fn consolidate_path(
         prepared.nodes[level - 1].dirty = true;
         prepared.retired.push(release);
     }
+
     // 单子根降深不需要申请新节点，inline 容量始终是四项。
     for level in 1..=depth {
         if prepared.nodes[0].entries.len() != 1
@@ -1054,6 +1070,7 @@ fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
     for (index, entry) in node.entries.iter().enumerate() {
         bytes[12 + index * 12..24 + index * 12].copy_from_slice(entry);
     }
+
     if node.buffer.is_some() && g.features_ro_compat & codec::METADATA_CSUM != 0 {
         let tail = codec::EXTENT_HEADER_BYTES + node.max * codec::EXTENT_ENTRY_BYTES;
         codec::put32(bytes, tail, codec::crc32c(seed, &bytes[..tail]));
@@ -1134,6 +1151,7 @@ fn prepare_indirect(
         .allocated
         .try_reserve_exact(length)
         .map_err(|_| FsError::NoMemory)?;
+
     let mut parent = None;
     let mut missing = 0;
     let mut physical = u64::from(codec::le32(&prepared.root, offsets[0] * 4)?);
@@ -1147,6 +1165,7 @@ fn prepare_indirect(
     if physical != 0 {
         return Err(FsError::Corrupt);
     }
+
     let mut next = 0u32;
     for level in (missing..length).rev() {
         let block =
@@ -1170,6 +1189,7 @@ fn prepare_indirect(
         }
         next = physical as u32;
     }
+
     if let Some((buffer, physical)) = parent {
         prepared.indirect.push(IndirectEdit {
             buffer,
@@ -1239,6 +1259,7 @@ pub(crate) fn prepare_truncate(
     if limit < keep {
         return Err(FsError::FileTooLarge);
     }
+
     let mut prepared = PreparedTruncate {
         root: inode.block,
         removed_blocks: 0,
@@ -1374,6 +1395,7 @@ fn truncate_extent_node(
         }
         return Ok(());
     }
+
     while let Some(entry) = node.entries.last().copied() {
         if high <= keep {
             break;
@@ -1420,6 +1442,7 @@ fn prepare_extent_truncate(
         prepared,
         context,
     )?;
+
     if root.entries.is_empty() {
         root.depth = 0;
         root.max = codec::EXTENT_ROOT_ENTRIES;
@@ -1459,6 +1482,7 @@ fn prepare_extent_truncate(
         root.depth = child.depth;
         root.max = codec::EXTENT_ROOT_ENTRIES;
     }
+
     patch_node(
         volume.geometry(),
         &mut prepared.root,
@@ -1502,6 +1526,7 @@ fn truncate_indirect_node(
         .get(physical, g.block_size, context)?;
     let mut pointers = [0u32; codec::MAX_BLOCK_BYTES / core::mem::size_of::<u32>()];
     buffer.with_read(|bytes| read_truncate_indirect(g, bytes, &mut pointers))??;
+
     let mut first = n;
     for index in (0..n).rev() {
         let start = low + index as u64 * span;
@@ -1523,6 +1548,7 @@ fn truncate_indirect_node(
             first = index;
         }
     }
+
     let empty = pointers[..n].iter().all(|pointer| *pointer == 0);
     if empty {
         retire_node(volume, physical, prepared, context)?;
@@ -1551,6 +1577,7 @@ fn prepare_indirect_truncate(
             codec::put32(&mut prepared.root, slot * 4, 0);
         }
     }
+
     let n = (volume.geometry().block_size / 4) as u64;
     let mut low = codec::DIRECT_BLOCKS as u64;
     let mut span = n;

@@ -28,6 +28,7 @@ impl fmt::Display for UnicodeBody {
 }
 
 struct BodyHex<'a>(&'a [u8]);
+
 impl fmt::Display for BodyHex<'_> {
     /// 只在生产区间结束后流式编码独立ring正文，不复制UART内容或申请格式化缓冲。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -109,6 +110,7 @@ fn test_records() {
     );
     log::testing::wait_service_blocked();
     super::workqueue::wait_services_blocked();
+
     let first = log::next_sequence();
     let start_ns = clock::now().as_nanos();
     let attempts = mm::allocation_attempts();
@@ -131,6 +133,7 @@ fn test_records() {
     let last = scenario().timer_seq.load(Ordering::Acquire);
     assert_eq!(last, first + 4);
     assert_eq!(log::next_sequence(), last + 1);
+
     let levels = [
         Level::Info,
         Level::Warn,
@@ -180,6 +183,7 @@ fn test_records() {
         assert!(cursor.read().is_none());
         assert!(cursor.read().is_none());
     }
+
     timer.as_ref().close_sync();
     // SAFETY: 克隆只观察同一固定 Arc 的强计数，不移出 Timer；close_sync 已停止真实 callback 尾部。
     let observer = unsafe { Pin::into_inner_unchecked(timer.clone()) };
@@ -192,6 +196,7 @@ fn test_records() {
     assert_eq!(worker.join().unwrap(), 125);
     let retained = scenario().producer.lock().take();
     drop((retained, timer));
+
     log::testing::catch_up(last + 1);
     log::testing::wait_service_blocked();
     let mut committed = Cursor::from_sequence(first);
@@ -292,6 +297,7 @@ fn test_uart() -> ::ktest::TestResult {
         || received < console::received() && console::last_byte() == b'H',
         "fresh UART RX IRQ hold acknowledgement",
     );
+
     console::ktest_disable_receive_interrupts();
     owner.h_received.store(true, Ordering::Release);
     let before = console::testing::snapshot();
@@ -302,6 +308,7 @@ fn test_uart() -> ::ktest::TestResult {
         fill_bytes
     );
     assert!(before.zero_writes < filled.zero_writes);
+
     let printer_before = log::testing::snapshot();
     log::testing::arm_pause(log::testing::PausePoint::AfterPartialWrite);
     let payload = [b'P'; 450];
@@ -325,6 +332,7 @@ fn test_uart() -> ::ktest::TestResult {
     assert!(filled.zero_writes < partial.zero_writes);
     assert!(before.tx_interrupts < partial.tx_interrupts);
     assert!(before.wakes < partial.wakes);
+
     assert_eq!(
         kmsg.pollable().unwrap().poll(None).unwrap(),
         PollMask::POLLIN | PollMask::POLLRDNORM
@@ -338,6 +346,7 @@ fn test_uart() -> ::ktest::TestResult {
     );
     assert_eq!(table.len(), 1);
     notified.clear_triggered();
+
     let mut slow = Cursor::from_sequence(held + 1);
     let mut fast = Cursor::from_sequence(held + 1);
     scenario().business_start.complete();
@@ -372,6 +381,7 @@ fn test_uart() -> ::ktest::TestResult {
         assert!(fast.read().is_none());
     }
     assert!(fast.read().is_none());
+
     assert_eq!(slow.available(), Some(8));
     assert_eq!(slow.available(), Some(8));
     let first = slow.read().unwrap();
@@ -397,6 +407,7 @@ fn test_uart() -> ::ktest::TestResult {
         kmsg.pollable().unwrap().poll(None).unwrap(),
         PollMask::default()
     );
+
     drop((table, notified, kmsg));
     log::testing::release_pause();
     let boundary = held + 73;
@@ -418,6 +429,7 @@ fn test_uart() -> ::ktest::TestResult {
     assert!(printer_before.bytes < complete.bytes);
     assert_eq!(console::received(), received + 1);
     finish_backpressure()?;
+
     crate::ktest::report::diagnostic(format_args!(
         "execution-backpressure fill-bytes={}",
         fill_bytes
@@ -645,6 +657,7 @@ struct Scenario {
     h_before: AtomicUsize,
     h_received: AtomicBool,
 }
+
 static CURRENT: core::sync::atomic::AtomicPtr<Scenario> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -658,10 +671,12 @@ fn scenario() -> Arc<Scenario> {
         Arc::from_raw(pointer)
     }
 }
+
 struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
+
 impl ::ktest::Fixture for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
     fn set_up(_: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
@@ -697,6 +712,7 @@ impl ::ktest::Fixture for ServiceFixture {
             .is_ok());
         Ok(Self { state, initial })
     }
+
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
@@ -708,6 +724,7 @@ impl ::ktest::Fixture for ServiceFixture {
         finish_backpressure()?;
         Ok(())
     }
+
     /// runner已join每个原Task；尾票归还以后才释放context/owner并比较完整两账。
     fn tear_down(self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         let mut owner = core::mem::ManuallyDrop::new(self);
@@ -726,6 +743,7 @@ impl ::ktest::Fixture for ServiceFixture {
         if owner.state.backpressure.load(Ordering::Acquire) || owner.state.raw.lock().is_some() {
             return Err(::ktest::TestError("UART ownership did not converge"));
         }
+
         let initial = owner.initial;
         let pointer = CURRENT.swap(core::ptr::null_mut(), Ordering::AcqRel);
         assert_eq!(pointer, Arc::as_ptr(&owner.state).cast_mut());
@@ -746,10 +764,12 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     ) -> Result<Self, ::ktest::TestError> {
         <Self as ::ktest::Fixture<()>>::set_up(context, &())
     }
+
     /// suite账务不改变原printer、UART及Timer的具体停止次序。
     fn quiesce(&mut self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         <Self as ::ktest::Fixture<()>>::quiesce(self, context)
     }
+
     /// case原拥有全部归还后，suite资源另承担跨例的最终账务。
     fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         <Self as ::ktest::Fixture<()>>::tear_down(self, context)
@@ -776,6 +796,7 @@ impl Scenario {
         }
     }
 }
+
 impl ServiceFixture {
     /// 真实fixed-0协调Task独立持有Scenario，UART/日志动作不借Any父的fixture或context栈。
     fn fixed(
@@ -789,6 +810,7 @@ impl ServiceFixture {
 #[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "klog"), timeout_ms = 30000)]
 pub(crate) mod records {
     use super::*;
+
     /// 五条真实Task/调度锁/pool锁/精确IRQ记录同环发表、零allocation_attempts并保持UTF8截断与独立游标。
     #[test]
     fn allocation_free_record_identity(
@@ -805,6 +827,7 @@ pub(crate) mod records {
 #[::ktest::suite(fixture = ServiceFixture, context = "Thread", tags("execution", "uart", "klog"), resources("uart"), isolation = "Case", timeout_ms = 45000)]
 pub(crate) mod uart {
     use super::*;
+
     /// 同一 UART 真背压时 kmsg 独立交付全文与延期通知，保留原450P、lost及4096次业务进度。
     #[test]
     fn socket_printer_backpressure(
@@ -813,6 +836,7 @@ pub(crate) mod uart {
     ) -> ::ktest::TestResult {
         fixture.fixed(test_uart)
     }
+
     /// 两方向都以真实UART硬件消费完整伪控制文本，不允许交给通用KTAP parser。
     #[test]
     #[case("tx", false)]
@@ -830,6 +854,7 @@ pub(crate) mod uart {
 pub(crate) mod fatal {
     use super::*;
     use crate::ktest::execution_services::workqueue::ServiceFixture as Pressure;
+
     /// 真printer已经Blocked以后摘尽原页和十二heap类，标准Box4096进入原alloc_error_handler。
     #[test]
     #[ktest(expected_fatal = "oom")]
@@ -845,6 +870,7 @@ pub(crate) mod fatal {
                 task::current_task().id().as_usize(),
                 cpu::current().id
             ));
+
             mm::shrink_all();
             let (pages, objects, heap_null) =
                 crate::ktest::execution_services::workqueue::exhaust_fault();
@@ -861,6 +887,7 @@ pub(crate) mod fatal {
             panic!("standard allocation unexpectedly survived exhausted heap");
         })
     }
+
     /// 唯一生产writer在写锁内真实奇序号故障，不能展开或等待单调clock/printer。
     #[test]
     #[ktest(expected_fatal = "timekeeper")]

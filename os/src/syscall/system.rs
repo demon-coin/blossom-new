@@ -13,10 +13,12 @@ use crate::{mm, sched, time};
 
 const MOUNT_STRING_LIMIT: usize = 4096;
 const MOUNT_METADATA_CAPACITY: usize = 64;
+
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
 const MS_SILENT: usize = 0x8000;
 const UMOUNT_NOFOLLOW: usize = 8;
+
 const STATFS_SIZE: usize = 120;
 const ST_RDONLY: u64 = 1;
 const ST_VALID: u64 = 0x20;
@@ -26,6 +28,7 @@ const REBOOT_MAGIC2: u32 = 672_274_793;
 const REBOOT_MAGIC2A: u32 = 85_072_278;
 const REBOOT_MAGIC2B: u32 = 369_367_448;
 const REBOOT_MAGIC2C: u32 = 537_993_216;
+
 const REBOOT_CMD_CAD_OFF: u32 = 0;
 const REBOOT_CMD_RESTART: u32 = 0x0123_4567;
 const REBOOT_CMD_HALT: u32 = 0xcdef_0123;
@@ -62,6 +65,7 @@ pub(super) fn sysinfo(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         0,
         0,
     ];
+
     let mut bytes = [0u8; 112];
     for (index, value) in fields.iter().enumerate() {
         bytes[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
@@ -70,6 +74,7 @@ pub(super) fn sysinfo(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     // 没有 swap 或 highmem；共享页、buffer 和 load average 尚无独立统计来源。
     bytes[80..82].copy_from_slice(&(sched::live_task_count() as u16).to_le_bytes());
     bytes[104..108].copy_from_slice(&(mm::PAGE_SIZE as u32).to_le_bytes());
+
     let mm = user.mm().expect("sysinfo has no MM");
     copyout(&mm, raw[0], &bytes)?;
     Ok(0)
@@ -124,6 +129,7 @@ pub(super) fn fstatfs(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     if fd < 0 {
         return Err(Errno::BadFd);
     }
+
     let runtime = user.runtime().expect("fstatfs has no runtime");
     let file = runtime.files.lookup(fd as usize)?;
     let path = file.path().ok_or(Errno::NoSyscall)?;
@@ -178,6 +184,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     if raw[3] & !(MS_RDONLY | MS_SILENT | MS_REMOUNT) != 0 || (!remount && raw[2] == 0) {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("mount has no MM");
     let source = if remount || raw[0] == 0 {
         None
@@ -201,6 +208,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     } else {
         AccessMode::ReadWrite
     };
+
     if remount {
         let (vfs, context) = {
             let fs = runtime.fs.lock();
@@ -216,6 +224,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         path.reconfigure_tmpfs(requested_mode, options)?;
         return Ok(0);
     }
+
     let (filesystem, mode) = match kind.as_deref().expect("new mount has no type") {
         b"ext4" => {
             if !options.is_empty() {
@@ -245,6 +254,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         }
         _ => return Err(Errno::NoDevice),
     };
+
     let (vfs, context) = {
         let fs = runtime.fs.lock();
         (fs.vfs.clone(), fs.context.clone())
@@ -256,6 +266,7 @@ pub(super) fn mount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         ResolveMode::Follow,
         Some((runtime.credentials.uid, runtime.credentials.gid)),
     )?;
+
     vfs.mount(&path, filesystem, mode)?;
     Ok(0)
 }
@@ -269,6 +280,7 @@ pub(super) fn umount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
     if raw[1] & !UMOUNT_NOFOLLOW != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("umount has no MM");
     let target = mm.read_c_string(raw[0], PATH_MAX)?;
     let (vfs, context) = {
@@ -287,6 +299,7 @@ pub(super) fn umount(user: &UserThread, raw: &[usize; 6]) -> SysResult {
         mode,
         Some((runtime.credentials.uid, runtime.credentials.gid)),
     )?;
+
     vfs.unmount_path(path)?;
     Ok(0)
 }
@@ -324,11 +337,13 @@ pub(super) fn reboot(user: &UserThread, raw: &[usize; 6]) -> Outcome {
         REBOOT_CMD_POWER_OFF => ShutdownOperation::PowerOff,
         _ => return Outcome::Return(Errno::InvalidArgument.result()),
     };
+
     let identity = user.identity().expect("reboot has no identity");
     let graph = identity.graph();
     if graph.root_role() != RootRole::System {
         return Outcome::Return(Errno::InvalidArgument.result());
     }
+
     match graph.request_shutdown(operation) {
         Ok(()) => Outcome::GroupExit(0),
         Err(error) => Outcome::Return(Errno::from(error).result()),

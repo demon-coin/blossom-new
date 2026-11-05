@@ -87,6 +87,7 @@ impl Completion {
         self.accepted_bytes += accepted as u64;
         self.completed_bytes += completed as u64;
         self.sequence += 1;
+
         let Some(start) = self.sample_time else {
             return;
         };
@@ -94,6 +95,7 @@ impl Completion {
         if elapsed == 0 || (self.bandwidth != 0 && elapsed < BANDWIDTH_INTERVAL_NS) {
             return;
         }
+
         let bytes = self.completed_bytes - self.sample_bytes;
         if bytes != 0 {
             self.bandwidth =
@@ -105,6 +107,7 @@ impl Completion {
                 self.last_sample_end_ns = now.as_nanos();
             }
         }
+
         if BANDWIDTH_INTERVAL_NS <= elapsed {
             self.sample_time = Some(now);
             self.sample_bytes = self.completed_bytes;
@@ -349,6 +352,7 @@ impl WritebackDomain {
             round_hook: SpinLock::new(None),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let work = DelayedWork::try_new(
             WB_QUEUE.get().expect("writeback service is not prepared"),
             0,
@@ -374,6 +378,7 @@ impl WritebackDomain {
                 self.metadata_sequence.load(Ordering::Acquire),
             )
         };
+
         loop {
             if self.storage_stopped(boundary) {
                 return Err(FsError::Io(BlockError::QueueStopped));
@@ -396,6 +401,7 @@ impl WritebackDomain {
                     }
                 }
             }
+
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
             // SAFETY: self 的真实 Arc 保域，pin 栈节点，所有出口先结束登记。
@@ -626,8 +632,10 @@ impl WritebackDomain {
         if let Some(source) = &self.source {
             source.notify_available();
         }
+
         self.work().cancel_sync();
         self.wait_storage_returned();
+
         let ticket = {
             let mut state = self.state.lock();
             assert!(!state.running, "writeback callback survived cancellation");
@@ -817,6 +825,7 @@ impl WritebackDomain {
                 state.next_slot % limit
             }
         };
+
         let mut first_error = None;
         let mut unconfirmed = false;
         match self.borrow_storage() {
@@ -846,6 +855,7 @@ impl WritebackDomain {
                         }
                     }
                 }
+
                 if !unconfirmed && !storage.stopped(self) {
                     if let Err(error) =
                         writeback::sync_metadata_budget(volume, METADATA_BUDGET, &mut storage)
@@ -861,6 +871,7 @@ impl WritebackDomain {
                 self.note_error();
             }
         }
+
         let pending = self.pressure() != 0 || volume.metadata_cache().has_dirty_or_writeback();
         let again = {
             let mut state = self.state.lock();
@@ -870,6 +881,7 @@ impl WritebackDomain {
             state.finished_rounds += 1;
             state.active && !state.halted && (pending || state.notified)
         };
+
         self.waiters.wake_all();
         #[cfg(feature = "ktest")]
         let hook = self.round_hook.lock().clone();
@@ -1009,6 +1021,7 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
     if pressure <= limit {
         return;
     }
+
     let (sequence, errors, completed, bandwidth) = {
         let state = domain.state.lock();
         (
@@ -1032,6 +1045,7 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
             .expect("dirty balance deadline overflow");
         (completed + target_bytes.max(1).min(excess), Some(deadline))
     };
+
     let mut waiting = false;
     loop {
         let waiter = Waiter::new();
@@ -1061,6 +1075,7 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
             waiting = true;
         }
         drop(state);
+
         let waker = pin!(waiter.waker());
         let timer = pin!(Timer::new(
             crate::cpu::current().id,

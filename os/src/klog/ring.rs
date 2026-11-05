@@ -111,6 +111,7 @@ impl Cursor {
         if ring.next <= self.next {
             return None;
         }
+
         let sequence = self.next.max(ring.oldest());
         let record = ring.slots[((sequence - 1) % CAPACITY as u64) as usize]
             .as_ref()

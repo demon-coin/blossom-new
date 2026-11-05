@@ -17,6 +17,7 @@ mod pages {
         panic!("owned page body unwind");
     }
 }
+
 #[ktest::suite(fixture = SlabFixture, tags("mm", "lifecycle"), timeout_ms = 30000)]
 mod objects {
     use super::*;
@@ -29,6 +30,7 @@ mod objects {
         panic!("slab body unwind");
     }
 }
+
 #[ktest::suite(fixture = HeapFixture, tags("mm", "lifecycle"), timeout_ms = 30000)]
 mod heap {
     use super::*;
@@ -44,6 +46,7 @@ mod heap {
         panic!("heap body unwind");
     }
 }
+
 #[ktest::suite(fixture = PressureFixture, tags("mm", "lifecycle", "pressure"), isolation = "Case", timeout_ms = 30000)]
 mod pressure {
     use super::*;

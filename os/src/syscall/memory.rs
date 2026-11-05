@@ -18,9 +18,11 @@ const STACK: usize = 0x2_0000;
 const FIXED_NOREPLACE: usize = 0x10_0000;
 const SUPPORTED: usize =
     SHARED | PRIVATE | FIXED | ANONYMOUS | DENYWRITE | EXECUTABLE | STACK | FIXED_NOREPLACE;
+
 const MS_ASYNC: usize = 1;
 const MS_INVALIDATE: usize = 2;
 const MS_SYNC: usize = 4;
+
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
@@ -40,6 +42,7 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
     {
         return Err(Errno::InvalidArgument);
     }
+
     let permissions = permissions(prot)?;
     let private = flags & MAP_SHARING_MASK == PRIVATE;
     let mut maximum = ALL;
@@ -76,6 +79,7 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
             private,
         }
     };
+
     let address = if flags & FIXED_NOREPLACE != 0 {
         MmapAddress::FixedNoReplace(address)
     } else if flags & FIXED != 0 {
@@ -83,6 +87,7 @@ pub(super) fn mmap(user: &UserThread, raw: [usize; 6]) -> SysResult {
     } else {
         MmapAddress::Hint(address)
     };
+
     let mm = user.mm().expect("mmap has no MM");
     mm.mmap(MmapRequest {
         address,
@@ -113,6 +118,7 @@ pub(super) fn mprotect(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[1] == 0 {
         return Ok(0);
     }
+
     let permissions = permissions(raw[2])?;
     let length = rounded_length(raw[1])?;
     user.mm()
@@ -137,6 +143,7 @@ pub(super) fn msync(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if end == raw[0] {
         return Ok(0);
     }
+
     user.mm().expect("msync has no MM").sync_mapping_range(
         raw[0]..end,
         flags & MS_SYNC != 0,
@@ -155,6 +162,7 @@ fn permissions(raw: usize) -> Result<PagePermissions, Errno> {
     if raw & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(Errno::InvalidArgument);
     }
+
     let write = raw & PROT_WRITE != 0;
     #[cfg(target_arch = "riscv64")]
     let read = raw & PROT_READ != 0 || write;

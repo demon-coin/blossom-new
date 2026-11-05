@@ -239,3 +239,22 @@ BLOSSOM_PLATFORM=qemu-virt cargo clippy --locked --target riscv64gc-unknown-none
 ```
 
 测试检查选择 `--profile ktest-dev/ktest-release/ktest-abort-dev/ktest-abort-release --features ktest`，只支持 `qemu-virt`；对应真实 ELF 仍由 `build-kernel-test-elf` 构建，不能把 Clippy 当链接或运行。每次修改按受影响 ISA、平台、profile、feature 验证预期满足性，不升级固定工具链、不新建质量管理框架。规范依据为 [Linux Lints](https://www.kernel.org/doc/html/latest/rust/coding-guidelines.html#lints)、[Rust 诊断属性](https://doc.rust-lang.org/reference/attributes/diagnostics.html)、[Clippy 分类](https://doc.rust-lang.org/clippy/lints.html)和 [Asterinas 属性规范](https://asterinas.github.io/book/to-contribute/coding-guidelines/for-maintainability/rust-specific/attributes-and-macros.html)。
+
+## 9. 逻辑段落与纯空行整理
+
+函数之间、函数内不同逻辑阶段、不同类别常量之间通常使用一个空行；同一阶段的连续准备或校验保持紧凑。例如资源准备、锁内重查与提交、锁外释放是不同阶段，但不能按每个 `if`、`const`、闭括号或固定行数机械分段。完整的 `if/else`、`match` 和紧密的 IRQ、屏障、unsafe 协议保持连续；SAFETY 注释与 unsafe、文档及属性与所属对象紧密相邻。
+
+[Linux Rust](https://www.kernel.org/doc/html/latest/rust/coding-guidelines.html#style-formatting)要求默认 rustfmt；[Rust Style Guide](https://doc.rust-lang.org/style-guide/#blank-lines)允许语句及代码项之间零或一个空行；[Asterinas logical-paragraphs](https://asterinas.github.io/book/to-contribute/coding-guidelines/for-maintainability/layout.html#logical-paragraphs)补充按子步骤分段的阅读原则。Linux C 的函数空行建议只作参考，不当作 Rust 强制规则。无需更改 `blank_lines_lower_bound` 等配置，格式工具不能代替语义判断。
+
+纯空行整理保持所有非空物理行及顺序，以及完整注释、普通/原始字符串和汇编字符串负载；字符串内部的空白行也是数据，不能用“删除所有空白后相等”证明语义保持。长函数先按实际阶段分段，不借排版拆函数、改命名、重排或修改注释。
+
+先追踪 `line!()`、`Location::caller()`、`#[track_caller]` 和源码文本消费者，再决定位置能否漂移。诊断位置、DWARF 和目录 `line` 可以在已核消费者允许时变化，完整测试名、参数、`source`、稳定属性及独立预期仍须相等；`include!` 编译代码与 `include_str!`/`include_bytes!` 消费数据不能混同。产物记录本次实际 SHA，不承诺 ELF 字节相同。
+
+格式工具只检查，不顺带写源：
+
+```sh
+cd os
+cargo fmt --all -- --check
+```
+
+原有非空行格式差异保留日志，不在纯空行任务中修复或修改上游依赖。严格 Clippy 沿用同工具链、平台、profile 和 feature 命令，比较前后诊断，不新增 `allow`/`expect` 或改变 lint 配置。全量静态等价后仍须实际构建、运行风险匹配路径并集中独审；未编译历史源只记录静态结论，不能计构建或运行通过。

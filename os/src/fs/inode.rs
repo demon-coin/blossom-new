@@ -87,6 +87,7 @@ enum Eviction {
     Running,
     Failed(FsError),
 }
+
 impl InodeSlot {
     /// 优先复用仍存活的卷根名字；弱登记不延长 dentry 或 canonical inode 的寿命。
     fn bind_root(&mut self, candidate: DentryRef) -> (DentryRef, Option<DentryRef>) {
@@ -115,6 +116,7 @@ fn root_slot_position(index: &InodeIndex, inode: &InodeRef) -> usize {
 static EVICTION_QUEUE: Once<WorkQueue> = Once::new();
 /// 失败的删除义务由独立服务强持，链上节点不反向拥有服务或自身。
 static FAILED_EVICTIONS: SpinLock<Option<Arc<InodeDomain>>> = SpinLock::new(None);
+
 /// BSP 在原共享 pool 准备后、发布运行许可之前准备 inode 回收和卷回写服务。
 pub(crate) fn initialize_inode_eviction() -> Result<(), FsError> {
     assert!(
@@ -158,6 +160,7 @@ impl InodeDomain {
             retained_next: SpinLock::new(None),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let work = Work::try_new(
             EVICTION_QUEUE
                 .get()
@@ -255,6 +258,7 @@ impl InodeDomain {
             .expect("inode eviction work is not prepared")
             .as_ref()
             .flush();
+
         let index = self.index.lock();
         for slot in index.slots.iter().flatten() {
             if let Eviction::Failed(error) = slot.eviction {
@@ -310,6 +314,7 @@ impl InodeDomain {
                 return Err(FsError::NoMemory);
             }
         }
+
         let candidate = InodeRef::try_new(filesystem, number, self)?;
         let mut loader = LoadGuard {
             domain: self,
@@ -323,6 +328,7 @@ impl InodeDomain {
             inode.wait_loaded()?;
             return Ok(inode);
         }
+
         #[cfg(feature = "ktest")]
         if let Some(cache) = _cache {
             cache.loads.fetch_add(1, Ordering::Relaxed);
@@ -396,6 +402,7 @@ impl InodeDomain {
                 }
                 Err(error) => return Err(error),
             }
+
             let position = index
                 .slots
                 .iter()
@@ -498,6 +505,7 @@ impl InodeDomain {
             }
             (before, requested)
         };
+
         if requested {
             self.queue();
             // 原 usize 接口只报告真正归还的槽；具体失败仍留在 slot、WB errseq 与观察出口。
@@ -510,6 +518,7 @@ impl InodeDomain {
     fn is_full(&self) -> bool {
         self.index.lock().slots.iter().all(Option::is_some)
     }
+
     /// 借用仍存活的 canonical 名字索引；不同预算不能改写现有有限容量。
     fn shared_dentry_cache(&self, capacity: usize) -> Result<Option<Arc<DentryCache>>, FsError> {
         let index = self.index.lock();
@@ -810,6 +819,7 @@ enum InodeStorage {
     Disk { root: SleepRwLock<[u8; 60]> },
     Memory,
 }
+
 /// inode 的唯一写序列化责任，属性和块根仍使用各自的短期保护。
 pub(crate) struct InodeWriteGuard<'a> {
     inode: &'a InodeRef,
@@ -846,6 +856,7 @@ enum PreparedMetadataStorage {
     Disk { record: BufferRef, offset: usize },
     Memory,
 }
+
 /// 目录内容和 inode-table 均已预备，Drop 只撤销尚未发表的目录块票。
 pub(crate) struct PreparedDiskDirectoryMutation {
     parent: InodeRef,
@@ -924,6 +935,7 @@ impl PreparedSymlink {
                 FsError::InvalidName
             });
         }
+
         let block_size = volume.geometry().block_size;
         let count = target.len().div_ceil(block_size);
         let mut owned_target = Vec::new();
@@ -942,6 +954,7 @@ impl PreparedSymlink {
         buffers
             .try_reserve_exact(count)
             .map_err(|_| FsError::NoMemory)?;
+
         let mappings = volume.prepare_symlink_mappings(inode, &inode.block, &logical)?;
         let root = *mappings.root();
         let mut prepared = Self {
@@ -966,6 +979,7 @@ impl PreparedSymlink {
             .blocks
             .checked_add(added)
             .ok_or(FsError::FileTooLarge)?;
+
         for &logical in &logical {
             let physical = prepared
                 .mappings
@@ -993,6 +1007,7 @@ impl PreparedSymlink {
                 .expect("prepared writable symlink data block");
             offset += count;
         }
+
         self.mappings
             .take()
             .expect("prepared symlink mapping")
@@ -1026,6 +1041,7 @@ impl Drop for PreparedSymlink {
                 unsafe { buffer.forget(self.volume.claim()) }
                     .expect("unpublished symlink data alias invalidation");
             }
+
             self.mappings
                 .take()
                 .expect("unpublished symlink mapping absent")
@@ -1058,6 +1074,7 @@ impl PreparedDiskNewInode {
                 .expect("prepared inode link update absent"),
         );
         drop(guard);
+
         self.allocation
             .take()
             .expect("unpublished inode reservation absent")
@@ -1105,6 +1122,7 @@ impl Drop for PreparedDiskNewInode {
             }
             return;
         }
+
         let Some(allocation) = self.allocation.take() else {
             return;
         };
@@ -1316,6 +1334,7 @@ impl InodeCache {
     pub fn iget(&self, filesystem: &Arc<Ext4Volume>, number: u64) -> Result<InodeRef, FsError> {
         self.domain.iget(filesystem, number, Some(self), None)
     }
+
     /// 为实际卷取得 canonical 根与共享名字索引；活域保原有限容量，失去最后索引拥有后可重新选预算。
     pub(crate) fn dentry_namespace(
         &self,
@@ -1342,6 +1361,7 @@ impl InodeCache {
         let candidate = DentryRef::try_root(inode.clone())?;
         Ok(self.domain.publish_root(&inode, candidate))
     }
+
     /// 准备真正链接前的普通文件记录和 canonical 对象。
     #[expect(
         clippy::too_many_arguments,
@@ -1483,6 +1503,7 @@ impl InodeCache {
                 (InodeKind::Symlink, 1)
             }
         };
+
         let allocation = volume.allocate_inode_for_parent(parent, kind, mode, umask, uid, gid)?;
         let number = allocation.number();
         let mut prepared = PreparedDiskNewInode {
@@ -1526,6 +1547,7 @@ impl InodeCache {
                 prepared.symlink = Some(symlink);
             }
         }
+
         let mut next = initial_inode_metadata(volume, initial, size, blocks, now_ns)?;
         if next.fast_symlink {
             next.flags &= !codec::EXTENTS;
@@ -1538,6 +1560,7 @@ impl InodeCache {
             let (_, huge) = codec::blocks_encoding(volume.geometry(), next.blocks)?;
             next.flags = (flags & !codec::HUGE_FILE) | if huge { codec::HUGE_FILE } else { 0 };
         }
+
         volume.initialize_unpublished_inode(
             prepared
                 .allocation
@@ -1548,6 +1571,7 @@ impl InodeCache {
             &root,
         )?;
         prepared.record_initialized = true;
+
         prepared.inode = Some(self.iget(volume, number)?);
         let update = {
             let guard = prepared.inode().inode_write()?;
@@ -1872,6 +1896,7 @@ impl InodeRef {
         if state.metadata.lock().flags & codec::EA_INODE != 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let mut count = state.writecount.lock();
         if *count < 0 {
             return Err(FsError::TextBusy);
@@ -1932,6 +1957,7 @@ impl InodeRef {
         if deleting && old.kind == InodeKind::Symlink && old.fast_symlink {
             return self.truncate_fast_symlink_locked(state, claim, &old, now, context);
         }
+
         let mut size_next = write_metadata(g, &old, 0, 0, 0, 0, now)?;
         size_next.size = new_size;
         let tail = if old.size < new_size {
@@ -1955,6 +1981,7 @@ impl InodeRef {
                 folio.lock_content().range_ready(0, PAGE_SIZE)?;
             }
         }
+
         // EA 共享引用与所有元数据 WB 使用同一串行保护，隐藏值准备也在父尺寸修改之前。
         let _metadata_writeback = volume.metadata_cache().lock_writeback();
         let (record, record_offset) = volume.inode_record(old.number, context)?;
@@ -1978,6 +2005,7 @@ impl InodeRef {
             };
             (prepared, inode_release, *root)
         };
+
         let mut next = write_metadata(g, &old, 0, 0, 0, prepared.removed_blocks, now)?;
         next.size = new_size;
         record
@@ -1991,10 +2019,12 @@ impl InodeRef {
             })
             .expect("prepared truncate size record");
         *state.metadata.lock() = size_next;
+
         let first = new_size.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         self.mapping.unmap_range(first..u64::MAX, true);
         #[cfg(feature = "ktest")]
         self.truncate_phase(TruncatePhase::AfterFirstUnmap);
+
         // 块根已放开；旧数据回写可准备地址和完成全尾，不能带 root 等 WB 互斥。
         let _writeback = self.mapping.lock_writeback();
         if let Some(tail) = &tail {
@@ -2010,6 +2040,7 @@ impl InodeRef {
         self.truncate_phase(TruncatePhase::BeforeSecondUnmap);
         self.mapping.unmap_range(first..u64::MAX, true);
         pages?;
+
         let mut root = state.disk_root().write();
         assert_eq!(
             *root, old_root,
@@ -2031,6 +2062,7 @@ impl InodeRef {
         *state.metadata.lock() = next;
         #[cfg(feature = "ktest")]
         self.truncate_phase(TruncatePhase::BeforeBlockRelease);
+
         for block in retired {
             // SAFETY: 两遍撤叶/CSD、文件页清理和全部旧数据 WB 已结束；
             // root 写侧已排空旧块查询，元数据 WB 串行排空并阻止旧窗口新提交；
@@ -2039,6 +2071,7 @@ impl InodeRef {
         }
         drop(root);
         drop(tail);
+
         if let Some(inode_release) = inode_release {
             // SAFETY: 仅真实末使用回收进入 deleting，canonical 槽处于 Running 且没有外部使用；
             // root 写侧已排空后放开，原页和所有旧 data/metadata IO、别名均结束；
@@ -2087,6 +2120,7 @@ impl InodeRef {
             *state.metadata.lock() = next;
             release
         };
+
         self.mapping.unmap_range(0..u64::MAX, true);
         let _writeback = self.mapping.lock_writeback();
         // SAFETY: inode.write 与 invalidate 独占仍由末次使用者持有，首轮完整撤叶/CSD 已结束；
@@ -2097,6 +2131,7 @@ impl InodeRef {
         if !self.mapping.is_empty() {
             return Err(FsError::Busy);
         }
+
         // SAFETY: links 为零的原 canonical slot 仍处于 Running 且无外部使用；
         // inline root 未作为块树读取，EA 与 inode 窗口由准备 token 保活，mapping 与 root 均已放开。
         unsafe { volume.release_inode(release) };
@@ -2118,6 +2153,7 @@ impl InodeRef {
         let context = storage
             .as_ref()
             .and_then(|storage| storage.metadata_io_context(volume.writeback_domain()));
+
         let mut attempt = ReclaimAttempt::new();
         let state = self.wait_loaded()?;
         let _scope = ReclaimScope::nofs();
@@ -2129,6 +2165,7 @@ impl InodeRef {
             0,
             "eviction retains write or exec access"
         );
+
         if deleting {
             if !self.disk().storage_released.load(Ordering::Acquire) {
                 {
@@ -2141,6 +2178,7 @@ impl InodeRef {
         } else if let Some(storage) = storage.as_mut() {
             writeback::sync_inode_with_storage(self, 0..u64::MAX, storage)?;
         }
+
         if let Some(storage) = storage.as_mut() {
             let _metadata_writeback = volume.metadata_cache().lock_writeback();
             writeback::sync_metadata_locked(volume, storage)?;
@@ -2148,6 +2186,7 @@ impl InodeRef {
         if deleting {
             return Ok(());
         }
+
         let _invalidate = state.invalidate.write();
         let _writeback = self.mapping.lock_writeback();
         self.mapping.prune_unused();
@@ -2242,6 +2281,7 @@ impl InodeRef {
                 let Some(folio) = self.fill_prepared(index, &mut prepared, None)? else {
                     return Ok(None);
                 };
+
                 let block_size = volume.geometry().block_size;
                 for offset in (0..PAGE_SIZE).step_by(block_size) {
                     let position = start
@@ -2309,6 +2349,7 @@ impl InodeRef {
                 return Err(error);
             }
         };
+
         let mut root = state.disk_root().write();
         let mut content = folio.lock_content();
         let offset = (position % PAGE_SIZE as u64) as usize;
@@ -2321,6 +2362,7 @@ impl InodeRef {
                 .mark_dirty(offset, block_size)
                 .expect("prepared mkwrite dirty range");
         }
+
         let next_root = prepared.root;
         let retired = prepared.publish(volume, old.checksum_seed);
         record
@@ -2339,6 +2381,7 @@ impl InodeRef {
             .mark_file_prepared(offset, block_size)
             .expect("published mkwrite block");
         drop(content);
+
         for block in retired {
             // SAFETY: root 写侧已排空旧读者，发表的新树已摘除原节点，写侧禁止新使用；
             // release 等旧元数据真实 WB 并失效准确窗口，然后才归还物理位图。
@@ -2381,6 +2424,7 @@ impl InodeRef {
             content.range_ready(0, PAGE_SIZE)?;
             return Ok(true);
         }
+
         let block_size = self.disk_volume()?.geometry().block_size;
         self.note_dirty();
         content.mark_prepared_dirty(
@@ -2411,6 +2455,7 @@ impl InodeRef {
         if initial.kind != InodeKind::Regular {
             return Err(FsError::InvalidOperation);
         }
+
         let start = if append { initial.size } else { offset };
         let limit = write_limit(volume.geometry(), initial.flags);
         let remaining = source.len() - source.copied();
@@ -2431,6 +2476,7 @@ impl InodeRef {
                 Ok(count) => count,
                 Err(error) => return write_result(start, accepted, error),
             };
+
             let old = *state.metadata.lock();
             // 输入已真正取得后才进入失效域，用户源 fault 不携带目的 invalidate guard。
             let end = position + pulled as u64;
@@ -2440,6 +2486,7 @@ impl InodeRef {
                     return write_result(start, accepted, error);
                 }
             }
+
             let (record, record_offset) = match volume.inode_record(old.number, None) {
                 Ok(record) => record,
                 Err(error) => return write_result(start, accepted, error),
@@ -2487,6 +2534,7 @@ impl InodeRef {
                     return write_result(start, accepted, error);
                 }
             };
+
             // 尚未发表的映射保持旧根；filefault 可取得读侧完成目的页初始化。
             let folio = match self.read_page(position / PAGE_SIZE as u64, &mut attempt, None) {
                 Ok(folio) => folio,
@@ -2495,6 +2543,7 @@ impl InodeRef {
                     return write_result(start, accepted, error);
                 }
             };
+
             let mut root = state.disk_root().write();
             let mut content = folio.lock_content();
             let block_offset = ((position / size as u64 * size as u64) % PAGE_SIZE as u64) as usize;
@@ -2513,6 +2562,7 @@ impl InodeRef {
             content
                 .mark_dirty(block_offset, size)
                 .expect("prepared file block dirty range");
+
             let next_root = prepared.root;
             let retired = prepared.publish(volume, old.checksum_seed);
             record
@@ -2531,6 +2581,7 @@ impl InodeRef {
                 .mark_file_prepared(block_offset, size)
                 .expect("published buffered write block");
             drop(content);
+
             for block in retired {
                 // SAFETY: root 写侧已排空旧块树读者，发表后的根和父节点均已去掉旧节点；
                 // 写侧仍阻止新读者，释放窗口保原页，forget 等真实元数据 IO/WB 收权后失效，
@@ -2544,6 +2595,7 @@ impl InodeRef {
         }
         Ok((start, accepted))
     }
+
     /// 内核按位置读取与用户接收端使用同一页交付循环。
     #[cfg(feature = "ktest")]
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
@@ -2573,6 +2625,7 @@ impl InodeRef {
         if data.size <= offset {
             return Ok(0);
         }
+
         let mut attempt = ReclaimAttempt::new();
         let len = (data.size - offset).min(remaining as u64) as usize;
         let mut copied = 0;
@@ -2626,6 +2679,7 @@ impl InodeRef {
             if count == 0 {
                 return Ok(copied);
             }
+
             let result = result.and_then(|()| target.push(&staging[..count]));
             copied = target.copied() - initial;
             if copied != 0 && !self.is_memory() {
@@ -2766,6 +2820,7 @@ impl InodeRef {
         let Some((folio, read)) = self.mapping.publish_file(self, index, prepared)? else {
             return Ok(None);
         };
+
         if let Some(mut read) = read {
             if self.is_memory() {
                 read.bytes_mut().iter_mut().for_each(|byte| {
@@ -2788,6 +2843,7 @@ impl InodeRef {
                 self.disk_volume()?.fill_page(index, size, &targets, read)?;
             }
         }
+
         folio.wait_ready()?;
         Ok(Some(folio))
     }
@@ -2943,6 +2999,7 @@ impl InodeWriteGuard<'_> {
     pub(crate) fn metadata_snapshot(&self) -> InodeMetadata {
         *self.state.metadata.lock()
     }
+
     /// 预备硬链接数及 ctime；格式或 inode-table 失败发生在目录名提交前。
     pub(crate) fn prepare_link_delta(
         &self,
@@ -3094,6 +3151,7 @@ impl DirectoryWriteGuard<'_> {
     ) -> Result<Option<InodeRef>, FsError> {
         lookup_locked(self.inode, cache, name)
     }
+
     /// 目录目标的链接变化复用当前目录写侧，不递归取得 inode 写锁。
     pub(crate) fn prepare_link_delta(
         &self,
@@ -3112,6 +3170,7 @@ impl DirectoryWriteGuard<'_> {
     pub(crate) fn publish_metadata(&self, prepared: PreparedInodeMetadata) {
         publish_inode_metadata(self.inode, self.state, prepared);
     }
+
     /// 真实扫描点目录与普通项，保留后端 checksum 和 I/O 错误。
     pub(crate) fn is_empty(&self) -> Result<bool, FsError> {
         if self.inode.is_memory() {
@@ -3298,6 +3357,7 @@ impl DirectoryWriteGuard<'_> {
             edit.cancel(&prepared.volume);
             return;
         }
+
         let mut root = self.state.disk_root().write();
         let result = edit.publish(&prepared.volume);
         assert_eq!(result.root, prepared.root, "directory edit root changed");
@@ -3313,6 +3373,7 @@ impl DirectoryWriteGuard<'_> {
             result.flags, prepared.next.flags,
             "directory edit flags changed"
         );
+
         let inode_mapping = prepared
             .inode_mapping
             .take()
@@ -3351,6 +3412,7 @@ impl DirectoryWriteGuard<'_> {
                 },
             ));
         }
+
         let result = (|| {
             let flags = edit.flags();
             let permitted = codec::INDEX | codec::HUGE_FILE;
@@ -3504,12 +3566,14 @@ fn prepare_inode_metadata(
             next,
         });
     }
+
     let volume = inode.disk_volume()?;
     volume.require_write(volume.claim())?;
     if old.flags & codec::EA_INODE != 0 {
         return Err(FsError::InvalidOperation);
     }
     codec::validate_inode_metadata_update(&old, &next)?;
+
     let (record, offset) = volume.inode_record(old.number, None)?;
     let root = state.disk_root().read();
     let current = record.with_read(|bytes| {
@@ -3537,6 +3601,7 @@ fn publish_inode_metadata(inode: &InodeRef, state: &InodeState, prepared: Prepar
         "inode metadata token mismatch"
     );
     assert_eq!(*state.metadata.lock(), prepared.old);
+
     if let PreparedMetadataStorage::Disk { ref record, offset } = prepared.storage {
         let volume = inode.disk_volume().expect("disk metadata token");
         let g = volume.geometry();
@@ -3552,6 +3617,7 @@ fn publish_inode_metadata(inode: &InodeRef, state: &InodeState, prepared: Prepar
             .expect("prepared writable inode metadata")
             .expect("prepared inode metadata patch");
     }
+
     *state.metadata.lock() = prepared.next;
 }
 
@@ -3736,6 +3802,7 @@ fn evict_inodes(work: Pin<&Work>) {
         drop(victim);
         drop(inode);
     }
+
     let failed = domain
         .index
         .lock()
@@ -3790,6 +3857,7 @@ fn write_metadata(
         .ok_or(FsError::Corrupt)?;
     let (_, huge) = codec::blocks_encoding(g, blocks)?;
     let (mtime, ctime) = codec::prepare_inode_write_times(now, old.extra_isize)?;
+
     let mut next = *old;
     next.size = old.size.max(
         position
@@ -4032,6 +4100,7 @@ impl InodeRef {
                 )
             }
         };
+
         let setgid = parent.mode & S_ISGID != 0;
         let kind_mode = match kind {
             InodeKind::Directory => S_IFDIR,
@@ -4061,6 +4130,7 @@ impl InodeRef {
         if kind != InodeKind::Symlink {
             mode &= !(umask & S_IRWXUGO);
         }
+
         let gid = if setgid { parent.gid } else { gid };
         let mut initial = InodeMetadata::memory(kind, mode, uid, gid, 0, now_ns);
         if let MemoryContent::Symlink(target) = &content {
@@ -4156,6 +4226,7 @@ impl InodeRef {
             return Err(FsError::InvalidOperation);
         }
         assert!(0 < *state.writecount.lock(), "memory write has no access");
+
         let start = if append { old.size } else { offset };
         let remaining = source.len() - source.copied();
         let mut accepted = 0usize;
@@ -4175,6 +4246,7 @@ impl InodeRef {
                 Ok(count) => count,
                 Err(error) => return write_result(start, accepted, error),
             };
+
             let _invalidate = state.invalidate.write();
             let current = *state.metadata.lock();
             if current.size < position {
@@ -4192,6 +4264,7 @@ impl InodeRef {
             {
                 return write_result(start, accepted, error.into());
             }
+
             let mut next = current;
             next.size = current.size.max(position + pulled as u64);
             next.mtime = memory_time(time::realtime());
@@ -4240,11 +4313,13 @@ impl InodeRef {
         if old.size < new_size {
             self.zero_memory_tail(old.size, new_size)?;
         }
+
         let mut next = old;
         next.size = new_size;
         next.mtime = memory_time(time::realtime());
         next.ctime = next.mtime;
         *state.metadata.lock() = next;
+
         let first = new_size.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         self.mapping.unmap_range(first..u64::MAX, true);
         #[cfg(feature = "ktest")]
@@ -4338,6 +4413,7 @@ impl MemoryDirectory {
         entries
             .try_reserve_exact(len.checked_add(1).ok_or(FsError::NoSpace)?)
             .map_err(|_| FsError::NoMemory)?;
+
         let source = source.lock();
         entries.extend(source.entries.iter().map(|entry| MemoryEntry {
             name: entry.name.clone(),
@@ -4381,6 +4457,7 @@ impl MemoryDirectory {
         if inode.metadata_snapshot()?.kind != kind {
             return Err(FsError::InvalidOperation);
         }
+
         let name = Arc::try_new(try_bytes(name)?).map_err(|_| FsError::NoMemory)?;
         self.entries.push(MemoryEntry {
             name,
@@ -4498,6 +4575,7 @@ impl DirectoryWriteGuard<'_> {
                 changed
             }
         };
+
         let mut next = self.metadata_snapshot();
         if changed {
             next.links = memory_link_count(next.links, links_delta)?;

@@ -31,12 +31,14 @@ struct Control {
     notification_tasks: [SpinLock<Option<Arc<task::Task>>>; 2],
     exit: Completion,
 }
+
 struct Tasks {
     initial: Baseline,
     state: Arc<Control>,
     handles: [Option<ChildHandle>; 2],
     idle_pause: Option<usize>,
 }
+
 impl Fixture<SuiteBaseline> for Tasks {
     /// 在发表真实 Task 前建立每例独立控制拥有与本次停稳基线。
     fn set_up(_: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
@@ -66,6 +68,7 @@ impl Fixture<SuiteBaseline> for Tasks {
             idle_pause: None,
         })
     }
+
     /// 失败也放行所有子任务，只撤销本例已成功武装的 idle 停点，保留仍在使用的原 owner。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
@@ -90,6 +93,7 @@ impl Fixture<SuiteBaseline> for Tasks {
         }
         Ok(())
     }
+
     /// 框架已经原 join 离栈，移出观察者与完成源后核对全部实际资源。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         let Self {
@@ -120,10 +124,12 @@ impl Fixture<SuiteBaseline> for Tasks {
         reclaimed(initial)
     }
 }
+
 struct LocalDrop {
     state: Arc<Control>,
     slot: usize,
 }
+
 impl Drop for LocalDrop {
     /// 只在原入口正常返回或受控子捕获展开时析构一次局部拥有。
     fn drop(&mut self) {
@@ -311,6 +317,7 @@ unsafe fn notification_barrier(_: *mut ()) {}
 #[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "context"), timeout_ms = 15000)]
 pub(crate) mod context {
     use super::*;
+
     /// 两个固定CPU0 Task独立深栈交替并保留原20/21观察结果，离栈后归还32页。
     #[test]
     fn deep_switch_return(_: &mut TestContext<'_>, fixture: &mut Tasks) -> TestResult {
@@ -344,6 +351,7 @@ pub(crate) mod context {
         );
         assert!(STACK_BYTES <= bases[0].abs_diff(bases[1]));
         bases.iter().copied().for_each(check_stack_pages);
+
         let live = page_total();
         state.go.store(true, Ordering::Release);
         until(
@@ -369,6 +377,7 @@ pub(crate) mod context {
         bases.iter().copied().for_each(check_stack_pages);
         Ok(())
     }
+
     /// 外部原Task Arc和完成观察者仍存活时，真实结果36已经晚于栈16页归还。
     #[test]
     fn join_exit_observers(_: &mut TestContext<'_>, fixture: &mut Tasks) -> TestResult {
@@ -427,6 +436,7 @@ pub(crate) mod context {
 #[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "migration"), min_cpus = 2, timeout_ms = 15000)]
 pub(crate) mod migration {
     use super::*;
+
     /// 同一真实Any子Task往返全部在线核两轮，身份、硬件CPU基址与栈局部地址不变，原join返回31。
     #[test]
     fn same_task_round_trip(_: &mut TestContext<'_>, fixture: &mut Tasks) -> TestResult {
@@ -481,6 +491,7 @@ pub(crate) mod migration {
                 || state.starts[0].load(Ordering::Acquire) == 1,
                 "busy notification A arrival",
             )?;
+
             let b_state = Arc::clone(&state);
             let b = spawn_result_on(1, move |token| {
                 assert_eq!(cpu::current().id, 1);
@@ -514,6 +525,7 @@ pub(crate) mod migration {
                 || state.starts[1].load(Ordering::Acquire) == 1,
                 "busy notification B arrival",
             )?;
+
             let a_task = notification_task(&state, 0);
             let b_task = notification_task(&state, 1);
             assert_eq!(sched::test_state(&a_task), task::State::Running(0));
@@ -528,6 +540,7 @@ pub(crate) mod migration {
                 || state.steps[1].load(Ordering::Acquire) == 1,
                 "busy notification IRQ held",
             )?;
+
             assert!(!cpu::get(1).idle.load(Ordering::Acquire));
             assert_eq!(cpu::test_pending_kicks(1) & cpu::KICK_RESCHEDULE, 0);
             state.go.store(true, Ordering::Release);
@@ -546,6 +559,7 @@ pub(crate) mod migration {
             assert_eq!(cpu::test_pending_kicks(1) & cpu::KICK_RESCHEDULE, 0);
             assert_eq!(a.try_join(), None);
             assert_eq!(b.try_join(), None);
+
             state.frames.store(1, Ordering::Release);
             assert_eq!(a.join()?, 20);
             assert_eq!(b.join()?, 21);
@@ -594,6 +608,7 @@ pub(crate) mod migration {
                 },
                 "idle notification B blocked",
             )?;
+
             let a_state = Arc::clone(&state);
             let a = spawn_result(move |token| notification_yielder(a_state, token, true))?;
             notification_until(
@@ -607,6 +622,7 @@ pub(crate) mod migration {
             assert_eq!(sched::test_state(&a_task), task::State::Running(0));
             assert_eq!(sched::affinity(&a_task), cpu::CpuSet::prefix(2));
             assert_eq!(sched::affinity(&b_task), cpu::CpuSet::single(0));
+
             state.exit.complete();
             assert_eq!(sched::test_state(&b_task), task::State::Ready);
             assert_eq!(sched::test_ready_occurrences(&b_task), 1);
@@ -628,6 +644,7 @@ pub(crate) mod migration {
                 cpu::test_pending_kicks(1) & (cpu::KICK_SCHED_WAKE | cpu::KICK_RESCHEDULE),
                 0
             );
+
             state.go.store(true, Ordering::Release);
             notification_until(
                 &state,
@@ -643,6 +660,7 @@ pub(crate) mod migration {
             let pending = cpu::test_pending_kicks(1);
             assert_eq!(pending & cpu::KICK_SCHED_WAKE, cpu::KICK_SCHED_WAKE);
             assert_eq!(pending & cpu::KICK_RESCHEDULE, 0);
+
             cpu::test_release_pause(1, cpu::TestPause::Idle);
             state.active[1].store(0, Ordering::Release);
             notification_until(
@@ -654,6 +672,7 @@ pub(crate) mod migration {
             assert_eq!(sched::test_state(&a_task), task::State::Running(1));
             assert_eq!(sched::test_ready_occurrences(&a_task), 0);
             assert_eq!(a.try_join(), None);
+
             state.frames.store(1, Ordering::Release);
             assert_eq!(a.join()?, 20);
             assert_eq!(b.join()?, 21);
@@ -667,6 +686,7 @@ pub(crate) mod migration {
 #[::ktest::suite(tags("execution", "fatal"), isolation = "Case", timeout_ms = 5000)]
 pub(crate) mod fatal {
     use super::*;
+
     /// 原IRQ-save guard下直接调用真实调度前提；只能由irq-schedule真实fatal终结独立VM。
     #[test]
     #[ktest(expected_fatal = "irq-schedule")]
@@ -676,6 +696,7 @@ pub(crate) mod fatal {
         sched::yield_now();
         panic!("execution fault crossed prohibited switch boundary");
     }
+
     /// 原Preempt guard下的集中安全边界必须给出preempt-schedule，其他panic不能满足此例。
     #[test]
     #[ktest(expected_fatal = "preempt-schedule")]

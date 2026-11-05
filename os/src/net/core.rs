@@ -51,6 +51,7 @@ impl TcpCore {
         if !(IPV4_MIN_MTU..=MAX_IP_PACKET_LEN).contains(&ip_mtu) {
             return Err(FsError::InvalidOperation);
         }
+
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(Vec::new()),
             tcp::SocketBuffer::new(Vec::new()),
@@ -72,6 +73,7 @@ impl TcpCore {
         if self.buffers_ready {
             return Ok(());
         }
+
         let rx = tcp::SocketBuffer::new(zeroed_bytes(self.receive_capacity)?);
         let tx = tcp::SocketBuffer::new(zeroed_bytes(self.send_capacity)?);
         let mut socket = tcp::Socket::new(rx, tx);
@@ -80,6 +82,7 @@ impl TcpCore {
         socket.set_keep_alive(self.socket.keep_alive());
         socket.set_recv_budget(self.receive_budget);
         socket.set_send_budget(self.send_budget);
+
         self.socket = socket;
         // 后备安装后永不再替换 raw，协议回到 Closed 也保留原队列和算法拥有。
         self.buffers_ready = true;
@@ -125,6 +128,7 @@ impl TcpCore {
         if !self.socket.accepts(&ip, &tcp) {
             return Err(FsError::InvalidOperation);
         }
+
         let ip_mtu = self.context.ip_mtu();
         self.socket
             .process(&mut self.context, &ip, &tcp, tcp.payload)
@@ -171,6 +175,7 @@ impl TcpCore {
         if target.copied() == target.len() {
             return Ok(IoProgress::Ready(0));
         }
+
         let before = target.copied();
         let mut prefix = [0u8; STREAM_PREFIX_LEN];
         let length = {
@@ -181,6 +186,7 @@ impl TcpCore {
             prefix[..bytes.len()].copy_from_slice(bytes);
             bytes.len()
         };
+
         let result = target.push(&prefix[..length]);
         let copied = target.copied() - before;
         if !peek && 0 < copied {
@@ -202,6 +208,7 @@ impl TcpCore {
         if source.copied() == source.len() && self.socket.may_send() {
             return Ok(IoProgress::Ready(0));
         }
+
         let before = source.copied();
         match self.socket.send(|bytes| {
             let copied = source.pull(bytes);

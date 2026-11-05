@@ -29,6 +29,7 @@ impl UserOwner {
         );
         let first_used = block::tests::used_index(&disk, legacy);
         let before = disk.test_snapshot();
+
         disk.test_suspend_completions();
         let fs_context = self.path.context().clone();
         self.start_program(context, image, fs_context, true, false, Credentials::ROOT)?;
@@ -40,6 +41,7 @@ impl UserOwner {
         let executor = user
             .executor()
             .ok_or(TestError("取消时用户读者执行者消失"))?;
+
         until("用户数据读未在真实在途请求上阻塞", || {
             let mut marker_bytes = [0u8; 8];
             let progress = mm.copyin(&mut marker_bytes, marker);
@@ -56,10 +58,12 @@ impl UserOwner {
         context.expect_eq(sched::test_state(&executor), State::Blocked);
         context.expect_eq(mm.user_count(), 1);
         context.expect_eq(disk.test_snapshot().inflight, inflight);
+
         disk.test_resume_completions();
         let event = self.wait(context)?;
         context.expect_eq(event.status, 9);
         self.reap_children(context, true)?;
+
         context.expect_eq(mm.user_count(), 0);
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
@@ -181,6 +185,7 @@ impl UserOwner {
             if mode == b"n" {
                 Self::futex_waiting(&old_mm, &root, FUTEX_CONTROL + 68, true, u32::MAX)?;
             }
+
             Self::lifecycle_go(&old_mm, 1)?;
             let image = Self::lifecycle_image(&old_mm, &[&root, &child])?;
             if let Some((new_mm, winner)) = image {
@@ -192,6 +197,7 @@ impl UserOwner {
                 } else {
                     &root_runtime
                 };
+
                 context.expect_eq(identity.tid(), group.tgid());
                 context.expect_eq(identity.tgid(), group.tgid());
                 context.expect_eq(identity.group().pgid(), group.pgid());
@@ -221,6 +227,7 @@ impl UserOwner {
                     identity.tid(),
                     executor.id().as_usize()
                 ));
+
                 Self::lifecycle_go(&new_mm, 100)?;
                 let event = self.finish_lifecycle(context, mode, &[0])?;
                 context.expect_eq(event.status, 0);
@@ -248,6 +255,7 @@ impl UserOwner {
         context.expect_eq(before.files.user_count(), 2);
         context.expect_eq(before.sighand.user_count(), 2);
         context.expect_eq(old_mm.user_count(), 2);
+
         Self::lifecycle_go(&old_mm, 1)?;
         let (new_mm, _) =
             Self::lifecycle_image(&old_mm, &[&child])?.ok_or(TestError("共享exec未提交新映像"))?;
@@ -268,6 +276,7 @@ impl UserOwner {
         context.diagnostic(format_args!(
             "user-exec-shared private-files=1 private-sighand=1 old-mm-users=1 clear-tid=0"
         ));
+
         Self::lifecycle_go(&new_mm, 100)?;
         let event = self.finish_lifecycle(context, b"x", &[0])?;
         context.expect_eq(event.status, 0);
@@ -280,6 +289,7 @@ impl UserOwner {
     pub(super) fn lifecycle_vfork(&mut self, context: &mut TestContext<'_>) -> TestResult {
         let event = self.run_named(context, PROGRAM, b"z", false, 0)?;
         context.expect_eq(event.status, 0);
+
         for mode in [b"v" as &[u8], b"k"] {
             let (old_mm, root) = self.start_lifecycle(context, mode)?;
             Self::lifecycle_checkpoint(&old_mm, &root, 8, 1)?;
@@ -290,6 +300,7 @@ impl UserOwner {
             })?;
             context.expect_eq(sched::test_state(&executor), State::Blocked);
             context.expect_eq(old_mm.user_count(), 2);
+
             if mode == b"k" {
                 let pid = self.running.as_ref().unwrap().pid;
                 self.graph()
@@ -352,6 +363,7 @@ impl UserOwner {
                 .try_wait_event(&root_identity.group(), &selector, 5),
             Ok(None),
         );
+
         Self::lifecycle_go(&mm, 1)?;
         Self::lifecycle_checkpoint(&mm, &root, 8, 3)?;
         context.expect_eq(self.graph().parent_pid(&orphan_identity), 0);
@@ -364,6 +376,7 @@ impl UserOwner {
             .map_err(|_| TestError("真实转亲子组回收失败"))?;
         context.expect_eq(event.status, 0);
         context.expect_eq(orphan.mm().is_none(), true);
+
         Self::lifecycle_go(&mm, 4)?;
         Self::lifecycle_checkpoint(&mm, &root, 8, 4)?;
         let replacement = self.futex_child(&mm, 16)?;
@@ -425,10 +438,12 @@ impl UserOwner {
         context.diagnostic(format_args!(
             "user-wait-observers registered=2 blocked=2 child-futex=1"
         ));
+
         Self::lifecycle_go(&mm, 1)?;
         let count = futex::wake(&mm, FUTEX_CONTROL + 12, false, 1, u32::MAX)
             .map_err(|_| TestError("wait计算子真实futex唤醒失败"))?;
         context.expect_eq(count, 1);
+
         let event = self.finish_lifecycle(context, b"w", &[0])?;
         context.expect_eq(event.status, 0);
         let first = mm
@@ -472,6 +487,7 @@ impl UserOwner {
             drop(executor);
             Self::futex_waiting(&child_mm, &child, FUTEX_CONTROL + 12, false, u32::MAX)?;
             context.expect_eq(mm.load_user_u32(FUTEX_CONTROL + 24), Ok(0));
+
             Self::lifecycle_go(&mm, 1)?;
             let count = futex::wake(&mm, FUTEX_CONTROL + 12, false, 1, u32::MAX)
                 .map_err(|_| TestError("自动回收子真实futex唤醒失败"))?;
@@ -480,6 +496,7 @@ impl UserOwner {
             context.expect_eq(child.mm().is_none(), true);
             context.expect_eq(child.runtime().is_none(), true);
             context.expect_eq(child_mm.user_count(), 0);
+
             Self::lifecycle_go(&mm, 2)?;
             Self::lifecycle_checkpoint(&mm, &root, 8, 3)?;
             let wait_result =

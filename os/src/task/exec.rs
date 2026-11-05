@@ -22,9 +22,11 @@ use crate::mm::{alloc_pages, PAGE_SIZE};
 use crate::task::Credentials;
 
 use crate::fs::PATH_MAX as MAX_PATH_BYTES;
+
 pub(crate) const DEFAULT_STACK_BYTES: u64 = 8 * 1024 * 1024;
 const SCRIPT_HEADER_BYTES: usize = 256;
 const MAX_INTERPRETER_DEPTH: usize = 5;
+
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -103,6 +105,7 @@ pub(crate) fn prepare(
                 credentials,
             );
         }
+
         read_prefix(
             &file,
             ELF_HEADER_BYTES as u64,
@@ -154,6 +157,7 @@ fn script_interpreter(
             return Err(ExecError::Format);
         }
     }
+
     while 2 < end && matches!(header[end - 1], b' ' | b'\t') {
         end -= 1;
     }
@@ -168,6 +172,7 @@ fn script_interpreter(
         .position(|byte| matches!(*byte, b' ' | b'\t' | 0))
         .map(|index| index + start);
     let name_end = separator.unwrap_or(end);
+
     let optional = separator
         .filter(|index| header[*index] != 0)
         .and_then(|separator| {
@@ -233,6 +238,7 @@ fn load_elf(
     } else {
         None
     };
+
     let mut mm = Mm::try_new()?;
     elf::map_images(
         &mut mm,
@@ -243,6 +249,7 @@ fn load_elf(
     let (entry, base) = interpreter
         .as_ref()
         .map_or((elf.entry, 0), |(_, _, image)| (image.entry, image.bias));
+
     let stack_permissions = if elf.executable_stack
         || interpreter
             .as_ref()
@@ -252,6 +259,7 @@ fn load_elf(
     } else {
         RW
     };
+
     map_return_page(&mut mm)?;
     let sp = stack::make_stack(
         &mm,
@@ -263,13 +271,16 @@ fn load_elf(
         credentials.gid,
         stack_permissions,
     )?;
+
     let heap = page_end(elf.end)?;
     mm.set_heap(heap, heap)?;
+
     let context = UserContext::new(entry, sp);
     mm.bind_executable(file, access);
     if let Some((file, access, _)) = interpreter {
         mm.bind_interpreter(file, access);
     }
+
     let mm = Arc::try_new(mm).map_err(|_| ExecError::NoMemory)?;
     Ok(LoadedImage { mm, context })
 }

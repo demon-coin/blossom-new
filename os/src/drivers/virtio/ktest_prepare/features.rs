@@ -90,6 +90,7 @@ mod hardware {
                 .and_then(|device| device.interrupt)
                 .ok_or(TestError("feature candidate IRQ missing"))?
         };
+
         let actions = irq::test_action_count(interrupt);
         let transport = &mut fixture.transport;
         reset_transport(transport)?;
@@ -100,6 +101,7 @@ mod hardware {
         if offered & (version_one | access_platform) != version_one | access_platform {
             return Err(TestError("real feature rejection requires --iommu-platform and modern MMIO (--modern) or PCI"));
         }
+
         transport.set_status(DeviceStatus::ACKNOWLEDGE);
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
         // 设备真实要求 ACCESS_PLATFORM；保留 VERSION_1 才进入设备的特性验证路径。
@@ -119,6 +121,7 @@ mod hardware {
         );
         context.expect_eq(irq::test_action_count(interrupt), actions);
         context.diagnostic(format_args!("feature-rejection scope=actual-modern-registers offered={:#x} driver-features={:#x} live-status={:#x} queue-used={}", offered, version_one, rejected.bits(), transport.queue_used(0)));
+
         reset_transport(transport)?;
         let accepted = transport
             .begin_init(access_platform)
@@ -134,6 +137,7 @@ mod hardware {
         );
         context.expect_eq(transport.queue_used(0), false);
         context.expect_eq(irq::test_action_count(interrupt), actions);
+
         transport
             .finish_init()
             .map_err(|_| TestError("same candidate DRIVER_OK handshake did not recover"))?;

@@ -14,6 +14,7 @@ pub(crate) const PHY_ADDRESS_COUNT: u32 = 1 << 5;
 pub(super) const SPEED_10: u16 = 10;
 pub(super) const SPEED_100: u16 = 100;
 pub(super) const SPEED_1000: u16 = 1000;
+
 const MII_BMCR: u8 = 0;
 const MII_BMSR: u8 = 1;
 const MII_PHYSID1: u8 = 2;
@@ -23,6 +24,7 @@ const MII_LPA: u8 = 5;
 const MII_CTRL1000: u8 = 9;
 const MII_STAT1000: u8 = 10;
 const MII_ESTATUS: u8 = 15;
+
 const BMCR_RESET: u16 = 1 << 15;
 const BMCR_LOOPBACK: u16 = 1 << 14;
 const BMCR_ANENABLE: u16 = 1 << 12;
@@ -53,9 +55,11 @@ const ADVERTISE_1000: u16 = ADVERTISE_1000HALF | ADVERTISE_1000FULL;
 const ESTATUS_TO_ADVERTISE_SHIFT: u32 = 4;
 const LPA_1000_MASTER_SLAVE_FAIL: u16 = 1 << 15;
 const LPA_1000_TO_ADVERTISE_SHIFT: u32 = 2;
+
 const PHY_RESET_TIMEOUT: Duration = Duration::from_millis(500);
 const MDIO_TIMEOUT: Duration = Duration::from_millis(20);
 const MDIO_BUSY: u32 = 1;
+
 const DWMAC4_MDIO_ADDRESS: usize = 0x200;
 const DWMAC4_MDIO_DATA: usize = 0x204;
 const DWMAC4_MDIO_PHY_SHIFT: u32 = 21;
@@ -63,18 +67,21 @@ const DWMAC4_MDIO_REGISTER_SHIFT: u32 = 16;
 const DWMAC4_MDIO_CLOCK_SHIFT: u32 = 8;
 const DWMAC4_MDIO_WRITE: u32 = 1 << 2;
 const DWMAC4_MDIO_READ: u32 = 3 << 2;
+
 const DWMAC1000_MDIO_ADDRESS: usize = 0x10;
 const DWMAC1000_MDIO_DATA: usize = 0x14;
 const DWMAC1000_MDIO_PHY_SHIFT: u32 = 11;
 const DWMAC1000_MDIO_REGISTER_SHIFT: u32 = 6;
 const DWMAC1000_MDIO_CLOCK_SHIFT: u32 = 2;
 const DWMAC1000_MDIO_WRITE: u32 = 1 << 1;
+
 const CSR_60_100M: u32 = 0;
 pub(super) const CSR_100_150M: u32 = 1;
 const CSR_20_35M: u32 = 2;
 const CSR_35_60M: u32 = 3;
 const CSR_150_250M: u32 = 4;
 const CSR_250_300M: u32 = 5;
+
 const YTPHY_PAGE_SELECT: u8 = 0x1e;
 const YTPHY_PAGE_DATA: u8 = 0x1f;
 const YT8511_EXT_CLOCK_GATE: u16 = 0x0c;
@@ -90,6 +97,7 @@ const YT8511_DELAY_GE_TX_DISABLE: u16 = 2 << 4;
 const YT8511_DELAY_FE_TX_MASK: u16 = 0xf << 12;
 const YT8511_DELAY_FE_TX_ENABLE: u16 = 0xf << 12;
 const YT8511_DELAY_FE_TX_DISABLE: u16 = 2 << 12;
+
 const YTPHY_CHIP_CONFIG: u16 = 0xa001;
 const YTPHY_RX_CLOCK_DELAY_ENABLE: u16 = 1 << 8;
 const YTPHY_RGMII_CONFIG1: u16 = 0xa003;
@@ -97,6 +105,7 @@ const YTPHY_TX_CLOCK_INVERTED: u16 = 1 << 14;
 const YTPHY_RX_DELAY_SHIFT: u32 = 10;
 const YTPHY_DELAY_MASK: u16 = 0xf;
 const YTPHY_RX_DELAY_MASK: u16 = YTPHY_DELAY_MASK << YTPHY_RX_DELAY_SHIFT;
+
 const YT8531_LDO_VOLTAGE_SHIFT: u32 = 4;
 const YT8531_LDO_VOLTAGE_MASK: u16 = 3;
 const YT8531_LDO_3V3: u16 = 0;
@@ -115,6 +124,7 @@ const YTPHY_SLEEP_CONTROL: u16 = 0x27;
 const YTPHY_SLEEP_ENABLE: u16 = 1 << 15;
 const YTPHY_CLOCK_GATING: u16 = 0x0c;
 const YTPHY_RX_CLOCK_GATE: u16 = 1 << 12;
+
 const YTPHY_DELAY_STEP_PS: u32 = 150;
 const YTPHY_DELAY_MAX_PS: u32 = YTPHY_DELAY_MASK as u32 * YTPHY_DELAY_STEP_PS;
 const YTPHY_RX_EXTRA_DELAY_PS: u32 = 1900;
@@ -164,6 +174,7 @@ impl Phy {
         if phy.id != expected {
             return Err(GmacError::Resource("selected GMAC PHY ID is unsupported"));
         }
+
         // Clause 22 软复位清除 POWER_DOWN，写入值也明确清除 ISOLATE；
         // 管理时钟由 MAC 的 MDC 提供，复位等待不依赖网线或自协商完成。
         phy.write(MII_BMCR, BMCR_RESET)?;
@@ -174,6 +185,7 @@ impl Phy {
             }
             timer::sleep(Duration::from_millis(1));
         }
+
         match phy.id {
             YT8531 => phy.configure_yt8531(resources)?,
             YT8511 => phy.configure_yt8511(resources)?,
@@ -207,6 +219,7 @@ impl Phy {
         if status & BMSR_ANEG_COMPLETE == 0 {
             return Ok(None);
         }
+
         let local = self.read(MII_ADVERTISE)?;
         let partner = self.read(MII_LPA)?;
         if partner & LPA_REMOTE_FAULT != 0 {
@@ -255,6 +268,7 @@ impl Phy {
         if advertisement & ADVERTISE_COPPER == 0 {
             return Err(GmacError::Resource("PHY has no supported copper mode"));
         }
+
         self.write(
             MII_ADVERTISE,
             (self.read(MII_ADVERTISE)? & !ADVERTISE_CONFIG_MASK) | advertisement,
@@ -269,6 +283,7 @@ impl Phy {
             (self.read(MII_CTRL1000)? & !ADVERTISE_1000)
                 | ((extended >> ESTATUS_TO_ADVERTISE_SHIFT) & ADVERTISE_1000),
         )?;
+
         self.write(
             MII_BMCR,
             (self.read(MII_BMCR)? & !(BMCR_POWER_DOWN | BMCR_ISOLATE | BMCR_LOOPBACK))
@@ -291,6 +306,7 @@ impl Phy {
                 "YT8511 does not support requested numeric PHY settings",
             ));
         }
+
         let old = self.read(YTPHY_PAGE_SELECT)?;
         let result = (|| {
             self.write(YTPHY_PAGE_SELECT, YT8511_EXT_CLOCK_GATE)?;
@@ -355,6 +371,7 @@ impl Phy {
                 0
             } | if tx_enabled { tx } else { 0 },
         )?;
+
         let voltage = (self.read_extended(YTPHY_CHIP_CONFIG)? >> YT8531_LDO_VOLTAGE_SHIFT)
             & YT8531_LDO_VOLTAGE_MASK;
         let clock = drive_strength(voltage, resources.phy_clock_drive_ua)?;
@@ -366,6 +383,7 @@ impl Phy {
                 | ((data & YT8531_DRIVE_CODE_HIGH) << YT8531_RX_DATA_DRIVE_HIGH_SHIFT)
                 | ((data & YT8531_DRIVE_CODE_LOW) << YT8531_RX_DATA_DRIVE_LOW_SHIFT),
         )?;
+
         // 禁止自动睡眠切断 RX 时钟；链路断开后仍须允许 MAC 的软件复位完成。
         self.modify_extended(YTPHY_SLEEP_CONTROL, YTPHY_SLEEP_ENABLE, 0)?;
         self.modify_extended(YTPHY_CLOCK_GATING, YTPHY_RX_CLOCK_GATE, 0)
@@ -409,6 +427,7 @@ impl Phy {
                     },
             ),
         };
+
         self.wait_idle(address)?;
         if let Some(value) = value {
             self.registers.write(data, u32::from(value));

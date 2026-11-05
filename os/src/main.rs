@@ -62,6 +62,7 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
             error, arguments
         )
     });
+
     let kernel = boot::kernel_region();
     assert!(
         resources.memory[..resources.memory_count]
@@ -72,6 +73,7 @@ unsafe fn initialize_boot(arguments: [usize; 4]) {
     resources
         .reserve(kernel)
         .expect("kernel reservation failed");
+
     // SAFETY: 永久槽的独占借用已完成 DTB 解析和内核保留；AP 未释放，发布消费借用后仅允许只读访问。
     unsafe { boot::publish(resources) };
     let resources = boot::info();
@@ -142,11 +144,13 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     // SAFETY: 唯一 BSP 仍保持 IRQ 关闭且 AP 未释放；MM 已完成页分配器和永久直映，
     // CPU 表已提前构造，辅核记录尚无固件读者，全部动态槽尚为空。
     unsafe { cpu::prepare_secondary_stacks() }.expect("AP stack allocation failed");
+
     // 统一各核计数器零点后才能开放时间服务与 AP 采样。
     arch::establish_counter_epoch();
     // SAFETY: 唯一 BSP 在 MM 初始化后、IRQ 与 AP 开放前初始化时间源；
     // BootInfo 的频率与 RTC 资源已验证，永久 MMIO 映射有效，尚无其他 RTC 访问者。
     unsafe { time::initialize(resources) };
+
     timer::initialize_services().expect("timer service task allocation failed");
     workqueue::initialize_services().expect("worker pool service task allocation failed");
     fs::initialize_inode_eviction().expect("inode eviction service allocation failed");
@@ -156,6 +160,7 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
     task::spawn_kernel_on(0, init).expect("initial kernel task allocation failed");
     #[cfg(feature = "ktest")]
     let _test_task = ktest::spawn_thread(test_command).expect("test suite Task allocation failed");
+
     // SAFETY: 本核基址/异常入口已安装，实际控制器已映射；仅 BSP 初始化路由一次。
     unsafe { irq::initialize(resources) };
     let uart_number = irq::map_source(resources.interrupts.uart_source)
@@ -195,6 +200,7 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
             window.cpu.end
         );
     }
+
     // SAFETY: 全部记录已构造，本核能服务 IPI；每个 AP 的独占栈和 CPU 对象永久保留。
     unsafe { cpu::start_secondaries() };
     for id in 0..cpu::count() {
@@ -207,6 +213,7 @@ unsafe fn run_kernel(#[cfg(feature = "ktest")] test_command: ktest::RunCommand) 
             local.stack_top()
         );
     }
+
     early_println!("READY arch={} cpus={}", arch::NAME, cpu::count());
     EXECUTION_READY.store(true, core::sync::atomic::Ordering::Release);
     for id in 0..cpu::count() {
@@ -260,6 +267,7 @@ fn init() -> i32 {
         )
     }
     .expect("storage initialization failed");
+
     crate::klog!(
         klog::Level::Info,
         "STORAGE online devices={}",
@@ -303,6 +311,7 @@ unsafe fn init_filesystems(
     let (vfs, context) =
         fs::system::mount_disks(root, extra, inodes, selected.root_mode, selected.rootdir)?;
     let vfs = Arc::try_new(vfs).map_err(|_| fs::FsError::NoMemory)?;
+
     {
         let mountpoint = vfs.resolve(&context, b"/dev", fs::ResolveMode::Follow)?;
         let devfs = fs::devfs::try_new(0o755)?;
@@ -319,6 +328,7 @@ unsafe fn init_filesystems(
         selected.extra,
         selected.root_mode
     );
+
     let net_owner = if drivers::net_device::NetDevice::has_candidate(inventory) {
         // SAFETY: 调用者传递同次库存、启动资源、网络及板设置独占和完整永久映射义务。
         // 原 NetStackOwner 在发表前保活 NIC，用户全部 join/reap 后才同步停止；失败不改用 lo。
@@ -346,12 +356,14 @@ unsafe fn init_filesystems(
         Some(Arc::clone(net_owner.stack())),
     )?;
     runtime.install_console()?;
+
     let prepared = task::prepare_program(&graph, None, image, runtime, task::Placement::Any)?;
     let pid = prepared.pid();
     assert_eq!(pid, 1, "system root must be PID1");
     let child = prepared.publish()?;
     let task_id = child.task_id();
     early_println!("INIT running pid={} task={}", pid, task_id.as_usize());
+
     let event = graph.wait(None, pid)?;
     let task_status = child.join();
     assert_eq!(event.pid, pid, "system wait returned another process");
@@ -366,6 +378,7 @@ unsafe fn init_filesystems(
         event.status,
         operation
     );
+
     // 关闭准入已随关机请求提交；此后只回收残余组，合法信号退出状态原样保留。
     loop {
         match graph.wait_root() {
@@ -379,8 +392,10 @@ unsafe fn init_filesystems(
             Err(error) => return Err(error.into()),
         }
     }
+
     drop(net_owner);
     early_println!("NET stopped");
+
     vfs.sync()?;
     drop(graph);
     drop(context);
@@ -409,6 +424,7 @@ fn report_device_resources(inventory: &DeviceInventory) {
             resource.interrupt_source
         );
     }
+
     for candidate in &inventory.mmio_blocks {
         crate::klog!(
             klog::Level::Info,
@@ -420,6 +436,7 @@ fn report_device_resources(inventory: &DeviceInventory) {
             candidate.interrupt
         );
     }
+
     for device in inventory.pci.devices() {
         crate::klog!(
             klog::Level::Info,
@@ -450,6 +467,7 @@ fn report_device_resources(inventory: &DeviceInventory) {
             }
         }
     }
+
     crate::klog!(
         klog::Level::Info,
         "DEVICE discovery mmio-blocks={} pci-functions={}",

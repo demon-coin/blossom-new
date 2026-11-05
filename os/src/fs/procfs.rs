@@ -89,6 +89,7 @@ pub fn try_new(root_mode: u16) -> Result<Arc<MemoryFs>, FsError> {
     fs.initialize_special(&root, b"meminfo", MemorySpecial::Meminfo, 0o444, 0)?;
     fs.initialize_special(&root, b"uptime", MemorySpecial::Uptime, 0o444, 0)?;
     fs.initialize_special(&root, b"interrupts", MemorySpecial::Interrupts, 0o444, 0)?;
+
     let net = fs.initialize_directory(&root, b"net", 0o555)?;
     fs.initialize_special(&net, b"dev", MemorySpecial::NetDev, 0o444, 0)?;
     fs.initialize_special(&net, b"route", MemorySpecial::NetRoute, 0o444, 0)?;
@@ -106,6 +107,7 @@ pub fn open(
     if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
         return Err(FsError::ReadOnly);
     }
+
     let bytes = match special {
         MemorySpecial::Cmdline => cmdline()?,
         MemorySpecial::Mounts => {
@@ -136,6 +138,7 @@ pub fn open(
         }
         _ => return Err(FsError::InvalidOperation),
     };
+
     Ok(Arc::try_new(SnapshotFile {
         path,
         bytes,
@@ -164,6 +167,7 @@ fn interrupts() -> Result<Vec<u8>, FsError> {
     for (owner, column) in online.iter_mut().enumerate().take(cpu::count()) {
         *column = cpu::get(owner).online.load(Ordering::Acquire);
     }
+
     let mut text = SnapshotText::try_new()?;
     let result = (|| {
         text.write_str("     ")?;
@@ -173,6 +177,7 @@ fn interrupts() -> Result<Vec<u8>, FsError> {
             }
         }
         text.write_char('\n')?;
+
         for (number, label) in [(0, "timer"), (1, "IPI")] {
             write!(text, "{:>3}: ", number)?;
             for (owner, &is_online) in online.iter().enumerate() {
@@ -188,6 +193,7 @@ fn interrupts() -> Result<Vec<u8>, FsError> {
             }
             writeln!(text, "{}", label)?;
         }
+
         for source in 0..irq::source_count() {
             let Some(snapshot) = irq::source_snapshot(source) else {
                 continue;
@@ -217,6 +223,7 @@ fn net_dev(net: &NetStack) -> Result<Vec<u8>, FsError> {
             *slot = Some((interface.id, net.statistics(interface.id)?));
         }
     }
+
     let mut text = SnapshotText::try_new()?;
     let result = (|| {
         text.write_str(concat!(
@@ -411,6 +418,7 @@ impl FileLike for SnapshotFile {
         if (i64::MAX as u64) < position {
             return Err(FsError::InvalidOperation);
         }
+
         *cursor = position;
         Ok(position)
     }

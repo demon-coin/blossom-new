@@ -102,6 +102,7 @@ impl UserOwner {
             self.network_control = Some((net.interface_snapshots(), net.route_snapshots()));
             self.mount_network_proc(context)?;
         }
+
         let result = self.network_run(context, mode);
         if result.is_err() {
             self.graph().request_root_exit(9);
@@ -110,6 +111,7 @@ impl UserOwner {
             }
             self.reap_children(context, true)?;
         }
+
         let observer_result = self.observer.take().map(|observer| observer.join());
         if net.ktest_has_held_syn() {
             checked(context, net.ktest_release_syn())?;
@@ -168,6 +170,7 @@ impl UserOwner {
                 checked(context, net.set_interface_up(interface.id, interface.up))?;
             }
         }
+
         let original = routes
             .iter()
             .flatten()
@@ -259,6 +262,7 @@ impl UserOwner {
         } else {
             None
         };
+
         let nic = matches!(
             mode,
             NetworkMode::NicTcp | NetworkMode::NicUdp | NetworkMode::NicControl
@@ -302,6 +306,7 @@ impl UserOwner {
         let prepared = task::prepare_program(self.graph(), None, image, runtime, Placement::Any)
             .map_err(|_| TestError("network user task preparation failed"))?;
         let pid = prepared.pid();
+
         let coordinator = if let Some((reader, writer, _, _)) = channels {
             let user = prepared.user();
             let graph = self.graph().clone();
@@ -327,6 +332,7 @@ impl UserOwner {
         } else {
             None
         };
+
         match mode {
             NetworkMode::Connect => checked(context, net.ktest_hold_syn(45204))?,
             NetworkMode::Signal => checked(context, net.ktest_hold_syn(45214))?,
@@ -343,6 +349,7 @@ impl UserOwner {
             join,
         });
         self.observer = coordinator.map(|task| task.publish());
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -478,6 +485,7 @@ fn coordinate(
                 .map_err(|_| TestError("empty read signal failed"))?;
             phase(reader, root, b'I', 4)?;
             go(writer)?;
+
             let child = phase(reader, root, b'T', 0)?;
             blocked(graph, child)?;
             graph
@@ -488,6 +496,7 @@ fn coordinate(
             }
             blocked(graph, child)?;
             go(writer)?;
+
             let pid = phase(reader, root, b'K', 0)?;
             network_until(
                 || net.ktest_has_held_syn(),
@@ -502,6 +511,7 @@ fn coordinate(
             net.ktest_release_syn()
                 .map_err(|_| TestError("interrupted SYN release failed"))?;
             go(writer)?;
+
             phase(reader, root, b'V', 0)?;
             net.ktest_clear_packet_control()
                 .map_err(|_| TestError("previous SYN control did not end"))?;

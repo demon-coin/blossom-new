@@ -81,12 +81,14 @@ impl UserAccount {
                 return Ok(account);
             }
         }
+
         let candidate = Arc::try_new(Self {
             uid,
             processes: AtomicU64::new(0),
             queued_signals: AtomicU64::new(0),
         })
         .map_err(|_| ProcessError::NoMemory)?;
+
         let mut prepared = Vec::new();
         loop {
             let needed = {
@@ -140,6 +142,7 @@ impl Drop for UserAccount {
     fn drop(&mut self) {
         assert_eq!(self.processes.load(Ordering::Relaxed), 0);
         assert_eq!(self.queued_signals.load(Ordering::Relaxed), 0);
+
         let (retired, directory) = {
             let mut accounts = ACCOUNTS.lock();
             let index = accounts
@@ -153,6 +156,7 @@ impl Drop for UserAccount {
             };
             (retired, directory)
         };
+
         drop(retired);
         drop(directory);
     }
@@ -201,6 +205,7 @@ impl TaskGraph {
         if resource == Resource::NoFile && new.is_some_and(|limit| MAX_NOFILE < limit.maximum) {
             return Err(ProcessError::Permission);
         }
+
         let slots = self.slots.lock();
         let group = self.identity_target(&slots, caller, pid)?;
         self.live_parent(&slots, group)
@@ -208,6 +213,7 @@ impl TaskGraph {
         if caller.group.uid != 0 && caller.group.uid != group.uid {
             return Err(ProcessError::Permission);
         }
+
         let mut limits = group.limits.lock();
         let old = limits.get(resource);
         if let Some(new) = new {

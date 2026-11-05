@@ -26,6 +26,7 @@ pub fn periodic_deadline(
     if period == 0 {
         return None;
     }
+
     let steps = match now.as_nanos().checked_sub(previous.as_nanos()) {
         Some(elapsed) => elapsed.checked_div(period)?.checked_add(1)?,
         None => 1,
@@ -81,6 +82,7 @@ fn sleep_inner(deadline: MonotonicInstant, after_arm: Option<fn(Waker)>) {
             after_arm(waiter.waker());
         }
         waiter.park();
+
         // 先结束这一轮唯一 active wait，cancel_sync 必要时才能开始自己的尾部等待。
         drop(waiter);
         timer.as_ref().cancel_sync();
@@ -104,6 +106,7 @@ pub(crate) fn sleep_until_interruptible(deadline: MonotonicInstant) -> crate::wa
         let result = waiter.park_signal();
         drop(waiter);
         timer.as_ref().cancel_sync();
+
         if deadline <= time::now() {
             return crate::wait::WaitResult::Woken;
         }

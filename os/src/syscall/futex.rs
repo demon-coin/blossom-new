@@ -12,6 +12,7 @@ const REQUEUE: u32 = 3;
 const CMP_REQUEUE: u32 = 4;
 const WAIT_BITSET: u32 = 9;
 const WAKE_BITSET: u32 = 10;
+
 const PRIVATE: u32 = 0x80;
 const CLOCK_REALTIME: u32 = 0x100;
 const COMMAND_MASK: u32 = !(PRIVATE | CLOCK_REALTIME);
@@ -36,6 +37,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if operation & CLOCK_REALTIME != 0 {
         return Outcome::Return(Errno::NoSyscall.result());
     }
+
     let result = (|| {
         let mm = user.mm().expect("futex has no MM");
         match command {
@@ -64,6 +66,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
             _ => Err(Errno::NoSyscall),
         }
     })();
+
     Outcome::Return(
         result
             .map(|count| count as isize)
@@ -90,6 +93,7 @@ fn wait(user: &UserThread, request: Request, deadline: Option<MonotonicInstant>)
     } else {
         raw[5] as u32
     };
+
     match futex::wait(
         &mm,
         raw[0],
@@ -127,10 +131,12 @@ fn parse_deadline(
     if address == 0 {
         return Ok(None);
     }
+
     let mm = user.mm().expect("futex timeout has no MM");
     let mut bytes = [0; 16];
     error::copyin(&mm, &mut bytes, address)?;
     let ns = time::decode_time(&bytes, NSEC_PER_SEC, 1)?;
+
     let deadline = if operation & COMMAND_MASK == WAIT {
         MonotonicInstant::from_nanos(
             clock::now()

@@ -51,6 +51,7 @@ impl TaskId {
 
 const RECLAIM_NOFS: u8 = 1;
 const RECLAIM_NOIO: u8 = 2;
+
 const KERNEL_STACK_ORDER: usize = 4;
 
 /// 当前普通任务直接回收可进入的依赖范围；显式业务 I/O 不受该模式禁止。
@@ -197,6 +198,7 @@ impl JoinState {
             if let Some(result) = self.try_join() {
                 return result;
             }
+
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
             // SAFETY: 当前共享借用保活原 JoinState/等待源；节点在原执行栈固定，
@@ -317,6 +319,7 @@ impl JoinHandle {
     pub fn task_id(&self) -> TaskId {
         self.id
     }
+
     /// 创建仅保留原完成状态的观察者，不延长 Task 或执行栈寿命。
     pub(crate) fn observer(&self) -> JoinObserver {
         JoinObserver {
@@ -331,15 +334,18 @@ pub(crate) struct JoinObserver {
     id: TaskId,
     join: Arc<JoinState>,
 }
+
 impl JoinObserver {
     /// Some 只来自原粘性完成事实，已确认执行栈归还。
     pub(crate) fn try_join(&self) -> Option<i32> {
         self.join.try_join()
     }
+
     /// 等待原完成事实，不消费作用域的唯一 join 责任。
     pub(crate) fn join(&self) -> i32 {
         self.join.wait_result()
     }
+
     /// 已退出后仍返回实际原任务身份。
     pub(crate) fn task_id(&self) -> TaskId {
         self.id
@@ -439,12 +445,14 @@ fn prepare(
         completed: AtomicBool::new(false),
         waiters: WaitQueue::new(),
     })?;
+
     let mut stack = alloc_pages(KERNEL_STACK_ORDER, false).ok_or(AllocError)?;
     let stack_top = stack.as_mut_ptr() as usize + stack.len();
     let id = NEXT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("task ID space exhausted");
     let id = TaskId(id);
+
     let value = Task {
         id,
         execution_ns: AtomicU64::new(0),
@@ -478,6 +486,7 @@ fn prepare(
         #[cfg(feature = "ktest")]
         ktest_scope: AtomicPtr::new(ptr::null_mut()),
     };
+
     // 完整 value 在 fallible Arc 分配前计入，失败时普通 Drop 精确配对。
     #[cfg(feature = "ktest")]
     LIVE_TASKS.fetch_add(1, Ordering::Relaxed);

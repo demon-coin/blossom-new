@@ -90,12 +90,14 @@ pub unsafe fn initialize(info: &BootInfo) {
             &info.reserved[..info.reserved_count],
         )
         .unwrap_or_else(|error| panic!("memory boot range initialization failed: {}", error));
+
     // SAFETY: 调用者保证 BSP 独占实际空闲 RAM、IRQ 关闭且 AP 未释放；BootMemory
     // 来自完整实际 BootInfo，backing 使用永久可写且一一对应的 RAM 直接映射，
     // 发布后不再通过其他别名修改或回收；初始化失败立即 panic 终止启动。
     let map = unsafe { page::initialize(&mut memory) }
         .unwrap_or_else(|error| panic!("physical page map initialization failed: {}", error));
     MEMORY.call_once(|| map);
+
     let map = pages();
     let stats = map.stats();
     crate::early_println!("MEMORY present={} reserved={} metadata={} free={} sections={} present_sections={} descriptor_size={}",

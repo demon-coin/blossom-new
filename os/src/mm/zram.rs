@@ -52,6 +52,7 @@ impl Zram {
             tail: 0,
         }
     }
+
     /// 数据插入
     fn insert(&mut self, data: Vec<u8>) -> Result<Arc<ZramTracker>, ZramError> {
         // 优先使用回收的索引
@@ -68,28 +69,33 @@ impl Zram {
                 }
             }
         };
+
         // 存储数据
         self.compressed[zram_id] = Some(data);
         // 返回跟踪器
         Ok(Arc::new(ZramTracker(zram_id)))
     }
+
     /// 获取数据
     fn get(&self, zram_id: usize) -> Result<&Vec<u8>, ZramError> {
         // 如果zram_id大于容器大小
         if zram_id >= self.compressed.len() {
             return Err(ZramError::InvalidIndex);
         }
+
         match &self.compressed[zram_id] {
             Some(compressed_data) => Ok(compressed_data),
             None => Err(ZramError::NotAllocated),
         }
     }
+
     /// 移除数据
     fn remove(&mut self, zram_id: usize) -> Result<Vec<u8>, ZramError> {
         // 如果索引大于容器大小
         if zram_id >= self.compressed.len() {
             return Err(ZramError::InvalidIndex);
         }
+
         // 刚好等于最后一个分配的id
         if zram_id == (self.tail - 1) as usize {
             // 回退tail
@@ -103,6 +109,7 @@ impl Zram {
             None => Err(ZramError::NotAllocated),
         }
     }
+
     /// 读接口
     pub fn read(&mut self, zram_id: usize, buf: &mut [u8]) -> Result<(), ZramError> {
         // 获取压缩数据
@@ -118,6 +125,7 @@ impl Zram {
             Err(error) => Err(error),
         }
     }
+
     /// 写接口
     pub fn write(&mut self, buf: &[u8]) -> Result<Arc<ZramTracker>, ZramError> {
         // 压缩输入数据
@@ -128,6 +136,7 @@ impl Zram {
         // 插入数据并返回跟踪器
         self.insert(compressed)
     }
+
     #[inline(always)]
     /// 释放
     pub fn discard(&mut self, zram_id: usize) -> Result<(), ZramError> {

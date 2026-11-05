@@ -263,6 +263,7 @@ impl Disk {
         {
             return Err(BlockError::InvalidRange);
         }
+
         limits.max_bytes = max_bytes;
         limits.max_segments = max_segments;
         limits.max_segment_bytes = max_segment_bytes;
@@ -403,6 +404,7 @@ impl Disk {
             slot_states.push(SlotState::Free);
             slot_writes.push(None);
         }
+
         let disk = Arc::try_new(Self {
             queue: SpinLock::new(QueueState {
                 device: Some(backend),
@@ -447,6 +449,7 @@ impl Disk {
             _pinned: PhantomPinned,
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         let raw = Arc::into_raw(disk);
         // SAFETY: into_raw 的唯一强引用尚未发表；构造过程中不队列化 Work，不注册 IRQ。
         // 原 Arc 立刻恢复，失败仍以 Prepared 正常析构；固定 Vec 不再重新分配。
@@ -469,6 +472,7 @@ impl Disk {
                 .map_err(|_| BlockError::NoMemory)?,
             );
         }
+
         Ok(disk)
     }
 
@@ -485,6 +489,7 @@ impl Disk {
                 .expect("prepared disk has no device")
                 .interrupt()
         };
+
         if let Some(number) = number {
             // SAFETY: 私有构造器返回 pinned Arc，外部 owner 显式 stop 并同步注销后才释放。
             let registration =
@@ -492,6 +497,7 @@ impl Disk {
                     .map_err(|_| BlockError::Busy)?;
             *self.irq.lock() = Some(registration);
         }
+
         let result = {
             let mut q = self.queue.lock();
             let result = q
@@ -515,6 +521,7 @@ impl Disk {
                 }
             }
         };
+
         if result.is_ok() {
             if let Some(registration) = self.irq.lock().as_ref() {
                 registration.enable();
@@ -657,6 +664,7 @@ impl Disk {
             if let Some(error) = error {
                 return Err((bio, error));
             }
+
             q.generators += 1;
             if bio.inner.operation() == BlkOperation::Write {
                 q.writer_generators += 1;
@@ -669,6 +677,7 @@ impl Disk {
                 }
             }
         }
+
         if let Err(error) = bio.inner.begin() {
             self.finish_generation_tail(&bio.inner);
             return Err((bio, error));
@@ -1035,6 +1044,7 @@ impl Disk {
                 }
             }
         }
+
         if let Some(error) = fault {
             self.mark_fault(error);
         }
@@ -1082,6 +1092,7 @@ impl Disk {
         if error == Some(BlockError::DeviceFault) {
             self.mark_fault(BlockError::DeviceFault);
         }
+
         let writing = resources.operation == BlkOperation::Write;
         let mut remaining = completed;
         let parts = core::mem::replace(&mut resources.parts, [const { None }; MAX_BATCH]);
@@ -1095,6 +1106,7 @@ impl Disk {
             };
             BioInner::finish_child(&part.bio, part.offset, part.length, progress, part_error);
         }
+
         resources.sg.clear();
         resources.part_count = 0;
         resources.configured = false;
@@ -1104,6 +1116,7 @@ impl Disk {
         {
             resources.ktest_read_prefix = None;
         }
+
         // 从此处起不再访问本轮 slot 数据；其他 producer 在状态清空后可以马上重用。
         {
             let mut q = self.queue.lock();
@@ -1306,6 +1319,7 @@ impl Disk {
             };
             (pending, held)
         };
+
         for tag in core::iter::IntoIterator::into_iter(held).flatten() {
             self.dispatch_slot(tag);
         }
@@ -1505,6 +1519,7 @@ impl PreparingSlot<'_> {
         {
             return Err(BlockError::InvalidRange);
         }
+
         let slot = &self.disk.slots[usize::from(self.tag)];
         slot.control.prepare(operation, sector)?;
         let resources = self.resources_mut();
@@ -1526,6 +1541,7 @@ impl PreparingSlot<'_> {
         if !self.resources().configured {
             return Err(BlockError::InvalidRange);
         }
+
         loop {
             if self.try_publish()? {
                 self.published = true;
@@ -1631,6 +1647,7 @@ impl PreparingSlot<'_> {
             }
             result
         };
+
         match result {
             Ok(_) => Ok(true),
             Err(error) => {
@@ -1662,6 +1679,7 @@ impl Drop for PreparingSlot<'_> {
         resources.sg.clear();
         resources.part_count = 0;
         resources.configured = false;
+
         {
             let mut q = disk.queue.lock();
             assert_eq!(q.slot_states[usize::from(tag)], SlotState::Preparing);

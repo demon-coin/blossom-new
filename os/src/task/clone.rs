@@ -48,6 +48,7 @@ const SUPPORTED: usize = CSIGNAL
 const STACK_REGISTER: usize = 2;
 #[cfg(target_arch = "loongarch64")]
 const STACK_REGISTER: usize = 3;
+
 #[cfg(target_arch = "riscv64")]
 const TLS_REGISTER: usize = 4;
 #[cfg(target_arch = "loongarch64")]
@@ -98,6 +99,7 @@ impl CloneArguments {
         if !thread && !matches!((flags & CSIGNAL) as u8, 0 | SIGCHLD) {
             return Err(CloneError::Unsupported);
         }
+
         #[cfg(target_arch = "riscv64")]
         let (tls, child_tid) = (raw[3], raw[4]);
         #[cfg(target_arch = "loongarch64")]
@@ -145,6 +147,7 @@ pub(crate) fn create(
     let inherited = identity
         .signals()
         .inherit(arguments.share_vm && !arguments.vfork);
+
     let mut context = user.context().fork();
     request.return_to(&mut context, 0);
     if arguments.stack != 0 {
@@ -153,11 +156,13 @@ pub(crate) fn create(
     if let Some(tls) = arguments.tls {
         context.gpr[TLS_REGISTER] = tls;
     }
+
     let mm = if arguments.share_vm {
         parent_mm.clone()
     } else {
         Arc::try_new(parent_mm.fork().map_err(CloneError::Vm)?).map_err(|_| CloneError::NoMemory)?
     };
+
     let identity = if arguments.thread {
         graph.prepare_thread(&group, inherited)
     } else {
@@ -179,6 +184,7 @@ pub(crate) fn create(
         arguments.clear_child_tid,
     )
     .map_err(program_error)?;
+
     let parent = user.executor().expect("clone has no parent executor");
     let child = program
         .user()
@@ -194,6 +200,7 @@ pub(crate) fn create(
     } else {
         None
     };
+
     let handle = program
         .publish_child(&parent_mm, arguments.parent_tid)
         .map_err(CloneError::Identity)?;

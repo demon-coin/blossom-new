@@ -17,6 +17,7 @@ pub(super) mod cases {
         fixture.prepare_namespace_parent(context)?;
         let vfs = fixture.user.path.vfs().clone();
         let fs_context = fixture.user.path.context().clone();
+
         let image = fixture.shared_image(context, b"N3")?;
         let mm = image.mm.clone();
         fixture.start_shared_as(
@@ -63,6 +64,7 @@ pub(super) mod cases {
         let mut raw_bytes = [0; 4];
         context.expect_eq(checked(context, raw.read_at(0, &mut raw_bytes))?, 4);
         context.expect_eq(&raw_bytes, b"RAW!");
+
         let short = fixture.hold_nofollow(context, b"/test/ns-work/ns-short")?;
         context.expect_eq(
             checked(context, short.metadata_snapshot())?.kind,
@@ -86,6 +88,7 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::NotFound),
         );
+
         for inode in [&short, &long, &dangling] {
             checked(context, crate::fs::writeback::sync_inode(inode))?;
         }
@@ -101,6 +104,7 @@ pub(super) mod cases {
         let inherited_stat = checked(context, inherited.stat())?;
         context.expect_eq((inherited_stat.uid, inherited_stat.gid), (1001, 1001));
         context.expect_eq(inherited_stat.mode & 0o7777, 0o7750);
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
 
@@ -151,6 +155,7 @@ pub(super) mod cases {
     ) -> TestResult {
         fixture.prepare_namespace(context)?;
         fixture.prepare_namespace_parent(context)?;
+
         let image = fixture.shared_image(context, b"N4")?;
         let mm = image.mm.clone();
         fixture.start_shared_as(
@@ -180,6 +185,7 @@ pub(super) mod cases {
         context.expect_eq(old.write_at(0, b"OLD!"), Ok(4));
         let old_tree = tree(context, &old_inode)?;
         context.expect_eq(old_tree.data, 1);
+
         let ranges = checked(
             context,
             prepare_unlinked_original_writeback(&old_inode, &folio),
@@ -228,6 +234,7 @@ pub(super) mod cases {
         bytes_at(context, &old, 0, b"OLD!")?;
         bytes_at(context, &replacement, 0, b"NEW!")?;
         context.expect_eq(disk.test_snapshot().inflight != 0, true);
+
         WriteOwner::release(&mm, 2)?;
         fixture.phase(&mm, 0, 3)?;
         context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
@@ -256,6 +263,7 @@ pub(super) mod cases {
             }
             return Err(TestError("W24 old-file WB failed after user unlink"));
         }
+
         disk.test_flush_completions();
         checked(context, watch.wait())?;
         checked(context, volume.wait_inode_reuse(number))?;
@@ -300,6 +308,7 @@ pub(super) mod cases {
     ) -> TestResult {
         fixture.prepare_namespace(context)?;
         fixture.prepare_namespace_parent(context)?;
+
         let image = fixture.shared_image(context, b"N5")?;
         let mm = image.mm.clone();
         fixture.start_shared_as(
@@ -323,6 +332,7 @@ pub(super) mod cases {
                 .ptr_eq(checked(context, old_target.path().unwrap().inode())?),
             false,
         );
+
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
 
@@ -341,6 +351,7 @@ pub(super) mod cases {
         context.expect_eq(checked(context, source.stat())?.links, 1);
         bytes_at(context, &new_target, 0, b"SRC!")?;
         bytes_at(context, &old_target, 0, b"TGT!")?;
+
         let plain_target = fixture.open(context, b"/test/ns-work/ns-plain-target", 0)?;
         bytes_at(context, &plain_target, 0, b"PLAIN")?;
         for pathname in [
@@ -358,9 +369,11 @@ pub(super) mod cases {
                 Some(FsError::NotFound),
             );
         }
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         fixture.remove_namespace_parent(context)?;
+
         for pathname in [
             b"/test/ns-work/ns-target".as_slice(),
             b"/test/ns-work/ns-plain-target",
@@ -391,6 +404,7 @@ pub(super) mod cases {
         fixture.prepare_namespace_parent(context)?;
         let vfs = fixture.user.path.vfs().clone();
         let fs_context = fixture.user.path.context().clone();
+
         let image = fixture.shared_image(context, b"N6")?;
         let mm = image.mm.clone();
         fixture.start_shared_as(
@@ -429,6 +443,7 @@ pub(super) mod cases {
             ),
             (2, 2),
         );
+
         let d1_a = fixture.open(context, b"/test/ns-work/ns-d1/a", 0)?;
         let d1_b = fixture.open(context, b"/test/ns-work/ns-d1/b", 0)?;
         let d2_a = fixture.open(context, b"/test/ns-work/ns-d2/a", 0)?;
@@ -461,6 +476,7 @@ pub(super) mod cases {
             ),
             (2, 2),
         );
+
         let a = fixture.open(context, b"/test/ns-work/ns-a", 0x10000)?;
         let b = fixture.open(context, b"/test/ns-work/ns-b", 0x10000)?;
         let a_stat = checked(context, a.stat())?;
@@ -474,6 +490,7 @@ pub(super) mod cases {
         ] {
             drop(fixture.open(context, pathname, 0x10000)?);
         }
+
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
 
@@ -519,6 +536,7 @@ pub(super) mod cases {
                 .is_ok(),
             true,
         );
+
         context.expect_eq(checked(context, cross_a.stat())?.links, 1);
         context.expect_eq(checked(context, cross_b.stat())?.links, 1);
         bytes_at(context, &cross_a, 0, b"AAAA")?;
@@ -548,6 +566,7 @@ pub(super) mod cases {
                 Some(FsError::NotFound),
             );
         }
+
         context.expect_eq(checked(context, alias_source.stat())?.links, 2);
         context.expect_eq(
             checked(context, alias_source.path().unwrap().inode())?
@@ -559,9 +578,11 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::NotFound),
         );
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         fixture.remove_namespace_parent(context)?;
+
         for pathname in [
             b"/test/ns-work/ns-alias-source".as_slice(),
             b"/test/ns-work/ns-alias-target",

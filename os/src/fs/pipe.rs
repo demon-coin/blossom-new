@@ -21,8 +21,10 @@ use crate::wait::WaitResult;
 pub const PIPE_BUF: usize = 4096;
 pub const PIPE_CAPACITY: usize = SLOTS * PIPE_BUF;
 const SLOTS: usize = 16;
+
 const SPACE_SHIFT: u32 = usize::BITS - PIPE_CAPACITY.leading_zeros();
 const BYTE_MASK: u64 = (1 << SPACE_SHIFT) - 1;
+
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
 
 struct Slot {
@@ -145,6 +147,7 @@ impl<const N: usize> PipeBuffer<N> {
             target.bytes += length;
             return Ok(length);
         }
+
         let accepted = target.append(&mut WriteBuffer::kernel(self.front(limit)))?;
         self.consume(accepted);
         Ok(accepted)
@@ -164,6 +167,7 @@ impl<const N: usize> PipeBuffer<N> {
             self.head = (self.head + 1) % N;
             self.used += 1;
         }
+
         let index = (self.head + N - 1) % N;
         let slot = self.slots[index].as_mut().unwrap();
         let offset = slot.offset + slot.length;
@@ -175,6 +179,7 @@ impl<const N: usize> PipeBuffer<N> {
                 PIPE_BUF - offset,
             )
         };
+
         let result = source.pull(dst);
         if let Ok(count) = result {
             slot.length += count;
@@ -233,6 +238,7 @@ impl<const N: usize> PipeBuffer<N> {
             }
             assert!(0 < delivered, "FIFO copyout made no progress");
         }
+
         Ok(target.copied() - start)
     }
 }
@@ -281,6 +287,7 @@ pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsE
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(FsError::InvalidOperation);
     }
+
     let read_head = Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?;
     let write_head = Arc::try_new(PollWaitHead::new()).map_err(|_| FsError::NoMemory)?;
     let inode = NEXT_INODE
@@ -298,6 +305,7 @@ pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsE
         gid,
     })
     .map_err(|_| FsError::NoMemory)?;
+
     let read_watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
     let write_watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
     let reader: FileRef = Arc::try_new(PipeEnd {
@@ -366,6 +374,7 @@ impl PipeEnd {
         if self.read {
             return Err(FsError::BadFd);
         }
+
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         let mut copied = 0;
@@ -393,6 +402,7 @@ impl PipeEnd {
                     if read == 0 {
                         return Ok(copied);
                     }
+
                     if !self.pipe.reader_open.load(Ordering::Acquire) {
                         return self.broken_pipe(caller, copied);
                     }
@@ -418,6 +428,7 @@ impl PipeEnd {
                     return Err(FsError::Interrupted);
                 }
             }
+
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -439,6 +450,7 @@ impl PipeEnd {
         if !self.read {
             return Err(FsError::BadFd);
         }
+
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         let mut copied = 0;
@@ -484,6 +496,7 @@ impl PipeEnd {
                     return Err(FsError::Interrupted);
                 }
             }
+
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -507,6 +520,7 @@ impl PipeEnd {
         if self.same_pipe(target) {
             return Err(FsError::InvalidOperation);
         }
+
         let mut waiting: Option<(bool, Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -555,6 +569,7 @@ impl PipeEnd {
                 }
                 input.is_empty()
             };
+
             // 登记只覆盖当前真正阻塞的端点；下一次锁内重扫后才允许 park。
             if waiting
                 .as_ref()
@@ -583,6 +598,7 @@ impl Pollable for PipeEnd {
                 &self.pipe.write_head
             })?;
         }
+
         let state = self.pipe.observation.load(Ordering::Acquire);
         let mut mask = PollMask::default();
         if self.read {
@@ -623,6 +639,7 @@ impl FileLike for PipeEnd {
         if target.len() == start {
             return Ok(0);
         }
+
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -648,6 +665,7 @@ impl FileLike for PipeEnd {
                     return Err(FsError::Interrupted);
                 }
             }
+
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -666,6 +684,7 @@ impl FileLike for PipeEnd {
     ) -> Result<usize, FsError> {
         Err(FsError::IllegalSeek)
     }
+
     /// 匿名端点没有目录路径。
     fn path(&self) -> Option<&Path> {
         None
@@ -682,6 +701,7 @@ impl FileLike for PipeEnd {
     fn watch_head(&self) -> Option<&Arc<WatchHead>> {
         Some(&self.watches)
     }
+
     /// 访问模式属于该 OFD，CLOEXEC 不进入对象。
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
@@ -694,6 +714,7 @@ impl FileLike for PipeEnd {
     fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
         set_nonblocking(&self.flags, enabled)
     }
+
     /// 流不能截断。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
@@ -706,6 +727,7 @@ impl FileLike for PipeEnd {
     fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
         Err(FsError::IllegalSeek)
     }
+
     /// 两端共享稳定匿名 FIFO 身份，不创建磁盘 Path、inode 或 Mount。
     fn stat(&self) -> Result<FileStat, FsError> {
         let zero = InodeTime {
@@ -729,6 +751,7 @@ impl FileLike for PipeEnd {
             ctime: zero,
         })
     }
+
     /// 端点不提供目录项。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         Err(FsError::NotDirectory)
@@ -754,6 +777,7 @@ impl FileLike for PipeEnd {
         if source.len() == start {
             return Ok(0);
         }
+
         let small = source.len() <= PIPE_BUF;
         let mut written = 0;
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
@@ -810,6 +834,7 @@ impl FileLike for PipeEnd {
                     return Self::progress(written, FsError::Interrupted);
                 }
             }
+
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -821,6 +846,7 @@ impl FileLike for PipeEnd {
             }
         }
     }
+
     /// 管道不能执行按位置写入。
     fn write_at_from(
         &self,

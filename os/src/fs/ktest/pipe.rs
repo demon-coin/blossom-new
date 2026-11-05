@@ -16,12 +16,14 @@ use crate::task::{JoinHandle, State, Task};
 use crate::{cpu, mm, sched, task};
 
 use crate::fs::{O_CLOEXEC as CLOEXEC, O_NONBLOCK as NONBLOCK};
+
 const ADDRESS: usize = 0x4600_0000;
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
     execute: false,
 };
+
 type Metadata = crate::workqueue::testing::MetadataStats;
 /// 保存子任务自己发表的弱身份，观察拥有不延长 Task 生命周期。
 type TaskObserver = Arc<SpinLock<Option<Weak<Task>>>>;
@@ -47,6 +49,7 @@ impl Fixture for PipeSuite {
             metadata: crate::workqueue::testing::metadata_stats(),
         })
     }
+
     /// 全部 case 拥有结束后核第二层六域及真实任务元数据。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         recovered(context, "pipe-suite-last-release", self.memory)?;
@@ -80,14 +83,17 @@ impl PipeOwner {
         self.writer = Some(writer);
         Ok(())
     }
+
     /// 正文只借读 OFD，不在表锁内执行管道操作。
     fn reader(&self) -> &FileRef {
         self.reader.as_ref().unwrap()
     }
+
     /// 正文只借写 OFD，复制仍是同一打开对象。
     fn writer(&self) -> &FileRef {
         self.writer.as_ref().unwrap()
     }
+
     /// 在发表真实任务前准备观察控制块；任务记录自己的实际弱身份。
     fn run(
         &mut self,
@@ -107,6 +113,7 @@ impl PipeOwner {
         self.joins.push(prepared.publish());
         Ok(())
     }
+
     /// 观察原 scheduler 的真实 Blocked，不把延时或开始标志当作等待证据。
     fn blocked(&self, index: usize) -> bool {
         let task = self.observers[index]
@@ -117,6 +124,7 @@ impl PipeOwner {
             .and_then(Weak::upgrade);
         task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
+
     /// 显式 join 离栈后结束所有观察拥有，返回值保留每个生产消费者的错误。
     fn join(&mut self, context: &mut TestContext<'_>) {
         while let Some(join) = self.joins.pop() {
@@ -144,6 +152,7 @@ impl Fixture<PipeSuite> for PipeOwner {
             observers: core::array::from_fn(|_| None),
         })
     }
+
     /// 先结束控制者两端使等待读写者收到 EOF/EPIPE，再逐个真实 join，最后释放观察者。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         drop(self.reader.take());
@@ -151,6 +160,7 @@ impl Fixture<PipeSuite> for PipeOwner {
         self.join(context);
         Ok(())
     }
+
     /// 控制 Vec、OFD、原页及任务观察者全部结束后核本例完整六域和元数据。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let before = self.before;
@@ -218,6 +228,7 @@ pub(crate) mod streams {
             }
             0
         })?;
+
         let mut offset = 0;
         let mut bytes = [0xa5; 733];
         while offset < LENGTH {
@@ -234,6 +245,7 @@ pub(crate) mod streams {
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 0);
         context.expect_eq(mask(context, fixture.reader())?, PollMask::POLLHUP);
         drop(fixture.reader.take());
+
         fixture.prepare(context, 0)?;
         checked(context, fixture.writer().write(b"tail"))?;
         drop(fixture.writer.take());
@@ -276,6 +288,7 @@ pub(crate) mod streams {
             })?;
         }
         drop(fixture.writer.take());
+
         let mut sequences = [0usize; 3];
         let mut record = [0; RECORD];
         let mut offset = 0;
@@ -339,6 +352,7 @@ pub(crate) mod streams {
             mask(context, fixture.writer())?,
             PollMask::POLLOUT | PollMask::POLLWRNORM,
         );
+
         let large = [0x37; PIPE_BUF + 1];
         context.expect_eq(fixture.writer().write(&large), Ok(PIPE_BUF));
         context.expect_eq(fixture.writer().write(&[]), Ok(0));
@@ -348,6 +362,7 @@ pub(crate) mod streams {
         }
         context.expect_eq(fixture.reader().read(&mut bytes), Ok(PIPE_BUF));
         context.expect_eq(bytes, [0x37; PIPE_BUF]);
+
         for _ in 0..15 {
             context.expect_eq(fixture.writer().write(&page), Ok(PIPE_BUF));
         }
@@ -368,6 +383,7 @@ pub(crate) mod streams {
         context.expect_eq(&bytes[..PIPE_BUF - 7], &page[..PIPE_BUF - 7]);
         context.expect_eq(&bytes[PIPE_BUF - 7..], b"fits007");
         context.expect_eq(fixture.writer().flags() & CLOEXEC, 0);
+
         drop(fixture.reader.take());
         context.expect_eq(fixture.writer().write(&[]), Ok(0));
         context.expect_eq(fixture.writer().write(b"x"), Err(FsError::BrokenPipe));
@@ -398,6 +414,7 @@ pub(crate) mod streams {
         until("pipe reader did not really block", || fixture.blocked(0))?;
         checked(context, fixture.writer().write(b"awake"))?;
         fixture.join(context);
+
         for _ in 0..16 {
             checked(context, fixture.writer().write(&[0x42; PIPE_BUF]))?;
         }
@@ -426,6 +443,7 @@ pub(crate) mod streams {
         }
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 6);
         context.expect_eq(&bytes[..6], b"resume");
+
         let poll = checked(context, PollContext::try_new())?;
         let sink: Arc<dyn PollNotify> = poll.clone();
         let mut table = checked(context, PollTable::new(sink, 1))?;
@@ -473,6 +491,7 @@ pub(crate) mod streams {
             checked(context, parent.flags(duplicate))?.close_on_exec,
             false,
         );
+
         let stat = checked(context, fixture.reader().stat())?;
         context.expect_eq(stat, checked(context, fixture.writer().stat())?);
         context.expect_eq(
@@ -496,6 +515,7 @@ pub(crate) mod streams {
             fixture.reader().ioctl(0xffff, 0, FileIoContext::Kernel),
             Err(FsError::NotTty),
         );
+
         checked(context, fixture.writer().write(b"shared"))?;
         drop(fixture.writer.take());
         checked(context, parent.close(w))?;
@@ -518,6 +538,7 @@ pub(crate) mod streams {
         drop(parent);
         drop(child);
         drop(fixture.reader.take());
+
         fixture.prepare(context, NONBLOCK)?;
         context.expect_eq(
             checked(context, fixture.reader().stat())?.inode != stat.inode,
@@ -589,6 +610,7 @@ pub(crate) mod streams {
             )?,
             23,
         );
+
         let mut target = checked(
             context,
             ReadBuffer::user(&memory, ADDRESS + PIPE_BUF - 11, 23),
@@ -606,6 +628,7 @@ pub(crate) mod streams {
         let mut bytes = [0; 32];
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 12);
         context.expect_eq(&bytes[..12], &[0x61; 12]);
+
         let mut source = checked(
             context,
             WriteBuffer::user(&memory, ADDRESS + PIPE_BUF - 9, 20),
@@ -621,6 +644,7 @@ pub(crate) mod streams {
         );
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 9);
         context.expect_eq(&bytes[..9], &[0x61; 9]);
+
         let mut source = checked(context, WriteBuffer::user(&memory, ADDRESS + PIPE_BUF, 1))?;
         context.expect_eq(
             fixture
@@ -628,6 +652,7 @@ pub(crate) mod streams {
                 .write_from(&mut source, FileIoContext::Kernel),
             Err(FsError::BadAddress),
         );
+
         checked(context, fixture.writer().write(b"retained"))?;
         let mut target = checked(context, ReadBuffer::user(&memory, ADDRESS + PIPE_BUF, 8))?;
         context.expect_eq(
@@ -654,6 +679,7 @@ pub(crate) mod streams {
         pressure
             .try_reserve_exact(mm::stats().present_pages)
             .map_err(|_| TestError("pipe page pressure slots OOM"))?;
+
         mm::shrink_all();
         mm::drain_all_pages();
         for order in [10, 0] {
@@ -667,6 +693,7 @@ pub(crate) mod streams {
         let mut bytes = [0; PIPE_BUF];
         context.expect_eq(fixture.reader().read(&mut bytes), Ok(PIPE_BUF));
         context.expect_eq(bytes, [0x79; PIPE_BUF]);
+
         drop(pressure);
         context.expect_eq(fixture.writer().write(b"after OOM"), Ok(9));
         context.expect_eq(fixture.reader().read(&mut bytes), Ok(9));

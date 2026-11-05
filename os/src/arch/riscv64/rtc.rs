@@ -12,16 +12,19 @@ const AONCLK_RTC_32K: u32 = 12;
 const AONCLK_RTC_CAL: u32 = 13;
 const AONRST_RTC_APB: u32 = 5;
 const AONRST_RTC_CAL: u32 = 7;
+
 const CRG_REGISTER_BYTES: usize = core::mem::size_of::<u32>();
 const RTC_INTERNAL_CLOCK: usize = AONCLK_RTC_INTERNAL as usize * CRG_REGISTER_BYTES;
 const RTC_32K_CLOCK: usize = AONCLK_RTC_32K as usize * CRG_REGISTER_BYTES;
 const RTC_32K_PARENT_INTERNAL: u32 = 1;
 const RESET_POLL_ATTEMPTS: usize = 100_000;
 const CALENDAR_READ_ATTEMPTS: usize = 4;
+
 const RTC_CONTROL: usize = 0;
 const RTC_TIME: usize = 0x3c;
 const RTC_DATE: usize = 0x40;
 const RTC_CALENDAR_CONTROL: u32 = (1 << 0) | (1 << 3);
+
 const RTC_YEAR_BASE: u32 = 2000;
 const RTC_YEAR_SHIFT: u32 = 11;
 const RTC_YEAR_MASK: u32 = (1 << 8) - 1;
@@ -73,6 +76,7 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     if setup.clocks.count == 0 || setup.reset_count == 0 {
         return Ok(None);
     }
+
     for clock in &setup.clocks.entries[..setup.clocks.count] {
         let reference = clock.reference;
         match reference.id {
@@ -104,6 +108,7 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
             _ => return Err("RTC clock is outside the supported AON binding"),
         }
     }
+
     for reset in &setup.resets[..setup.reset_count] {
         if !(AONRST_RTC_APB..=AONRST_RTC_CAL).contains(&reset.id) {
             return Err("RTC reset is outside the AON binding");
@@ -128,6 +133,7 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     if !ready {
         return Err("RTC AON reset deassertion timed out");
     }
+
     let config = read(info.rtc, RTC_CONTROL);
     write(info.rtc, RTC_CONTROL, config | RTC_CALENDAR_CONTROL);
     for _ in 0..CALENDAR_READ_ATTEMPTS {

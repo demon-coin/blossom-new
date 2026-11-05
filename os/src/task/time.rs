@@ -12,6 +12,7 @@ use crate::time::{self, MonotonicInstant};
 use crate::timer::{Timer, TimerKind};
 
 pub(crate) const USER_HZ: u64 = 100;
+
 pub(crate) const ITIMER_REAL: usize = 0;
 pub(crate) const ITIMER_VIRTUAL: usize = 1;
 pub(crate) const ITIMER_PROF: usize = 2;
@@ -245,6 +246,7 @@ impl GroupTime {
         if which == ITIMER_REAL {
             return self.set_real(value);
         }
+
         let mut state = self.state.lock();
         if state.closed {
             return None;
@@ -255,6 +257,7 @@ impl GroupTime {
         } else {
             now.checked_add(value.value_ns)?
         };
+
         let old = state.timers[which].remaining(now);
         state.timers[which] = IntervalTimer {
             expires,
@@ -279,7 +282,9 @@ impl GroupTime {
         let old = state.timers[ITIMER_REAL].remaining(now);
         state.timers[ITIMER_REAL] = IntervalTimer::default();
         drop(state);
+
         self.real_timer().cancel_sync();
+
         let mut state = self.state.lock();
         state.timers[ITIMER_REAL] = IntervalTimer {
             expires,
@@ -316,6 +321,7 @@ impl GroupTime {
         let virtual_due = state.timers[ITIMER_VIRTUAL].expire(self.clock(ITIMER_VIRTUAL));
         let prof_due = state.timers[ITIMER_PROF].expire(self.clock(ITIMER_PROF));
         drop(state);
+
         if virtual_due {
             self.send(SIGVTALRM);
         }
@@ -374,6 +380,7 @@ fn real_expired(timer: Pin<&Timer>) {
             .expect("running REAL timer was closed");
     }
     drop(state);
+
     if due {
         group.send(SIGALRM);
     }

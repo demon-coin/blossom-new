@@ -40,6 +40,7 @@ impl Action {
         })
         .map_err(|_| TestError("NoMemory: UART context"))
     }
+
     /// 无其他Arc拥有者且未开放准入时一次登记，context固定到同步注销/join。
     fn register(owner: &mut Arc<Self>) -> TestResult {
         assert_eq!(
@@ -71,6 +72,7 @@ impl Action {
         }
         Ok(())
     }
+
     /// 已安装后取得共享token，不提供可变访问或撤销其存储。
     fn token(&self) -> &IrqRegistration {
         // SAFETY: 只在register成功后调用，槽不再改写；token本身用内部锁同步。
@@ -80,6 +82,7 @@ impl Action {
                 .expect("UART token not installed")
         }
     }
+
     /// 对部分setup与正常fixture都停止真实producer并同步释放执行引用。
     fn stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -135,6 +138,7 @@ struct IoStage {
     before: usize,
     handshake: bool,
 }
+
 struct Uart {
     old: Arc<Action>,
     new: Arc<Action>,
@@ -153,6 +157,7 @@ fn restore_default() -> TestResult {
     console::enable_receive_interrupts();
     Ok(())
 }
+
 impl Fixture for Uart {
     /// 在转移唯一默认token前准备全部context；setup失败也恢复真实默认action。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -173,6 +178,7 @@ impl Fixture for Uart {
             stage: None,
         })
     }
+
     /// 先释放handler停止条件、停真实producer并同步注销，再完成唯一通道剩余ACK。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.old.stop();
@@ -182,6 +188,7 @@ impl Fixture for Uart {
         }
         Ok(())
     }
+
     /// 已join实际注销Task且执行引用为零后释放context，最后归还默认UART owner。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         assert!(self
@@ -228,6 +235,7 @@ impl Uart {
         self.stage.as_mut().unwrap().handshake = true;
         Ok(())
     }
+
     /// ACK不算测试payload；未消费payload在失败清理时只为结束raw ownership读走。
     fn finish_stage(&mut self) -> TestResult {
         console::disable_interrupts();
@@ -241,6 +249,7 @@ impl Uart {
         if console::received() == stage.before && control_byte()? != stage.byte {
             return Err(TestError("UART cleanup payload mismatch"));
         }
+
         let mut line = [0u8; 64];
         let mut length = 0;
         loop {
@@ -276,6 +285,7 @@ impl Uart {
         self.stage = None;
         Ok(())
     }
+
     /// 原始payload必须恰由真实IRQ处理一次；控制H和ACK没有进入计数。
     fn receive_stage(&mut self, action: &Arc<Action>, byte: u8) -> TestResult {
         let before = self
@@ -294,6 +304,7 @@ impl Uart {
         assert!(!action.fault.load(Ordering::Acquire));
         self.finish_stage()
     }
+
     /// 同轮旧context停止后验证实际pending，再把字节交给新context和新token。
     fn lifecycle(&mut self, concurrent: bool) -> TestResult {
         let old = Arc::clone(&self.old);
@@ -327,6 +338,7 @@ impl Uart {
         } else {
             old.token().unregister_sync();
         }
+
         old.alive.store(false, Ordering::Release);
         assert!(!old.token().is_enabled());
         let hits = old.hits.load(Ordering::Acquire);
@@ -338,6 +350,7 @@ impl Uart {
         )?;
         assert_eq!(console::received(), before);
         assert_eq!(old.hits.load(Ordering::Acquire), hits);
+
         Action::register(&mut self.new)?;
         let new = Arc::clone(&self.new);
         console::enable_receive_interrupts();
@@ -356,6 +369,7 @@ impl Uart {
 #[::ktest::suite(context = "Thread", fixture = Uart, tags("boot", "uart"), resources("uart"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
+
     /// 真实宿主U输入只由UART IRQ消费一次。
     #[test]
     fn normal_rx(_: &mut TestContext<'_>, fixture: &mut Uart) -> TestResult {
@@ -366,6 +380,7 @@ pub(crate) mod cases {
         assert_eq!(old.hits.load(Ordering::Acquire), 1);
         Ok(())
     }
+
     /// M先在真实设备FIFO pending，屏蔽期间无handler，解屏蔽才消费。
     #[test]
     fn masked_pending(_: &mut TestContext<'_>, fixture: &mut Uart) -> TestResult {
@@ -378,16 +393,19 @@ pub(crate) mod cases {
         wait(console::receive_pending, "masked UART input did not arrive")?;
         assert_eq!(console::received(), before);
         assert_eq!(old.hits.load(Ordering::Acquire), hits);
+
         old.token().enable();
         fixture.receive_stage(&old, b'M')?;
         assert_eq!(old.hits.load(Ordering::Acquire), hits + 1);
         Ok(())
     }
+
     /// 本核同步注销L并以新context消费已pending的R；不冒称AP并发。
     #[test]
     fn lifecycle_local(_: &mut TestContext<'_>, fixture: &mut Uart) -> TestResult {
         fixture.lifecycle(false)
     }
+
     /// AP在BSP真实handler内同步注销，返回前handler离开；随后验证旧token不能影响新context。
     #[test]
     #[ktest(min_cpus = 2)]

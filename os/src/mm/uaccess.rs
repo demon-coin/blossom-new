@@ -33,6 +33,7 @@ impl Mm {
                 error: Some(error),
             };
         }
+
         let mut copied = 0;
         while copied < dst.len() {
             let current = address + copied;
@@ -67,6 +68,7 @@ impl Mm {
                 error: Some(error),
             };
         }
+
         let mut copied = 0;
         while copied < src.len() {
             let current = address + copied;
@@ -134,6 +136,7 @@ impl Mm {
         if max_bytes == 0 {
             return Err(CStringError::Unterminated);
         }
+
         let mut result = Vec::new();
         let mut buffer = [0u8; PAGE_SIZE];
         let mut scanned = 0;

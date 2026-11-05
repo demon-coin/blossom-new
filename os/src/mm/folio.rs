@@ -284,6 +284,7 @@ impl FolioRef {
         if backing.order() != 0 {
             return Err(backing);
         }
+
         let file_role = matches!(
             &contents,
             FolioContents::File {
@@ -313,6 +314,7 @@ impl FolioRef {
                 background::account_file_page(true);
             }
         }
+
         // SAFETY: 生产 PageMap 在独占元数据 RAM 中一次发布，描述符永久有效
         // 且不再移动；此 Pin 只借用描述符，活 folio 用途的固定由私有投影协议保证。
         let descriptor = unsafe { Pin::new_unchecked(descriptor) };
@@ -354,6 +356,7 @@ impl FolioRef {
     pub fn ref_count(&self) -> usize {
         FolioState::shared(&self.descriptor.usage()).references
     }
+
     /// 只识别由 MemoryPageCharge 标记的 RAM 文件原页，不凭文件打开对象猜后端。
     pub(crate) fn is_memory(&self) -> bool {
         let usage = self.descriptor.usage();
@@ -428,6 +431,7 @@ impl FolioRef {
         if offset % SECTOR_SIZE != 0 || len % SECTOR_SIZE != 0 {
             return Err(BlockError::Misaligned);
         }
+
         let mut content = self.lock_content();
         let range = {
             let mut usage = self.descriptor.usage();
@@ -628,6 +632,7 @@ impl FolioRef {
                 None
             }
         };
+
         if let Some(FolioOwner::Metadata(cache)) = &self.owner {
             cache.notify_metadata_available();
         }
@@ -897,6 +902,7 @@ impl FolioContent<'_> {
         if offset % SECTOR_SIZE != 0 || len % SECTOR_SIZE != 0 {
             return Err(BlockError::Misaligned);
         }
+
         let mut usage = self.folio.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
         if !matches!(&shared.contents, FolioContents::File { .. }) {
@@ -927,6 +933,7 @@ impl FolioContent<'_> {
         if self.folio.is_memory() {
             return Ok(());
         }
+
         let mut usage = self.folio.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
         if !matches!(&shared.contents, FolioContents::File { .. }) {
@@ -942,6 +949,7 @@ impl FolioContent<'_> {
         self.folio
             .account_state(old_dirty, shared.writeback, shared);
         drop(usage);
+
         self.folio.notify_dirty_state(false);
         Ok(())
     }
@@ -961,6 +969,7 @@ impl FolioContent<'_> {
             }
             FolioState::range_ready(shared, offset, len)?;
         }
+
         let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
         let zeros = [0u8; SECTOR_SIZE];
         for part in (0..len).step_by(zeros.len()) {
@@ -1012,6 +1021,7 @@ impl FolioContent<'_> {
         self.folio
             .account_state(old_dirty, shared.writeback, shared);
         drop(usage);
+
         self.folio.notify_dirty_state(true);
         Ok(())
     }
@@ -1111,6 +1121,7 @@ impl FolioContent<'_> {
         self.folio
             .account_state(old_dirty, shared.writeback, shared);
         drop(usage);
+
         self.folio.notify_dirty_state(true);
     }
 
@@ -1181,6 +1192,7 @@ impl FolioContent<'_> {
         if offset % SECTOR_SIZE != 0 || len % SECTOR_SIZE != 0 {
             return Err(BlockError::Misaligned);
         }
+
         let mask = sector_mask(offset, len);
         let folio = self.folio.clone();
         let original_dirty;
@@ -1201,6 +1213,7 @@ impl FolioContent<'_> {
             shared.dirty &= !mask;
             self.folio.account_state(old_dirty, old_wb, shared);
         }
+
         background::note_writeback_start();
         if let Some(FolioOwner::File(inode)) = &self.folio.owner {
             inode
@@ -1246,6 +1259,7 @@ impl FolioContent<'_> {
         self.folio
             .account_state(old_dirty, shared.writeback, shared);
         drop(usage);
+
         self.folio.notify_dirty_state(false);
         Ok(())
     }
@@ -1266,6 +1280,7 @@ impl Drop for FolioContent<'_> {
             );
             state.flags.fetch_and(!CONTENT_LOCKED, Ordering::Release);
         }
+
         state.waiters.wake_all();
     }
 }
@@ -1380,6 +1395,7 @@ impl FolioWriteback {
             self.folio.account_state(old_dirty, old_wb, shared);
             self.completed = true;
         }
+
         state.waiters.wake_all();
         self.folio.notify_dirty_state(accepted == 0);
     }
@@ -1516,6 +1532,7 @@ impl FolioRead {
             self.completed = true;
             state.flags.fetch_and(!CONTENT_LOCKED, Ordering::Release);
         }
+
         state.waiters.wake_all();
     }
 }

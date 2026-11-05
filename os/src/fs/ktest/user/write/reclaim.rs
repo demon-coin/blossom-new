@@ -52,6 +52,7 @@ pub(super) mod cases {
     ) -> TestResult {
         const FILE: usize = 0x4b00_0000;
         const ANON: usize = 0x4d00_0000;
+
         let file = fixture.cold_open(context)?.0;
         let inode = fixture.inodes.last().unwrap().clone();
         let volume = fixture.cold_volume.as_ref().unwrap().clone();
@@ -72,6 +73,7 @@ pub(super) mod cases {
         let inode = fixture.inodes.last().unwrap().clone();
         let disk = checked(context, inode.disk_volume())?.disk().clone();
         context.expect_eq(checked(context, file.stat())?.size, (19 * PAGE_SIZE) as u64);
+
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -101,6 +103,7 @@ pub(super) mod cases {
             .mapping(SHARED_ALIAS)
             .ok_or(TestError("slow consumer private COW leaf absent"))?
             .physical;
+
         let mut donors = [0usize; 16];
         let mut preparing = ReclaimAttempt::new();
         for (index, physical) in donors.iter_mut().enumerate() {
@@ -124,11 +127,13 @@ pub(super) mod cases {
             mm.fault(FILE + 3 * PAGE_SIZE, UserAccess::Read),
             Err(VmError::BeyondEof),
         );
+
         sched::test_migrate_to(0);
         let mut room = SmallHeapRoom::prepare()?;
         let mut pressure = PagePressure::prepare()?;
         disk.test_flush_completions();
         let before_io = disk.test_snapshot();
+
         let result = (|| -> TestResult {
             let page_none = {
                 let _pin = PreemptGuard::new();
@@ -153,6 +158,7 @@ pub(super) mod cases {
                     "raw allocator reclaimed file cache before the explicit consumer",
                 ));
             }
+
             context.expect_eq(ReclaimMode::current(), ReclaimMode::Normal);
             let mut attempt = ReclaimAttempt::new();
             let mut target = None;
@@ -167,6 +173,7 @@ pub(super) mod cases {
                 2 => vm(context, mm.fault(ANON, UserAccess::Read))?,
                 _ => unreachable!(),
             }
+
             let retired = (0..16)
                 .filter(|index| inode.mapping().cached_folio(*index).is_none())
                 .count();
@@ -220,6 +227,7 @@ pub(super) mod cases {
             context.diagnostic(format_args!("W32 slow consumer={} page-none={} small-heap-page-none={} donors={:?} retired-cache={} consumed-physical={:#x} private-physical={:#x} file-api-budget={:?} MM-budget-observer=none IO-submitted={} IO-completed={}",
                 consumer, page_none, small_heap_page_none, donors, retired, physical, private,
                 if consumer == 0 { Some(stats) } else { None }, after_io.submitted - before_io.submitted, after_io.completed - before_io.completed));
+
             let pins: [Option<FolioRef>; 17] =
                 core::array::from_fn(|index| inode.mapping().cached_folio(index as u64));
             let finite_none = {
@@ -232,6 +240,7 @@ pub(super) mod cases {
                     "slow consumer finite failure did not start at page None",
                 ));
             }
+
             let mut finite = ReclaimAttempt::new();
             let io = disk.test_snapshot();
             if consumer == 0 {
@@ -256,6 +265,7 @@ pub(super) mod cases {
                 context.expect_eq(mm.fault(address, UserAccess::Read), Err(error));
                 context.expect_eq(mm.mapping(address).is_none(), true);
             }
+
             let finite_stats = finite.stats();
             context.expect_eq(finite_stats.freed_file + finite_stats.freed_tables, 0);
             context.expect_eq(
@@ -275,6 +285,7 @@ pub(super) mod cases {
             drop((pins, target));
             Ok(())
         })();
+
         drop(pressure);
         result?;
         context.expect_eq(checked(context, file.stat())?.size, (19 * PAGE_SIZE) as u64);
@@ -305,6 +316,7 @@ pub(super) mod cases {
         );
         checked(context, file.truncate((3 * PAGE_SIZE) as u64))?;
         checked(context, file.sync_range(0..u64::MAX, false))?;
+
         let mut preparing = ReclaimAttempt::new();
         let dirty = checked(
             context,
@@ -325,6 +337,7 @@ pub(super) mod cases {
             };
             *target = physical * block as u64;
         }
+
         let pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let gate = Arc::try_new(Completion::new())
             .map_err(|_| TestError("dirty slow consumer gate OOM"))?;
@@ -359,6 +372,7 @@ pub(super) mod cases {
             *actor_evidence.lock() = Some((allocation, stats, error));
             error.map_or(Ok(()), Err)
         })?;
+
         context.expect_eq(
             checked(context, file.write_at(0, &[0x82; PAGE_SIZE]))?,
             PAGE_SIZE,
@@ -368,6 +382,7 @@ pub(super) mod cases {
         disk.test_flush_completions();
         let before_io = disk.test_snapshot();
         let before_domain = domain.snapshot();
+
         gate.complete();
         let waiting = until(
             "dirty slow consumer did not wait for original WB Work",
@@ -393,6 +408,7 @@ pub(super) mod cases {
         context.expect_eq(0 < stats.completed_bytes, true);
         context.expect_eq(stats.completed_bytes <= stats.submitted_bytes, true);
         context.expect_eq(stats.io_error, false);
+
         until(
             "dirty slow consumer original Work did not finish its finite round",
             || {
@@ -426,6 +442,7 @@ pub(super) mod cases {
             Some(clean.phys_addr()),
         );
         context.expect_eq(inode.mapping().cached_folio(2).is_none(), true);
+
         bytes_at(context, &file, 0, &[0x82; PAGE_SIZE])?;
         for target in targets.iter().copied().take(PAGE_SIZE / block) {
             disk_block_bytes(context, volume.claim(), target, &[0x82; PAGE_SIZE][..block])?;
@@ -454,6 +471,7 @@ pub(super) mod cases {
         if !disk.limits().flush {
             return Err(TestError("metadata lock regression requires real FLUSH"));
         }
+
         checked(context, file.truncate(0))?;
         context.expect_eq(
             checked(context, file.write_at(0, &[0x76; PAGE_SIZE]))?,
@@ -467,6 +485,7 @@ pub(super) mod cases {
                 !state.pending && !state.running
             },
         )?;
+
         let (expected, record_size) = inode_record_snapshot(context, &volume, inode.number())?;
         let geometry = volume.geometry();
         let descriptor_byte =
@@ -503,6 +522,7 @@ pub(super) mod cases {
         )?;
         let inode_byte = (inode.number() - 1) % geometry.inodes_per_group * record_size as u64;
         let table_block = layout.inode_table + inode_byte / geometry.block_size as u64;
+
         let gate = Arc::try_new(Completion::new())
             .map_err(|_| TestError("metadata lock regression gate OOM"))?;
         fixture.prepare_gate = Some(gate.clone());
@@ -516,6 +536,7 @@ pub(super) mod cases {
             actor_entered.store(true, Ordering::Release);
             syncing.sync_range(0..u64::MAX, false)
         })?;
+
         cache.prune_unused();
         let cold = checked(
             context,
@@ -530,6 +551,7 @@ pub(super) mod cases {
                 "metadata lock regression inode table did not become cold",
             ));
         }
+
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
         let before = disk.test_snapshot();
@@ -550,6 +572,7 @@ pub(super) mod cases {
                     "metadata sync acquired aux before waiting for WB",
                 ));
             }
+
             let (buffer, offset) = checked(context, volume.inode_record(inode.number(), None))?;
             let mut actual = [0u8; 256];
             checked(
@@ -579,6 +602,7 @@ pub(super) mod cases {
             context.diagnostic(format_args!("W33 metadata-lock-order full-record-bytes={} CRC-decoded=1 cold-read-submitted={} cold-read-completed={} aux-returned=1 sync-still-blocked=1", record_size, cold_io.submitted - before.submitted, cold_io.completed - before.completed));
             Ok(())
         })();
+
         drop(writeback);
         fixture.join_consumers()?;
         result?;
@@ -630,6 +654,7 @@ pub(super) mod cases {
                 .absolute_byte(byte, expected.len())
                 .map_err(FsError::from),
         )?;
+
         let pages = mm::alloc_pages(0, true).ok_or(TestError("W33 disk readback page OOM"))?;
         let mapped = MappedPages::new(pages, 0, expected.len(), BufferDirection::DeviceToDriver)
             .map_err(|_| TestError("W33 disk readback mapping failed"))?;
@@ -654,6 +679,7 @@ pub(super) mod cases {
             }
             .map_err(FsError::from),
         )?;
+
         let completion = bio.completion();
         claim.submit_bio(bio);
         let result = completion.wait();
@@ -666,6 +692,7 @@ pub(super) mod cases {
         {
             return Err(TestError("W33 direct disk readback incomplete"));
         }
+
         context.expect_eq(memory.len(), 1);
         // SAFETY: 本次完整 Read 成功，completion 已结束设备访问；独占原 memory 保活，
         // 无回调、并发写者或裸别名，准确映射的全部字节已由实际设备初始化。
@@ -741,6 +768,7 @@ pub(super) mod cases {
                 "W33 requires real FLUSH and the selected tree disk geometry",
             ));
         }
+
         checked(context, file.truncate(0))?;
         let source = volume
             .metadata_cache()
@@ -756,6 +784,7 @@ pub(super) mod cases {
                 .is_some_and(|io| io.belongs_to(&source)),
             true,
         );
+
         let mut folios: [Option<FolioRef>; 16] = core::array::from_fn(|_| None);
         let mut targets = [[0u64; 4]; 16];
         let mut offsets = [0u64; 16];
@@ -784,6 +813,7 @@ pub(super) mod cases {
                 targets[index][part] = physical * block as u64;
             }
         }
+
         let nodes = checked(context, external_root_nodes(&inode, traditional))?;
         let (record, _) = checked(context, volume.inode_record(inode.number(), None))?;
         // 冷节点必须先完成正式写盘；独立 Buffer 归还之后仅由原 prune 摘离静止 Node。
@@ -802,6 +832,7 @@ pub(super) mod cases {
             context.expect_eq(buffer.folio().writeback_sectors(), 0);
             drop(buffer);
         }
+
         for index in 0..16 {
             let input = [0x70 + index as u8; PAGE_SIZE];
             context.expect_eq(
@@ -826,6 +857,7 @@ pub(super) mod cases {
                 ));
             }
         }
+
         sched::test_migrate_to(0);
         reclaim_cost(context, "pressure-ready");
         let layouts = source.snapshot();
@@ -843,6 +875,7 @@ pub(super) mod cases {
             let _pin = PreemptGuard::new();
             fixture.user.pressure().exhaust()
         };
+
         let pressured = (|| -> Result<_, FsError> {
             if evidence != (true, true) {
                 return Err(FsError::NoMemory);
@@ -854,6 +887,7 @@ pub(super) mod cases {
             let data_domain = domain.snapshot();
             let dma = disk.ktest_last_folio_dma();
             let after_data_source = source.snapshot();
+
             crate::fs::writeback::sync_metadata_with_storage(&volume, &mut storage)?;
             disk.test_flush_completions();
             Ok((
@@ -867,6 +901,7 @@ pub(super) mod cases {
                 source.snapshot(),
             ))
         })();
+
         // 同步接口先消费全部已接受 IO 尾；解除真实压力后才归还 scratch/book 或建立读回存储。
         fixture.user.release_pressure();
         let (mode, data, data_domain, dma, data_source, after, domain_after, after_source) =
@@ -926,6 +961,7 @@ pub(super) mod cases {
             context.expect_eq(snapshot.leased, 0);
             context.expect_eq(snapshot.aux_free, true);
         }
+
         let mut verify_attempt = ReclaimAttempt::new();
         for (index, folio) in folios.iter().flatten().enumerate() {
             context.expect_eq(folio.dirty_sectors(), 0);
@@ -949,6 +985,7 @@ pub(super) mod cases {
         }
         context.expect_eq(record.folio().dirty_sectors(), 0);
         context.expect_eq(record.folio().writeback_sectors(), 0);
+
         drop(storage);
         let returned = source.snapshot();
         context.expect_eq(returned.free_wb, 8);
@@ -960,6 +997,7 @@ pub(super) mod cases {
             data.completed - before.completed, after.metadata_submitted - data.metadata_submitted,
             after.flush_submitted - data.flush_submitted, after.completed - data.completed,
             domain_before, domain_after, dma, returned));
+
         let readback = disk.test_snapshot();
         for (index, target) in targets[..16].iter().enumerate() {
             let expected = [0x70 + index as u8; PAGE_SIZE];
@@ -1015,6 +1053,7 @@ pub(super) mod cases {
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
         checked(context, crate::fs::writeback::sync_inode(&io_inode))?;
         checked(context, crate::fs::writeback::sync_metadata(&volume))?;
+
         let mut file_attempt = ReclaimAttempt::new();
         let clean = checked(
             context,
@@ -1036,6 +1075,7 @@ pub(super) mod cases {
                 .unwrap()
                 .file_page(0, &mut io_attempt),
         )?;
+
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -1053,6 +1093,7 @@ pub(super) mod cases {
         let metadata_physical = record.folio().phys_addr();
         let disk = volume.disk().clone();
         disk.test_flush_completions();
+
         let id = task::current_task().id();
         context.expect_eq(ReclaimMode::current(), ReclaimMode::Normal);
         let outer = ReclaimScope::nofs();
@@ -1073,6 +1114,7 @@ pub(super) mod cases {
             drop(noio);
             context.expect_eq(ReclaimMode::current(), ReclaimMode::NoFs);
         }
+
         let fresh = fixture.consume_sync(1, || {
             if ReclaimMode::current() == ReclaimMode::Normal {
                 Ok(())
@@ -1086,6 +1128,7 @@ pub(super) mod cases {
         context.expect_eq(fixture.consumers[1].take().unwrap().join(), 0);
         context.expect_eq(fresh.result(), Some(Ok(())));
         context.expect_eq(ReclaimMode::current(), ReclaimMode::NoFs);
+
         let writeback_lock = inode.mapping().lock_writeback();
         context.expect_eq(
             checked(context, file.write_at(PAGE_SIZE as u64, &[0x61; PAGE_SIZE]))?,
@@ -1122,6 +1165,7 @@ pub(super) mod cases {
         context.expect_eq(dirty_mask != 0, true);
         context.expect_eq(wb_mask != 0, true);
         let before = disk.test_snapshot();
+
         {
             let invalidate = checked(context, inode.lock_invalidate())?;
             let limited = inode.with_map_read(|_, _| {
@@ -1149,6 +1193,7 @@ pub(super) mod cases {
         context.expect_eq(record.folio().phys_addr(), metadata_physical);
         context.expect_eq(disk.test_snapshot().submitted, before.submitted);
         context.expect_eq(disk.test_snapshot().completed, before.completed);
+
         // 一个共享请求预算先消费所有可收缓存；再用同一 Task 的真实 allocator 填满释放的存储。
         let mut attempt = ReclaimAttempt::new();
         for _ in 0..64 {
@@ -1174,6 +1219,7 @@ pub(super) mod cases {
                 Ok((failed, attempt.stats(), ReclaimMode::current()))
             })
         })();
+
         fixture.user.release_pressure();
         let (error, stats, mode) = checked(context, no_memory)?;
         context.expect_eq(evidence, (true, true));
@@ -1185,12 +1231,14 @@ pub(super) mod cases {
         context.expect_eq(stats.completed_bytes, 0);
         context.expect_eq(dirty.dirty_sectors(), dirty_mask);
         context.expect_eq(wb.writeback_sectors(), wb_mask);
+
         drop(writeback_lock);
         drop(outer);
         context.expect_eq(ReclaimMode::current(), ReclaimMode::Normal);
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(io.result(), Some(Ok(())));
+
         drop(clean);
         let mut freed = 0;
         for _ in 0..4 {
@@ -1232,6 +1280,7 @@ pub(super) mod cases {
         const PARENT_FILE: usize = 0x4b00_0000;
         const PRIVATE: usize = 0x4c00_0000;
         const CHILD_FILE: usize = 0x4d00_0000;
+
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-reserve", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
@@ -1243,6 +1292,7 @@ pub(super) mod cases {
             );
         }
         checked(context, file.sync_range(0..u64::MAX, false))?;
+
         let image = fixture.shared_image(context, b"R")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -1266,6 +1316,7 @@ pub(super) mod cases {
         context.expect_eq(parent_file.physical, child_file.physical);
         context.expect_eq(parent_private.physical, child_private.physical);
         context.expect_eq(parent_file.physical != parent_private.physical, true);
+
         let controls = TruncateControls::new()?;
         fixture.truncate_controls = Some(controls.clone());
         let observing = controls.clone();
@@ -1288,6 +1339,7 @@ pub(super) mod cases {
             })
             .map_err(|_| TestError("reclaim CSD observation preparation OOM"))?,
         ));
+
         let gone = || {
             inode.mapping().cached_folio(0).is_none()
                 && mm.mapping(PARENT_FILE).is_none()
@@ -1315,6 +1367,7 @@ pub(super) mod cases {
                 break;
             }
         }
+
         inode.mapping().ktest_set_unmap_hook(None);
         context.expect_eq(gone(), true);
         context.expect_eq(0 < freed_file, true);
@@ -1331,6 +1384,7 @@ pub(super) mod cases {
             child_mm.mapping(PRIVATE).map(|mapping| mapping.physical),
             Some(child_private.physical),
         );
+
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
         fixture.phase(&mm, 8, 2)?;
@@ -1353,6 +1407,7 @@ pub(super) mod cases {
             child_mm.mapping(PRIVATE).map(|mapping| mapping.physical),
             Some(child_private.physical),
         );
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         context.diagnostic(format_args!(

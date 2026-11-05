@@ -60,6 +60,7 @@ fn partial_members() {
         empty <= slub::MIN_PARTIAL,
         "memory SLUB node retained too many empty slabs"
     );
+
     for id in 0..cpu::count() {
         let state = slub::cpu_snapshot(SLUB_CLASS, id);
         assert!(
@@ -196,6 +197,7 @@ mod ownership {
                     "memory SLUB full setup failed"
                 );
             }
+
             f.release(0);
             let partial = slub::slab_head_snapshot(first.head_pfn)
                 .expect("memory SLUB first free destroyed live slab");
@@ -224,6 +226,7 @@ mod ownership {
                 backing,
                 "memory SLUB empty CPU partial released backing early"
             );
+
             f.release(objects);
             f.release(objects * 2);
             partial_members();
@@ -231,6 +234,7 @@ mod ownership {
                 0 < slub::node_snapshot(SLUB_CLASS).count,
                 "memory SLUB partial bound did not move any slab to node"
             );
+
             flush_all();
             partial_members();
             assert_eq!(
@@ -253,6 +257,7 @@ mod ownership {
                 "memory SLUB node acquisition did not freeze active"
             );
             partial_members();
+
             shrink_all();
             partial_members();
             for object in f.held.iter().flatten() {
@@ -371,6 +376,7 @@ mod fallback {
             let baseline_backing = slub::backing_pages();
             assert!(black_box(slub::allocate(SLUB_CLASS)).is_none());
             assert_eq!(slub::backing_pages(), baseline_backing);
+
             drop(f.samples[0].take());
             mm::drain_all_pages();
             assert_eq!(buddy::free_pages(), 1);
@@ -385,6 +391,7 @@ mod fallback {
             assert_eq!(slub::backing_pages(), baseline_backing + 1);
             assert_eq!(free(), 0);
             f.objects[existing].as_ref().unwrap().check();
+
             drop(f.objects[existing].take());
             shrink_all();
             mm::drain_all_pages();
@@ -418,6 +425,7 @@ mod accounting {
             let length = pages.len();
             // SAFETY: owning fixture 独占整个 live 页块，完整 length 均可写。
             unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0x6d, length) };
+
             flush_all();
             shrink_all();
             mm::drain_all_pages();
@@ -444,6 +452,7 @@ mod accounting {
                 baseline.buddy_free_pages - live.buddy_free_pages,
                 whole + (1 << slab.order)
             );
+
             f.release(0);
             drop(f.pages.take());
             let final_state = crate::mm::ktest::settled();

@@ -18,11 +18,13 @@ pub(crate) mod cases {
             let prefix = CpuSet::prefix(count);
             assert!(prefix.iter().eq(0..count));
             assert!(!prefix.contains(count));
+
             let mut inserted = CpuSet::empty();
             for id in 0..count {
                 inserted.insert(id);
             }
             assert_eq!(prefix, inserted);
+
             if count == 0 {
                 continue;
             }
@@ -43,6 +45,7 @@ pub(crate) mod cases {
                 set.insert(id);
             }
         }
+
         let mut bytes = [0xa5u8; CpuSet::byte_len() + 8];
         set.write_bytes(&mut bytes[..CpuSet::byte_len()]);
         assert!(bytes[CpuSet::byte_len()..].iter().all(|byte| *byte == 0xa5));
@@ -50,12 +53,14 @@ pub(crate) mod cases {
             assert_eq!((bytes[id / 8] & (1u8 << (id % 8))) != 0, set.contains(id));
         }
         assert_eq!(CpuSet::from_bytes(&bytes), set);
+
         for length in 0..=CpuSet::byte_len() {
             let imported = CpuSet::from_bytes(&bytes[..length]);
             for id in 0..MAX_CPUS {
                 assert_eq!(imported.contains(id), id < length * 8 && set.contains(id));
             }
         }
+
         assert_eq!(CpuSet::from_bytes(&[]), CpuSet::empty());
         assert_eq!(
             CpuSet::from_bytes(&[0xff; CpuSet::byte_len() + 8]),

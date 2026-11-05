@@ -11,6 +11,7 @@ use crate::{
 
 const OWN: u32 = 1 << 31;
 const ERROR_SUMMARY: u32 = 1 << 15;
+
 const DWMAC4_RX_CONTEXT: u32 = 1 << 30;
 const DWMAC4_RX_FIRST: u32 = 1 << 29;
 const DWMAC4_RX_LAST: u32 = 1 << 28;
@@ -22,6 +23,7 @@ const DWMAC1000_RX_LENGTH_MASK: u32 = 0x3fff;
 const DWMAC4_RX_INTERRUPT: u32 = 1 << 30;
 const DWMAC4_RX_BUFFER1_VALID: u32 = 1 << 24;
 const DWMAC1000_RX_END_RING: u32 = 1 << 15;
+
 const DWMAC4_TX_INTERRUPT: u32 = 1 << 31;
 const DWMAC4_TX_FIRST: u32 = 1 << 29;
 const DWMAC4_TX_LAST: u32 = 1 << 28;
@@ -29,6 +31,7 @@ const DWMAC1000_TX_INTERRUPT: u32 = 1 << 30;
 const DWMAC1000_TX_LAST: u32 = 1 << 29;
 const DWMAC1000_TX_FIRST: u32 = 1 << 28;
 const DWMAC1000_TX_END_RING: u32 = 1 << 21;
+
 const DESCRIPTOR_WORD_BYTES: usize = core::mem::size_of::<u32>();
 const DWMAC4_DESCRIPTOR_BYTES: usize = 4 * DESCRIPTOR_WORD_BYTES;
 const DWMAC1000_DESCRIPTOR_WORDS: usize = 8;
@@ -199,6 +202,7 @@ pub(super) const fn received(generation: Generation, status: u32) -> Option<usiz
     if matches!(generation, Generation::Dwmac4) && status & DWMAC4_RX_CONTEXT != 0 {
         return None;
     }
+
     let (first, last, length) = match generation {
         Generation::Dwmac4 => (
             DWMAC4_RX_FIRST,
@@ -214,6 +218,7 @@ pub(super) const fn received(generation: Generation, status: u32) -> Option<usiz
     if status & (OWN | ERROR_SUMMARY) != 0 || status & (first | last) != first | last {
         return None;
     }
+
     // 两代均关闭自动 FCS stripping，所有长度都按同一实际 DMA 字节范围解释。
     if length < FRAME_MIN + ETHERNET_FCS_BYTES || FRAME_MAX + ETHERNET_FCS_BYTES < length {
         None

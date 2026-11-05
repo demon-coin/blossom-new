@@ -17,6 +17,7 @@ pub(super) const SERVER: InetEndpoint = InetEndpoint {
     address: IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
     port: 44702,
 };
+
 pub(super) const ADDRESS: usize = 0x4600_0000;
 pub(super) const RW: PagePermissions = PagePermissions {
     read: true,

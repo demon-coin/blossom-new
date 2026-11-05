@@ -54,6 +54,7 @@ impl<T> SleepMutex<T> {
         if let Some(guard) = self.try_lock() {
             return guard;
         }
+
         loop {
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));

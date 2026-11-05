@@ -58,6 +58,7 @@ impl TraceFile {
         if snapshot.bytes.is_none() {
             snapshot.bytes = Some(trace::snapshot()?);
         }
+
         let bytes = snapshot
             .bytes
             .as_ref()
@@ -65,6 +66,7 @@ impl TraceFile {
         if bytes.len() as u64 <= offset || target.copied() == target.len() {
             return Ok(0);
         }
+
         let start = target.copied();
         match target.push(&bytes[offset as usize..]) {
             Ok(count) => Ok(count),
@@ -131,6 +133,7 @@ impl FileLike for TraceFile {
                 return Err(FsError::NotPermitted);
             }
         }
+
         match command {
             BLOSSOM_TRACE_START => trace::start()?,
             BLOSSOM_TRACE_STOP => trace::stop()?,
@@ -183,6 +186,7 @@ impl FileLike for TraceFile {
         if (i64::MAX as u64) < position {
             return Err(FsError::InvalidOperation);
         }
+
         snapshot.cursor = position;
         Ok(position)
     }

@@ -65,6 +65,7 @@ struct Coordinator<T> {
     release: fn(&T),
     success: bool,
 }
+
 impl<T> Drop for Coordinator<T> {
     /// 当前动作已退栈后只释放该具体fixture的测试gate；远核IRQ不能阻挡Any父恢复清理。
     fn drop(&mut self) {
@@ -90,6 +91,7 @@ pub(super) fn on_zero<T: Send + Sync + 'static>(
         guard.success = result.is_ok() && !crate::ktest::child_failed();
         result.map(|()| 0)
     })?;
+
     let value = child.join()?;
     if crate::ktest::child_failed() {
         return Err(TestError("fixed coordinator child failed"));
@@ -113,6 +115,7 @@ pub(crate) fn baseline() -> Baseline {
         "remote scheduler resource tail",
     )
     .unwrap();
+
     mm::shrink_all();
     mm::drain_all_pages();
     (mm::stats(), crate::workqueue::testing::metadata_stats())
@@ -152,11 +155,13 @@ pub(super) struct QueueOwner {
     closed: AtomicBool,
     closing: AtomicBool,
 }
+
 impl QueueOwner {
     /// 显式关闭一次，原实现仍负责排空颜色、释放预留和join真实rescuer。
     pub(super) fn close_sync(&self) {
         self.stop().unwrap();
     }
+
     /// 关闭尚未真实返回时保留原owner，拒绝把提前closed位当成rescuer已经join。
     fn stop(&self) -> TestResult {
         if self.closed.load(Ordering::Acquire) {
@@ -165,13 +170,16 @@ impl QueueOwner {
         if self.closing.swap(true, Ordering::AcqRel) {
             return Err(TestError("work queue close did not converge"));
         }
+
         self.deref().close_sync();
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
 }
+
 impl Deref for QueueOwner {
     type Target = WorkQueue;
+
     /// 只有真实构造成功的owner才能进入正文或原flush。
     fn deref(&self) -> &Self::Target {
         self.queue.as_ref().expect("unpublished work queue")
@@ -185,6 +193,7 @@ pub(super) struct Nodes {
     delayed: SpinLock<Vec<(Pin<Arc<DelayedWork>>, bool)>>,
     queues: SpinLock<Vec<Arc<QueueOwner>>>,
 }
+
 impl Nodes {
     /// case setup预备登记容量，后续节点发表前无分配地保留原owner的强引用。
     pub(super) fn new(
@@ -216,6 +225,7 @@ impl Nodes {
             queues: SpinLock::new(queues),
         })
     }
+
     /// 原Timer构造后、任何arm之前把同一固定分配保存在catch外。
     pub(super) fn timer(
         &self,
@@ -230,6 +240,7 @@ impl Nodes {
         slots.push(owner.clone());
         owner
     }
+
     /// 先准备空owner控制块，再创建真实域；失败没有已发表Work或未关闭域遗失。
     pub(super) fn queue(&self, config: WorkQueueConfig) -> Arc<QueueOwner> {
         {
@@ -249,6 +260,7 @@ impl Nodes {
         slots.push(owner.clone());
         owner
     }
+
     /// 在queue接受任何票之前保活同一个真实Work。
     pub(super) fn work(
         &self,
@@ -263,6 +275,7 @@ impl Nodes {
         slots.push(owner.clone());
         owner
     }
+
     /// 在delay登记之前保存原DelayedWork，不复制内部timer/work票。
     pub(super) fn delayed(
         &self,
@@ -278,6 +291,7 @@ impl Nodes {
         slots.push((owner.clone(), false));
         owner
     }
+
     /// 记录该D真实close_sync已经返回；domain.closed不能代替内部timer的尾部责任。
     pub(super) fn close_delayed(&self, object: Pin<&DelayedWork>) {
         let (index, complete) = {
@@ -293,6 +307,7 @@ impl Nodes {
             self.delayed.lock()[index].1 = true;
         }
     }
+
     /// 具体fixture已停止所有生产者、释放业务gate及测试停点以后停止真实节点与原域。
     pub(super) fn stop(&self) -> TestResult {
         let timers = self.timers.lock().len();
@@ -303,11 +318,13 @@ impl Nodes {
                 owner.as_ref().close_sync();
             }
         }
+
         let delayed = self.delayed.lock().len();
         for index in 0..delayed {
             let owner = self.delayed.lock()[index].0.clone();
             self.close_delayed(owner.as_ref());
         }
+
         let works = self.works.lock().len();
         for index in 0..works {
             let owner = self.works.lock()[index].clone();
@@ -316,6 +333,7 @@ impl Nodes {
                 owner.as_ref().close_sync();
             }
         }
+
         let queues = self.queues.lock().len();
         for index in 0..queues {
             let owner = self.queues.lock()[index].clone();
@@ -323,6 +341,7 @@ impl Nodes {
         }
         Ok(())
     }
+
     /// 原scope已经join后确认每种异步票均归还；失败仍保留所有fixture拥有者供case-abort。
     pub(super) fn tails(&self) -> TestResult {
         let timers = self.timers.lock().len();
@@ -330,11 +349,13 @@ impl Nodes {
             let object = self.timers.lock()[index].clone();
             owned_tail(&object)?;
         }
+
         let works = self.works.lock().len();
         for index in 0..works {
             let object = self.works.lock()[index].clone();
             owned_tail(&object)?;
         }
+
         let delayed = self.delayed.lock().len();
         for index in 0..delayed {
             let object = self.delayed.lock()[index].0.clone();

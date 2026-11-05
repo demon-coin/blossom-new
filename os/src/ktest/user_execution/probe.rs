@@ -19,6 +19,7 @@ pub(super) const DATA: usize = 0x20000;
 const STACK: usize = 0x30000;
 pub(super) const STACK_TOP: usize = STACK + mm::PAGE_SIZE;
 pub(super) const TARGET: usize = 0x40000;
+
 const RX: PagePermissions = PagePermissions {
     read: true,
     write: false,
@@ -146,6 +147,7 @@ pub(super) fn image(offset: usize, slot: usize) -> Result<(Mm, UserContext, usiz
     page(&mut mm, CODE, RX, arch::user_code())?;
     let data = page(&mut mm, DATA, RW, &[])?;
     page(&mut mm, STACK, RW, &[])?;
+
     let mut context = UserContext::new(CODE + offset, STACK_TOP);
     for (index, register) in context.gpr.iter_mut().enumerate().skip(1) {
         *register = 0x7100 + slot * 0x100 + index;
@@ -164,6 +166,7 @@ pub(super) fn image(offset: usize, slot: usize) -> Result<(Mm, UserContext, usiz
     context.gpr[TP] = 0x5100 + slot;
     context.gpr[GP] = 0x6100 + slot;
     context.gpr[A6] = DATA;
+
     let mut scalar: [u64; 32] =
         core::array::from_fn(|index| 0x3ff0000000000000 + (slot * 32 + index) as u64);
     scalar[0] = if slot == 0 {

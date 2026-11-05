@@ -23,6 +23,7 @@ const PLL_SYSCON: usize = 0x1303_0000;
 const SYS_PIN: usize = 0x1304_0000;
 const AON_CRG: usize = 0x1700_0000;
 const AON_PIN: usize = 0x1702_0000;
+
 pub(crate) const ENABLE: u32 = 1 << 31;
 pub(crate) const DIV_MASK: u32 = 0x00ff_ffff;
 pub(crate) const MUX_MASK: u32 = 0x0f00_0000;
@@ -67,6 +68,7 @@ const SYSCLK_GMAC0_PTP: u32 = 109;
 const SYSCLK_GMAC_PHY: u32 = 110;
 const SYSCLK_GMAC0_GTXC: u32 = 111;
 const SYSCLK_IOMUX_APB: u32 = 112;
+
 const AONCLK_GMAC0_AHB: u32 = 2;
 const AONCLK_GMAC0_AXI: u32 = 3;
 const AONCLK_GMAC0_RMII_RTX: u32 = 4;
@@ -74,6 +76,7 @@ const AONCLK_GMAC0_TX: u32 = 5;
 const AONCLK_GMAC0_TX_INV: u32 = 6;
 const AONCLK_GMAC0_RX: u32 = 7;
 const AONCLK_GMAC0_RX_INV: u32 = 8;
+
 const SYSRST_IOMUX_APB: u32 = 2;
 const SYSRST_SDIO0_AHB: u32 = 64;
 const SYSRST_GMAC1_AHB: u32 = 67;
@@ -89,6 +92,7 @@ const PLL_FRAC_BITS: u32 = 24;
 const PLL_FRAC_MASK: u32 = (1 << PLL_FRAC_BITS) - 1;
 const PLL_POSTDIV_SHIFT: u32 = 28;
 const PLL_POSTDIV_MASK: u32 = 3;
+
 const PLL0_PD: usize = 0x18;
 const PLL0_PD_SHIFT: u32 = 24;
 const PLL0_FBDIV: usize = 0x1c;
@@ -117,6 +121,7 @@ const GPIO_DOEN_MASK: u32 = 0x3f;
 const GPIO_GPI_MASK: u32 = 0x7f;
 const GPIO_GPI_PIN_BIAS: u32 = 2;
 const GPIO_OUTPUT_DISABLE: u32 = 1;
+
 const PINMUX_PIN_MASK: u32 = 0xff;
 const PINMUX_FUNCTION_SHIFT: u32 = 8;
 const PINMUX_FUNCTION_MASK: u32 = 3;
@@ -126,11 +131,13 @@ const PINMUX_DOUT_SHIFT: u32 = 16;
 const PINMUX_DOUT_MASK: u32 = 0xff;
 const PINMUX_DIN_SHIFT: u32 = 24;
 const GPI_NONE: u32 = 0xff;
+
 const PAD_GMAC1_MDC: u32 = 75;
 const PAD_GMAC1_RXC: u32 = 82;
 const PAD_GMAC1_TXC: u32 = 88;
 const PAD_GMAC0_MDC: u32 = 6;
 const PAD_GMAC0_TXC: u32 = 19;
+
 const PADCFG_INPUT_ENABLE: u32 = 1;
 const PADCFG_DRIVE_SHIFT: u32 = 1;
 const PADCFG_DRIVE_MASK: u32 = 3 << PADCFG_DRIVE_SHIFT;
@@ -139,6 +146,7 @@ const PADCFG_PULL_DOWN: u32 = 1 << 4;
 const PADCFG_SLEW_SHIFT: u32 = 5;
 const PADCFG_SLEW_MASK: u32 = 1 << PADCFG_SLEW_SHIFT;
 const PADCFG_SCHMITT_ENABLE: u32 = 1 << 6;
+
 const GPOUT_SDIO0_RST: u32 = 19;
 const GPOUT_SDIO1_CLK: u32 = 55;
 const GPOUT_SDIO1_CMD: u32 = 57;
@@ -176,6 +184,7 @@ pub(crate) unsafe fn apply_setup(
     {
         return Ok(());
     }
+
     let _guard = SETUP_LOCK.lock();
     for clock in &setup.clocks.assigned[..setup.clocks.assigned_count] {
         configure_clock(clock)?;
@@ -188,6 +197,7 @@ pub(crate) unsafe fn apply_setup(
     for clock in &setup.clocks.assigned[..setup.clocks.assigned_count] {
         enable_clock(clock.reference, 0)?;
     }
+
     prepare_pins(setup)?;
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, true)?;
@@ -201,6 +211,7 @@ pub(crate) unsafe fn apply_setup(
                 .ok_or("JH7110 reset hold deadline overflow")?,
         )
     };
+
     for pin in &setup.pins[..setup.pin_count] {
         apply_pin(pin)?;
     }
@@ -209,6 +220,7 @@ pub(crate) unsafe fn apply_setup(
             core::hint::spin_loop();
         }
     }
+
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, false)?;
     }
@@ -255,6 +267,7 @@ pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, 
         },
         false,
     )?;
+
     let pin = input.pin;
     let offset = pin as usize / GPIO_SLOTS_PER_WORD as usize * REGISTER_BYTES;
     let shift = pin % GPIO_SLOTS_PER_WORD * GPIO_SLOT_BITS;
@@ -279,6 +292,7 @@ pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, 
     if let Some((offset, shift)) = function_field(pin) {
         update(input.provider, offset, PINMUX_FUNCTION_MASK << shift, 0)?;
     }
+
     Ok(read(
         input.provider,
         SYS_GPIOIN + pin as usize / u32::BITS as usize * REGISTER_BYTES,
@@ -1020,9 +1034,11 @@ fn apply_pin(pin: &PinResource) -> Result<(), &'static str> {
                 )?;
             }
         }
+
         if let Some((offset, shift)) = function_field(number) {
             update(pin.provider, offset, PINMUX_FUNCTION_MASK << shift, 0)?;
         }
+
         let (mask, value) = pad_config(pin)?;
         if mask != 0 {
             update(
@@ -1050,8 +1066,10 @@ mod checks {
         assert_eq!(sd_divider(396_000_000, 50_000_000, 15), Ok(8));
         assert!(sd_divider(396_000_000, 0, 15).is_err());
         assert!(sd_divider(396_000_000, 1_000_000, 15).is_err());
+
         assert_eq!(function_field(9), Some((0x2b0, 8)));
         assert_eq!(function_field(10), Some((0x29c, 2)));
+
         let mut pin = PinResource {
             provider: Region {
                 start: SYS_PIN,
@@ -1072,6 +1090,7 @@ mod checks {
         pin.bias_disable = false;
         pin.drive_strength = Some(6);
         assert!(validate_pin(&pin).is_err());
+
         let reset = ResourceReference {
             provider: Region {
                 start: SYS_CRG,

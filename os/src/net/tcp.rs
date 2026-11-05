@@ -145,6 +145,7 @@ impl Drop for TcpOperationGuard<'_> {
         let state_change =
             observed_state_change(self.initial_trace_state, self.core.as_deref().unwrap());
         drop(self.core.take());
+
         if let Some(value) = state_change {
             trace::record(trace::Kind::TcpState, self.endpoint.id, value);
         }
@@ -213,6 +214,7 @@ impl TcpEndpoint {
             _slot: slot,
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let cpu = net.allocate_protocol_cpu();
         let context = Arc::as_ptr(&endpoint) as usize;
         let work = Work::try_new(net.work_queue(), cpu, run_tcp, context)
@@ -306,6 +308,7 @@ impl TcpEndpoint {
                 PollMask::POLLIN | PollMask::POLLRDNORM
             };
         }
+
         let metadata = self.metadata.lock();
         let mut mask = PollMask::default();
         if metadata.error.is_some() {
@@ -378,6 +381,7 @@ impl TcpEndpoint {
         if core.can_receive() {
             return core.receive(target, peek);
         }
+
         let mut metadata = self.metadata.lock();
         if let Some(error) = metadata.error.take() {
             return Err(error);
@@ -408,6 +412,7 @@ impl TcpEndpoint {
         if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
         }
+
         let mut core = self.lock();
         let mut metadata = self.metadata.lock();
         if !metadata.connected || core.state() == State::Closed {
@@ -616,6 +621,7 @@ impl TcpEndpoint {
         if self.metadata.lock().lease.is_some() {
             return Err(FsError::InvalidOperation);
         }
+
         let dual_stack =
             local.address == AddressFamily::Ipv6.unspecified() && !self.metadata.lock().v6_only;
         let lease = net.tables().reserve_binding(
@@ -627,6 +633,7 @@ impl TcpEndpoint {
             dual_stack,
         )?;
         let local = lease.local();
+
         let mut metadata = self.metadata.lock();
         if matches!(local.address, IpAddress::Ipv6(_)) && !local.is_unspecified() {
             metadata.v6_only = true;
@@ -644,6 +651,7 @@ impl TcpEndpoint {
         if !listening && (core.state() != State::Closed || self.metadata.lock().engaged) {
             return Err(FsError::InvalidOperation);
         }
+
         let capacity = {
             let children = self.children.lock();
             if limit <= children.pending.capacity() && limit <= children.ready.capacity() {
@@ -662,6 +670,7 @@ impl TcpEndpoint {
                 .try_reserve_exact(capacity)
                 .map_err(|_| FsError::NoMemory)?;
         }
+
         let net = self.net()?;
         let _admission = net.admission()?;
         if !listening {
@@ -673,6 +682,7 @@ impl TcpEndpoint {
                 return Err(error);
             }
         }
+
         {
             let mut children = self.children.lock();
             if 0 < capacity {
@@ -701,6 +711,7 @@ impl TcpEndpoint {
             return Err(metadata.error.unwrap_or(FsError::NotConnected));
         }
         drop(metadata);
+
         self.check_address(peer.address, true)?;
         let net = self.net()?;
         let admission = net.admission()?;
@@ -712,6 +723,7 @@ impl TcpEndpoint {
             port: lease.local().port,
         };
         core.set_ip_mtu(route.mtu);
+
         core.connect(local, peer, time::now())?;
         if let Err(error) = net
             .tables()
@@ -791,6 +803,7 @@ impl TcpEndpoint {
             }
             input.packets.push_back(packet);
         }
+
         self.schedule();
         Ok(())
     }
@@ -817,6 +830,7 @@ impl TcpEndpoint {
         if net.is_stopping() || self.stopped.load(Ordering::Acquire) {
             return;
         }
+
         self.input.lock().owner_waiting = true;
         let Some(mut core) = self.core.try_lock() else {
             return;
@@ -824,6 +838,7 @@ impl TcpEndpoint {
         self.input.lock().owner_waiting = false;
         let previous = self.observation(&core);
         let initial_trace_state = trace::enabled().then(|| core.state());
+
         let mut notification = None;
         let result = self.advance(&net, &mut core, &mut notification);
         let blocked = result == Err(FsError::WouldBlock);
@@ -839,6 +854,7 @@ impl TcpEndpoint {
                 );
             }
         }
+
         self.record_connected(&core);
         let current = self.observation(&core);
         let mask = current.notification_since(&previous);
@@ -853,6 +869,7 @@ impl TcpEndpoint {
             && !reply_pending;
         let state_change = observed_state_change(initial_trace_state, &core);
         drop(core);
+
         if let Some(value) = state_change {
             trace::record(trace::Kind::TcpState, self.id, value);
         }
@@ -864,6 +881,7 @@ impl TcpEndpoint {
                 .source
                 .notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         }
+
         if ended {
             net.retire_tcp(self.id);
             return;
@@ -875,6 +893,7 @@ impl TcpEndpoint {
             }
             return;
         }
+
         if net.is_stopping() {
             return;
         }
@@ -952,6 +971,7 @@ impl TcpEndpoint {
                 }
             }
         }
+
         while 0 < remaining {
             remaining -= 1;
             core.dispatch(time::now(), |packet| net.send_ip(packet))?;
@@ -1000,6 +1020,7 @@ impl TcpEndpoint {
                 return Ok(());
             }
         }
+
         let (lease, reuse, v6_only, timeouts) = {
             let metadata = self.metadata.lock();
             (
@@ -1033,6 +1054,7 @@ impl TcpEndpoint {
             child_core.set_keepalive(core.keepalive());
             child_core.listen(local)?;
         }
+
         let listener = net
             .tables()
             .tcp_by_id(self.id)
@@ -1046,6 +1068,7 @@ impl TcpEndpoint {
             metadata.v6_only = v6_only;
             metadata.timeouts = timeouts;
         }
+
         let admission = net.admission()?;
         if let Some(existing) = net.tables().lookup_tcp(tuple) {
             drop(admission);
@@ -1099,6 +1122,7 @@ impl TcpEndpoint {
         self.input.lock().closed = true;
         self.timer.get().unwrap().as_ref().close_sync();
         self.work.get().unwrap().as_ref().close_sync();
+
         {
             let mut core = self.core.lock();
             if core.state() != State::Closed {
@@ -1109,6 +1133,7 @@ impl TcpEndpoint {
             }
             core.abort();
         }
+
         let (packets, reply) = {
             let mut input = self.input.lock();
             (core::mem::take(&mut input.packets), input.reply.take())
@@ -1126,6 +1151,7 @@ impl TcpEndpoint {
                 core::mem::take(&mut children.ready),
             )
         };
+
         for child in children.0.into_iter().chain(children.1) {
             child.abandon();
         }
@@ -1149,6 +1175,7 @@ impl TcpEndpoint {
                 None
             }
         };
+
         drop(removed);
     }
 }

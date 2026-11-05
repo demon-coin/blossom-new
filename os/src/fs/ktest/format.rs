@@ -97,6 +97,7 @@ fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> 
         page[..group.len()].copy_from_slice(&group);
         write_view_fixture(view.disk(), start + descriptor, &page)?;
     }
+
     page.fill(0);
     let inode = 11 * 128;
     page[inode..inode + 2].copy_from_slice(&0x81a4u16.to_le_bytes());
@@ -105,6 +106,7 @@ fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> 
     page[inode + 28..inode + 32].copy_from_slice(&(size as u32 / 512).to_le_bytes());
     page[inode + 40..inode + 44].copy_from_slice(&32u32.to_le_bytes());
     write_view_fixture(view.disk(), start + 7 * size as u64, &page)?;
+
     page.fill(0x61 + log_block as u8);
     write_view_fixture(view.disk(), start + 32 * size as u64, &page[..size])?;
     Ok(())
@@ -141,6 +143,7 @@ fn open_error(context: &mut TestContext<'_>, fixture: &Owner, expected: FsError)
 #[ktest::suite(context = "Thread", tags("ext4-codec"), timeout_ms = 15000)]
 pub(crate) mod codec {
     use super::*;
+
     /// initialized/unwritten 分界与零长度都消费同源解码，不复制 ee_len 判定。
     #[test]
     #[ktest(tags("B13"))]
@@ -157,6 +160,7 @@ pub(crate) mod codec {
         context.expect_eq(ext4_codec::extent_length(0), Err(FsError::Corrupt));
         Ok(())
     }
+
     /// 短头、entries 越界及下降深度错误必须拒绝，不能作为 hole。
     #[test]
     #[ktest(tags("B13"))]
@@ -183,6 +187,7 @@ pub(crate) mod codec {
         );
         Ok(())
     }
+
     /// 标准 CRC 向量覆盖算法，seed 与分段只由生产实现执行。
     #[test]
     #[ktest(tags("B12"))]
@@ -195,6 +200,7 @@ pub(crate) mod codec {
         );
         Ok(())
     }
+
     /// 三类特性遵守只读类别语义，忽略日志提示位后仍校验真实几何和已拒格式。
     #[test]
     #[ktest(tags("B12"))]
@@ -219,6 +225,7 @@ pub(crate) mod codec {
                 (1024, 128, 32),
             );
         }
+
         for (offset, value, expected) in [
             (96, 0x80000002u32, FsError::Unsupported),
             (96, 0x12, FsError::Unsupported),
@@ -247,6 +254,7 @@ pub(crate) mod codec {
         );
         Ok(())
     }
+
     /// root 与 index 的尾保留字节可以非零，修改它们仍必须通过完整 CRC 校验。
     #[test]
     #[ktest(tags("B12"))]
@@ -281,6 +289,7 @@ pub(crate) mod codec {
             file_acl: 0,
             extra_isize: 0,
         };
+
         for (logical, expected) in [
             (0, ext4_codec::DirectoryLayout::Root),
             (2, ext4_codec::DirectoryLayout::Index),
@@ -313,6 +322,7 @@ pub(crate) mod codec {
                 ext4_codec::verify_directory(&geometry, &inode, logical, &bytes, logical != 0),
                 Ok(expected),
             );
+
             bytes[tail] ^= 1;
             context.expect_eq(
                 ext4_codec::verify_directory(&geometry, &inode, logical, &bytes, logical != 0),
@@ -326,6 +336,7 @@ pub(crate) mod codec {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4", "ext4-valid"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod volume {
     use super::*;
+
     /// 实盘几何包括三种块大小、inode/descriptor 尺寸与 CRC seed，并核验文件内容和 EOF。
     #[test]
     #[ktest(tags("B12", "B22"))]
@@ -347,6 +358,7 @@ pub(crate) mod volume {
             context.expect_eq(g.features_ro_compat & 0x400, 0x400);
             context.expect_eq(g.features_incompat & 0x2000 != 0, g.block_size == 4096);
         }
+
         let file = fixture.file(context, &volume, b"pattern")?;
         let metadata = checked(context, file.metadata_snapshot())?;
         context.expect_eq(metadata.kind, InodeKind::Regular);
@@ -361,6 +373,7 @@ pub(crate) mod volume {
             );
             context.expect_eq(patterned(&bytes[..expected], offset), true);
         }
+
         let last = PATTERN_SIZE / mm::PAGE_SIZE as u64;
         let folio = file
             .mapping()
@@ -381,12 +394,14 @@ pub(crate) mod volume {
         context.expect_eq(checked(context, file.read_at(u64::MAX, &mut bytes))?, 0);
         context.expect_eq(checked(context, file.read_at(0, &mut []))?, 0);
         context.expect_eq(file.mapping().len(), before);
+
         let empty = fixture.file(context, &volume, b"empty")?;
         context.expect_eq(checked(context, empty.read_at(0, &mut bytes))?, 0);
         context.expect_eq(empty.mapping().len(), 0);
         context.diagnostic(format_args!("ext4-geometry block-size={} inode-size={} descriptor-size={} compat={:#x} incompat={:#x} ro-compat={:#x} EOF-tail-zero=1", g.block_size, g.inode_size, g.descriptor_size, g.features_compat, g.features_incompat, g.features_ro_compat));
         Ok(())
     }
+
     /// 非连续实盘映射、合法 hole 与 unwritten 都以原文件页完成真实内容。
     #[test]
     #[ktest(tags("B13"))]
@@ -408,6 +423,7 @@ pub(crate) mod volume {
         context.expect_eq(checked(context, sparse.read_at(12288, &mut bytes))?, 37);
         context.expect_eq(patterned(&bytes[..37], 12288), true);
         context.expect_eq(matches!(checked(context, sparse.map_block(4096 / bs))?, BlockMapping::Hole { len } if 0 < len), true);
+
         let unwritten = fixture.file(context, &volume, b"unwritten")?;
         let mapped = checked(context, unwritten.map_block(0))?;
         context.expect_eq(
@@ -423,6 +439,7 @@ pub(crate) mod volume {
             mm::PAGE_SIZE,
         );
         context.expect_eq(bytes.iter().all(|byte| *byte == 0), true);
+
         let deep = fixture.file(context, &volume, b"deep")?;
         if volume.geometry().features_incompat & 0x40 != 0 {
             let header = checked(
@@ -450,6 +467,7 @@ pub(crate) mod volume {
                 context.expect_eq(bytes[..bs as usize].iter().all(|byte| *byte == 0), true);
             }
         }
+
         if bs == 1024 {
             let traditional = fixture.file(context, &volume, b"indirect")?;
             for logical in [0, 12, 268, 65804] {
@@ -470,6 +488,7 @@ pub(crate) mod volume {
         );
         Ok(())
     }
+
     /// 原始字节名、硬链接、fast 与块 symlink 直接消费 canonical inode。
     #[test]
     #[ktest(tags("B16", "B19"))]
@@ -483,6 +502,7 @@ pub(crate) mod volume {
         let hard = fixture.file(context, &volume, b"hardlink")?;
         context.expect_eq(first.ptr_eq(&hard), true);
         context.expect_eq(core::ptr::eq(first.mapping(), hard.mapping()), true);
+
         let fast = fixture.file(context, &volume, b"fastlink")?;
         context.expect_eq(
             checked(context, fast.metadata_snapshot())?.fast_symlink,
@@ -495,6 +515,7 @@ pub(crate) mod volume {
             false,
         );
         context.expect_eq(checked(context, long.read_link())?.as_slice(), &[b't'; 180]);
+
         let raw = fixture.file(context, &volume, b"name-\xff\xfe")?;
         let mut bytes = [0xa7; 9];
         context.expect_eq(checked(context, raw.read_at(0, &mut bytes))?, 9);
@@ -510,6 +531,7 @@ pub(crate) mod volume {
             }
         }
         context.expect_eq(raw_entries, 1);
+
         context.expect_eq(
             root.lookup(fixture.cache(), b"absent").err(),
             Some(FsError::NotFound),
@@ -537,6 +559,7 @@ pub(crate) mod volume {
         }
         Ok(())
     }
+
     /// 跨块与真实 dx 多层目录枚举不得返回 unused、tail 或 index 伪项。
     #[test]
     #[ktest(tags("B19"))]
@@ -581,6 +604,7 @@ pub(crate) mod volume {
         }
         context.expect_eq(dots, 2);
         context.expect_eq(seen.iter().all(|present| *present), true);
+
         for index in [0, 5999, DIRECTORY_ENTRIES - 1] {
             let item = checked(
                 context,
@@ -595,6 +619,7 @@ pub(crate) mod volume {
             directory.lookup(fixture.cache(), b"absent").err(),
             Some(FsError::NotFound),
         );
+
         let plain = fixture.file(context, &volume, b"plain")?;
         let mut count = 0;
         let mut cursor = checked(context, plain.directory_cursor(0))?;
@@ -610,6 +635,7 @@ pub(crate) mod volume {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-identity"), resources("root", "extra"), timeout_ms = 30000)]
 pub(crate) mod identity {
     use super::*;
+
     /// 同卷硬链接同 inode/mapping，两个真实卷的同号 inode 必须各自拥有身份。
     #[test]
     #[ktest(tags("B16"))]
@@ -679,6 +705,7 @@ pub(crate) mod identity {
         )?;
         checked(context, format_view_fixture(&first_view, 0))?;
         checked(context, format_view_fixture(&second_view, 2))?;
+
         let last_byte = checked(
             context,
             first_view
@@ -698,6 +725,7 @@ pub(crate) mod identity {
         let second_inode = checked(context, fixture.cache().iget(&second, 12))?;
         first.writeback_domain().stop_sync();
         second.writeback_domain().stop_sync();
+
         let result = (|| {
             let reopened = checked(
                 context,
@@ -718,6 +746,7 @@ pub(crate) mod identity {
             context.expect_eq(data[..1024].iter().all(|byte| *byte == 0x61), true);
             context.expect_eq(checked(context, second_inode.read_at(0, &mut data))?, 4096);
             context.expect_eq(data.iter().all(|byte| *byte == 0x63), true);
+
             let first_cache = first.metadata_cache();
             let second_cache = second.metadata_cache();
             context.expect_eq(Arc::ptr_eq(first_cache, second_cache), false);
@@ -732,6 +761,7 @@ pub(crate) mod identity {
                 crate::cache::MetadataCache::shared(second.claim(), 63).err(),
                 Some(BlockError::Busy),
             );
+
             let first_zero = checked(
                 context,
                 first_cache.get(0, 4096, None).map_err(FsError::from),
@@ -768,6 +798,7 @@ pub(crate) mod identity {
                 first_inode.update_metadata(second.claim(), |_| ()).err(),
                 Some(FsError::InvalidOperation),
             );
+
             checked(
                 context,
                 last.update(first.claim(), |bytes| bytes.fill(0xa1))
@@ -779,6 +810,7 @@ pub(crate) mod identity {
                     .update(second.claim(), |bytes| bytes[0] = 0xa2)
                     .map_err(FsError::from),
             )?;
+
             let boundary = 65536;
             context.expect_eq(first_cache.page_mask(boundary), 0x01);
             context.expect_eq(second_cache.page_mask(boundary), 0xfe);
@@ -819,6 +851,7 @@ pub(crate) mod identity {
             );
             context.expect_eq(from_first[0].is_none(), true);
             context.expect_eq(from_second[0].is_some(), true);
+
             let first_domain = first.writeback_domain();
             let second_domain = second.writeback_domain();
             let first_context =
@@ -828,6 +861,7 @@ pub(crate) mod identity {
             first_domain.stop_sync();
             context.expect_eq(first_context.check(), Err(BlockError::NotReady));
             context.expect_eq(second_context.check(), Ok(()));
+
             let mut first_error = first_cache.sample_wb_error();
             let mut second_error = second_cache.sample_wb_error();
             disk.test_fail_next_metadata(BlockError::Io);
@@ -865,6 +899,7 @@ pub(crate) mod identity {
             );
             Ok(())
         })();
+
         let first_sync = checked(context, crate::fs::writeback::sync_metadata(&first));
         let second_sync = checked(context, crate::fs::writeback::sync_metadata(&second));
         first.writeback_domain().activate();
@@ -876,6 +911,7 @@ pub(crate) mod identity {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bounded"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bounded {
     use super::*;
+
     /// inode 全活预算明确 NoMemory；稀疏文件页可增长，clean 回收保留外部拥有与 canonical 身份。
     #[test]
     #[ktest(tags("B23"))]
@@ -893,6 +929,7 @@ pub(crate) mod bounded {
         context.expect_eq(cache.prune_unused(), 0);
         let hard = checked(context, root.lookup(&cache, b"hardlink"))?;
         context.expect_eq(file.ptr_eq(&hard), true);
+
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         let mut held = [const { None }; 2];
         for (page, slot) in held.iter_mut().enumerate() {
@@ -916,6 +953,7 @@ pub(crate) mod bounded {
         context.expect_eq(patterned(&bytes, 0), true);
         drop(held);
         context.expect_eq(file.mapping().prune_unused(), 2);
+
         drop(root);
         context.expect_eq(cache.prune_unused(), 1);
         let again = checked(context, cache.iget(&volume, file.number()))?;
@@ -926,12 +964,14 @@ pub(crate) mod bounded {
         drop(hard);
         context.expect_eq(cache.prune_unused(), 1);
         context.expect_eq(cache.len(), 0);
+
         let root = checked(context, cache.iget(&volume, 2))?;
         let empty = checked(context, root.lookup(&cache, b"empty"))?;
         context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         drop(empty);
         drop(root);
         cache.prune_unused();
+
         let only = checked(context, cache.iget(&volume, number))?;
         context.expect_eq(checked(context, only.read_at(0, &mut bytes))?, 4096);
         let detached = only
@@ -963,6 +1003,7 @@ pub(crate) mod bounded {
         drop(same_page);
         drop(again);
         context.expect_eq(cache.prune_unused(), 0);
+
         drop(detached);
         let last_prune = cache.prune_unused();
         context.expect_eq(last_prune, 1);
@@ -976,6 +1017,7 @@ pub(crate) mod bounded {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod oom {
     use super::*;
+
     /// 真实页与堆 NULL 下已有 inode/页仍读，新 miss 原 NoMemory，放压后恢复真实加载。
     #[test]
     #[ktest(tags("B23"))]
@@ -997,6 +1039,7 @@ pub(crate) mod oom {
             .mapping()
             .cached_folio(0)
             .ok_or(TestError("OOM live page missing"))?;
+
         let pressure = fixture
             .pressure
             .take()
@@ -1012,6 +1055,7 @@ pub(crate) mod oom {
             },
         );
         fixture.join_tasks()?;
+
         let result = fixture.observer().results.lock()[0]
             .take()
             .ok_or(TestError("OOM native result absent"))?;
@@ -1044,6 +1088,7 @@ pub(crate) mod oom {
         context.expect_eq(address, folio.phys_addr());
         checked(context, folio.copy_to(0, &mut bytes).map_err(FsError::from))?;
         context.expect_eq(patterned(&bytes, 0), true);
+
         let empty = checked(context, fixture.cache().iget(&volume, empty_number))?;
         context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         context.expect_eq(checked(context, inode.read_at(4096, &mut bytes))?, 4096);
@@ -1063,6 +1108,7 @@ macro_rules! rejected_volume {
         #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags($tag), resources("root"), timeout_ms = 30000)]
         pub(crate) mod $name {
             use super::*;
+
             /// 独立受控镜像的挂载错误必须保持原因，不能映射到硬件 EIO。
             #[test]
             #[ktest(tags("B12"))]
@@ -1072,6 +1118,7 @@ macro_rules! rejected_volume {
         }
     };
 }
+
 rejected_volume!(bad_super, "ext4-bad-super", FsError::Checksum);
 rejected_volume!(bad_geometry, "ext4-bad-geometry", FsError::Unsupported);
 rejected_volume!(bad_features, "ext4-bad-features", FsError::Unsupported);
@@ -1079,6 +1126,7 @@ rejected_volume!(bad_features, "ext4-bad-features", FsError::Unsupported);
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-group"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_group {
     use super::*;
+
     /// descriptor CRC 在实际 open 或首次 inode 加载的负责层保持 Checksum。
     #[test]
     #[ktest(tags("B12"))]
@@ -1104,6 +1152,7 @@ pub(crate) mod bad_group {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-inode"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_inode {
     use super::*;
+
     /// inode 自身 CRC 错误不误报目录 NotFound，失败 iget 不留 Loading 占位。
     #[test]
     #[ktest(tags("B12"))]
@@ -1135,6 +1184,7 @@ pub(crate) mod bad_inode {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-extent"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_extent {
     use super::*;
+
     /// 外部 extent node 的 CRC 实际失败，读页发布原 Checksum 而非假零。
     #[test]
     #[ktest(tags("B13"))]
@@ -1157,6 +1207,7 @@ pub(crate) mod bad_extent {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-dir"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_directory {
     use super::*;
+
     /// 普通目录 tail CRC 失败传播到 lookup 和 dir_next。
     #[test]
     #[ktest(tags("B19"))]
@@ -1181,6 +1232,7 @@ pub(crate) mod bad_directory {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-dx"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_dx {
     use super::*;
+
     /// dx 根 CRC 与普通 leaf 的覆盖范围不同，索引伪项不能绕过实际校验。
     #[test]
     #[ktest(tags("B19"))]
@@ -1205,6 +1257,7 @@ pub(crate) mod bad_dx {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-dir-layout"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_directory_layout {
     use super::*;
+
     /// 无目录 CRC 时零 rec_len 仍须拒绝，不能无限枚举或假 NotFound。
     #[test]
     #[ktest(tags("B19"))]
@@ -1232,6 +1285,7 @@ pub(crate) mod bad_directory_layout {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-dx-layout"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_dx_layout {
     use super::*;
+
     /// 无 CRC 的 dx 空索引计数有独立 Corrupt，不能被跳过当作 unused。
     #[test]
     #[ktest(tags("B19"))]
@@ -1256,6 +1310,7 @@ pub(crate) mod bad_dx_layout {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-bad-mapping"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod bad_mapping {
     use super::*;
+
     /// 坏 root 可在 inode 层提前拒绝；合法 root 下的 IND data 指针由实际映射层拒绝。
     #[test]
     #[ktest(tags("B13"))]
@@ -1299,6 +1354,7 @@ pub(crate) mod bad_mapping {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", tags("ext4-prefix"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod prefix {
     use super::*;
+
     /// 合法 direct root 实际交付前三页，下一页在真实 IND 节点解析时失败并返回正前缀。
     #[test]
     #[ktest(tags("B22"))]

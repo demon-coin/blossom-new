@@ -145,6 +145,7 @@ impl FileTable {
             if needed <= current {
                 return Ok(());
             }
+
             let mut directory = Vec::new();
             if capacity < needed {
                 directory
@@ -164,6 +165,7 @@ impl FileTable {
                     .map_err(|_| FsError::NoMemory)?,
                 );
             }
+
             {
                 let mut slots = self.slots.lock();
                 if slots.pages.len() != current {
@@ -185,12 +187,14 @@ impl FileTable {
         loop {
             let required = self.slots.lock().open_span();
             child.grow(required)?;
+
             let mut target = child.slots.lock();
             let source = self.slots.lock();
             let highest = source.open_span();
             if target.len() < highest {
                 continue;
             }
+
             for fd in 0..highest {
                 if let Some(Slot::Open { file, flags }) = source.get(fd) {
                     target.replace(
@@ -498,6 +502,7 @@ impl FileTable {
                 };
                 slots.replace(target, replacement)
             };
+
             drop(old);
             return Ok(target);
         }

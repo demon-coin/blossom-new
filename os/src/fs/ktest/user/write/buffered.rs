@@ -15,6 +15,7 @@ fn modified_between(
         context,
         checked(context, inode.disk_volume())?.load_inode(inode.number(), None),
     )?;
+
     for (modified, recorded, extra) in [
         (stat.mtime, record.mtime, 136),
         (stat.ctime, record.ctime, 132),
@@ -52,6 +53,7 @@ pub(super) mod cases {
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-kernel", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
+
         let first_write = time::realtime();
         let input = [0x39; 1027];
         context.expect_eq(checked(context, file.write_at(4093, &input))?, input.len());
@@ -60,6 +62,7 @@ pub(super) mod cases {
         bytes_at(context, &file, 0, &[0; 4093])?;
         bytes_at(context, &file, 4093, &input)?;
         context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 0);
+
         let address_space = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(context, address_space.map_anonymous(SOURCE, 4096, RW, RW))?;
         context.expect_eq(address_space.copyout(SOURCE + 4079, &[0x72; 17]).copied, 17);
@@ -76,6 +79,7 @@ pub(super) mod cases {
         context.expect_eq(checked(context, file.seek(SeekFrom::Current(0)))?, 17);
         context.expect_eq(checked(context, file.stat())?.size, 5120);
         bytes_at(context, &file, 0, &[0x72; 17])?;
+
         let mut source = checked(
             context,
             WriteBuffer::user(&address_space, SOURCE + 4096, 64),
@@ -91,6 +95,7 @@ pub(super) mod cases {
             (after_fault.mtime, after_fault.ctime),
             (before_fault.mtime, before_fault.ctime),
         );
+
         let shared = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -99,16 +104,19 @@ pub(super) mod cases {
         let mut visible = [0u8; 1];
         context.expect_eq(shared.copyin(&mut visible, SOURCE + 4096).copied, 1);
         context.expect_eq(visible, [0x39]);
+
         context.expect_eq(checked(context, file.write_at(4096, &[0x64]))?, 1);
         bytes_at(context, &file, 4096, &[0x64])?;
         context.expect_eq(shared.copyin(&mut visible, SOURCE + 4096).copied, 1);
         context.expect_eq(visible, [0x64]);
+
         context.expect_eq(shared.copyin(&mut visible, SOURCE + 6000).copied, 1);
         context.expect_eq(visible, [0]);
         context.expect_eq(checked(context, file.write_at(6000, &[0x42]))?, 1);
         context.expect_eq(shared.copyin(&mut visible, SOURCE + 6000).copied, 1);
         context.expect_eq(visible, [0x42]);
         drop(shared);
+
         let mapped = fixture.open(context, b"/test/write-map", 2)?;
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
@@ -124,12 +132,14 @@ pub(super) mod cases {
             )?,
             1027,
         );
+
         let mut expected = [0u8; 1027];
         for (index, byte) in expected.iter_mut().enumerate() {
             *byte = ((4093 + index) & 255) as u8;
         }
         bytes_at(context, &mapped, 8192, &expected)?;
         context.expect_eq(checked(context, mapped.stat())?.size, 9219);
+
         drop(mm);
         drop(mapped);
         fixture.run(context, b"w")
@@ -148,6 +158,7 @@ pub(super) mod cases {
         context.expect_eq(Arc::ptr_eq(&first, &second), false);
         let gate = Arc::try_new(Completion::new()).map_err(|_| TestError("append gate OOM"))?;
         fixture.append_gate = Some(gate.clone());
+
         fixture.user.path.owner.publish(
             0,
             Job::Append {
@@ -173,6 +184,7 @@ pub(super) mod cases {
         gate.complete();
         gate.complete();
         fixture.user.path.owner.join_tasks()?;
+
         for index in 0..2 {
             let result = fixture.user.path.owner.observer().results.lock()[index]
                 .take()
@@ -183,6 +195,7 @@ pub(super) mod cases {
             context.expect_eq(count, 16384);
         }
         context.expect_eq(checked(context, first.stat())?.size, 32768);
+
         let mut seen = [0u32; 2];
         let mut bytes = [0u8; 512];
         for record in 0..64 {
@@ -205,6 +218,7 @@ pub(super) mod cases {
             seen[writer] |= 1 << index;
         }
         context.expect_eq(seen, [u32::MAX; 2]);
+
         let table = checked(context, FileTable::try_new())?;
         let fd = checked(context, table.reserve(1024))?
             .publish(first.clone(), DescriptorFlags::default());
@@ -213,6 +227,7 @@ pub(super) mod cases {
             Arc::ptr_eq(&checked(context, table.lookup(dup))?, &first),
             true,
         );
+
         let cursor = checked(context, first.seek(SeekFrom::Current(0)))?;
         context.expect_eq(checked(context, table.write_at(dup, 0, b"positioned"))?, 10);
         context.expect_eq(checked(context, first.seek(SeekFrom::Current(0)))?, cursor);
@@ -232,6 +247,7 @@ pub(super) mod cases {
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-oom", 2)?;
         context.expect_eq(checked(context, file.write(&[0x41; 4096]))?, 4096);
+
         let volume = fixture.volume();
         let before = allocation_counts(context, &volume)?;
         let unpublished = checked(context, volume.allocate_block(0))?;
@@ -241,6 +257,7 @@ pub(super) mod cases {
         context.expect_eq(allocated, (before.0 - 1, before.1));
         let restored = allocation_counts(context, &volume)?;
         context.expect_eq(restored, before);
+
         let unpublished = checked(context, volume.allocate_inode(0, 0o100600, 123, 234))?;
         let record = volume.load_inode(unpublished.number(), None);
         let allocated = allocation_counts(context, &volume);
@@ -259,6 +276,7 @@ pub(super) mod cases {
         context.expect_eq(allocated?, (before.0, before.1 - 1));
         let restored = allocation_counts(context, &volume)?;
         context.expect_eq(restored, before);
+
         let mut page_pressure = PagePressure::prepare()?;
         let (evidence, page_error) = {
             let evidence = {
@@ -273,6 +291,7 @@ pub(super) mod cases {
         context.expect_eq(page_error, Err(FsError::NoMemory));
         let after_page_failure = allocation_counts(context, &volume)?;
         context.expect_eq(after_page_failure, before);
+
         let pressure = fixture
             .user
             .path
@@ -288,6 +307,7 @@ pub(super) mod cases {
             },
         );
         fixture.user.path.owner.join_tasks()?;
+
         let result = fixture.user.path.owner.observer().results.lock()[0]
             .take()
             .ok_or(TestError("write OOM result missing"))?;
@@ -306,7 +326,9 @@ pub(super) mod cases {
         context.expect_eq(after_heap_failure, before);
         context.expect_eq(checked(context, file.stat())?.size, 4096);
         bytes_at(context, &file, 0, &[0x6d; 17])?;
+
         context.expect_eq(checked(context, file.write_at(4096, &[0x9b; 17]))?, 17);
+
         let unwritten = fixture.open(context, b"/test/write-unwritten", 2)?;
         context.expect_eq(checked(context, unwritten.write_at(513, &[0x63; 17]))?, 17);
         let mut expected = [0u8; 4096];
@@ -332,6 +354,7 @@ pub(super) mod cases {
                 "ENOSPC fixture must have 8..256 genuinely free blocks",
             ));
         }
+
         let rollback = fixture.open(context, b"/test/write-rollback", 2)?;
         let rollback_inode = fixture.inodes.last().unwrap().clone();
         let block_size = volume.geometry().block_size as u64;
@@ -346,6 +369,7 @@ pub(super) mod cases {
         let metadata = checked(context, rollback_inode.metadata_snapshot())?;
         let root = checked(context, rollback_inode.with_map_read(|_, root| Ok(*root)))?;
         let available = allocation_counts(context, &volume)?;
+
         let mut held = Vec::new();
         held.try_reserve_exact(available.0 as usize)
             .map_err(|_| TestError("ENOSPC reservation slots OOM"))?;
@@ -364,6 +388,7 @@ pub(super) mod cases {
                 }
             }
         }
+
         // 四项根的第五个稀疏数据块会先申请唯一余块，再因外部节点无空间而归还。
         let single_before = allocation_counts(context, &volume);
         let failed = rollback.write_at(8 * block_size, &[0x28]);
@@ -373,6 +398,7 @@ pub(super) mod cases {
         for block in held.drain(..) {
             volume.release_unpublished_block(block);
         }
+
         context.expect_eq(single_before?, (1, available.1));
         context.expect_eq(single_after?, (1, available.1));
         context.expect_eq(failed, Err(FsError::NoSpace));
@@ -390,6 +416,7 @@ pub(super) mod cases {
         context.expect_eq(untouched, [0xa7; 17]);
         let restored = allocation_counts(context, &volume)?;
         context.expect_eq(restored, available);
+
         let file = fixture.open(context, b"/test/write-full", 2)?;
         let full_inode = fixture.inodes.last().unwrap().clone();
         let before = allocation_counts(context, &volume)?;
@@ -399,6 +426,7 @@ pub(super) mod cases {
             .try_reserve_exact(length)
             .map_err(|_| TestError("ENOSPC input OOM"))?;
         request.resize(length, 0x87);
+
         let count = checked(context, file.write(&request))?;
         context.expect_eq(0 < count && count < request.len(), true);
         context.expect_eq(
@@ -419,6 +447,7 @@ pub(super) mod cases {
                 &request[offset..core::cmp::min(count, offset + 4096)],
             )?;
         }
+
         let after = allocation_counts(context, &volume)?;
         context.expect_eq(after.0, 0);
         let tree = tree(context, &full_inode)?;
@@ -442,6 +471,7 @@ pub(super) mod cases {
         let before = allocation_counts(context, &volume)?;
         let entries = ((block_size - 16) / 12) * 4 + 1;
         let data = [0x4e; 4096];
+
         for index in 0..entries {
             context.expect_eq(
                 checked(
@@ -455,6 +485,7 @@ pub(super) mod cases {
                 context.expect_eq(grown.depth, 1);
             }
         }
+
         let grown = tree(context, &inode)?;
         context.expect_eq(grown.depth, 2);
         context.expect_eq(grown.extents, entries);
@@ -485,6 +516,7 @@ pub(super) mod cases {
                 true,
             );
         }
+
         let merge = fixture.open(context, b"/test/write-merge", 2)?;
         let merge_inode = fixture.inodes.last().unwrap().clone();
         let original = tree(context, &merge_inode)?;
@@ -497,6 +529,7 @@ pub(super) mod cases {
         );
         let split = tree(context, &merge_inode)?;
         context.expect_eq(split.extents, original.extents + 2);
+
         context.expect_eq(
             checked(context, merge.write_at(0, &data[..block_size]))?,
             block_size,
@@ -512,6 +545,7 @@ pub(super) mod cases {
         context.expect_eq(merged.extents, original.extents + 1);
         context.expect_eq((merged.data, merged.nodes), (original.data, original.nodes));
         let merge_before = allocation_counts(context, &volume)?;
+
         context.expect_eq(original.data, 64);
         for logical in (3..8).step_by(2) {
             context.expect_eq(
@@ -524,6 +558,7 @@ pub(super) mod cases {
         }
         let first_split = tree(context, &merge_inode)?;
         context.expect_eq((first_split.depth, first_split.nodes), (1, 2));
+
         for logical in (9..64).step_by(2) {
             context.expect_eq(
                 checked(
@@ -539,6 +574,7 @@ pub(super) mod cases {
         context.expect_eq(expanded.data, original.data);
         let split_counts = allocation_counts(context, &volume)?;
         context.expect_eq(merge_before.0 - split_counts.0, expanded.nodes);
+
         for logical in (4..64).step_by(2) {
             context.expect_eq(
                 checked(
@@ -556,6 +592,7 @@ pub(super) mod cases {
         context.expect_eq(collapsed.data, original.data);
         let collapsed_counts = allocation_counts(context, &volume)?;
         context.expect_eq(collapsed_counts, merge_before);
+
         let reused = fixture.open(context, b"/test/write-rollback", 2)?;
         let reused_inode = fixture.inodes.last().unwrap().clone();
         let replacement = [0xb9; 4096];
@@ -584,10 +621,12 @@ pub(super) mod cases {
                 physical, logical
             ));
         }
+
         for inode in &fixture.inodes {
             checked(context, crate::fs::writeback::sync_inode(inode))?;
         }
         checked(context, crate::fs::writeback::sync_metadata(&volume))?;
+
         let mut device_bytes = [0u8; 4096];
         for physical in first_split
             .blocks
@@ -634,6 +673,7 @@ pub(super) mod cases {
             0,
         );
         let before = allocation_counts(context, &volume)?;
+
         let first_write = time::realtime();
         for (index, logical) in [0u64, 12, 268, 65804].iter().copied().enumerate() {
             let bytes = [0x31 + index as u8; 17];
@@ -650,6 +690,7 @@ pub(super) mod cases {
             );
             bytes_at(context, &file, logical * 1024, &expected)?;
         }
+
         modified_between(context, &file, &inode, first_write, time::realtime())?;
         let mapped = tree(context, &inode)?;
         context.expect_eq((mapped.data, mapped.nodes), (4, 6));
@@ -695,11 +736,13 @@ pub(super) mod cases {
             exec::DEFAULT_STACK_BYTES,
         )
         .map_err(|_| TestError("deny arguments OOM"))?;
+
         context.expect_eq(
             exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT).err(),
             Some(ExecError::File(FsError::TextBusy)),
         );
         drop(writer);
+
         let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
             .map_err(|_| TestError("deny real ELF load failed"))?;
         context.expect_eq(
@@ -722,6 +765,7 @@ pub(super) mod cases {
             .err(),
             Some(FsError::TextBusy),
         );
+
         let child = vm(context, image.mm.fork())?;
         let old_mm = image.mm.clone();
         drop(image);
@@ -736,6 +780,7 @@ pub(super) mod cases {
             Some(FsError::TextBusy),
         );
         drop(old_mm);
+
         context.expect_eq(
             open_path_with_flags(
                 fixture.user.path.vfs(),
@@ -747,6 +792,7 @@ pub(super) mod cases {
             Some(FsError::TextBusy),
         );
         drop(child);
+
         drop(checked(
             context,
             open_path_with_flags(
@@ -756,6 +802,7 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?);
+
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -770,12 +817,14 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?);
+
         let bad = fixture.open(context, b"/test/write-map", 0)?;
         context.expect_eq(
             exec::load(&vfs, &fs_context, bad.clone(), &args, Credentials::ROOT).err(),
             Some(ExecError::Format),
         );
         drop(fixture.open(context, b"/test/write-map", 1)?);
+
         let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
             .map_err(|_| TestError("prepare deny real load failed"))?;
         let runtime = checked(
@@ -806,6 +855,7 @@ pub(super) mod cases {
             Some(FsError::TextBusy),
         );
         drop(prepared);
+
         drop(checked(
             context,
             open_path_with_flags(
@@ -815,6 +865,7 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?);
+
         let image = exec::load(&vfs, &fs_context, program.clone(), &args, Credentials::ROOT)
             .map_err(|_| TestError("OOM deny real load failed"))?;
         let runtime = checked(
@@ -851,6 +902,7 @@ pub(super) mod cases {
             fixture.user.release_pressure();
             (evidence, fork_error, prepare_error)
         };
+
         context.expect_eq(evidence, (true, true));
         context.expect_eq(fork_error, Some(VmError::NoMemory));
         context.expect_eq(
@@ -868,6 +920,7 @@ pub(super) mod cases {
                 FileIoContext::Kernel,
             ),
         )?);
+
         // loader 已取得 deny 后格式失败与真实 Mm 分配失败都必须归还原责任。
         let mut pages = PagePressure::prepare()?;
         let (evidence, load_error) = {

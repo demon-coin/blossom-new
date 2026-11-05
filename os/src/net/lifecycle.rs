@@ -87,6 +87,7 @@ impl EgressWaiting {
         );
         projection.linked = true;
         drop(projection);
+
         if let Some(tail) = self.tail.as_ref() {
             tail.projection.lock().next = Some(node.clone());
         } else {
@@ -107,6 +108,7 @@ impl EgressWaiting {
         self.head = projection.next.take();
         projection.linked = false;
         drop(projection);
+
         self.len -= 1;
         if self.head.is_none() {
             self.tail.take();
@@ -132,6 +134,7 @@ impl EgressWaiting {
         if self.head.as_ref().is_some_and(|node| node.id == id) {
             return self.pop();
         }
+
         let mut previous = self.head.clone()?;
         loop {
             let node = previous.projection.lock().next.clone()?;
@@ -140,6 +143,7 @@ impl EgressWaiting {
                 let next = projection.next.take();
                 projection.linked = false;
                 drop(projection);
+
                 previous.projection.lock().next = next;
                 if self.tail.as_ref().is_some_and(|tail| tail.id == id) {
                     self.tail = Some(previous);
@@ -240,6 +244,7 @@ impl RetiredEndpoints {
         projection.linked = true;
         projection.next = self.head.take();
         drop(projection);
+
         self.head = Some(endpoint);
     }
 

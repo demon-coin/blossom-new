@@ -37,6 +37,7 @@ pub(crate) const O_ACCMODE: u32 = 0o3;
 pub(crate) const O_RDONLY: u32 = 0o0;
 pub(crate) const O_WRONLY: u32 = 0o1;
 pub(crate) const O_RDWR: u32 = 0o2;
+
 pub(crate) const O_CREAT: u32 = 0o100;
 pub(crate) const O_EXCL: u32 = 0o200;
 pub(crate) const O_TRUNC: u32 = 0o1000;
@@ -50,6 +51,7 @@ pub(crate) const O_DIRECTORY: u32 = 0o200000;
 pub(crate) const O_NOFOLLOW: u32 = 0o400000;
 pub(crate) const O_CLOEXEC: u32 = 0o2000000;
 pub(crate) const O_NOCTTY: u32 = 0o400;
+
 const MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 const OPEN_FLAGS: u32 = MUTABLE_FLAGS | O_SYNC | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_NOCTTY;
 
@@ -88,6 +90,7 @@ impl<'a> UserVector<'a> {
                 .checked_add(vector.length)
                 .ok_or(FsError::InvalidOperation)?;
         }
+
         Ok(Self {
             mm,
             vectors,
@@ -144,6 +147,7 @@ impl<'a> ReadBuffer<'a> {
                 return Err(FsError::BadAddress);
             }
         }
+
         Ok(Self {
             target: ReadTarget::User {
                 mm,
@@ -250,6 +254,7 @@ impl<'a> WriteBuffer<'a> {
                 return Err(FsError::BadAddress);
             }
         }
+
         Ok(Self {
             source: WriteSource::User {
                 mm,
@@ -294,6 +299,7 @@ impl<'a> WriteBuffer<'a> {
         if count == 0 {
             return Ok(0);
         }
+
         let copied = match &mut self.source {
             WriteSource::Kernel(bytes) => {
                 dst[..count].copy_from_slice(&bytes[self.prepared..self.prepared + count]);
@@ -329,6 +335,7 @@ impl<'a> WriteBuffer<'a> {
                 copied
             }
         };
+
         self.prepared += copied;
         if copied == 0 {
             if let Some(error) = self.error {
@@ -571,17 +578,20 @@ pub fn open_path_with_flags(
     if flags & !(OPEN_FLAGS | O_ACCMODE | O_TRUNC) != 0 {
         return Err(FsError::Unsupported);
     }
+
     // 独立的完整同步位同样隐含数据同步位，写后路径只需据 O_DSYNC 判断是否同步。
     let flags = if flags & (O_SYNC & !O_DSYNC) != 0 {
         flags | O_DSYNC
     } else {
         flags
     };
+
     let inode = path.inode()?;
     let kind = inode.metadata_snapshot()?.kind;
     if flags & O_DIRECTORY != 0 && kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
     }
+
     if let Some(special) = inode.memory_special() {
         return match special {
             MemorySpecial::Null | MemorySpecial::Zero | MemorySpecial::TestHook => {
@@ -601,6 +611,7 @@ pub fn open_path_with_flags(
             | MemorySpecial::Interrupts => procfs::open(path, flags, special, vfs, caller),
         };
     }
+
     match kind {
         InodeKind::Regular => {
             if access != 0 || flags & O_TRUNC != 0 {
@@ -633,6 +644,7 @@ pub fn open_path_with_flags(
                 wb_errors: SpinLock::new(wb_errors),
             })
             .map_err(|_| FsError::NoMemory)?;
+
             // 完整 OFD 已分配，截断后只交出原拥有，描述符调用者再消费预留槽位。
             if flags & O_TRUNC != 0 {
                 let access = file
@@ -778,6 +790,7 @@ impl FileLike for InodeFile {
         if range.end < range.start {
             return Err(FsError::InvalidOperation);
         }
+
         let inode = self.path.inode()?;
         if inode.is_memory() {
             return Ok(());
@@ -790,6 +803,7 @@ impl FileLike for InodeFile {
         } else {
             Ok(())
         };
+
         // 共同元数据同步覆盖本卷当前选中的 inode、块树、分配和目录记录，可写出更多元数据。
         // 文件同步不保证跨文件原子提交，fdatasync 仍须提交使数据可寻址的记录和设备 FLUSH。
         // 未确认设备停止时保持原在途拥有，禁止继续提交元数据或 FLUSH。
@@ -799,6 +813,7 @@ impl FileLike for InodeFile {
         } else {
             Ok(())
         };
+
         let mut samples = self.wb_errors.lock();
         let samples = samples.as_mut().expect("disk OFD has no writeback samples");
         let data_error = inode.mapping().check_and_advance_wb_error(&mut samples.0);
@@ -840,6 +855,7 @@ impl FileLike for InodeFile {
         let flags = self.flags();
         require_write(flags)?;
         self.path.check_writable()?;
+
         let mut cursor = self.cursor.lock();
         check_write_range(*cursor, source.len() - source.copied())?;
         let inode = self.path.inode()?;
@@ -854,6 +870,7 @@ impl FileLike for InodeFile {
                 .expect("inode write position overflow");
         }
         drop(cursor);
+
         sync_written(self, flags, start, bytes)?;
         if 0 < bytes && !inode.is_memory() {
             background::balance_dirty_pages(inode);
@@ -872,12 +889,14 @@ impl FileLike for InodeFile {
         require_write(flags)?;
         self.path.check_writable()?;
         check_write_range(offset, source.len() - source.copied())?;
+
         let inode = self.path.inode()?;
         let access = self
             .write_access
             .as_ref()
             .expect("writable OFD has no write access");
         let (start, bytes) = access.write_from(offset, flags & O_APPEND != 0, source)?;
+
         sync_written(self, flags, start, bytes)?;
         if 0 < bytes && !inode.is_memory() {
             background::balance_dirty_pages(inode);
@@ -1022,12 +1041,14 @@ impl FileLike for DirectoryFile {
         if inode.is_memory() {
             return Ok(());
         }
+
         let volume = inode.disk_volume()?;
         let result = if volume.mode() == AccessMode::ReadWrite {
             writeback::sync_metadata(volume)
         } else {
             Ok(())
         };
+
         let mut sample = self.wb_error.lock();
         let sample = sample
             .as_mut()
@@ -1155,9 +1176,11 @@ fn seek_path(path: &Path, cursor: &SleepMutex<u64>, from: SeekFrom) -> Result<u6
     if (i64::MAX as u64) < position {
         return Err(FsError::InvalidOperation);
     }
+
     *cursor = position;
     Ok(position)
 }
+
 /// 显式seek按后端cookie重置碰撞状态；SEEK_CUR(0)保留真实续读位置。
 fn seek_directory(
     path: &Path,
@@ -1181,6 +1204,7 @@ fn seek_directory(
     if (i64::MAX as u64) < position {
         return Err(FsError::InvalidOperation);
     }
+
     let next = path.inode()?.directory_cursor(position)?;
     let cookie = next.cookie();
     *cursor = next;

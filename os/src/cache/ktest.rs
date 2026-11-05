@@ -111,6 +111,7 @@ fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice
             "cache attached device count differs from declared resources",
         ));
     }
+
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(count)
@@ -283,6 +284,7 @@ impl HeapPressure {
                 self.pages.push(pages);
             }
         }
+
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
             let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
                 .expect("cache heap pressure layout");
@@ -297,6 +299,7 @@ impl HeapPressure {
                 self.heap[index] = pointer as usize;
             }
         }
+
         mm::drain_all_pages();
         let pages_failed = black_box(mm::alloc_pages(0, false)).is_none();
         let mut heap_failed = true;
@@ -447,6 +450,7 @@ impl Owner {
                 "cache views require logical block <= 1KiB; page cases require <= 4KiB",
             ));
         }
+
         let legacy = matches!(device.identity(), VirtioIdentity::Mmio { version: 1, .. });
         let ring = device.control_regions().0;
         let layout = virtio_drivers::queue::RingLayout::new(info.queue_depth, legacy)
@@ -473,6 +477,7 @@ impl Owner {
             queue.close_sync();
             return Err(TestError("cache Disk activation failed"));
         }
+
         let owner = Self::prepare_resources(
             scenario,
             baseline,
@@ -534,6 +539,7 @@ impl Owner {
                     core::mem::swap(&mut disk, extra.as_mut().unwrap());
                 }
             }
+
             let capacity = if scenario == Scenario::Bounded { 2 } else { 8 };
             let metadata = if matches!(
                 scenario,
@@ -573,6 +579,7 @@ impl Owner {
                 })
                 .transpose()
                 .map_err(|_| TestError("extra metadata preparation failed"))?;
+
             let (failure_folio, read) =
                 if matches!(scenario, Scenario::Failure | Scenario::PrepareOom) {
                     let (folio, read) = mapping
@@ -628,6 +635,7 @@ impl Owner {
                     .try_reserve_exact(PRESSURE_CAPACITY)
                     .map_err(|_| TestError("cache pressure handles OOM"))?;
             }
+
             for index in 0..count {
                 let observer = observation.clone();
                 let task_disk = disk.clone();
@@ -832,6 +840,7 @@ impl Owner {
         })?;
         context.expect_eq(self.disk.test_snapshot().submitted - before.submitted, 1);
         context.expect_eq(self.disk.test_snapshot().inflight, 1);
+
         self.disk.test_resume_completions();
         self.join_tasks()?;
         self.disk.test_flush_completions();
@@ -862,6 +871,7 @@ impl Owner {
         })?;
         context.expect_eq(self.disk.test_snapshot().submitted - before.submitted, 2);
         context.expect_eq(self.disk.test_snapshot().inflight, 2);
+
         self.disk.test_resume_completions();
         self.join_tasks()?;
         self.disk.test_flush_completions();
@@ -889,6 +899,7 @@ impl Owner {
         until("failed file waiters did not block", || {
             self.observation.blocked(1) && self.observation.blocked(2)
         })?;
+
         self.disk
             .stop()
             .map_err(|_| TestError("cache failure real stop failed"))?;
@@ -896,6 +907,7 @@ impl Owner {
         self.observation.gate.complete();
         self.join_tasks()?;
         context.expect_eq(self.disk.test_snapshot().submitted, before);
+
         for result in &*self.observation.results.lock() {
             context.expect_eq(matches!(result, Some(Err(BlockError::QueueStopped))), true);
         }
@@ -992,6 +1004,7 @@ impl Owner {
             true,
         );
         context.expect_eq(self.metadata.as_ref().unwrap().prune_unused(), 0);
+
         drop(self.held[0].take());
         self.held[0] = Some(Returned::Buffer(
             self.metadata
@@ -1034,6 +1047,7 @@ impl Owner {
                 Ok(true),
             );
         }
+
         drop(self.held[0].take());
         drop(self.held[1].take());
         drop(self.held[2].take());
@@ -1075,6 +1089,7 @@ impl Owner {
             ),
             true,
         );
+
         self.pressure.clear();
         let (folio, read) = self
             .mapping
@@ -1117,6 +1132,7 @@ impl Owner {
                 .map_err(|_| TestError("OOM warm file read failed"))?,
         ));
         self.disk.test_flush_completions();
+
         self.exhaust_pages(context)?;
         let buffer = self
             .metadata
@@ -1180,6 +1196,7 @@ impl Owner {
         let avail = self.avail_index();
         self.observation.gate.complete();
         self.join_tasks()?;
+
         let evidence = self
             .observation
             .oom_evidence
@@ -1249,6 +1266,7 @@ impl Owner {
             tiny.update(&ro, |bytes| bytes.fill(0xee)),
             Err(BlockError::ReadOnly),
         );
+
         let two = same
             .get(0, 2048, None)
             .map_err(|_| TestError("private 2KiB metadata read failed"))?;
@@ -1261,6 +1279,7 @@ impl Owner {
         );
         two.update(&claim, |bytes| bytes[..512].fill(0x19))
             .map_err(|_| TestError("private 2KiB metadata update failed"))?;
+
         let super_view = cache
             .get(0, mm::PAGE_SIZE, None)
             .map_err(|_| TestError("private super metadata read failed"))?;
@@ -1280,6 +1299,7 @@ impl Owner {
         );
         context.expect_eq(super_view.folio().dirty_sectors(), 0b0000_1111);
         context.expect_eq(super_view.folio().writeback_sectors(), 0);
+
         drop(super_view);
         drop(two);
         drop(tiny);
@@ -1353,6 +1373,7 @@ impl Owner {
                 .map_err(|_| TestError("record source checksum failed"))?;
             before[index] = InodeMetadata::from_data(&decoded);
         }
+
         let mut after = before;
         for index in 0..2 {
             after[index].mode ^= 0o020;
@@ -1362,6 +1383,7 @@ impl Owner {
             codec::validate_inode_metadata_update(&before[index], &after[index])
                 .map_err(|_| TestError("record expected metadata not representable"))?;
         }
+
         let claim = Disk::claim_fs(&BlockView::whole(self.disk.clone()), AccessMode::ReadWrite)
             .map_err(|_| TestError("private record RW claim failed"))?;
         let cache = self.metadata.as_ref().unwrap().clone();
@@ -1374,6 +1396,7 @@ impl Owner {
                 bytes[256..512].copy_from_slice(&original[1]);
             })
             .map_err(|_| TestError("private record initialization failed"))?;
+
         for index in 0..2 {
             let target = buffer.clone();
             let task_claim = claim.clone();
@@ -1400,6 +1423,7 @@ impl Owner {
                 .map_err(|_| TestError("record update Task preparation failed"))?,
             );
         }
+
         let content = buffer.folio().lock_content();
         self.publish_one();
         self.publish_one();
@@ -1415,6 +1439,7 @@ impl Owner {
         drop(content);
         blocked?;
         self.join_tasks()?;
+
         let (decoded, roots_preserved, corrupt_rejected) = buffer
             .with_read(|bytes| {
                 let mut decoded = [Err(FsError::Corrupt); 2];
@@ -1439,6 +1464,7 @@ impl Owner {
             context.expect_eq(roots_preserved[index], true);
             context.expect_eq(corrupt_rejected[index], true);
         }
+
         for index in 0..2 {
             let unchanged = volume
                 .load_inode(numbers[index], None)
@@ -1467,6 +1493,7 @@ impl Owner {
         if let Some(extra) = &self.extra {
             extra.test_resume_completions();
         }
+
         if let Some(join) = self.joins.first() {
             until("cache read owner did not leave stack", || {
                 join.try_join().is_some()
@@ -1479,6 +1506,7 @@ impl Owner {
         if let Some(extra) = &self.extra {
             extra.test_flush_completions();
         }
+
         self.held.fill_with(|| None);
         let results =
             core::mem::replace(&mut *self.observation.results.lock(), [const { None }; 3]);
@@ -1492,6 +1520,7 @@ impl Owner {
         }
         drop(self.metadata.take());
         drop(self.extra_metadata.take());
+
         self.disk
             .stop()
             .map_err(|_| TestError("cache stop cannot converge; retaining original DMA owner"))?;
@@ -1592,6 +1621,7 @@ mod folio {
                 }
                 *address = folio.phys_addr();
             }
+
             if pass == 0 {
                 let mut pressure = HeapPressure::prepare()?;
                 let evidence = pressure.exhaust();
@@ -1613,6 +1643,7 @@ mod folio {
                 context.expect_eq(hit.copy_to(0, &mut byte), Ok(()));
                 context.expect_eq(byte[0], index as u8);
             }
+
             let first = mapping
                 .get_or_prepare(key(0), None)
                 .map_err(|_| TestError("sparse first pin failed"))?
@@ -1734,6 +1765,7 @@ mod oom {
     ) -> TestResult {
         fixture.0.oom(context)
     }
+
     /// 真实 OOM 保 miss 错误，放压后只建立一个原页填充拥有者。
     #[test]
     fn sparse_miss_recovers_after_real_oom(

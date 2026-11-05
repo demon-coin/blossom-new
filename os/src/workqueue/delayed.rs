@@ -211,9 +211,11 @@ impl DelayedWork {
             releases.push(raw);
         }
         let boundary = self.work().capture_locked();
+
         drop(state);
         drop(serial);
         drop(releases);
+
         if discard {
             self.timer().cancel_sync();
         }
@@ -253,6 +255,7 @@ impl DelayedWork {
         if existed && !modify {
             return Ok(false);
         }
+
         let deadline = time::now()
             .checked_add(delay)
             .ok_or(DelayedError::OutOfRange)?;
@@ -273,6 +276,7 @@ impl DelayedWork {
         } else {
             self.cancel_timer_locked(&mut releases);
         }
+
         match pending {
             Pending::Pool => releases.work = self.work().cancel_queued_locked(),
             Pending::Delay(_) => {
@@ -286,6 +290,7 @@ impl DelayedWork {
             }
             Pending::None => {}
         }
+
         // SAFETY: 真实 Arc raw 仍由 receiver 保活；单独取得新 pending 票，运行票不受影响。
         unsafe {
             Arc::increment_strong_count(self.owned_raw);
@@ -304,6 +309,7 @@ impl DelayedWork {
                 .queue_locked()
                 .expect("accepted delayed queue closed"));
         }
+
         drop(state);
         drop(releases);
         if delay.is_zero() {
@@ -338,6 +344,7 @@ impl DelayedWork {
         }
         drop(state);
         drop(releases);
+
         self.timer().cancel_sync();
         delayed | guard.finish()
     }
@@ -431,6 +438,7 @@ fn transfer(timer: Pin<&Timer>) {
             releases.push(pending);
         }
     }
+
     drop(state);
     drop(releases);
     if transferred {
@@ -438,6 +446,7 @@ fn transfer(timer: Pin<&Timer>) {
         #[cfg(feature = "ktest")]
         testing::pause(raw, testing::PausePoint::AfterTransfer);
     }
+
     // SAFETY: 这是本 callback 最后一次 D 访问，归还由新增 timer queued 转入的唯一运行上下文票。
     // Timer 自己的 owned running 票仍覆盖 run_callback 的真实尾部，不再读取 D 上下文。
     drop(unsafe { Arc::from_raw(raw) });

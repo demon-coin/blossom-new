@@ -57,6 +57,7 @@ impl UserOwner {
             &[b"--runtime-socket-timeouts"],
             Credentials::ROOT,
         );
+
         let net = self
             .net
             .as_ref()
@@ -88,6 +89,7 @@ impl UserOwner {
             Credentials::ROOT,
             None,
         )?;
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -118,6 +120,7 @@ impl UserOwner {
         checked(context, runtime.install_console())?;
         let ready_write = publish_descriptor(context, &runtime, ready_writer)?;
         let go_read = publish_descriptor(context, &runtime, go_reader)?;
+
         let (ready_text, ready_start) = decimal_fd(ready_write);
         let (go_text, go_start) = decimal_fd(go_read);
         let arguments = Arguments::from_kernel(
@@ -154,6 +157,7 @@ impl UserOwner {
             .map_err(|_| TestError("migration initial mask allocation failed"))?;
         let first_mask = Arc::try_new(SpinLock::new(cpu::CpuSet::empty()))
             .map_err(|_| TestError("migration first mask allocation failed"))?;
+
         let coordination_task = task.clone();
         let coordination_user = user.clone();
         let initial_observed = initial_mask.clone();
@@ -185,6 +189,7 @@ impl UserOwner {
                 if mask == cpu::CpuSet::empty() || (target == 1 && !mask.contains(0)) {
                     return 1;
                 }
+
                 sched::test_request_migration(&coordination_task, target);
                 if go_writer.write(b"M") != Ok(1) {
                     return 1;
@@ -193,6 +198,7 @@ impl UserOwner {
             0
         })
         .map_err(|_| TestError("libc migration coordinator preparation failed"))?;
+
         let join = prepared
             .publish()
             .map_err(|_| TestError("libc migration publication failed"))?;
@@ -204,6 +210,7 @@ impl UserOwner {
             join,
         });
         self.observer = Some(coordinator.publish());
+
         let event = self.wait(context)?;
         let final_mask = user.ktest_take_user_cpu_mask();
         context.expect_eq(final_mask.contains(1), true);
@@ -257,12 +264,14 @@ impl UserOwner {
             }
             self.reap_children(context, event.status != 0)?;
         }
+
         self.run_console_named(
             context,
             LIBC,
             &[b"--script-errors", b"stage7"],
             Credentials::ROOT,
         )?;
+
         self.run_console_named(context, BUSYBOX, &[b"sh", BASE_ABI], Credentials::ROOT)?;
         self.run_console_named(
             context,
@@ -305,6 +314,7 @@ impl UserOwner {
             checked(context, runtime.files.dup_exact(fd, 2, limit))?;
             checked(context, runtime.files.close(fd))?;
         }
+
         let target = match &placement {
             Placement::Cpu(target) => Some(*target),
             Placement::Any => None,
@@ -376,8 +386,10 @@ impl UserOwner {
             }
         })
         .map_err(|_| TestError("selftest output collector preparation failed"))?;
+
         self.start_console_program(context, image, Placement::Any, credentials, Some(writer))?;
         self.observer = Some(collector.publish());
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {

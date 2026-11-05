@@ -39,6 +39,7 @@ impl PathOwner {
         )?)
         .map_err(|_| TestError("path view owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
+
         let observer = self.owner.observer().clone();
         let hook: Arc<dyn Fn(&DentryRef) + Send + Sync> =
             Arc::try_new(move |dentry: &DentryRef| {
@@ -51,6 +52,7 @@ impl PathOwner {
             })
             .map_err(|_| TestError("path lookup observer OOM"))?;
         vfs.dcache().ktest_set_lookup_hook(Some(hook));
+
         self.volume = Some(volume);
         self.context = Some(fs_context);
         self.vfs = Some(vfs);
@@ -68,6 +70,7 @@ impl PathOwner {
             .as_ref()
             .expect("path context consumed before body")
     }
+
     /// 真实任务已停稳、外部 Path 已释放后撤观察入口并释放本例 FS 视图。
     pub(super) fn release_view(&mut self) {
         if let Some(vfs) = &self.vfs {
@@ -196,6 +199,7 @@ pub(crate) mod walk {
             fixture.resolve(context, b"/walk/sub/..")?.ptr_eq(&walk),
             true,
         );
+
         for pathname in [b"/absent/..".as_slice(), b"/walk/absent/../sub"] {
             context.expect_eq(
                 vfs.resolve(fixture.context(), pathname, ResolveMode::Follow)
@@ -235,6 +239,7 @@ pub(crate) mod walk {
             lookup_error(vfs, root.dentry(), &[b'n'; 256]),
             Some(FsError::NameTooLong),
         );
+
         let file = fixture.resolve(context, b"/pattern")?;
         let hard = fixture.resolve(context, b"/hardlink")?;
         context.expect_eq(
@@ -255,6 +260,7 @@ pub(crate) mod walk {
         );
         read_pattern(context, &file)?;
         read_pattern(context, &hard)?;
+
         let raw = fixture.resolve(context, b"/name-\xff\xfe")?;
         context.expect_eq(raw.dentry().name().as_slice(), b"name-\xff\xfe".as_slice());
         let mut bytes = [0xa7; 9];
@@ -293,6 +299,7 @@ pub(crate) mod walk {
             ),
         )?;
         context.expect_eq(Arc::ptr_eq(&volume, &reopened), true);
+
         let ro = checked(
             context,
             Vfs::try_new(
@@ -323,6 +330,7 @@ pub(crate) mod walk {
             context,
             rw.resolve(&rw_context, b"/pattern", ResolveMode::Follow),
         )?;
+
         context.expect_eq(
             checked(context, ro_file.inode())?.ptr_eq(checked(context, rw_file.inode())?),
             true,
@@ -388,6 +396,7 @@ pub(crate) mod walk {
             context,
             vfs.mount(&covered, Filesystem::Ext4(volume), AccessMode::ReadOnly),
         )?;
+
         {
             let path = fixture.resolve(context, b"/disk/pattern")?;
             let file = checked(
@@ -493,6 +502,7 @@ pub(crate) mod walk {
         let sub = fixture.resolve(context, b"/walk/sub")?;
         let cwd = checked(context, FsContext::new(vfs.root(), walk.clone()))?;
         let pattern = fixture.resolve(context, b"/pattern")?;
+
         for pathname in [
             b"relative".as_slice(),
             b"absolute",
@@ -503,6 +513,7 @@ pub(crate) mod walk {
             context.expect_eq(path.ptr_eq(&pattern), true);
             read_pattern(context, &path)?;
         }
+
         for mode in [
             ResolveMode::Follow,
             ResolveMode::NoFollow,
@@ -520,6 +531,7 @@ pub(crate) mod walk {
                 expected,
             );
         }
+
         let link = checked(
             context,
             vfs.resolve(&cwd, b"directory", ResolveMode::NoFollow),
@@ -548,6 +560,7 @@ pub(crate) mod walk {
             vfs.resolve(&cwd, b"relative/", ResolveMode::NoFollow).err(),
             Some(FsError::NotDirectory),
         );
+
         for pathname in [b"chain01".as_slice(), b"loop"] {
             context.expect_eq(
                 vfs.resolve(&cwd, pathname, ResolveMode::Follow).err(),
@@ -593,6 +606,7 @@ pub(crate) mod boundary {
                 Some(FsError::NotFound),
             );
         }
+
         context.expect_eq(FsContext::new(walk.clone(), vfs.root()).is_err(), true);
         let regular = fixture.resolve(context, b"/pattern")?;
         context.expect_eq(
@@ -653,6 +667,7 @@ pub(crate) mod mounts {
             fixture.resolve(context, b"/mnt/extra/..")?.ptr_eq(&mnt),
             true,
         );
+
         let extra_context = checked(context, FsContext::new(mounted.clone(), mounted.clone()))?;
         context.expect_eq(
             checked(
@@ -673,6 +688,7 @@ pub(crate) mod mounts {
             false,
         );
         read_pattern(context, &file)?;
+
         checked(
             context,
             vfs.mount(
@@ -699,6 +715,7 @@ pub(crate) mod mounts {
         );
         drop(alias);
         checked(context, vfs.unmount(&other))?;
+
         context.expect_eq(vfs.unmount(&covered).err(), Some(FsError::Busy));
         drop(extra_context);
         drop(mounted);
@@ -719,6 +736,7 @@ pub(crate) mod mounts {
             .err(),
             Some(FsError::NotFound),
         );
+
         vfs.prune_unused();
         checked(
             context,
@@ -796,6 +814,7 @@ pub(crate) mod mounts {
                 .err(),
             Some(FsError::NotEmpty),
         );
+
         let file = checked(
             context,
             vfs.open_with(
@@ -838,6 +857,7 @@ pub(crate) mod mounts {
             .ptr_eq(&inode),
             true,
         );
+
         checked(
             context,
             vfs.rename_from(
@@ -881,10 +901,12 @@ pub(crate) mod mounts {
             .err(),
             Some(FsError::CrossDevice),
         );
+
         drop(file);
         vfs.prune_unused();
         let reopened = fixture.resolve(context, b"/mnt/extra/b/moved/file")?;
         context.expect_eq(checked(context, reopened.inode())?.ptr_eq(&inode), true);
+
         let nested = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#")?;
         let procfs = checked(context, MemoryFs::try_new(MemoryFsKind::Procfs, 0o555))?;
         checked(
@@ -894,6 +916,7 @@ pub(crate) mod mounts {
         let proc_root = fixture.resolve(context, b"/mnt/extra/b/moved/raw \t\n\\#")?;
         context.expect_eq(proc_root.check_writable(), Err(FsError::ReadOnly));
         context.expect_eq(vfs.unmount(&nested).err(), Some(FsError::Busy));
+
         let text = checked(context, vfs.mounts_text(&vfs.root()))?;
         let lines: Vec<&[u8]> = text
             .split(|&byte| byte == b'\n')
@@ -931,6 +954,7 @@ pub(crate) mod mounts {
                 .count(),
             2,
         );
+
         let devfs = checked(context, MemoryFs::try_new(MemoryFsKind::Devfs, 0o755))?;
         checked(
             context,
@@ -956,6 +980,7 @@ pub(crate) mod mounts {
         );
         drop(device);
         checked(context, vfs.unmount(&nested))?;
+
         checked(
             context,
             vfs.unlink_from(
@@ -972,6 +997,7 @@ pub(crate) mod mounts {
         )?;
         context.expect_eq(checked(context, reopened.inode())?.ptr_eq(&inode), true);
         context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 0);
+
         drop(reopened);
         drop(nested);
         drop(parent);
@@ -1014,6 +1040,7 @@ pub(crate) mod pruning {
         context.expect_eq(vfs.dcache().ktest_load_count(), loads + 1);
         context.expect_eq(vfs.dcache().prune_unused(), 1);
         context.expect_eq(fixture.resolve(context, b"/pattern")?.ptr_eq(&file), true);
+
         drop(file);
         context.expect_eq(vfs.dcache().prune_unused(), 1);
         context.expect_eq(vfs.dcache().is_empty(), true);
@@ -1025,6 +1052,7 @@ pub(crate) mod pruning {
             Some(FsError::NotFound),
         );
         context.expect_eq(vfs.dcache().ktest_load_count(), loads + 3);
+
         let sub = fixture.resolve(context, b"/walk/sub")?;
         let parent = sub
             .dentry()
@@ -1112,6 +1140,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
             && fixture.owner.observer().blocked(2)
     })?;
     context.expect_eq(vfs.dcache().ktest_load_count(), before_load + 1);
+
     fixture
         .owner
         .observer()
@@ -1119,6 +1148,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
         .store(false, Ordering::Release);
     fixture.owner.observer().gate.complete();
     fixture.owner.join_tasks()?;
+
     let results = core::mem::replace(
         &mut *fixture.owner.observer().results.lock(),
         [const { None }; 3],
@@ -1162,6 +1192,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
                 first = Some(dentry);
             }
         }
+
         let path = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &path)?;
         context.expect_eq(vfs.dcache().ktest_load_count(), before_load + 1);
@@ -1215,6 +1246,7 @@ pub(crate) mod loading {
                 == 1
                 && fixture.owner.observer().blocked(0)
         })?;
+
         fixture.owner.publish(
             1,
             Job::Resolve {
@@ -1246,6 +1278,7 @@ pub(crate) mod loading {
             checked(context, checked(context, path.inode())?.metadata_snapshot())?.kind,
             InodeKind::Regular,
         );
+
         fixture
             .owner
             .observer()
@@ -1253,6 +1286,7 @@ pub(crate) mod loading {
             .store(false, Ordering::Release);
         fixture.owner.observer().gate.complete();
         fixture.owner.join_tasks()?;
+
         let returned = fixture.owner.observer().results.lock()[0]
             .take()
             .ok_or(TestError("held path result absent"))?;
@@ -1305,6 +1339,7 @@ pub(crate) mod oom {
         let cached = fixture.resolve(context, b"/pattern")?;
         read_pattern(context, &cached)?;
         let root = vfs.root();
+
         let pressure = fixture
             .owner
             .pressure
@@ -1321,6 +1356,7 @@ pub(crate) mod oom {
             },
         );
         fixture.owner.join_tasks()?;
+
         let returned = fixture.owner.observer().results.lock()[0]
             .take()
             .ok_or(TestError("path OOM result absent"))?;
@@ -1344,6 +1380,7 @@ pub(crate) mod oom {
         context.expect_eq(len_after, len_before);
         context.expect_eq(submitted_after, submitted_before);
         context.expect_eq(vfs.dcache().ktest_waiting(root.dentry(), b"empty"), 0);
+
         let empty = fixture.resolve(context, b"/empty")?;
         let mut bytes = [0xa7; 1];
         context.expect_eq(

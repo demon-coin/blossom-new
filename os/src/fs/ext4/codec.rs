@@ -14,7 +14,9 @@ use crate::time::NSEC_PER_SEC;
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
 pub(crate) const EA_INODE: u32 = 0x0020_0000;
 pub(crate) const INDEX: u32 = 0x1000;
+
 pub(crate) const METADATA_CSUM: u32 = 0x400;
+
 // inode 标志与超级块 feature 属于不同字段；同名能力不能共用位值。
 pub(crate) const HUGE_FILE: u32 = 0x0004_0000;
 const COMPR: u32 = 0x0000_0004;
@@ -27,6 +29,7 @@ const CASEFOLD: u32 = 0x4000_0000;
 
 pub(crate) const FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 pub(crate) const FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+
 pub(crate) const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 pub(crate) const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
@@ -35,6 +38,7 @@ const FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
 pub(crate) const FEATURE_INCOMPAT_EA_INODE: u32 = 0x0400;
 const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
 pub(crate) const FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
+
 pub(crate) const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 pub(crate) const FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 const FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0004;
@@ -51,16 +55,20 @@ pub(crate) const SUPERBLOCK_BYTES: usize = 1024;
 pub(crate) const SUPERBLOCK_END: usize = SUPERBLOCK_OFFSET + SUPERBLOCK_BYTES;
 const SUPER_CHECKSUM_OFFSET: usize = SUPERBLOCK_BYTES - core::mem::size_of::<u32>();
 const CRC32C_CHECKSUM: u8 = 1;
+
 const MIN_BLOCK_BYTES: usize = 1024;
 const MAX_BLOCK_LOG: u32 = 2;
 pub(crate) const MAX_BLOCK_BYTES: usize = MIN_BLOCK_BYTES << MAX_BLOCK_LOG;
+
 pub(crate) const ROOT_INODE: u64 = 2;
 const FIRST_NON_RESERVED_INODE: u64 = 11;
+
 pub(crate) const GOOD_OLD_INODE_BYTES: usize = 128;
 pub(crate) const LARGE_INODE_BYTES: usize = 256;
 pub(crate) const INODE_EXTRA_BYTES: usize = 160 - GOOD_OLD_INODE_BYTES;
 const MIN_DESCRIPTOR_BYTES: usize = 32;
 const LARGE_DESCRIPTOR_BYTES: usize = 64;
+
 pub(crate) const BG_INODE_UNINIT: u16 = 0x0001;
 pub(crate) const BG_BLOCK_UNINIT: u16 = 0x0002;
 
@@ -69,11 +77,13 @@ pub(crate) const INDIRECT_LEVELS: usize = 3;
 pub(crate) const INODE_BLOCK_BYTES: usize =
     (DIRECT_BLOCKS + INDIRECT_LEVELS) * core::mem::size_of::<u32>();
 const INODE_BLOCKS_LIMIT: u64 = 1u64 << (u32::BITS + u16::BITS);
+
 pub(crate) const INODE_CTIME_EXTRA_OFFSET: usize = 132;
 pub(crate) const INODE_MTIME_EXTRA_OFFSET: usize = 136;
 pub(crate) const INODE_ATIME_EXTRA_OFFSET: usize = 140;
 const EPOCH_BITS: u32 = 2;
 const EPOCH_MASK: u32 = (1 << EPOCH_BITS) - 1;
+
 pub(crate) const EXTENT_MAGIC: u16 = 0xf30a;
 pub(crate) const EXTENT_HEADER_BYTES: usize = 12;
 pub(crate) const EXTENT_ENTRY_BYTES: usize = 12;
@@ -85,8 +95,10 @@ pub(crate) const EXTENT_PHYSICAL_LIMIT: u64 = 1u64 << (u32::BITS + u16::BITS);
 pub(crate) const EXTENT_DEPTH_LIMIT: usize = 32;
 pub(crate) const EXTENT_INIT_MAX_LEN: u16 = 1 << 15;
 pub(crate) const EXTENT_UNWRITTEN_MAX_LEN: u16 = EXTENT_INIT_MAX_LEN - 1;
+
 pub(crate) const DIR_TAIL_BYTES: usize = 12;
 pub(crate) const FT_DIR_CSUM: u8 = 0xde;
+
 const XATTR_MAGIC: u32 = 0xea02_0000;
 const XATTR_ENTRY_BYTES: usize = 16;
 pub(crate) const MAX_EA_INODES: usize = MAX_BLOCK_BYTES / XATTR_ENTRY_BYTES;
@@ -118,6 +130,7 @@ pub(crate) fn le32(data: &[u8], offset: usize) -> Result<u32, FsError> {
     let b = bytes(data, offset, 4)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
+
 /// 按目录哈希版本计算原始字节的 major/minor 哈希。
 pub(crate) fn directory_hash(
     geometry: &Geometry,
@@ -143,6 +156,7 @@ pub(crate) fn directory_hash(
         DX_HASH_SIPHASH => return Err(FsError::Unsupported),
         _ => return Err(FsError::Unsupported),
     };
+
     major &= !1;
     if major == u32::MAX - 1 {
         major = u32::MAX - 3;
@@ -403,6 +417,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if le16(data, 56)? != SUPER_MAGIC {
         return Err(FsError::Corrupt);
     }
+
     let features_compat = le32(data, 92)?;
     let features_incompat = le32(data, 96)?;
     let features_ro_compat = le32(data, 100)?;
@@ -414,6 +429,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
             return Err(FsError::Checksum);
         }
     }
+
     // 只读兼容位可忽略未知值，已知扩展读取格式仍须明确拒绝。
     let supported_incompat = FEATURE_INCOMPAT_FILETYPE
         | FEATURE_INCOMPAT_RECOVER
@@ -438,6 +454,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if le32(data, 72)? != 0 || 1 < le32(data, 76)? {
         return Err(FsError::Unsupported);
     }
+
     let log = le32(data, 24)?;
     if MAX_BLOCK_LOG < log {
         return Err(FsError::Unsupported);
@@ -450,6 +467,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if first_data_block != u64::from(block_size == MIN_BLOCK_BYTES) {
         return Err(FsError::Corrupt);
     }
+
     let has64 = features_incompat & FEATURE_INCOMPAT_64BIT != 0;
     let blocks_count = u64::from(le32(data, 4)?)
         | if has64 {
@@ -481,6 +499,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if has64 && descriptor_size != LARGE_DESCRIPTOR_BYTES {
         return Err(FsError::Unsupported);
     }
+
     if blocks_count <= first_data_block
         || inodes_count == 0
         || blocks_per_group == 0
@@ -502,6 +521,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     {
         return Err(FsError::Corrupt);
     }
+
     let groups_count = ceil_div(blocks_count - first_data_block, blocks_per_group)?;
     if u64::from(u32::MAX) < groups_count
         || groups_count != ceil_div(inodes_count, inodes_per_group)?
@@ -517,6 +537,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if blocks_count <= first_data_block + descriptor_blocks {
         return Err(FsError::Corrupt);
     }
+
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(bytes(data, 104, 16)?);
     let checksum_seed = if features_incompat & FEATURE_INCOMPAT_CSUM_SEED != 0 {
@@ -541,6 +562,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     if 31 < log_groups_per_flex {
         return Err(FsError::Corrupt);
     }
+
     Ok(Geometry {
         block_size,
         inode_size,
@@ -591,6 +613,7 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
             return Err(FsError::Checksum);
         }
     }
+
     let first = if g.features_incompat & FEATURE_INCOMPAT_FLEX_BG != 0 {
         g.first_data_block
     } else {
@@ -637,6 +660,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if number == 0 || g.inodes_count < number {
         return Err(FsError::Corrupt);
     }
+
     let extra_isize = if g.inode_size == GOOD_OLD_INODE_BYTES {
         0
     } else {
@@ -645,6 +669,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if g.inode_size < GOOD_OLD_INODE_BYTES + extra_isize || extra_isize & 3 != 0 {
         return Err(FsError::Corrupt);
     }
+
     let generation = le32(data, 100)?;
     let checksum_seed = crc32c(
         crc32c(g.checksum_seed, &(number as u32).to_le_bytes()),
@@ -672,6 +697,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
             return Err(FsError::Checksum);
         }
     }
+
     let mode = le16(data, 0)?;
     let kind = match mode & S_IFMT {
         S_IFREG => InodeKind::Regular,
@@ -696,6 +722,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if kind == InodeKind::Symlink && flags & (IMMUTABLE | APPEND) != 0 {
         return Err(FsError::Corrupt);
     }
+
     let size = u64::from(le32(data, 4)?)
         | if kind == InodeKind::Regular || g.features_incompat & FEATURE_INCOMPAT_LARGEDIR != 0 {
             u64::from(le32(data, 108)?) << 32
@@ -716,6 +743,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     } else if flags & HUGE_FILE != 0 {
         return Err(FsError::Corrupt);
     }
+
     let file_acl = u64::from(le32(data, 104)?)
         | if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
             u64::from(le16(data, 118)?) << 32
@@ -739,6 +767,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     if fast_symlink && INODE_BLOCK_BYTES as u64 <= size {
         return Err(FsError::Corrupt);
     }
+
     let mut block = [0u8; 60];
     block.copy_from_slice(bytes(data, 40, 60)?);
     let rdev = decode_device(kind, &block);
@@ -906,10 +935,12 @@ pub(crate) fn patch_inode_metadata(
     if InodeMetadata::from_data(&current) != *old {
         return Err(FsError::Corrupt);
     }
+
     let record = record.get_mut(..g.inode_size).ok_or(FsError::Corrupt)?;
     let atime = time_encoding(next.atime, INODE_ATIME_EXTRA_OFFSET, next.extra_isize)?;
     let mtime = time_encoding(next.mtime, INODE_MTIME_EXTRA_OFFSET, next.extra_isize)?;
     let ctime = time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)?;
+
     put16(record, 0, next.mode);
     put16(record, 2, next.uid as u16);
     put16(record, 120, (next.uid >> 16) as u16);
@@ -1078,6 +1109,7 @@ pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: Gr
         }
     }
     put16(record, 18, state.flags);
+
     let number = (group as u32).to_le_bytes();
     if g.features_ro_compat & METADATA_CSUM != 0 {
         put16(record, 30, 0);
@@ -1153,11 +1185,13 @@ pub(crate) fn patch_super_counts(
         .checked_add_signed(inodes)
         .expect("free inode count overflow");
     assert!(next_blocks <= g.blocks_count && next_inodes <= g.inodes_count);
+
     put32(record, 12, next_blocks as u32);
     if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
         put32(record, 344, (next_blocks >> 32) as u32);
     }
     put32(record, 16, next_inodes as u32);
+
     // ABI: s_wtime 与 s_wtime_hi 共同编码 40 位秒数，使用与 inode 时间相同的时钟。
     let write_seconds = now_ns / NSEC_PER_SEC;
     put32(record, 48, write_seconds as u32);
@@ -1201,6 +1235,7 @@ pub(crate) fn patch_inode_mapping(
         .expect("prepared inode mtime");
     let ctime = time_encoding(next.ctime, INODE_CTIME_EXTRA_OFFSET, next.extra_isize)
         .expect("prepared inode ctime");
+
     put32(record, 4, next.size as u32);
     put32(record, 108, (next.size >> 32) as u32);
     put32(record, 28, blocks as u32);

@@ -179,6 +179,7 @@ impl Timer {
             if self.kind == TimerKind::Coarse {
                 state.wheel.accepts(deadline, now)?;
             }
+
             let added = !(*self.node.get()).queued;
             if !added {
                 state.unlink(pointer);
@@ -196,6 +197,7 @@ impl Timer {
             }
             (*self.node.get()).queued = true;
             drop(state);
+
             changed(self.cpu);
             Ok(added)
         }
@@ -282,6 +284,7 @@ impl Timer {
                 (release, (*self.node.get()).running, queued)
             };
             drop(state);
+
             release_owned(pointer, release);
             if queued {
                 changed(self.cpu);
@@ -289,6 +292,7 @@ impl Timer {
             if !running {
                 return cancelled;
             }
+
             let waiter = Waiter::new();
             let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
             // SAFETY: 永久 base 与固定栈节点存活至 registration 先于 node 析构；不遗忘登记。
@@ -489,6 +493,7 @@ fn run_callback(base: &'static TimerBase, timer: *const Timer, owned: bool, kind
     }
     #[cfg(feature = "ktest")]
     testing::pause(timer, testing::PausePoint::Tail);
+
     let state = base.state.lock();
     #[cfg(feature = "ktest")]
     let mut state = state;
@@ -515,6 +520,7 @@ pub(crate) fn handle_interrupt() {
         };
         run_callback(base, timer, owned, TimerKind::Precise);
     }
+
     let mut state = base.state.lock();
     let wake = !state.service_pending && state.coarse_due(time::now());
     if wake {
@@ -550,6 +556,7 @@ fn service(cpu: usize) -> i32 {
         assert!(observation.is_none(), "duplicate timer service");
         *observation = Some(task);
     }
+
     loop {
         let waiter = Waiter::new();
         let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
@@ -561,6 +568,7 @@ fn service(cpu: usize) -> i32 {
         }
         drop(registration);
         drop(waiter);
+
         loop {
             let bh = cpu::BottomHalfGuard::enter();
             let mut callbacks = 0;

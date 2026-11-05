@@ -71,6 +71,7 @@ pub(crate) mod source {
         let task_release = Arc::clone(&release);
         let task_next_round = Arc::clone(&next_round);
         let task_second = Arc::clone(&second);
+
         let join = task::prepare_kernel_on(cpu::current().id, move || {
             task_head.notify(PollMask::POLLIN);
             task_first.complete();
@@ -90,6 +91,7 @@ pub(crate) mod source {
             sink.notifications.load(Ordering::Acquire),
             sink.mask.load(Ordering::Acquire),
         );
+
         next_round.complete();
         second.wait();
         let second_observed = (

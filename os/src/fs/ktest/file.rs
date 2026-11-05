@@ -222,6 +222,7 @@ pub(crate) mod regular {
             ),
         );
         context.expect_eq(stat.size, PATTERN_SIZE);
+
         read_pattern(context, table, fd, 0, 17)?;
         read_pattern(context, table, independent, 0, 11)?;
         read_pattern(context, table, hard, 0, 7)?;
@@ -237,6 +238,7 @@ pub(crate) mod regular {
         );
         read_pattern(context, table, duplicate, 17, 19)?;
         context.expect_eq(checked(context, table.seek(fd, SeekFrom::Current(0)))?, 36);
+
         let mut bytes = [0xa7; 29];
         context.expect_eq(
             checked(context, table.read_at(fd, 4091, &mut bytes))?,
@@ -247,6 +249,7 @@ pub(crate) mod regular {
             checked(context, table.seek(duplicate, SeekFrom::Current(0)))?,
             36,
         );
+
         context.expect_eq(
             checked(context, table.seek(fd, SeekFrom::Current(-16)))?,
             20,
@@ -269,6 +272,7 @@ pub(crate) mod regular {
         context.expect_eq(table.write(fd, b"write").err(), Some(FsError::BadFd));
         context.expect_eq(table.write(fd, b"").err(), Some(FsError::BadFd));
         context.expect_eq(table.readdir(fd).err(), Some(FsError::NotDirectory));
+
         checked(context, table.seek(fd, SeekFrom::Start(0)))?;
         let mut offset = 0;
         while offset < PATTERN_SIZE {
@@ -397,6 +401,7 @@ pub(crate) mod directories {
                 checked(context, table.seek(fd, SeekFrom::Current(0)))?,
                 end_cookie,
             );
+
             checked(context, table.seek(fd, SeekFrom::Start(0)))?;
             enumerate_names(context, table, duplicate, indexed)?;
             let mut byte = [0xa7; 1];
@@ -410,6 +415,7 @@ pub(crate) mod directories {
                 checked(context, table.close(fd))?;
             }
         }
+
         let fd = fixture.open(context, b"/", OpenOptions::default())?;
         let table = fixture.table();
         let mut raw = 0;
@@ -420,6 +426,7 @@ pub(crate) mod directories {
             }
         }
         context.expect_eq(raw, 1);
+
         let followed = fixture.open(context, b"/fastlink", OpenOptions::default())?;
         read_pattern(context, table, followed, 0, 31)?;
         context.expect_eq(
@@ -468,6 +475,7 @@ pub(crate) mod directories {
                 .err(),
             Some(FsError::NotDirectory),
         );
+
         let raw_fd = fixture.open(context, b"/name-\xff\xfe", OpenOptions::default())?;
         let mut bytes = [0xa7; 9];
         context.expect_eq(checked(context, table.read(raw_fd, &mut bytes))?, 9);
@@ -531,6 +539,7 @@ pub(crate) mod slots {
                 .err(),
             Some(FsError::TooManyFiles),
         );
+
         drop(reservation);
         let reservation = checked(context, table.reserve(fixture.limit))?;
         context.expect_eq(reservation.fd(), 1);
@@ -548,6 +557,7 @@ pub(crate) mod slots {
             table.dup_exact(fd, 2, fixture.limit).err(),
             Some(FsError::BadFd),
         );
+
         checked(context, table.close(second))?;
         context.expect_eq(table.close(second).err(), Some(FsError::BadFd));
         context.expect_eq(checked(context, table.dup(fd, fixture.limit))?, second);
@@ -578,6 +588,7 @@ pub(crate) mod slots {
             true,
         );
         context.expect_eq(checked(context, table.flags(fd))?.close_on_exec, false);
+
         let wide = checked(context, FileTable::try_new())?;
         let base = checked(context, wide.reserve(4097))?.publish(file, DescriptorFlags::default());
         context.expect_eq(checked(context, wide.dup_exact(base, 299, 4097))?, 299);
@@ -595,6 +606,7 @@ pub(crate) mod slots {
                 true,
             );
         }
+
         let reserved = checked(context, wide.reserve(4097))?;
         let child = checked(context, wide.try_clone())?;
         context.expect_eq(child.lookup(reserved.fd()).err(), Some(FsError::BadFd));
@@ -661,6 +673,7 @@ pub(crate) mod racing {
                 == 1
                 && fixture.path.owner.observer().blocked(0)
         })?;
+
         checked(context, table.close(fd))?;
         let reused = fixture.open(context, b"/name-\xff\xfe", OpenOptions::default())?;
         context.expect_eq(reused, fd);
@@ -674,6 +687,7 @@ pub(crate) mod racing {
             submitted < fixture.path.owner.disk()?.test_snapshot().submitted,
             true,
         );
+
         let reservation = checked(context, table.reserve(fixture.limit))?;
         let target = reservation.fd();
         fixture.path.owner.publish(
@@ -718,6 +732,7 @@ pub(crate) mod racing {
             ),
             true,
         );
+
         fixture
             .path
             .owner
@@ -765,6 +780,7 @@ pub(crate) mod prefix {
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
             12288,
         );
+
         context.expect_eq(
             table.read(fd, &mut bytes[..4096]).err(),
             Some(FsError::Corrupt),
@@ -773,6 +789,7 @@ pub(crate) mod prefix {
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
             12288,
         );
+
         context.expect_eq(checked(context, table.read(fd, &mut []))?, 0);
         context.expect_eq(
             checked(context, table.seek(fd, SeekFrom::End(0)))?,
@@ -819,6 +836,7 @@ pub(crate) mod mounts {
                 AccessMode::ReadOnly,
             ),
         )?;
+
         let fd = fixture.open(context, b"/mnt/extra/pattern", OpenOptions::default())?;
         let table = fixture.table();
         read_pattern(context, table, fd, 0, 31)?;
@@ -829,6 +847,7 @@ pub(crate) mod mounts {
         let mut bytes = [0xa7; 37];
         context.expect_eq(checked(context, file.read(&mut bytes))?, 37);
         context.expect_eq(patterned(&bytes, 31), true);
+
         drop(file);
         checked(context, vfs.unmount(&covered))?;
         vfs.prune_unused();
@@ -917,6 +936,7 @@ pub(crate) mod oom {
             checked(context, table.seek(fd, SeekFrom::Current(0)))?,
             mm::PAGE_SIZE as u64,
         );
+
         let reopened = fixture.open(context, b"/pattern", OpenOptions::default())?;
         context.expect_eq(reopened, reused_fd);
         read_pattern(context, &table, reopened, 0, 47)?;
@@ -935,6 +955,7 @@ pub(crate) mod oom {
 const VM_CODE: usize = 0x10000;
 const VM_STACK: usize = 0x30000;
 const VM_TARGET: usize = 0x50000;
+
 const VM_RO: PagePermissions = PagePermissions {
     read: true,
     write: false,
@@ -1127,6 +1148,7 @@ pub(crate) mod vm_lifetime {
             expected.len()
         );
         assert!(patterned(&expected, 0));
+
         let mut file_page_attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
@@ -1151,6 +1173,7 @@ pub(crate) mod vm_lifetime {
         fixture.join_vm_user(u64::from_le_bytes(expected) as usize)?;
         assert_eq!(mm.mapping(VM_TARGET).unwrap().physical, original);
         assert_eq!(checked(context, file.seek(SeekFrom::Current(0)))?, 19);
+
         mm.protect(VM_TARGET, mm::PAGE_SIZE, VM_RW).unwrap();
         fixture.start_vm_access(2, Arc::clone(&mm), UserAccess::Write)?;
         fixture.join_vm_user(0)?;
@@ -1169,6 +1192,7 @@ pub(crate) mod vm_lifetime {
         );
         assert!(patterned(&cached, 13));
         assert_ne!(&cached, private);
+
         let tail = VM_TARGET + 2 * mm::PAGE_SIZE;
         let offset = PATTERN_SIZE & !(mm::PAGE_SIZE as u64 - 1);
         mm.map_file(
@@ -1201,6 +1225,7 @@ pub(crate) mod vm_lifetime {
             mm.fault(tail + mm::PAGE_SIZE, UserAccess::Write),
             Err(VmError::BeyondEof)
         );
+
         let empty = fixture.open(context, b"/empty", OpenOptions::default())?;
         let empty_file = checked(context, fixture.table().lookup(empty))?;
         let empty_address = tail + 3 * mm::PAGE_SIZE;
@@ -1218,6 +1243,7 @@ pub(crate) mod vm_lifetime {
             mm.fault(empty_address, UserAccess::Read),
             Err(VmError::BeyondEof)
         );
+
         let sparse = fixture.open(context, b"/sparse", OpenOptions::default())?;
         let sparse_file = checked(context, fixture.table().lookup(sparse))?;
         let sparse_address = empty_address + mm::PAGE_SIZE;
@@ -1234,6 +1260,7 @@ pub(crate) mod vm_lifetime {
         bytes.fill(0xa7);
         assert_eq!(mm.copyin(&mut bytes, sparse_address).error, None);
         assert!(bytes.iter().all(|byte| *byte == 0));
+
         let directory = fixture.open(context, b"/", OpenOptions::default())?;
         let directory_file = checked(context, fixture.table().lookup(directory))?;
         assert_eq!(
@@ -1297,6 +1324,7 @@ pub(crate) mod vm_racing {
                 && fixture.path.owner.observer().gate.test_waiting() == 1
         })?;
         assert!(mm.mapping(VM_TARGET).is_none());
+
         mm.unmap(VM_TARGET, mm::PAGE_SIZE).unwrap();
         mm.map_anonymous(VM_TARGET, mm::PAGE_SIZE, VM_RO, VM_RW)
             .unwrap();
@@ -1309,6 +1337,7 @@ pub(crate) mod vm_racing {
         fixture.path.owner.observer().gate.complete();
         fixture.join_vm_user(0)?;
         assert_eq!(mm.read_u64(VM_TARGET), Ok(0));
+
         let mut attempt = ReclaimAttempt::new();
         let old = checked(
             context,

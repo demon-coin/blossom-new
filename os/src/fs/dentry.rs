@@ -64,6 +64,7 @@ pub(crate) struct PreparedDentry<'a> {
     replaced: Option<DentryRef>,
     reserved: bool,
 }
+
 /// 正绑定已完成；只有此状态允许向名字索引发表候选。
 pub(crate) struct PreparedPositiveDentry<'a>(PreparedDentry<'a>);
 
@@ -80,6 +81,7 @@ impl DentryCache {
         if capacity == 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(capacity)
@@ -114,6 +116,7 @@ impl DentryCache {
         let inode = parent.inode()?;
         let directory = inode.directory_read()?;
         validate_name(name)?;
+
         let (existing, full) = {
             let index = self.entries.lock();
             (
@@ -125,6 +128,7 @@ impl DentryCache {
             dentry.inode()?;
             return Ok(dentry);
         }
+
         // 静止磁盘正绑定仍强持 inode；RAM 权威 inode 不占磁盘缓存预算。
         if full || (!inode.is_memory() && inodes.is_full()) {
             self.prune_unused();
@@ -141,6 +145,7 @@ impl DentryCache {
                 return Err(FsError::NoMemory);
             }
         }
+
         let candidate = DentryRef::try_child(parent, name)?;
         let mut loader = LoadGuard {
             cache: self,
@@ -161,6 +166,7 @@ impl DentryCache {
             dentry.inode()?;
             return Ok(dentry);
         }
+
         #[cfg(feature = "ktest")]
         {
             self.loads.fetch_add(1, Ordering::Relaxed);
@@ -169,6 +175,7 @@ impl DentryCache {
                 hook(&candidate);
             }
         }
+
         let result = directory
             .lookup(inodes, name)
             .and_then(|inode| inode.ok_or(FsError::NotFound));
@@ -223,6 +230,7 @@ impl DentryCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
     /// 父目录写 guard 已持有时读取缓存项，避免在最终组件重查中递归取读锁。
     pub(crate) fn cached_locked(&self, parent: &DentryRef, name: &[u8]) -> Option<DentryRef> {
         let index = self.entries.lock();
@@ -243,6 +251,7 @@ impl DentryCache {
         if self.capacity <= index.entries.len() + index.reserved {
             return Err(FsError::NoMemory);
         }
+
         loader.active = true;
         candidate.set_hashed(true);
         index.entries.push(candidate.clone());
@@ -372,6 +381,7 @@ impl DentryCache {
             let old_topology = source.replace_topology(Some(parent.clone()), name, true);
             (old_source, old_target, old_topology)
         };
+
         drop(old_source);
         drop(old_target);
         drop(old_topology);
@@ -484,6 +494,7 @@ impl DentryRef {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
     /// 弱登记稳定名字对象，不延长根 dentry 或其 inode 的生命期。
     pub(crate) fn downgrade(&self) -> Weak<Dentry> {
         Arc::downgrade(&self.0)
@@ -539,6 +550,7 @@ impl DentryRef {
         }
     }
 }
+
 impl<'cache> PreparedDentry<'cache> {
     /// 完成未入索引候选的正绑定，并转换为仅能成功发表的状态。
     pub(crate) fn bind_positive(self, inode: InodeRef) -> PreparedPositiveDentry<'cache> {
@@ -594,6 +606,7 @@ impl PreparedDentry<'_> {
         drop(replaced);
     }
 }
+
 impl Drop for PreparedDentry<'_> {
     /// 未发表候选退出时只归还索引预算，复杂引用在短锁外释放。
     fn drop(&mut self) {

@@ -52,6 +52,7 @@ impl AnonPageRef {
                 references: 1,
             });
         }
+
         // SAFETY: 生产 PageMap 一次发布永久描述符，随后不移动；首引用发布前
         // 已安装唯一匿名用途，所有用途变化都由同一用途锁与真实计数串行。
         let descriptor = unsafe { Pin::new_unchecked(descriptor) };
@@ -100,6 +101,7 @@ impl Drop for AnonPageRef {
                 None
             }
         };
+
         drop(discarded);
     }
 }
@@ -163,6 +165,7 @@ impl SharedAnon {
         if let Some(page) = self.pages.lock().find(index).cloned() {
             return Ok(page);
         }
+
         let candidate = AnonPageRef::try_new_reclaim(attempt)
             .ok_or(VmError::NoMemory)
             .and_then(|page| {
@@ -173,12 +176,14 @@ impl SharedAnon {
                 })
                 .map_err(|_| VmError::NoMemory)
             });
+
         let mut pages = self.pages.lock();
         if let Some(page) = pages.find(index).cloned() {
             drop(pages);
             drop(candidate);
             return Ok(page);
         }
+
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {

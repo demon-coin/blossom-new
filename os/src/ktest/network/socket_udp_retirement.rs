@@ -13,6 +13,7 @@ pub(crate) mod socket_udp_retirement {
     use crate::net::address::{AddressFamily, InetEndpoint, SocketAddress};
     use crate::net::socket::{SocketFile, MSG_DONTWAIT};
     use crate::net::IoProgress;
+
     /// 真实发送准备 OOM 后结束末 SocketFile，放压不再提交工作，原 reaper 须归还节点和绑定。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -48,19 +49,14 @@ pub(crate) mod socket_udp_retirement {
                 .map_err(|_| TestError("UDP OOM gate observation allocation failed"))?;
             let finished = Arc::try_new(AtomicBool::new(false))
                 .map_err(|_| TestError("UDP OOM gate lifetime allocation failed"))?;
-
             let prepared_gate = prepare_udp_oom_gate(
                 Arc::clone(&entered),
                 Arc::clone(&release),
                 Arc::clone(&finished),
             )?;
-
             net.work_queue().flush();
-
             // exhaust 包含同步 SLUB IPI；停点尚未发表，预备任务栈已占有，CPU0 仍可服务 IPI。
-
             let evidence = pressure.exhaust();
-
             crate::ktest::report::diagnostic(format_args!(
                 "UDP OOM case=last-ofd evidence={:?}",
                 evidence
@@ -68,7 +64,6 @@ pub(crate) mod socket_udp_retirement {
             if evidence != (true, true) {
                 return Err(TestError("UDP OOM did not exhaust real pages and heap"));
             }
-
             let gate = prepared_gate.publish()?;
 
             let result = (|| -> TestResult {
@@ -78,22 +73,18 @@ pub(crate) mod socket_udp_retirement {
                 )?;
 
                 // OFD 保有真实端点；直接提交预备字节，避免在压力中另做文件层 copyin 分配。
-
                 if child_operation(endpoint.send(&payload, None))?
                     != IoProgress::Ready(payload.len())
                 {
                     return Err(TestError("UDP OOM message was not actually accepted"));
                 }
-
                 if child_operation(endpoint.poll(None))?.contains(PollMask::POLLOUT) {
                     return Err(TestError(
                         "UDP OOM accepted message did not consume TX budget",
                     ));
                 }
                 release.store(true, Ordering::Release);
-
                 net.work_queue().flush();
-
                 if !child_operation(endpoint.poll(None))?.contains(PollMask::POLLERR) {
                     return Err(TestError("UDP OOM dispatch did not report POLLERR"));
                 }
@@ -105,19 +96,14 @@ pub(crate) mod socket_udp_retirement {
                 if error != Some(FsError::NoMemory) {
                     return Err(TestError("UDP dispatch did not fail with real NoMemory"));
                 }
+
                 // take_error 的 Modify guard 也安排原 Work；这份票必须仍在压力下结束。
-
                 net.work_queue().flush();
-
                 drop(endpoint);
                 drop(sender);
-
                 net.work_queue().flush();
-
                 // close 回调中提交的 reaper 属于后继颜色，再等一次覆盖其真实停止尾部。
-
                 net.work_queue().flush();
-
                 if file_weak.upgrade().is_some() || gate.try_join().is_some() {
                     return Err(TestError(
                         "UDP OOM OFD or gate lifetime did not end as required",
@@ -127,18 +113,15 @@ pub(crate) mod socket_udp_retirement {
             })();
 
             drop(pressure);
-
             release.store(true, Ordering::Release);
             finished.store(true, Ordering::Release);
-
             let joined = gate.join();
-
             result?;
             if joined? != 0 {
                 return Err(TestError("UDP OOM IRQ gate child failed"));
             }
-            // 放压后只观察末端点，不升级它调用 Modify，也不发送或手动安排工作。
 
+            // 放压后只观察末端点，不升级它调用 Modify，也不发送或手动安排工作。
             observe(
                 || endpoint_weak.upgrade().is_none() && net.ktest_live_endpoints() == 0,
                 "UDP terminal NoMemory stranded the last OFD endpoint or slot",
@@ -162,7 +145,6 @@ pub(crate) mod socket_udp_retirement {
         })?;
 
         context.expect_eq(controller.join()?, 0);
-
         context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
         context.expect_eq(fixture.net.is_stopping(), false);
         Ok(())
@@ -213,17 +195,13 @@ pub(crate) mod socket_udp_retirement {
                 .map_err(|_| TestError("UDP successor gate observation allocation failed"))?;
             let finished = Arc::try_new(AtomicBool::new(false))
                 .map_err(|_| TestError("UDP successor gate lifetime allocation failed"))?;
-
             let prepared_gate = prepare_udp_oom_gate(
                 Arc::clone(&entered),
                 Arc::clone(&release),
                 Arc::clone(&finished),
             )?;
-
             net.work_queue().flush();
-
             let evidence = pressure.exhaust();
-
             crate::ktest::report::diagnostic(format_args!(
                 "UDP OOM case=successor evidence={:?}",
                 evidence
@@ -233,7 +211,6 @@ pub(crate) mod socket_udp_retirement {
                     "UDP successor OOM did not exhaust real pages and heap",
                 ));
             }
-
             let gate = prepared_gate.publish()?;
 
             let result = (|| -> TestResult {
@@ -247,23 +224,19 @@ pub(crate) mod socket_udp_retirement {
                 {
                     return Err(TestError("UDP successor OOM message was not accepted"));
                 }
-
                 // 原 metadata 容量为32；大消息之后31条零长记录跨过16条批预算，不需新 payload 后备。
                 for _ in 0..31 {
                     if child_operation(endpoint.send(&[], None))? != IoProgress::Ready(0) {
                         return Err(TestError("UDP zero successor was not actually accepted"));
                     }
                 }
-
                 if child_operation(endpoint.poll(None))?.contains(PollMask::POLLOUT) {
                     return Err(TestError(
                         "UDP successor records did not consume metadata capacity",
                     ));
                 }
                 release.store(true, Ordering::Release);
-
                 net.work_queue().flush();
-
                 if !child_operation(endpoint.poll(None))?.contains(PollMask::POLLERR) {
                     return Err(TestError(
                         "UDP successor OOM dispatch did not report POLLERR",
@@ -279,10 +252,9 @@ pub(crate) mod socket_udp_retirement {
                         "UDP successor dispatch did not fail with real NoMemory",
                     ));
                 }
+
                 // 等查询票及原批预算后的后继票；接收逐条等待真正 IN，不把 raw 消费冒充交付。
-
                 net.work_queue().flush();
-
                 for _ in 0..31 {
                     observe(
                         || {
@@ -307,9 +279,7 @@ pub(crate) mod socket_udp_retirement {
                         ));
                     }
                 }
-
                 net.work_queue().flush();
-
                 if !child_operation(endpoint.poll(None))?.contains(PollMask::POLLOUT)
                     || gate.try_join().is_some()
                 {
@@ -321,16 +291,14 @@ pub(crate) mod socket_udp_retirement {
             })();
 
             drop(pressure);
-
             release.store(true, Ordering::Release);
             finished.store(true, Ordering::Release);
-
             let joined = gate.join();
-
             result?;
             if joined? != 0 {
                 return Err(TestError("UDP successor IRQ gate child failed"));
             }
+
             let mut bytes = [0u8; 64];
             if receiver.receive(
                 &mut ReadBuffer::kernel(&mut bytes),
@@ -342,6 +310,7 @@ pub(crate) mod socket_udp_retirement {
                     "UDP failed OOM message was delivered after pressure release",
                 ));
             }
+
             {
                 let input = b"normal after OOM";
                 let sent = child_operation(sender.send(
@@ -376,6 +345,7 @@ pub(crate) mod socket_udp_retirement {
                     ));
                 }
             }
+
             child_operation(sender.connect(SocketAddress::Unspecified, FileIoContext::Kernel))?;
             let input = b"new lease after OOM";
             if child_operation(sender.send(
@@ -424,6 +394,7 @@ pub(crate) mod socket_udp_retirement {
                     "UDP post-OOM new lease bytes or source were mispaired",
                 ));
             }
+
             net.work_queue().flush();
             let binding = child_operation(net.tables().reserve_binding(
                 &net,
@@ -448,6 +419,7 @@ pub(crate) mod socket_udp_retirement {
                     ))
                 }
             }
+
             drop((binding, endpoint, sender, receiver));
             socket_retired(&net)?;
             if net.is_stopping() {
@@ -459,7 +431,6 @@ pub(crate) mod socket_udp_retirement {
         })?;
 
         context.expect_eq(controller.join()?, 0);
-
         context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
         context.expect_eq(fixture.net.is_stopping(), false);
         Ok(())

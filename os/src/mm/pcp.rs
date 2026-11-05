@@ -10,6 +10,7 @@ use crate::mm::buddy::{self, Block, BATCH_CAPACITY};
 use crate::sync::{IrqSaveGuard, SpinLock};
 
 const NONE: usize = usize::MAX;
+
 // managed 的约千分之一先限到 1 MiB，再按 high/batch 比例缩小。
 const MANAGED_BATCH_SHIFT: usize = 10;
 const MAX_BATCH_BYTES: usize = 1 << 20;
@@ -134,6 +135,7 @@ pub(crate) fn allocate() -> Option<Block> {
             None
         }
     };
+
     cached.or_else(|| buddy::allocate(0))
 }
 
@@ -158,6 +160,7 @@ pub(crate) unsafe fn release(head_pfn: usize) {
             false
         }
     };
+
     if !cached {
         // SAFETY: try_lock_with_irq 失败没有接管页面，调用者的唯一零阶归还权仍完整；
         // 所有 PCP/IRQ guard 已退出，该页没有被插入任何自由链。

@@ -187,6 +187,7 @@ impl Worker {
                 }
             }
         };
+
         if changed {
             notify(self.cpu);
         }
@@ -198,6 +199,7 @@ impl Worker {
         if !was_running {
             return;
         }
+
         let _lock = STATE_LOCK.lock();
         // SAFETY: scheduler 与 claim/finish 由同一状态锁串行；callback 返回之前才会结束此身份。
         unsafe {
@@ -405,6 +407,7 @@ unsafe fn candidate(
                 cursor = node.next;
             }
         }
+
         let mut cursor = head;
         while !cursor.is_null() {
             let work = &*cursor;
@@ -469,6 +472,7 @@ pub(super) fn notify(cpu: usize) {
             (selected, manager, state.create_failed || associated_rescue)
         }
     };
+
     if let Some(worker) = idle {
         worker.wake();
     }
@@ -699,6 +703,7 @@ fn reap_retired(cpu: usize) {
         let Some((worker, join)) = retired else {
             return;
         };
+
         assert_eq!(join.join(), 0);
         {
             let _lock = STATE_LOCK.lock();
@@ -716,6 +721,7 @@ fn reap_retired(cpu: usize) {
                 }
             }
         }
+
         worker.ready.wake_all();
         if let Some(domain) = &worker.reserved_domain {
             domain.finished.wake_all();
@@ -738,6 +744,7 @@ pub(super) fn initialize() -> Result<(), AllocError> {
         workers.push(prepare_worker(cpu, true, None, None)?);
         managers.push(task::prepare_kernel_on(cpu, move || manager(cpu))?);
     }
+
     for (worker, prepared) in workers {
         publish_worker(worker, prepared);
     }
@@ -785,6 +792,7 @@ fn manager(cpu: usize) -> i32 {
             state.manager_task = Some(observation);
         }
     }
+
     loop {
         reap_retired(cpu);
         let waiter = Waiter::new();
@@ -805,6 +813,7 @@ fn manager(cpu: usize) -> i32 {
         }
         drop(registration);
         drop(waiter);
+
         let requested = {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 消费本次事件；后续冷却责任由此 Task 保留，不能依赖再次提交来重发请求。
@@ -819,6 +828,7 @@ fn manager(cpu: usize) -> i32 {
         if !requested {
             continue;
         }
+
         loop {
             // 其它域持续 OOM 也不能阻止已退出预留者的真实 join 和域 close。
             reap_retired(cpu);
@@ -1014,6 +1024,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             // SAFETY: running 拥有票保活原 into_raw 的固定 Work 存储。
             let work = unsafe { Pin::new_unchecked(&*ticket.work) };
             (work.callback)(work);
+
             {
                 let _lock = STATE_LOCK.lock();
                 // SAFETY: 只有此 running 执行者能完成票；callback 已正常返回且反馈成对恢复。
@@ -1047,6 +1058,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             drop(ticket);
             #[cfg(feature = "ktest")]
             testing::pause(worker.cpu, testing::PausePoint::Finished);
+
             // 连续后继票不能独占 CPU；交接期间仅真实可领取的未关联票免于额外创建执行者。
             if cpu::current().need_resched.load(Ordering::Relaxed) {
                 {
@@ -1059,6 +1071,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             }
             continue;
         }
+
         let (retired, stop) = {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 退休与救援停止谓词同 claim 共用状态锁。
@@ -1081,6 +1094,7 @@ fn service(worker: Arc<Worker>, domain: Option<Arc<Domain>>) -> i32 {
             // 首次 retire=false 已在锁下确认此动态普通 worker 仍有关联票；此处尚未登记 ready。
             testing::pause(worker.cpu, testing::PausePoint::BeforeWait);
         }
+
         let waiter = Waiter::new();
         let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
         // SAFETY: worker 的本地 Arc 保住等待源，固定栈 node 到本轮 registration 撤销。
@@ -1149,6 +1163,7 @@ pub(super) fn assert_wait_allowed(domain: &Arc<Domain>, work: *const Work) {
 pub(super) mod testing {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
+
     /// 生产 claim、完成后及首次退休检查后的独立锁外停点。
     #[derive(Clone, Copy)]
     pub(crate) enum PausePoint {
@@ -1156,14 +1171,17 @@ pub(super) mod testing {
         Finished,
         BeforeWait,
     }
+
     const PAUSE_POINTS: usize = PausePoint::BeforeWait as usize + 1;
     const ARMED: usize = 1;
     const PAUSED: usize = 2;
     const RELEASED: usize = 3;
     const PAUSE_TIMEOUT_SECONDS: u64 = 10;
     const SERVICE_TIMEOUT_SECONDS: u64 = 10;
+
     static PAUSE: [[AtomicUsize; PAUSE_POINTS]; crate::boot::MAX_CPUS] =
         [const { [const { AtomicUsize::new(0) }; PAUSE_POINTS] }; crate::boot::MAX_CPUS];
+
     /// 真实当前与累积池计数，sleeping/running 是成对 scheduler 反馈而非模型值。
     pub(crate) struct PoolStats {
         pub workers: usize,
@@ -1177,6 +1195,7 @@ pub(super) mod testing {
         pub running: usize,
         pub early_wake: usize,
     }
+
     /// 锁下读取生产池计数。
     pub(crate) fn pool_stats(cpu: usize) -> PoolStats {
         let _lock = STATE_LOCK.lock();
@@ -1197,6 +1216,7 @@ pub(super) mod testing {
             }
         }
     }
+
     /// 只观察管理 Task 的真实阻塞状态；弱引用升级、scheduler 查询与强引用析构均在状态锁外。
     pub(crate) fn manager_blocked(cpu: usize) -> bool {
         let observation = {
@@ -1208,10 +1228,12 @@ pub(super) mod testing {
             .and_then(|manager| manager.upgrade())
             .is_some_and(|manager| crate::sched::test_state(&manager) == task::State::Blocked)
     }
+
     /// 观察真实角色，受控回收必须由预备域救援 Task 执行。
     pub(crate) fn is_rescuer() -> bool {
         task::current_worker().is_some_and(|worker| worker.domain.is_some())
     }
+
     /// 所有基础执行者和 manager 必须真实到达无工作阻塞稳态。
     pub(crate) fn wait_services_blocked() {
         let start = crate::arch::read_counter();
@@ -1263,6 +1285,7 @@ pub(super) mod testing {
             crate::sched::yield_now();
         }
     }
+
     /// 为实际 CPU 与指定生产窗口独立建立一次停点。
     /// 同一 fixture 的 Thread 控制者串行武装和清理，真实执行者退出旧停点后才可复武装。
     pub(crate) fn arm_pause(cpu: usize, point: PausePoint) {
@@ -1277,10 +1300,12 @@ pub(super) mod testing {
             Ok(0)
         );
     }
+
     /// 检查真实执行者是否已到达指定窗口，不混淆同 CPU 的不同停点。
     pub(crate) fn is_paused(cpu: usize, point: PausePoint) -> bool {
         PAUSE[cpu][point as usize].load(Ordering::Acquire) == PAUSED
     }
+
     /// 唯一 Thread 控制者放行指定窗口的真实执行者。
     /// 不得持状态锁、调度锁或执行者退出依赖锁；与取消串行，返回不代表已经完成 close/join。
     pub(crate) fn release_pause(cpu: usize, point: PausePoint) {
@@ -1294,6 +1319,7 @@ pub(super) mod testing {
             Ok(PAUSED)
         );
     }
+
     /// 取消尚未到达的武装，或按原 2→3 握手放行已经暂停的真实 worker。
     ///
     /// 仅 Thread 控制者在未持状态锁、调度锁或执行者退出所需锁时调用；同一停点
@@ -1319,6 +1345,7 @@ pub(super) mod testing {
             }
         }
     }
+
     /// 锁外使用有限硬件 counter 握手，绝不持状态锁等待另一 CPU。
     pub(super) fn pause(cpu: usize, point: PausePoint) {
         let pause = &PAUSE[cpu][point as usize];

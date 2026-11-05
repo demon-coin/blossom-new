@@ -34,12 +34,14 @@ pub const SYSCALL_FSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_FSYNC: usize = 82;
 pub const SYSCALL_UTIMENSAT: usize = 88;
+
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
 pub const SYSCALL_FUTEX: usize = 98;
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
+
 pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
 pub const SYSCALL_SETITIMER: usize = 103;
@@ -47,6 +49,7 @@ pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 pub const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 pub const SYSCALL_SYSLOG: usize = 116;
 pub const SYSCALL_YIELD: usize = 124;
+
 pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_TKILL: usize = 130;
 pub const SYSCALL_TGKILL: usize = 131;
@@ -54,6 +57,7 @@ pub const SYSCALL_SIGACTION: usize = 134;
 pub const SYSCALL_SIGPROCMASK: usize = 135;
 pub const SYSCALL_SIGTIMEDWAIT: usize = 137;
 pub const SYSCALL_SIGRETURN: usize = 139;
+
 pub const SYSCALL_TIMES: usize = 153;
 pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
@@ -70,6 +74,7 @@ pub const SYSCALL_GETGID: usize = 176;
 pub const SYSCALL_GETEGID: usize = 177;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_SYSINFO: usize = 179;
+
 pub const SYSCALL_SOCKET: usize = 198;
 pub const SYSCALL_SOCKETPAIR: usize = 199;
 pub const SYSCALL_BIND: usize = 200;
@@ -83,6 +88,7 @@ pub const SYSCALL_RECVFROM: usize = 207;
 pub const SYSCALL_SETSOCKOPT: usize = 208;
 pub const SYSCALL_GETSOCKOPT: usize = 209;
 pub const SYSCALL_SOCK_SHUTDOWN: usize = 210;
+
 pub const SYSCALL_SBRK: usize = 213;
 pub const SYSCALL_BRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
@@ -101,6 +107,7 @@ pub const SYSCALL_MEMBARRIER: usize = 283;
 pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_STATX: usize = 291;
 pub const SYSCALL_FACCESSAT2: usize = 439;
+
 // Not standard POSIX sys_call
 pub const SYSCALL_LS: usize = 500;
 pub const SYSCALL_SHUTDOWN: usize = 501;

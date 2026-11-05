@@ -42,6 +42,7 @@ const RX_BUDGET: usize = 16;
 const TX_BUDGET: usize = 32;
 const FRAME_DESCRIPTOR_COUNT: u16 = 2;
 const POOL_MAX_SLOTS: usize = 32;
+
 type Driver = VirtIONet<KernelHal, SomeTransport<'static>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -155,11 +156,13 @@ impl VirtioNet {
         if transport.device_type() != DeviceType::Network {
             return Err(ProbeError::Resource("selected VirtIO device is not network").into());
         }
+
         transport.request_reset();
         if !transport.reset_complete() {
             return Err(Error::ResetPending.into());
         }
         KernelHal::dma_barrier();
+
         let info = Driver::negotiate(&mut transport)?;
         let status = transport.get_status();
         let inner = prepare_inner(transport, info, domain)?;
@@ -184,6 +187,7 @@ impl VirtioNet {
             observation: ktest::Observation::new(),
         })
         .map_err(|_| VirtioInitError::NoMemory { status })?;
+
         let work = Work::try_new(
             net.work_queue(),
             cpu,
@@ -202,12 +206,14 @@ impl VirtioNet {
         if self.state.lock().phase != Phase::Prepared {
             return Err(Error::AlreadyUsed.into());
         }
+
         // SAFETY: context 是此真实 Arc 的固定值；Root 强拥有覆盖注册到同步注销全尾，
         // handler 有界且不等待，尚未 enable，所有页与 Work 已准备完成。
         let registration =
             unsafe { irq::register(self.interrupt, irq_callback, Arc::as_ptr(self) as *mut ()) }
                 .map_err(ProbeError::Irq)?;
         *self.registration.lock() = Some(registration);
+
         let result = {
             let mut state = self.state.lock();
             state.must_reset = true;
@@ -226,6 +232,7 @@ impl VirtioNet {
                 }
             }
         };
+
         let pending = result?;
         self.registration.lock().as_ref().unwrap().enable();
         self.notify(true);
@@ -285,6 +292,7 @@ impl VirtioNet {
             slot.state = SlotState::Preparing;
             (index, slot.page.take().expect("free TX slot has no page"))
         };
+
         let mut prepared = PreparingTx {
             nic: self,
             slot,
@@ -298,6 +306,7 @@ impl VirtioNet {
                 unsafe { slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len()) };
             write_frame(&mut bytes[self.info.header_len..self.info.header_len + frame_len]);
         }
+
         let result = {
             let mut state = self.state.lock();
             if state.phase != Phase::Live {
@@ -379,6 +388,7 @@ impl VirtioNet {
                 .as_ref()
                 .close_sync();
         }
+
         let must_reset = {
             let state = self.state.lock();
             let inner = state.inner.as_ref().unwrap();
@@ -431,6 +441,7 @@ impl VirtioNet {
                 timer::sleep(Duration::from_millis(1));
             }
         }
+
         #[cfg(feature = "ktest")]
         if must_reset {
             self.observation.reset_confirmed();
@@ -444,6 +455,7 @@ impl VirtioNet {
         self.observation
             .unregistered
             .store(true, core::sync::atomic::Ordering::Release);
+
         let owner = {
             let mut state = self.state.lock();
             let inner: &mut Inner = state.inner.as_mut().unwrap();
@@ -516,6 +528,7 @@ impl VirtioNet {
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
+
         let mut received = 0;
         while received < RX_BUDGET {
             let Some((index, page, len)) = self.take_rx().inspect_err(|_| {
@@ -546,6 +559,7 @@ impl VirtioNet {
                 self.observation.before_rearm.stop();
             }
         }
+
         let again = {
             let mut state = self.state.lock();
             if state.phase != Phase::Live {
@@ -823,6 +837,7 @@ fn prepare_inner(
     )?;
     let rx_heads = prepare_heads(info.rx_depth, status)?;
     let tx_heads = prepare_heads(info.tx_depth, status)?;
+
     // SAFETY: ring 原页先于 queue 构造且保活，真实 coherent CPU/device 同一存储；
     // 未发表的错误路径先析构 queue 控制视图，再按局部逆序析构原页。
     let rx_queue = unsafe { VirtQueue::<KernelHal>::new(rx_layout, rx_ring.region()) }
@@ -891,6 +906,7 @@ fn prepare_heads(depth: u16, status: DeviceStatus) -> Result<Vec<Option<usize>>,
 fn publish_rx(inner: &mut Inner) -> Result<bool, Error> {
     inner.driver.publish()?;
     inner.driver.set_interrupts(false);
+
     for index in 0..inner.rx.len() {
         let slot = &mut inner.rx[index];
         let page = slot.page.as_mut().ok_or(Error::IoError)?;
@@ -904,6 +920,7 @@ fn publish_rx(inner: &mut Inner) -> Result<bool, Error> {
         let head = unsafe { inner.driver.submit_rx(segment) }?;
         install_head(&mut inner.rx, &mut inner.rx_heads, index, head)?;
     }
+
     let pending = inner.driver.enable_interrupts_and_recheck();
     if pending {
         inner.driver.set_interrupts(false);

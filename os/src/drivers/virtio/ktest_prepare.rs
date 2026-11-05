@@ -195,6 +195,7 @@ impl Owner {
         let interrupt = device.interrupt();
         let legacy = matches!(identity, VirtioIdentity::Mmio { version: 1, .. });
         drop(device);
+
         let mut held = Vec::new();
         held.try_reserve_exact(mm::stats().present_pages)
             .map_err(|_| TestError("pressure owner storage allocation failed"))?;
@@ -241,6 +242,7 @@ impl Owner {
         );
         context.expect_eq(snapshot.requires_reset, false);
         context.expect_eq(snapshot.status.contains(DeviceStatus::DRIVER_OK), false);
+
         device
             .publish()
             .map_err(|_| TestError("same candidate publication after OOM failed"))?;
@@ -296,6 +298,7 @@ impl Owner {
         } else {
             None
         };
+
         exhaust(&mut self.held);
         drop(reserved);
         mm::drain_all_pages();
@@ -307,6 +310,7 @@ impl Owner {
             }
             Err(error) => Some(error),
         };
+
         self.held.clear();
         if self.device.is_some() {
             return Err(TestError(
@@ -320,6 +324,7 @@ impl Owner {
         context.expect_eq(irq::test_action_count(self.interrupt), actions);
         context.expect_eq(settled()?, resident);
         context.expect_eq(crate::workqueue::testing::metadata_stats(), metadata);
+
         self.recover(context)?;
         context.expect_eq(irq::test_action_count(self.interrupt), actions);
         context.expect_eq(settled()?, resident);
@@ -349,6 +354,7 @@ impl Owner {
                 self.device.as_ref().unwrap().info().queue_depth,
                 self.info.queue_depth,
             );
+
             let mut observation = None;
             exhaust(&mut self.held);
             drop(reserved);
@@ -365,6 +371,7 @@ impl Owner {
                 }
                 Err(error) => Some(error),
             };
+
             self.held.clear();
             if let Some(disk) = self.disk.as_ref() {
                 disk.stop()
@@ -402,6 +409,7 @@ impl Owner {
         let (order, tag, status) = failure.ok_or(TestError(
             "no actual SG reserve failure in original six page budgets",
         ))?;
+
         self.device = Some(
             prepare(&self.inventory)
                 .map_err(|_| TestError("SG candidate failed after releasing pressure"))?,
@@ -423,6 +431,7 @@ impl Owner {
         drop(self.disk.take());
         context.expect_eq(settled()?, resident);
         context.expect_eq(crate::workqueue::testing::metadata_stats(), metadata);
+
         self.recover(context)?;
         context.expect_eq(settled()?, resident);
         context.expect_eq(crate::workqueue::testing::metadata_stats(), metadata);
@@ -452,10 +461,12 @@ impl Owner {
                 || pdu.device.value() + pdu.len as u64 <= ring.device.value(),
             true,
         );
+
         let snapshot = device.test_prepare_snapshot();
         context.expect_eq(snapshot.status.contains(DeviceStatus::DRIVER_OK), false);
         context.expect_eq(snapshot.requires_reset, false);
         context.expect_eq(snapshot.avail_index, 0);
+
         device
             .publish()
             .map_err(|_| TestError("backend geometry publication failed"))?;
@@ -509,6 +520,7 @@ struct Ring(Owner);
 struct Pdu(Owner);
 struct Sg(Owner);
 struct Backend(Owner);
+
 macro_rules! fixture {
     ($name:ident, $sg:expr) => {
         impl Fixture for $name {
@@ -516,10 +528,12 @@ macro_rules! fixture {
             fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
                 Owner::new($sg).map(Self)
             }
+
             /// typed fixture 保活到原设备、IRQ、Work 与 manager join 都完成。
             fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
                 self.0.quiesce()
             }
+
             /// 普通 final 之前验证原六域归还。
             fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
                 self.0.tear_down(context)
@@ -527,6 +541,7 @@ macro_rules! fixture {
         }
     };
 }
+
 fixture!(Ring, false);
 fixture!(Pdu, false);
 fixture!(Sg, true);
@@ -541,6 +556,7 @@ mod ring {
         fixture.0.pages(context, false)
     }
 }
+
 #[::ktest::suite(fixture = Pdu, isolation = "Case", tags("block", "prepare", "B03"), resources("scratch"), timeout_ms = 20000)]
 mod pdu {
     use super::*;
@@ -550,6 +566,7 @@ mod pdu {
         fixture.0.pages(context, true)
     }
 }
+
 #[::ktest::suite(fixture = Sg, isolation = "Case", tags("block", "prepare", "B03"), resources("scratch"), timeout_ms = 30000)]
 mod sg {
     use super::*;
@@ -559,6 +576,7 @@ mod sg {
         fixture.0.sg(context)
     }
 }
+
 #[::ktest::suite(fixture = Backend, isolation = "Case", tags("block", "prepare", "B03"), resources("scratch"), timeout_ms = 15000)]
 mod backend {
     use super::*;

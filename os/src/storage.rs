@@ -58,6 +58,7 @@ impl Storage {
         if STORAGE.get().is_some() {
             return Err(BlockError::Busy);
         }
+
         // SAFETY: 调用者传入唯一库存、设备独占权及永久映射，准备尚不发表任何数据请求。
         let (prepared, devices) = unsafe { Self::prepare(inventory) }?;
         let storage = STORAGE.call_once(|| prepared);
@@ -95,6 +96,7 @@ impl Storage {
                 storage.names.len(),
                 "storage inventory changed during preparation"
             );
+
             for device in core::iter::once(root).chain(extra) {
                 let present =
                     storage.names.iter().enumerate().any(|(index, name)| {
@@ -104,6 +106,7 @@ impl Storage {
                     return Err(BlockError::NotReady);
                 }
             }
+
             for index in 0..storage.names.len() {
                 if let Some(disk) = storage.owned_disk(index) {
                     disk.start()?;
@@ -113,6 +116,7 @@ impl Storage {
             *storage.views.lock() = views;
             Ok(())
         })();
+
         if let Err(error) = result {
             // 所有已经准备的 owner 均已在永久表内；未确认停止时不摘原槽和完成域。
             return Err(storage.stop_all().err().unwrap_or(error));
@@ -152,6 +156,7 @@ impl Storage {
         if count == 0 {
             return Err(BlockError::NotReady);
         }
+
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(virtio_count)
@@ -166,6 +171,7 @@ impl Storage {
                 unsafe { VirtioDevice::prepare_pci(&inventory.pci, device) }.map_err(init_error)?,
             );
         }
+
         // 原生控制器和 RAM 各有八软件槽及一个原 progress，硬件单通道独立于回调容量。
         let max_active = devices.iter().try_fold(
             (mmc_count + ahci_count + ram_count) * (usize::from(NATIVE_TAG_COUNT) + 1),
@@ -198,6 +204,7 @@ impl Storage {
         if ram_count == 1 {
             names.push(DeviceName::Ram);
         }
+
         let queue = WorkQueue::try_new(WorkQueueConfig {
             max_active,
             ordered: false,
@@ -286,6 +293,7 @@ impl Storage {
         self.ready.store(false, Ordering::Release);
         let views = core::mem::take(&mut *self.views.lock());
         drop(views);
+
         let mut first_error = None;
         for index in 0..self.names.len() {
             let Some(disk) = self.owned_disk(index) else {
@@ -301,6 +309,7 @@ impl Storage {
             }
             drop(disk);
         }
+
         if self.disks.lock().iter().all(Option::is_none) {
             self.queue.close_sync();
             *closed = true;

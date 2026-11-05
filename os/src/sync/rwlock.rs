@@ -67,6 +67,7 @@ impl<T> SleepRwLock<T> {
         if let Some(guard) = self.try_read() {
             return guard;
         }
+
         loop {
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
@@ -102,6 +103,7 @@ impl<T> SleepRwLock<T> {
         if let Some(guard) = self.try_write() {
             return guard;
         }
+
         let mut waiting = WriterWait::new(self);
         loop {
             let waiter = Waiter::new();
@@ -175,6 +177,7 @@ impl<T> Drop for WriterWait<'_, T> {
         if !self.pending {
             return;
         }
+
         let wake = {
             let mut state = self.lock.state.lock();
             state.waiting_writers = state
@@ -184,6 +187,7 @@ impl<T> Drop for WriterWait<'_, T> {
             (!state.writer && (state.readers == 0 || state.waiting_writers == 0))
                 .then_some(state.waiting_writers)
         };
+
         if let Some(waiting_writers) = wake {
             self.lock.wake_waiters(waiting_writers);
         }
@@ -218,6 +222,7 @@ impl<T> Drop for ReadGuard<'_, T> {
                 .expect("rwlock reader count underflow");
             (state.readers == 0).then_some(state.waiting_writers)
         };
+
         if let Some(waiting_writers) = wake {
             self.lock.wake_waiters(waiting_writers);
         }

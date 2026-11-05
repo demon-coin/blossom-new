@@ -30,6 +30,7 @@ impl Fixture for LocalFixture {
 struct NoHeapBase {
     token: usize,
 }
+
 impl Fixture for NoHeapBase {
     /// suite setup 自己也经真实窄捕获执行，诊断由父核对每 VM 恰出现一次。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -38,6 +39,7 @@ impl Fixture for NoHeapBase {
             token: catch(|| 13).unwrap(),
         })
     }
+
     /// 最后一例收敛后消费基础对象，不重置任何内核全局状态。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert_eq!(self.token, 13);
@@ -45,6 +47,7 @@ impl Fixture for NoHeapBase {
         Ok(())
     }
 }
+
 impl Fixture<NoHeapBase> for LocalFixture {
     /// 每例验证基础对象可用，再独立创建局部锁与析构账本。
     fn set_up(context: &mut TestContext<'_>, base: &NoHeapBase) -> Result<Self, TestError> {
@@ -89,6 +92,7 @@ fn nested_and_sequential(context: &mut TestContext<'_>) {
         assert!(!is_unwinding());
         panic!("vertical outer");
     });
+
     for message in ["vertical first", "vertical second"] {
         let result = catch(|| panic!("{}", message)).unwrap_err();
         assert!(result.matches_message(message));
@@ -109,6 +113,7 @@ fn lock_and_irq(context: &mut TestContext<'_>, fixture: &LocalFixture, initially
         panic!("vertical locked panic");
     });
     assert_eq!(crate::arch::irq_enabled(), before);
+
     let mut guard = fixture
         .lock
         .try_lock()
@@ -332,6 +337,7 @@ mod thread {
         assert!(!is_unwinding());
         assert_eq!(fixture.drops.each_ref().map(Cell::get), [1, 1, 1]);
         assert_eq!(fixture.unwinding_drops.get(), 3);
+
         let record = catch(|| panic!("vertical after migration")).unwrap_err();
         assert!(record.matches_message("vertical after migration"));
         assert!(!is_unwinding());
@@ -456,6 +462,7 @@ struct SetupEvidence {
     attempts: Cell<usize>,
     drops: Cell<usize>,
 }
+
 impl Fixture for SetupEvidence {
     /// 基础账本仍是无堆栈对象。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -464,6 +471,7 @@ impl Fixture for SetupEvidence {
             drops: Cell::new(0),
         })
     }
+
     /// 每次尝试必须释放其局部对象；选择任意子集都不依赖其它实例。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert_eq!(self.drops.get(), self.attempts.get());
@@ -475,14 +483,18 @@ impl Fixture for SetupEvidence {
         Ok(())
     }
 }
+
 struct PartialSetup<'a>(&'a Cell<usize>);
+
 impl Drop for PartialSetup<'_> {
     /// Err 返回与真实展开都由正常 Rust 析构释放局部部分对象。
     fn drop(&mut self) {
         self.0.set(self.0.get() + 1);
     }
 }
+
 struct RejectedFixture;
+
 impl Fixture<SetupEvidence> for RejectedFixture {
     /// 只返回真实 Err 或真实 panic，从不发表半构造 fixture。
     fn set_up(context: &mut TestContext<'_>, base: &SetupEvidence) -> Result<Self, TestError> {
@@ -513,6 +525,7 @@ struct CleanupError {
     in_quiesce: bool,
     panics: bool,
 }
+
 impl Fixture for CleanupError {
     /// 无异步资源的具体对象按参数选择真实清理阶段和失败形式。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -524,6 +537,7 @@ impl Fixture for CleanupError {
             ),
         })
     }
+
     /// 清理失败由框架 terminate 结束 VM，不在用例中伪造 fatal。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         if self.in_quiesce {
@@ -535,6 +549,7 @@ impl Fixture for CleanupError {
             Ok(())
         }
     }
+
     /// 消费函数同样保留主体错误并终止，不把清理错误压成普通 Pass。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         if self.panics {
@@ -651,11 +666,13 @@ struct ChildState {
     entered: crate::cpu::AtomicCpuSet,
     finished: crate::cpu::AtomicCpuSet,
 }
+
 struct ChildFixture {
     state: alloc::sync::Arc<ChildState>,
     started: usize,
     cpu_mask: crate::cpu::CpuSet,
 }
+
 impl Fixture for ChildFixture {
     /// 只在 Thread 例申请拥有型状态，分配失败返回真实 TestError。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -670,6 +687,7 @@ impl Fixture for ChildFixture {
             cpu_mask: crate::cpu::CpuSet::empty(),
         })
     }
+
     /// 父框架完成合作停止和真实离栈 join 后，才观察子局部对象的实际析构。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         use core::sync::atomic::Ordering;
@@ -678,10 +696,12 @@ impl Fixture for ChildFixture {
         Ok(())
     }
 }
+
 struct OwnedChildDrop {
     state: alloc::sync::Arc<ChildState>,
     cpu: usize,
 }
+
 impl Drop for OwnedChildDrop {
     /// 普通返回或展开都恰记录一次局部对象释放，绝不在 Drop 中等待或调度。
     fn drop(&mut self) {
@@ -742,6 +762,7 @@ mod children {
         } else {
             drop(publish_child(fixture, cpu, 0)?);
         }
+
         while fixture
             .state
             .entered

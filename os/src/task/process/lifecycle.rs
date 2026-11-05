@@ -16,6 +16,7 @@ impl TaskGraph {
             process.exec_owner = Some(owner);
             slots.len()
         };
+
         for index in 0..capacity {
             let member = {
                 let slots = self.slots.lock();
@@ -37,6 +38,7 @@ impl TaskGraph {
         }
         // 已停止成员使用图的控制等待源，private通知之外还须唤醒其原停驻登记。
         self.control_waiters.wake_all();
+
         loop {
             let completed = {
                 let mut slots = self.slots.lock();
@@ -70,6 +72,7 @@ impl TaskGraph {
             }
             waiter.park();
         }
+
         let released = {
             let mut slots = self.slots.lock();
             let process = self.exec_process(&mut slots, identity, owner)?;
@@ -98,6 +101,7 @@ impl TaskGraph {
                 (Some(old), released, leader_charge)
             }
         };
+
         drop(released);
         Ok(())
     }
@@ -117,6 +121,7 @@ impl TaskGraph {
             process.did_exec = true;
             process.exec_owner = None;
         }
+
         self.control_waiters.wake_all();
         Ok(())
     }
@@ -181,6 +186,7 @@ impl TaskGraph {
                         && (1..=SIGNAL_COUNT as i32).contains(&signal))),
             "invalid Linux exit status"
         );
+
         let (user, group, released, exit, stopped, parent, hangup, charge) = {
             let mut slots = self.slots.lock();
             let old_pgid = identity.group.pgid_object();
@@ -294,11 +300,13 @@ impl TaskGraph {
             };
             (user, group, released, exit, stopped, parent, hangup, charge)
         };
+
         drop(user);
         drop(released);
         drop(charge);
         identity.signals.reclaim_pending();
         group.signals.reclaim_pending();
+
         if let Some(exit) = exit {
             // 先在锁外确认定时回调尾部，随后才允许用户wait回收组身份与时间拥有。
             group.time.stop();
@@ -307,6 +315,7 @@ impl TaskGraph {
             }
             self.flush_group_notifications();
             self.reparent_children(&group);
+
             let (parent, mut retired) = {
                 let mut slots = self.slots.lock();
                 let process = slots[identity.tgid() - 1]
@@ -359,6 +368,7 @@ impl TaskGraph {
                 let retired = autoreap.then(|| reap_child(&mut slots, identity.tgid() - 1, false));
                 (parent, retired)
             };
+
             if let Some(parent) = parent {
                 parent.signals.notify();
             }
@@ -373,6 +383,7 @@ impl TaskGraph {
             send_parent_event(parent.as_deref(), event);
             self.waiters.wake_all();
         }
+
         self.control_waiters.wake_all();
         self.flush_group_notifications();
         drop(group);
@@ -439,6 +450,7 @@ impl TaskGraph {
                 let retired = autoreap.then(|| reap_child(&mut slots, index, false));
                 (parent.filter(|_| event.is_some()), retired)
             };
+
             if let Some(parent) = parent {
                 parent.signals.notify();
             }
@@ -507,6 +519,7 @@ impl TaskGraph {
             }
             reap_child(&mut slots, index, kernel_join)
         };
+
         self.complete_retired_notification(&mut collected);
         self.waiters.wake_all();
         Ok(Some(collected))
@@ -538,6 +551,7 @@ impl TaskGraph {
             if let Some(collected) = self.collect_child(parent, pid, false, true)? {
                 return Ok(collected);
             }
+
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
             // SAFETY: self借用保活固定源；node固定当前Task栈，registration先于
@@ -575,6 +589,7 @@ impl TaskGraph {
             }
             (pid, completed)
         };
+
         if let Some(pid) = pid {
             return self.wait(None, pid);
         }

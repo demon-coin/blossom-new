@@ -72,6 +72,7 @@ impl PollContext {
             // 先撤上下文并结束活等待，再同步确认回调尾部，期间两份存储不移动或退栈。
             unsafe { timer.arm_borrowed(limit) }.expect("fresh precise poll timer rejected");
         }
+
         {
             let mut state = self.state.lock();
             assert!(state.waker.is_none(), "poll context already parked");
@@ -86,6 +87,7 @@ impl PollContext {
             waiter.park();
             WaitResult::Woken
         };
+
         let installed = self.state.lock().waker.take();
         drop(installed);
         drop(waiter);
@@ -191,6 +193,7 @@ impl BitAnd for PollMask {
         Self(self.0 & rhs.0)
     }
 }
+
 impl BitAndAssign for PollMask {
     /// 将当前集合限制为与右侧集合的交集。
     fn bitand_assign(&mut self, rhs: Self) {
@@ -282,6 +285,7 @@ impl PollWaitHead {
             })
             .map_err(|_| FsError::NoMemory)?,
         );
+
         let mut state = self.state.lock();
         {
             let mut next = node.next.lock();
@@ -333,6 +337,7 @@ impl PollWaitHead {
                 detached
             }
         };
+
         drop(detached);
     }
 }

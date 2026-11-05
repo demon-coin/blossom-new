@@ -86,6 +86,7 @@ pub(crate) mod socket_udp_lease {
             endpoints.push(endpoint);
         }
         context.expect_eq(fixture.net.ktest_live_endpoints(), count);
+
         let alias = Arc::clone(endpoints.last().unwrap());
         let weak = Arc::downgrade(&alias);
         for endpoint in &endpoints {
@@ -97,6 +98,7 @@ pub(crate) mod socket_udp_lease {
             "cold UDP non-last owners did not retire",
         )?;
         context.expect_eq(weak.upgrade().is_some(), true);
+
         drop(alias);
         observe(
             || weak.upgrade().is_none(),
@@ -130,6 +132,7 @@ pub(crate) mod socket_udp_lease {
         };
         let payload: [u8; 513] = ::core::array::from_fn(super::support::pattern);
         let before = fixture.net.tables().ktest_udp_storage();
+
         let mut pressure = HeapPressure::prepare()?;
         fixture.net.work_queue().flush();
         let evidence = pressure.exhaust();
@@ -144,6 +147,7 @@ pub(crate) mod socket_udp_lease {
         let peer = sender.peer_address();
         let mask = sender.poll(None);
         drop(pressure);
+
         context.diagnostic(format_args!(
             "UDP first activation={} pressure={:?} result={:?}",
             activation, evidence, result
@@ -161,6 +165,7 @@ pub(crate) mod socket_udp_lease {
         context.expect_eq(sender.timeouts().receive, Some(31));
         context.expect_eq(sender.timeouts().send, Some(47));
         context.expect_eq(sender.take_error(), None);
+
         match activation {
             0 => {
                 context.expect_eq(child_operation(sender.bind(local))?, local);
@@ -185,6 +190,7 @@ pub(crate) mod socket_udp_lease {
         context.expect_eq(sender.reuse_address(), true);
         context.expect_eq(sender.timeouts().receive, Some(31));
         context.expect_eq(sender.timeouts().send, Some(47));
+
         sender.close();
         receiver.close();
         drop((sender, receiver));
@@ -210,6 +216,7 @@ pub(crate) mod socket_udp_lease {
             }))?;
             receivers.push(receiver);
         }
+
         let sender = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         for (index, receiver) in receivers.iter().enumerate() {
             let payload: [u8; 513] =
@@ -227,6 +234,7 @@ pub(crate) mod socket_udp_lease {
             };
             receive_exact(receiver, &payload, source)?;
         }
+
         context.expect_eq(fixture.net.tables().ktest_udp_storage()[2].0, 129 + 1);
         sender.close();
         for receiver in &receivers {
@@ -272,6 +280,7 @@ pub(crate) mod socket_udp_lease {
         context.expect_eq(old_winner.id(), receivers.last().unwrap().id());
         let before = fixture.net.tables().ktest_udp_storage();
         context.expect_eq(before[2], (capacity, capacity));
+
         let mut pressure = HeapPressure::prepare()?;
         fixture.net.work_queue().flush();
         let evidence = pressure.exhaust();
@@ -294,6 +303,7 @@ pub(crate) mod socket_udp_lease {
             .map(|entry| entry.id());
         let binding = first.local();
         drop(pressure);
+
         context.diagnostic(format_args!(
             "UDP key capacity={} pressure={:?} connected={:?} insert={:?} disconnected={:?}",
             capacity, evidence, connected, failed, disconnected
@@ -307,6 +317,7 @@ pub(crate) mod socket_udp_lease {
         context.expect_eq(final_winner, Some(first.id()));
         context.expect_eq(binding, Some(SERVER));
         context.expect_eq(first.peer_address(), Err(FsError::NotConnected));
+
         let payload = b"same id retained its original lease";
         context.expect_eq(
             child_operation(sender.send(payload, Some(SERVER)))?,
@@ -327,6 +338,7 @@ pub(crate) mod socket_udp_lease {
             IoProgress::Ready(17),
         );
         receive_exact(&candidate, b"new key recovered", source)?;
+
         for (index, receiver) in receivers.iter().enumerate() {
             child_operation(receiver.connect(None))?;
             context.expect_eq(
@@ -345,6 +357,7 @@ pub(crate) mod socket_udp_lease {
             );
             receive_exact(receiver, &bytes, source)?;
         }
+
         let contender = child_operation(fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         context.expect_eq(contender.bind(SERVER), Err(FsError::AddressInUse));
         contender.close();
@@ -357,6 +370,7 @@ pub(crate) mod socket_udp_lease {
         drop((receivers, old_winner, first, candidate, sender, contender));
         socket_retired(&fixture.net)
     }
+
     /// AF_UNSPEC 保已接纳消息的旧租约，旧消息交付后归端口且后继绑定仍保持唯一。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -397,6 +411,7 @@ pub(crate) mod socket_udp_lease {
                 || entered.load(Ordering::Acquire),
                 "UDP Work CPU did not enter actual IRQ gate",
             )?;
+
             let old = child_operation(sender.local_address())?;
             let old_input = b"old prepared message";
             child_operation(sender.set_send_budget(old_input.len()))?;
@@ -430,6 +445,7 @@ pub(crate) mod socket_udp_lease {
                     "accepted old UDP record lost binding before dispatch",
                 ));
             }
+
             let input = b"successor prepared datagram";
             if child_operation(sender.send(input, Some(destination)))?
                 != IoProgress::Ready(input.len())
@@ -446,6 +462,7 @@ pub(crate) mod socket_udp_lease {
             if third.bind(new) != Err(FsError::AddressInUse) {
                 return Err(TestError("UDP successor binding not retained"));
             }
+
             release.store(true, Ordering::Release);
             if gate.join()? != 0 {
                 return Err(TestError("UDP lease IRQ gate child failed"));
@@ -474,6 +491,7 @@ pub(crate) mod socket_udp_lease {
                     return Err(TestError("UDP old or successor source and bytes differ"));
                 }
             }
+
             let mut bound = false;
             let mut failure = None;
             observe(
@@ -493,6 +511,7 @@ pub(crate) mod socket_udp_lease {
             if third.bind(new) != Err(FsError::AddressInUse) {
                 return Err(TestError("old UDP lease final put unbound successor"));
             }
+
             release.store(false, Ordering::Release);
             entered.store(false, Ordering::Release);
             let held = Arc::clone(&entered);
@@ -527,6 +546,7 @@ pub(crate) mod socket_udp_lease {
             if gate.join()? != 0 {
                 return Err(TestError("UDP close IRQ gate child failed"));
             }
+
             observe(
                 || {
                     receiver
@@ -549,6 +569,7 @@ pub(crate) mod socket_udp_lease {
             {
                 return Err(TestError("UDP close delivery source or full bytes differ"));
             }
+
             receiver.close();
             contender.close();
             third.close();

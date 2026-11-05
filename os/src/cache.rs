@@ -241,6 +241,7 @@ impl FolioIndex {
         if let Some(victim) = victim {
             victim.release();
         }
+
         let (candidate, allocator, lease) = if let Some(reserve) = reserve {
             assert!(self.metadata, "file/raw index received a metadata source");
             let lease = reserve.try_metadata_slot()?;
@@ -267,6 +268,7 @@ impl FolioIndex {
         };
         let mut prepared = Some(Node::prepare(key, candidate.clone(), None, allocator)?);
         drop(lease);
+
         let (existing, victim) = {
             let mut entries = self.entries.lock();
             if entries.closed {
@@ -280,6 +282,7 @@ impl FolioIndex {
                 (None, victim)
             }
         };
+
         if let Some(victim) = victim {
             victim.release();
         }
@@ -500,6 +503,7 @@ impl MetadataCache {
         if let Some(reserve) = self.reserve() {
             return Ok(reserve);
         }
+
         let mut hot = Vec::new();
         hot.try_reserve_exact(self.capacity())
             .map_err(|_| BlockError::NoMemory)?;
@@ -528,6 +532,7 @@ impl MetadataCache {
         for slot in 0..self.capacity() {
             Node::prime(&reserve, slot)?;
         }
+
         // 所有可失败申请已完成，prime 后的构造只消费真实预备控制块。
         // hot 和源基准保活原 folio，旧节点在替换控制准备期间始终留在索引中。
         for (slot, (key, folio)) in hot.into_iter().enumerate() {
@@ -560,6 +565,7 @@ impl MetadataCache {
             // 原 Heap 控制及其页引用在索引锁外结束，不能由最后 put 反取队列锁。
             old.release();
         }
+
         reserve.mark_ready();
         *self.reserve.lock() = Some(Arc::clone(&reserve));
         Ok(reserve)
@@ -618,6 +624,7 @@ impl MetadataCache {
         if let Some(existing) = Self::existing_facade(&pages.facades.lock(), claim)? {
             return Ok(existing);
         }
+
         let mut selected = Vec::new();
         selected
             .try_reserve_exact(capacity)
@@ -634,6 +641,7 @@ impl MetadataCache {
             load_hook: SpinLock::new(None),
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         let mut facades = pages.facades.lock();
         facades.retain(|entry| entry.strong_count() != 0);
         if let Some(existing) = Self::existing_facade(&facades, claim)? {
@@ -695,6 +703,7 @@ impl MetadataCache {
         if let Some(context) = initial_context {
             context.check()?;
         }
+
         let (folio, tail, reserve) = {
             let _init = self.reserve_init.read();
             let reserve = self.reserve();
@@ -731,6 +740,7 @@ impl MetadataCache {
                 hook(self, block, block_size);
             }
         }
+
         // 首次 ready 与旧 Heap IO 由同一读写 gate 排斥；读侧不串行不同页的普通 RO IO。
         // hook 已在 gate 外结束，完成/凭证归还均不反取 gate；已捕 Some 的旧边界不重采。
         let _legacy_scope = reserve.is_none().then(ReclaimScope::noio);
@@ -789,6 +799,7 @@ impl MetadataCache {
                 Err(BlockError::NotReady) => {}
                 Err(error) => return Err(error),
             }
+
             let _scope = source.map(|_| ReclaimScope::noio());
             let lease = match (source, context) {
                 (Some(source), Some(context)) => Some(source.acquire_aux(context)?),
@@ -1103,6 +1114,7 @@ impl MetadataCache {
             }
             cursor = key + 1;
         }
+
         self.closed.store(true, Ordering::Release);
         cursor = first;
         loop {
@@ -1190,12 +1202,14 @@ impl BufferRef {
         if !claim.view().same_range(cache.claim.view()) {
             return Err(BlockError::InvalidRange);
         }
+
         let result = if let Some(tail) = &self.tail {
             self.update_split(tail, update)?
         } else {
             let mut content = self.folio.lock_content();
             update(content.metadata_bytes_mut(self.offset, self.len)?)
         };
+
         let volume = cache.filesystem.lock().upgrade();
         if let Some(volume) = volume {
             volume.writeback_domain().notify_dirty(&volume);
@@ -1249,6 +1263,7 @@ impl BufferRef {
         if !claim.view().same_range(cache.claim.view()) {
             return Err(BlockError::InvalidRange);
         }
+
         let mut content = self.folio.lock_content();
         let count = self.len.min(PAGE_SIZE - self.offset);
         // SAFETY: 调用者终结本窗口旧消费且块尚未归还；guard 排斥并发 CPU 访问，
@@ -1445,6 +1460,7 @@ impl FileMapping {
         if let Some(folio) = cached {
             return Ok(PreparedFile::Cached(folio.with_file_owner(owner.clone())));
         }
+
         let mut charge = owner
             .is_memory()
             .then(|| owner.reserve_memory_page())
@@ -1549,6 +1565,7 @@ impl FileMapping {
         if range.end <= range.start {
             return 0;
         }
+
         let mut pages = ResidentPages::default();
         let mut tables = RetiredTables::default();
         let mut unmapped = 0;
@@ -1571,6 +1588,7 @@ impl FileMapping {
                 };
             }
         }
+
         self.sync_retired(&pages, &tables);
         drop(pages);
         drop(tables);
@@ -1648,6 +1666,7 @@ impl FileMapping {
                 count += 1;
             }
         }
+
         for data in sources[..count].iter().flatten() {
             if !data.private {
                 let (observed, _) = data.domain.mkclean_range(data, start, folio.phys_addr());
@@ -1671,6 +1690,7 @@ impl FileMapping {
         if dirty != 0 || writeback != 0 {
             return false;
         }
+
         let mut pages = ResidentPages::default();
         let mut tables = RetiredTables::default();
         let mut unmapped = 0;
@@ -1696,6 +1716,7 @@ impl FileMapping {
                 };
             }
         }
+
         self.sync_retired(&pages, &tables);
         drop(pages);
         let freed_tables = tables.release();
@@ -1772,6 +1793,7 @@ impl FileMapping {
             drop(detached);
             drop(folio);
         }
+
         let valid = (new_size % PAGE_SIZE as u64) as usize;
         if valid == 0 {
             return Ok(());
@@ -1969,6 +1991,7 @@ pub(crate) fn reclaim_file(attempt: &mut ReclaimAttempt) {
     if !attempt.wait_writeback() {
         return;
     }
+
     let domain = volume.writeback_domain();
     let boundary = domain.request_progress(&volume);
     let progress = domain.wait_progress(boundary);
@@ -2073,6 +2096,7 @@ fn reclaim_node(
             })
         }
     };
+
     if needs_writeback && writeback.is_none() {
         if let Ok(volume) = inode.disk_volume() {
             if volume.mode() == AccessMode::ReadWrite {

@@ -103,6 +103,7 @@ pub(crate) mod entry {
                         assert_eq!(u64::from_le_bytes(bytes), expected);
                     }
                 }
+
                 let saved = Registers::read(&user);
                 // fork 从真正执行过的完整现场派生，再让复制结果经过同一硬件进入/退出路径。
                 let copied = user.context().fork();
@@ -114,6 +115,7 @@ pub(crate) mod entry {
                     Registers::read(&user) == saved,
                     "copied user registers changed"
                 );
+
                 let id = task::current_task().id();
                 for target in (0..cpu::count()).chain(0..cpu::count()) {
                     if stop.load(Ordering::Acquire) || token.stop_requested() {
@@ -130,6 +132,7 @@ pub(crate) mod entry {
                     assert_eq!(user.context().pc, CODE + arch::loop_spin_offset());
                     sched::cond_resched();
                 }
+
                 user.context().pc = CODE + arch::exit_offset();
                 assert_eq!(event(&user, &token, &stop)?, UserTrap::Syscall);
                 assert_eq!(user.context().gpr[A0], 43);
@@ -170,6 +173,7 @@ pub(crate) mod entry {
             })?;
             fixture.joined(0, 43)?;
         }
+
         for (permissions, accesses) in [
             (
                 None,
@@ -257,12 +261,14 @@ pub(crate) mod entry {
                 Err(PageTableError::MissingTables)
             );
             assert!(table.lookup(TARGET).is_none());
+
             prepared = PreparedTables::try_new(table.needed_tables(TARGET))
                 .map_err(|_| TestError("NoMemory: table middle pages"))?;
             assert!(table
                 .map(TARGET, first.phys_addr(), RW, &mut prepared)
                 .unwrap()
                 .is_none());
+
             let old = table
                 .map(TARGET, second.phys_addr(), RO, &mut prepared)
                 .unwrap()
@@ -272,6 +278,7 @@ pub(crate) mod entry {
                 table.lookup(TARGET + 17).unwrap().physical,
                 second.phys_addr()
             );
+
             let (old, retired) = table.unmap(TARGET);
             assert_eq!(old.unwrap().physical, second.phys_addr());
             assert!(table.lookup(TARGET).is_none());

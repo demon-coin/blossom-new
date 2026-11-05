@@ -127,6 +127,7 @@ impl NetTables {
             unix_growth: SleepMutex::new(()),
         })
     }
+
     /// 只读本域 UDP 相关表的实际长度和后备容量，消费者据此选择真正的增长边界。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_udp_storage(&self) -> [(usize, usize); 3] {
@@ -154,6 +155,7 @@ impl NetTables {
         if !requested.is_unspecified() && !net.is_local(requested.address) {
             return Err(FsError::AddressNotAvailable);
         }
+
         let _growth = self.bindings_growth.lock();
         let mut lease = Arc::try_new(BindLease {
             protocol,
@@ -184,6 +186,7 @@ impl NetTables {
                 }
                 (requested, state.next_port)
             };
+
             if state.bindings.len() == state.bindings.capacity() {
                 if candidate.capacity() <= state.bindings.len() {
                     let capacity = state.bindings.capacity();
@@ -194,6 +197,7 @@ impl NetTables {
                 candidate.append(&mut state.bindings);
                 mem::swap(&mut candidate, &mut state.bindings);
             }
+
             // 尚无外部强引用或弱引用，只有准备者能修改最终端点。
             let prepared = Arc::get_mut(&mut lease).expect("unpublished binding lease shared");
             prepared.local = local;
@@ -250,6 +254,7 @@ impl NetTables {
             if state.closed || state.tcp.iter().any(|entry| entry.id() == id) {
                 return Err(FsError::InvalidOperation);
             }
+
             if state.tcp.len() == state.tcp.capacity() {
                 if candidate.capacity() <= state.tcp.len() {
                     let capacity = state.tcp.capacity();
@@ -260,6 +265,7 @@ impl NetTables {
                 candidate.append(&mut state.tcp);
                 mem::swap(&mut candidate, &mut state.tcp);
             }
+
             state.tcp.push(endpoint);
             return Ok(());
         }
@@ -275,6 +281,7 @@ impl NetTables {
             if state.closed || state.udp.iter().any(|entry| entry.id() == id) {
                 return Err(FsError::InvalidOperation);
             }
+
             if state.udp.len() == state.udp.capacity() {
                 if candidate.capacity() <= state.udp.len() {
                     let capacity = state.udp.capacity();
@@ -285,6 +292,7 @@ impl NetTables {
                 candidate.append(&mut state.udp);
                 mem::swap(&mut candidate, &mut state.udp);
             }
+
             state.udp.push(endpoint);
             return Ok(());
         }
@@ -300,6 +308,7 @@ impl NetTables {
             if state.closed || state.unix.iter().any(|entry| entry.id() == id) {
                 return Err(FsError::InvalidOperation);
             }
+
             if state.unix.len() == state.unix.capacity() {
                 if candidate.capacity() <= state.unix.len() {
                     let capacity = state.unix.capacity();
@@ -310,6 +319,7 @@ impl NetTables {
                 candidate.append(&mut state.unix);
                 mem::swap(&mut candidate, &mut state.unix);
             }
+
             state.unix.push(pair);
             return Ok(());
         }
@@ -325,6 +335,7 @@ impl NetTables {
         {
             return Err(FsError::InvalidOperation);
         }
+
         let _growth = self.tuples_growth.lock();
         let mut candidate = Vec::new();
         loop {
@@ -338,6 +349,7 @@ impl NetTables {
             if state.tuples.iter().any(|entry| entry.0 == id) {
                 return Err(FsError::InvalidOperation);
             }
+
             if state.tuples.len() == state.tuples.capacity() {
                 if candidate.capacity() <= state.tuples.len() {
                     let capacity = state.tuples.capacity();
@@ -348,6 +360,7 @@ impl NetTables {
                 candidate.append(&mut state.tuples);
                 mem::swap(&mut candidate, &mut state.tuples);
             }
+
             state.tuples.push((id, tuple));
             return Ok(());
         }
@@ -387,6 +400,7 @@ impl NetTables {
             if local.port == 0 || state.listeners.iter().any(|entry| entry.0 == id) {
                 return Err(FsError::InvalidOperation);
             }
+
             if state.listeners.len() == state.listeners.capacity() {
                 if candidate.capacity() <= state.listeners.len() {
                     let capacity = state.listeners.capacity();
@@ -397,6 +411,7 @@ impl NetTables {
                 candidate.append(&mut state.listeners);
                 mem::swap(&mut candidate, &mut state.listeners);
             }
+
             state.listeners.push((id, local, dual_stack));
             return Ok(());
         }
@@ -429,6 +444,7 @@ impl NetTables {
                 })
                 .ok_or(FsError::BadFd)?
                 .dual_stack;
+
             if let Some(index) = state.udp_keys.iter().position(|entry| entry.0 == id) {
                 state.udp_keys.remove(index);
             } else if state.udp_keys.len() == state.udp_keys.capacity() {
@@ -441,6 +457,7 @@ impl NetTables {
                 candidate.append(&mut state.udp_keys);
                 mem::swap(&mut candidate, &mut state.udp_keys);
             }
+
             state.udp_keys.push((id, local, peer, dual_stack));
             return Ok(());
         }
@@ -542,6 +559,7 @@ impl NetTables {
         state.tuples.clear();
         state.listeners.clear();
         state.udp_keys.clear();
+
         (
             mem::take(&mut state.tcp),
             mem::take(&mut state.udp),

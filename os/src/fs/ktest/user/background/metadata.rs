@@ -34,6 +34,7 @@ fn throttled_writer(
     let deadline = time::now()
         .checked_add(time::Duration::from_secs(60))
         .ok_or(TestError("dirty writer observation deadline overflow"))?;
+
     loop {
         let snapshot = domain.snapshot();
         let (limit, _) = domain.ktest_limits();
@@ -75,6 +76,7 @@ pub(super) mod cases {
         let before = volume.writeback_domain().snapshot();
         let old_mode = checked(context, inode.metadata_snapshot())?.mode;
         let control = fixture.observe_rounds(true)?;
+
         checked(
             context,
             inode.update_metadata(volume.claim(), |attributes| {
@@ -82,6 +84,7 @@ pub(super) mod cases {
             }),
         )?;
         context.expect_eq(checked(context, file.stat())?.mode, old_mode ^ 0o100);
+
         let after = control.round(1)?;
         context.expect_eq(volume.metadata_cache().has_dirty_or_writeback(), false);
         context.expect_eq(before.completed_bytes < after.completed_bytes, true);
@@ -90,6 +93,7 @@ pub(super) mod cases {
             "background-idle-metadata before={:?} after={:?}",
             before, after
         ));
+
         fixture.release_rounds();
         drained(&volume)?;
         Ok(())
@@ -110,6 +114,7 @@ pub(super) mod cases {
         let pathname = b"/test/background-empty";
         let before = volume.writeback_domain().snapshot();
         let control = fixture.observe_rounds(true)?;
+
         let created = checked(
             context,
             vfs.open_with(
@@ -123,6 +128,7 @@ pub(super) mod cases {
                 |path, _| crate::fs::open_path(&vfs, path),
             ),
         )?;
+
         let result = (|| {
             context.expect_eq(checked(context, created.stat())?.size, 0);
             let after = control.round(1)?;
@@ -135,6 +141,7 @@ pub(super) mod cases {
             ));
             Ok(())
         })();
+
         fixture.release_rounds();
         let removed = checked(
             context,
@@ -167,6 +174,7 @@ pub(super) mod cases {
                 "pressure case requires real FLUSH and the unchanged 4096-page ceiling",
             ));
         }
+
         let mut attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
@@ -178,6 +186,7 @@ pub(super) mod cases {
         let before = volume.writeback_domain().snapshot();
         let global_before = global_snapshot();
         let disk_before = disk.test_snapshot();
+
         disk.test_hold_file_writeback(&folio);
         if fail {
             disk.test_fail_next_data(BlockError::Io);
@@ -194,6 +203,7 @@ pub(super) mod cases {
                     && before.rounds < volume.writeback_domain().snapshot().rounds
             },
         )?;
+
         let held_at = time::now();
         let held = volume.writeback_domain().snapshot();
         context.expect_eq(held.round_selected_data, 1);
@@ -201,6 +211,7 @@ pub(super) mod cases {
             disk_before.data_submitted < disk.test_snapshot().data_submitted,
             true,
         );
+
         let writing = file.clone();
         let writer_control = control.clone();
         let writer_domain = volume.writeback_domain().clone();
@@ -237,6 +248,7 @@ pub(super) mod cases {
             }
             Ok(())
         })?;
+
         let pressured = throttled_writer(volume.writeback_domain(), &writer, held.writer_waits)?;
         let global_pressured = global_snapshot();
         let pressure_limits = volume.writeback_domain().ktest_limits();
@@ -257,6 +269,7 @@ pub(super) mod cases {
         context.expect_eq(pressured.error_seq, held.error_seq);
         context.expect_eq(pressured.sample_end_ns, held.sample_end_ns);
         context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
+
         let observed_cursor = Arc::try_new(AtomicUsize::new(usize::MAX))
             .map_err(|_| TestError("pressure cursor observation OOM"))?;
         let cursor = observed_cursor.clone();
@@ -284,6 +297,7 @@ pub(super) mod cases {
             "throttled writer retained cursor or inode locks or blocked unrelated real I/O",
             || independent_io.result().is_some(),
         )?;
+
         context.expect_eq(independent_io.result(), Some(Ok(())));
         context.expect_eq(observed_cursor.load(Ordering::Acquire) != usize::MAX, true);
         if fail {
@@ -301,6 +315,7 @@ pub(super) mod cases {
         context.expect_eq(io_before.completed < io_after.completed, true);
         context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
         context.expect_eq(folio.writeback_sectors() != 0, true);
+
         let waits_before_release =
             throttled_writer(volume.writeback_domain(), &writer, held.writer_waits)?;
         let release_at = time::now();
@@ -315,6 +330,7 @@ pub(super) mod cases {
                         < volume.writeback_domain().snapshot().writer_wakes
             },
         )?;
+
         let returned = volume.writeback_domain().snapshot();
         let global_after = global_snapshot();
         context.expect_eq(independent_io.result(), Some(Ok(())));
@@ -365,6 +381,7 @@ pub(super) mod cases {
                 true,
             );
         }
+
         fixture.release_rounds();
         fixture.write.join_consumers()?;
         context.expect_eq(writer.result(), Some(Ok(())));
@@ -382,6 +399,7 @@ pub(super) mod cases {
             ((PRESSURE_PAGES - 1) * PAGE_SIZE) as u64,
             &[PRESSURE_BYTE; 32],
         )?;
+
         checked(context, file.sync_range(0..u64::MAX, false))?;
         drained(&volume)?;
         let final_state = volume.writeback_domain().snapshot();
@@ -407,6 +425,7 @@ pub(super) mod cases {
             final_state.sample_bytes <= final_state.completed_bytes,
             true,
         );
+
         let creations_after = creation_snapshot()?;
         let metadata_after = metadata_stats();
         context.expect_eq(

@@ -39,6 +39,7 @@ const MAX_BODY_SIZE: usize =
 const MAX_FRAME_SIZE: usize =
     EXTCONTEXT + SCTX_INFO_SIZE + MAX_BODY_SIZE + CONTEXT_INFO_ALIGNMENT + SCTX_INFO_SIZE;
 const _: () = assert!(MAX_FRAME_SIZE < SIGNAL_MIN_STACK);
+
 const FPU_MAGIC: u32 = 0x4650_5501;
 const LSX_MAGIC: u32 = 0x5358_0001;
 const LASX_MAGIC: u32 = 0x4153_5801;
@@ -110,6 +111,7 @@ impl UserContext {
         let layout = FpLayout::current();
         let (sp, frame_size, record_size) = frame_address(self.gpr[3], args, &layout)?;
         let mut bytes = [0u8; MAX_FRAME_SIZE];
+
         args.info.encode(&mut bytes[..INFO_SIZE]);
         put_u64(&mut bytes, STACK, args.altstack.base as u64);
         put_u32(&mut bytes, STACK_FLAGS, args.altstack.flags);
@@ -140,6 +142,7 @@ impl UserContext {
                 self.fcsr as u32,
             );
         }
+
         // 清零缓冲同时初始化全部 ABI padding、uc_flags/link 和最终 magic=0/size=0。
         let progress = mm.copyout(sp, &bytes[..frame_size]);
         if let Some(error) = progress.error {
@@ -149,6 +152,7 @@ impl UserContext {
             progress.copied, frame_size,
             "successful signal frame copy is incomplete"
         );
+
         self.gpr[1] = args.trampoline;
         self.gpr[3] = sp;
         self.gpr[4] = args.info.signum as usize;
@@ -171,12 +175,14 @@ impl UserContext {
         if flags & !(SC_USED_FP | SC_ADDRERR_RD | SC_ADDRERR_WR) != 0 {
             return Err(VmError::InvalidRange);
         }
+
         let altstack = decode_altstack(&bytes);
         // new 清除异常 CSR 与 kernel_sp；用户帧只提供整数、PC 和扩展寄存器。
         let mut context = Self::new(get_u64(&bytes, MCONTEXT) as usize, 0);
         for (index, register) in context.gpr.iter_mut().enumerate().skip(1) {
             *register = get_u64(&bytes, REGISTERS + index * 8) as usize;
         }
+
         let magic = get_u32(&bytes, EXTCONTEXT);
         let size = get_u32(&bytes, EXTCONTEXT + 4) as usize;
         let mut fcsr_address = None;
@@ -222,6 +228,7 @@ impl UserContext {
             context.fcsr = get_u32(&fp, layout.registers_size() + 8) as usize;
             fcsr_address = Some(body + layout.registers_size() + 8);
         }
+
         let pending_signal = restore_fcsr_pending(mm, fcsr_address, &mut context)?;
         Ok(SignalFrameRestore {
             context,
@@ -309,6 +316,7 @@ fn restore_fcsr_pending(
     if fcsr & enabled == 0 {
         return Ok(None);
     }
+
     let cleared = fcsr & !enabled;
     let progress = mm.copyout(
         address.expect("pending FCSR requires an FP record"),
@@ -321,6 +329,7 @@ fn restore_fcsr_pending(
         progress.copied, 4,
         "successful signal FCSR copy is incomplete"
     );
+
     context.fcsr = cleared as usize;
     Ok(Some(SignalInfo::kernel(SIGFPE)))
 }

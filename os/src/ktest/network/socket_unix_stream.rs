@@ -10,6 +10,7 @@ pub(crate) mod socket_unix_stream {
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::mm::space::Mm;
     use crate::net::{IoProgress, UnixSocketType};
+
     /// 四页槽满后读一字节不归槽，跨槽 PEEK 部分 fault 保留全文；整页释放才写就绪。
     #[test]
     fn unix_shared_fifo_slots_and_cross_page_peek_fault(
@@ -32,6 +33,7 @@ pub(crate) mod socket_unix_stream {
                 page.len(),
             );
         }
+
         let mut bytes = [0u8; 4096];
         for count in [1, 4088] {
             context.expect_eq(
@@ -54,6 +56,7 @@ pub(crate) mod socket_unix_stream {
             );
             context.expect_eq(fifo.empty_slot_capacity(), 0);
         }
+
         let memory = Mm::try_new().map_err(|_| TestError("UNIX MM allocation failed"))?;
         memory
             .map_anonymous(ADDRESS, 4096, RW, RW)
@@ -78,6 +81,7 @@ pub(crate) mod socket_unix_stream {
             operation(context, sender.poll(None))?.contains(PollMask::POLLOUT),
             false,
         );
+
         context.expect_eq(
             operation(
                 context,
@@ -99,6 +103,7 @@ pub(crate) mod socket_unix_stream {
             true,
         );
         context.expect_eq(fifo.empty_slot_capacity(), page.len());
+
         for _ in 0..3 {
             context.expect_eq(
                 operation(
@@ -117,6 +122,7 @@ pub(crate) mod socket_unix_stream {
             );
             context.expect_eq(bytes, page);
         }
+
         sender.close();
         receiver.close();
         drop((sender, receiver, fifo, memory));
@@ -143,6 +149,7 @@ pub(crate) mod socket_unix_stream {
             operation(context, fifo.append(&mut WriteBuffer::kernel(&page)))?,
             page.len(),
         );
+
         let mut pressure = Vec::new();
         pressure
             .try_reserve_exact(crate::mm::stats().present_pages)
@@ -160,6 +167,7 @@ pub(crate) mod socket_unix_stream {
         let mut source = WriteBuffer::kernel(b"new page");
         context.expect_eq(fifo.append(&mut source), Err(FsError::NoMemory));
         context.expect_eq(source.copied(), 0);
+
         let mut bytes = [0u8; 4096];
         context.expect_eq(
             receiver.receive(&mut ReadBuffer::kernel(&mut bytes), false),
@@ -171,6 +179,7 @@ pub(crate) mod socket_unix_stream {
             Ok(page.len()),
         );
         context.expect_eq(bytes, page);
+
         drop(pressure);
         context.expect_eq(
             operation(context, sender.send(b"after OOM"))?,
@@ -196,6 +205,7 @@ pub(crate) mod socket_unix_stream {
             9,
         );
         context.expect_eq(&bytes[..9], b"after OOM");
+
         sender.close();
         receiver.close();
         drop((sender, receiver, fifo));

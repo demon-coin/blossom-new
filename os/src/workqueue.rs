@@ -94,6 +94,7 @@ impl WorkQueue {
             INITIALIZED.load(Ordering::Acquire),
             "work services not initialized"
         );
+
         let value = Domain {
             config,
             state: UnsafeCell::new(DomainState {
@@ -128,6 +129,7 @@ impl WorkQueue {
                 prepared.push(pool::prepare_rescuer(cpu, &domain)?);
             }
         }
+
         // SAFETY: 所有 Task 尚未发表；表容量已准备，插入不分配。
         unsafe {
             let rescues = &mut *domain.rescuers.get();
@@ -179,6 +181,7 @@ impl WorkQueue {
             // SAFETY: 原 manager 只在真实 join 返回后于同锁扣除此计数。
             unsafe { (*self.domain.state.get()).reserved_workers == 0 }
         });
+
         {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 短锁保护 rescuer 的退出谓词。
@@ -191,6 +194,7 @@ impl WorkQueue {
         for rescue in rescues.iter() {
             rescue.worker.wake();
         }
+
         for rescue in rescues.iter() {
             // SAFETY: close_serial 串行唯一关闭者，其他路径只借用不变 worker，不访问 join。
             let join = unsafe {
@@ -252,6 +256,7 @@ impl Domain {
             state.color ^= FLUSH_COLOR_MASK;
             old
         };
+
         wait_until(&self.finished, || {
             let _lock = STATE_LOCK.lock();
             // SAFETY: 锁下检查颜色票计数。
@@ -467,6 +472,7 @@ impl Work {
             (*raw.cast_mut()).owned_raw = raw;
             Pin::new_unchecked(Arc::from_raw(raw))
         };
+
         if reserved {
             // Task 原生准备包含 order4/16页栈；失败尚未发表执行者，原 Work 普通析构。
             let (worker, prepared) = pool::prepare_reserved(cpu, &owner.domain, raw)?;
@@ -489,6 +495,7 @@ impl Work {
     pub fn context(&self) -> usize {
         self.context
     }
+
     /// 返回实际执行和 delayed timer 都必须使用的固定 CPU。
     pub fn cpu(&self) -> usize {
         self.cpu
@@ -665,6 +672,7 @@ impl Work {
             let affected = state.queued != 0 || state.running != 0 || delayed;
             (affected, self.cancel_queued_locked())
         };
+
         drop(removed);
         self.finished.wake_all();
         self.domain.finished.wake_all();
@@ -688,6 +696,7 @@ impl Work {
     pub fn cancel_sync(self: Pin<&Self>) -> bool {
         self.begin_stop(false).finish()
     }
+
     /// 唯一 owner 永久关闭 Work；预留执行者交原 manager 真实 join 后才返回。
     pub fn close_sync(self: Pin<&Self>) -> bool {
         let affected = self.begin_stop(true).finish();
@@ -753,6 +762,7 @@ pub(super) fn wait_until(source: &WaitQueue, mut done: impl FnMut() -> bool) {
     if done() {
         return;
     }
+
     loop {
         let waiter = Waiter::new();
         let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
@@ -789,6 +799,7 @@ pub(crate) mod testing {
         wait_services_blocked, PausePoint,
     };
     use super::*;
+
     /// 当前仍存活的真实 payload 数；不代表 Weak 控制块或 allocator backing 已归还。
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct MetadataStats {
@@ -796,6 +807,7 @@ pub(crate) mod testing {
         pub workers: usize,
         pub domains: usize,
     }
+
     /// 在任务与服务已停稳后读取构造/最后强拥有析构计数，clone 不增加计数。
     pub(crate) fn metadata_stats() -> MetadataStats {
         MetadataStats {
@@ -804,11 +816,13 @@ pub(crate) mod testing {
             domains: LIVE_DOMAINS.load(Ordering::Relaxed),
         }
     }
+
     /// 在真实工作元数据锁内记录标量消息，验证延期通知不会反向取得调度锁。
     pub(crate) fn test_klog() -> u64 {
         let _lock = STATE_LOCK.lock();
         crate::klog::write(crate::klog::Level::Debug, format_args!("X25 pool locked"))
     }
+
     /// 观察真实工作票与当前实际 TaskId。
     pub(crate) struct WorkSnapshot {
         pub queued: bool,
@@ -816,11 +830,13 @@ pub(crate) mod testing {
         pub closed: bool,
         pub worker: usize,
     }
+
     /// 在生产状态锁下读取票身份，不构造模型状态。
     pub(crate) fn snapshot(work: Pin<&Work>) -> WorkSnapshot {
         let _lock = STATE_LOCK.lock();
         snapshot_locked(work)
     }
+
     /// 调用者持 STATE_LOCK，供 delayed 同锁连贯观察其两阶段票。
     pub(super) fn snapshot_locked(work: Pin<&Work>) -> WorkSnapshot {
         // SAFETY: 调用者持统一状态锁，Worker 指针由 running Task 身份保活。

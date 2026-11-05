@@ -127,6 +127,7 @@ pub(crate) mod socket_tcp_progress {
         let configured_bytes = prepare_cold_tcp(context, fixture, 1024)?;
         let cold = baseline().0;
         expect_cold_memory(context, before, cold, configured_bytes)?;
+
         for (ordinal, file) in fixture.tcp_candidates.iter().enumerate() {
             let local = InetEndpoint {
                 port: 47000 + ordinal as u16,
@@ -140,6 +141,7 @@ pub(crate) mod socket_tcp_progress {
         fixture.net.work_queue().flush();
         expect_cold_memory(context, cold, baseline().0, configured_bytes)?;
         context.expect_eq(fixture.net.ktest_live_endpoints(), 1024);
+
         let middle = 512;
         let local = InetEndpoint {
             port: 47512,
@@ -159,6 +161,7 @@ pub(crate) mod socket_tcp_progress {
             "middle cold TCP did not retire normally",
         )?;
         context.expect_eq(fixture.net.ktest_live_endpoints(), 1023);
+
         let replacement = operation(
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
@@ -181,6 +184,7 @@ pub(crate) mod socket_tcp_progress {
             local,
         );
         context.expect_eq(fixture.net.ktest_live_endpoints(), 1024);
+
         let probe = operation(
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
@@ -251,6 +255,7 @@ pub(crate) mod socket_tcp_progress {
             file.set_timeout(true, Some(5_000_000_000));
             file.set_timeout(false, Some(5_000_000_000));
         }
+
         fixture.net.work_queue().flush();
         fixture.pressure = Some(crate::cache::ktest::HeapPressure::prepare()?);
         let evidence = fixture.pressure.as_mut().unwrap().exhaust();
@@ -263,6 +268,7 @@ pub(crate) mod socket_tcp_progress {
         let policy_after = tcp_policy(&subject);
         let state_after = endpoint.state();
         drop(fixture.pressure.take());
+
         context.diagnostic(format_args!(
             "cold TCP activation listen={} pressure={:?} result={:?}",
             listening, evidence, result
@@ -282,6 +288,7 @@ pub(crate) mod socket_tcp_progress {
         if evidence != (true, true) || result != Err(FsError::NoMemory) {
             return Err(TestError("cold TCP activation did not encounter real OOM"));
         }
+
         if listening {
             operation(context, listener.bind(SocketAddress::Inet(local)))?;
             operation(context, listener.listen(1))?;
@@ -309,6 +316,7 @@ pub(crate) mod socket_tcp_progress {
             operation(context, server.tcp_endpoint())?.state(),
             State::Established,
         );
+
         let mut position = 0;
         while position < 8193 {
             let count = (8193 - position).min(97);
@@ -322,6 +330,7 @@ pub(crate) mod socket_tcp_progress {
             context.expect_eq(&output[..count], &input[..count]);
             position += count;
         }
+
         operation(context, client.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
         operation(context, server.shutdown(SHUT_WR))?;
@@ -329,6 +338,7 @@ pub(crate) mod socket_tcp_progress {
         drop((server, subject, client, listener));
         retire_cold_tcp(context, fixture)
     }
+
     /// A 的真实处理拥有持续期间，另一 CPU 的 B 普通文件收发和后台 ACK 独立完成。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -375,6 +385,7 @@ pub(crate) mod socket_tcp_progress {
         )?;
         let server_a = operation(context, listener_a.accept(0, 0, 0, FileIoContext::Kernel))?;
         let server_b = operation(context, listener_b.accept(0, 0, 0, FileIoContext::Kernel))?;
+
         let held = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("native socket ownership observation allocation failed"))?;
         let held_by_a = held.clone();
@@ -396,6 +407,7 @@ pub(crate) mod socket_tcp_progress {
             || held.load(Ordering::Acquire),
             "native A did not take processing ownership",
         )?;
+
         let b = client_b.clone();
         let b_complete = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("native B completion observation allocation failed"))?;
@@ -424,6 +436,7 @@ pub(crate) mod socket_tcp_progress {
         )?;
         context.expect_eq(fixture.release.load(Ordering::Acquire), false);
         context.expect_eq(child.join()?, 0);
+
         fixture.release.store(true, Ordering::Release);
         context.expect_eq(holder.join()?, 0);
         drop((
@@ -480,6 +493,7 @@ pub(crate) mod socket_tcp_progress {
             context,
             healthy_listener.accept(0, 0, 0, FileIoContext::Kernel),
         )?;
+
         operation(context, fixture.net.ktest_drop_next_data(45621, 45620))?;
         let input: [u8; 97] = ::core::array::from_fn(pattern);
         context.expect_eq(operation(context, client.write(&input))?, input.len());
@@ -502,6 +516,7 @@ pub(crate) mod socket_tcp_progress {
         {
             return Err(TestError("data drop observation did not precede raw RTO"));
         }
+
         let mut output = [0u8; 97];
         socket_read_exact(&server, &mut output)?;
         context.expect_eq(output, input);
@@ -523,6 +538,7 @@ pub(crate) mod socket_tcp_progress {
             healthy_server.tcp_endpoint().unwrap().state(),
             State::Established,
         );
+
         socket_write_all(&healthy_client, &input)?;
         socket_read_exact(&healthy_server, &mut output)?;
         context.expect_eq(output, input);
@@ -567,6 +583,7 @@ pub(crate) mod socket_tcp_progress {
         let file_weak = Arc::downgrade(&client);
         let client_weak = Arc::downgrade(client.tcp_endpoint().unwrap());
         let server_weak = Arc::downgrade(server.tcp_endpoint().unwrap());
+
         socket_write_all(&client, b"tail before FIN")?;
         drop(client);
         context.expect_eq(file_weak.upgrade().is_none(), true);
@@ -576,6 +593,7 @@ pub(crate) mod socket_tcp_progress {
         context.expect_eq(&output, b"tail before FIN");
         context.expect_eq(operation(context, server.read(&mut [0u8; 1]))?, 0);
         context.expect_eq(server.tcp_endpoint().unwrap().state(), State::CloseWait);
+
         drop(server);
         observe(
             || {
@@ -587,6 +605,7 @@ pub(crate) mod socket_tcp_progress {
         )?;
         context.expect_eq(fixture.net.is_stopping(), false);
         context.expect_eq(0 < fixture.net.ktest_live_endpoints(), true);
+
         drop(listener);
         socket_retired(&fixture.net)?;
         context.expect_eq(client_weak.upgrade().is_none(), true);
@@ -612,6 +631,7 @@ pub(crate) mod socket_tcp_progress {
         context.expect_eq(endpoint.lock().nagle_enabled(), false);
         operation(context, listener.set_nodelay(false))?;
         context.expect_eq(endpoint.lock().nagle_enabled(), true);
+
         operation(context, listener.set_nodelay(true))?;
         operation(context, listener.set_reuse_address(true))?;
         operation(context, endpoint.set_receive_budget(1024))?;
@@ -625,6 +645,7 @@ pub(crate) mod socket_tcp_progress {
             })),
         )?;
         operation(context, listener.listen(4))?;
+
         let client = operation(
             context,
             SocketFile::try_new_tcp(fixture.net.clone(), AddressFamily::Ipv4, 0, 0, 0),
@@ -653,6 +674,7 @@ pub(crate) mod socket_tcp_progress {
             child_endpoint.congestion_control(),
             smoltcp::socket::tcp::CongestionControl::Reno,
         );
+
         operation(context, child_endpoint.set_keepalive(false))?;
         context.expect_eq(child_endpoint.keepalive(), false);
         context.expect_eq(endpoint.keepalive(), true);
@@ -673,10 +695,12 @@ pub(crate) mod socket_tcp_progress {
         );
         context.expect_eq(endpoint.lock().nagle_enabled(), false);
         context.expect_eq(listener.reuse_address(), true);
+
         socket_write_all(&client, b"raw policy child")?;
         let mut output = [0u8; 16];
         socket_read_exact(&child, &mut output)?;
         context.expect_eq(&output, b"raw policy child");
+
         operation(context, client.shutdown(SHUT_WR))?;
         context.expect_eq(operation(context, child.read(&mut [0u8; 1]))?, 0);
         operation(context, child.shutdown(SHUT_WR))?;

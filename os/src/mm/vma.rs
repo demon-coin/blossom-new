@@ -84,6 +84,7 @@ impl Vma {
         if !permissions_within(permissions, maximum) {
             return Err(VmError::Permission);
         }
+
         let file_range = match &backing {
             VmaBacking::File {
                 inode,
@@ -102,6 +103,7 @@ impl Vma {
             ),
             _ => None,
         };
+
         Arc::try_new(Self {
             range,
             permissions,
@@ -189,6 +191,7 @@ impl Vma {
         {
             return false;
         }
+
         let length = (self.range.end - self.range.start) as u64;
         match (&self.backing, &next.backing) {
             (VmaBacking::Anonymous, VmaBacking::Anonymous) => true,
@@ -295,6 +298,7 @@ impl MmapState {
         if limit < (stack.range.end - base) as u64 {
             return Err(VmError::Unmapped);
         }
+
         Vma::try_stack(base..stack.range.end, stack.permissions, stack.maximum)
     }
 
@@ -407,6 +411,7 @@ impl MmapState {
                 }
             }
         }
+
         let mut cursor = MINIMUM;
         for vma in &self.vmas {
             if vma.range.end <= cursor {

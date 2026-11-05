@@ -13,6 +13,7 @@ use ktest::{TestContext, TestResult};
 
 const MAX_BLOCK: usize = PAGE_SIZE << buddy::MAX_ORDER;
 const LARGE: usize = usize::MAX;
+
 const LAYOUTS: &[(usize, usize, usize)] = &[
     (1, 1, 0),
     (8, 8, 0),
@@ -155,6 +156,7 @@ mod layouts {
                 large_pages += layout_check(object, class);
                 object.fill((index as u8).wrapping_mul(7).wrapping_add(1));
             }
+
             assert_eq!(free() + slub::backing_pages() + large_pages, initial);
             for (index, object) in f.held[..LAYOUTS.len()].iter().flatten().enumerate() {
                 object.check(
@@ -219,12 +221,14 @@ mod layouts {
                 let start = start.expect("owned heap sample has no adjacent live neighbors");
                 f.held.rotate_left(start);
             }
+
             for (index, byte) in [0x35, 0xac, 0x79].iter().copied().enumerate() {
                 f.held[index].as_mut().unwrap().fill(byte);
             }
             let middle = f.held[1].as_ref().unwrap().pointer;
             drop(f.held[1].take());
             f.held[1] = Some(HeapObject::allocate(layout, true));
+
             let left = f.held[0].as_ref().unwrap();
             let zero = f.held[1].as_ref().unwrap();
             let right = f.held[2].as_ref().unwrap();
@@ -268,6 +272,7 @@ mod layouts {
                 f.held[index] = Some(HeapObject::allocate(layout, false));
                 f.held[index].as_mut().unwrap().fill(byte);
             }
+
             let middle = f.held[1].as_mut().unwrap();
             assert!(middle.resize(new_size));
             assert_eq!(middle.pointer.as_ptr() as usize % 64, 0);
@@ -312,6 +317,7 @@ mod layouts {
             }
             assert!(initial < vector.capacity() && 1 < growths);
             assert_eq!(vector.len(), 1025);
+
             for (i, &word) in black_box(vector).iter().enumerate() {
                 assert_eq!(word, i * 23 + 3);
             }
@@ -334,6 +340,7 @@ mod exhaustion {
             let original = f.heap[1].as_ref().unwrap().pointer;
             f.exhaust();
             assert!(!f.pressure.is_empty());
+
             assert!(!f.heap[1].as_mut().unwrap().resize(8193));
             let survivor = f.heap[1].as_ref().unwrap();
             assert_eq!(survivor.pointer, original);

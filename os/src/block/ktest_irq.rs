@@ -64,6 +64,7 @@ fn devices(inventory: &DeviceInventory) -> Result<[VirtioDevice; 2], TestError> 
             "multi-device IRQ requires exactly two attached root/extra devices",
         ));
     }
+
     if inventory.mmio_blocks.len() == 2 {
         // SAFETY: host 只给此 Case 两个独占测试盘，库存和完整永久 MMIO 映射有效；
         // 尚无其它 driver/IRQ owner，每个候选只构造一份实例。
@@ -101,6 +102,7 @@ impl Request {
         if mm::PAGE_SIZE < unit {
             return Err(TestError("IRQ logical block exceeds original page"));
         }
+
         let pages = mm::alloc_pages(0, true)
             .ok_or(TestError("IRQ original Read page allocation failed"))?;
         let mapped = MappedPages::new(pages, 0, unit, BufferDirection::DeviceToDriver)
@@ -207,6 +209,7 @@ impl Fixture for MultiIrq {
                 "RV two real MMIO devices must have distinct PLIC sources",
             ));
         }
+
         let queue0 = WorkQueue::try_new(WorkQueueConfig {
             max_active: usize::from(devices[0].info().tag_count) + 1,
             ordered: false,
@@ -246,6 +249,7 @@ impl Fixture for MultiIrq {
             }
         };
         let disks = [disk0, disk1];
+
         let requests = (|| {
             Ok([
                 Request::new(&disks[0])?,
@@ -274,6 +278,7 @@ impl Fixture for MultiIrq {
                 return Err(error);
             }
         };
+
         let mut fixture = Self {
             baseline,
             metadata,
@@ -309,6 +314,7 @@ impl Fixture for MultiIrq {
                 TestError("multi-device IRQ stop unconfirmed; retaining original DMA/domain")
             })?;
         }
+
         self.uart.quiesce()?;
         for queue in &self.queues {
             queue.close_sync();
@@ -422,12 +428,14 @@ impl MultiIrq {
                 self.actions[index] + added,
             );
         }
+
         disable(&self.disks[0]);
         disable(&self.disks[1]);
         self.uart.begin(b'I')?;
         self.submit(0, 0);
         self.submit(1, 1);
         self.pending(context)?;
+
         self.uart.enable();
         self.enable_disks()?;
         self.requests[0].reclaim(context)?;
@@ -462,6 +470,7 @@ impl MultiIrq {
             context.expect_eq(queue.phase, super::disk::QueuePhase::Live);
             context.expect_eq(queue.failure, None);
         }
+
         self.disks[0]
             .stop()
             .map_err(|_| TestError("first shared action removal cannot safely stop"))?;
@@ -476,6 +485,7 @@ impl MultiIrq {
                     0
                 },
         );
+
         let queue_irqs = self.disks[1].test_snapshot().irq_queue;
         let neighbor_dispatch = irq::testing::dispatch_count(self.sources[1]);
         disable(&self.disks[1]);
@@ -488,6 +498,7 @@ impl MultiIrq {
                     && crate::console::receive_pending()
             },
         )?;
+
         self.uart.enable();
         enable(&self.disks[1]);
         self.requests[3].reclaim(context)?;

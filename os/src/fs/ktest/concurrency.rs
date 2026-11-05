@@ -53,6 +53,7 @@ fn inode_flight(context: &mut TestContext<'_>, fixture: &mut Owner, failure: boo
         .observer()
         .hold_loader
         .store(true, Ordering::Release);
+
     for index in 0..3 {
         fixture.publish(
             index,
@@ -75,12 +76,14 @@ fn inode_flight(context: &mut TestContext<'_>, fixture: &mut Owner, failure: boo
             && fixture.observer().blocked(2)
     })?;
     context.expect_eq(fixture.cache().ktest_load_count(), before_load + 1);
+
     fixture
         .observer()
         .hold_loader
         .store(false, Ordering::Release);
     fixture.observer().gate.complete();
     fixture.join_tasks()?;
+
     let results = core::mem::replace(&mut *fixture.observer().results.lock(), [const { None }; 3]);
     if failure {
         for result in results {
@@ -165,6 +168,7 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
     let before = fixture.disk()?.test_snapshot();
     let first_used = used_index(fixture)?;
     fixture.disk()?.test_suspend_completions();
+
     fixture.publish(
         0,
         Job::Read {
@@ -191,6 +195,7 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
     until("file followers did not Block", || {
         (1..count).all(|index| fixture.observer().blocked(index))
     })?;
+
     context.expect_eq(
         fixture.disk()?.test_snapshot().submitted - before.submitted,
         if same { 1 } else { 2 },
@@ -206,9 +211,11 @@ fn file_flight(context: &mut TestContext<'_>, fixture: &mut Owner, same: bool) -
     context.expect_eq(first_folio.is_ready(), false);
     context.expect_eq(first_folio.range_ready(0, 4096), Err(BlockError::NotReady));
     let address = first_folio.phys_addr();
+
     fixture.disk()?.test_resume_completions();
     fixture.join_tasks()?;
     fixture.disk()?.test_flush_completions();
+
     let pages_loaded = if same { 1 } else { 2 };
     context.expect_eq(
         fixture.disk()?.test_snapshot().submitted - before.submitted,
@@ -240,6 +247,7 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
         .observer()
         .hold_loader
         .store(true, Ordering::Release);
+
     fixture.publish(
         0,
         Job::Fill {
@@ -267,12 +275,14 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
         fixture.observer().blocked(1) && fixture.observer().blocked(2)
     })?;
     context.expect_eq(folio.is_ready(), false);
+
     fixture
         .observer()
         .hold_loader
         .store(false, Ordering::Release);
     fixture.observer().gate.complete();
     fixture.join_tasks()?;
+
     let expected = if checksum {
         FsError::Checksum
     } else {
@@ -284,6 +294,7 @@ fn page_failure(context: &mut TestContext<'_>, fixture: &mut Owner, checksum: bo
     }
     context.expect_eq(folio.wait_ready(), Err(expected.folio_error()));
     context.expect_eq(folio.range_ready(0, 4096), Err(expected.folio_error()));
+
     drop(folio);
     context.expect_eq(inode.mapping().prune_unused(), 1);
     context.expect_eq(inode.mapping().len(), 0);
@@ -313,12 +324,14 @@ pub(crate) mod inode_loading {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("fs-file-loading"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod file_loading {
     use super::*;
+
     /// 一个文件页只有一个 loading owner，两个真实等待者消费同原 PFN。
     #[test]
     #[ktest(tags("B14"))]
     fn same_page_unique_fill(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         file_flight(context, fixture, true)
     }
+
     /// 不同文件页在真实设备上同时保持两个在途请求，不能用全 inode 读锁串行。
     #[test]
     #[ktest(tags("B15"))]
@@ -328,6 +341,7 @@ pub(crate) mod file_loading {
     ) -> TestResult {
         file_flight(context, fixture, false)
     }
+
     /// 首段真实收权后仍 Locked；后续 hole 与非连续 Mapped 块在同原 PFN 上完成。
     #[test]
     #[ktest(tags("B13"))]
@@ -347,6 +361,7 @@ pub(crate) mod file_loading {
         })
         .map_err(|_| TestError("segment observer OOM"))?;
         volume.ktest_set_segment_hook(Some(hook));
+
         fixture.publish(
             0,
             Job::Fill {
@@ -357,6 +372,7 @@ pub(crate) mod file_loading {
         until("segment did not return original read from real IO", || {
             fixture.observer().loader_entered.load(Ordering::Acquire) == 1
         })?;
+
         let folio = inode
             .mapping()
             .cached_folio(0)
@@ -375,9 +391,11 @@ pub(crate) mod file_loading {
             .ktest_last_folio_dma()
             .ok_or(TestError("first real folio SG observation missing"))?;
         context.expect_eq(first_dma, (address, address as u64, 0, bs));
+
         fixture.observer().gate.complete();
         fixture.join_tasks()?;
         volume.ktest_set_segment_hook(None);
+
         context.expect_eq(folio.phys_addr(), address);
         context.expect_eq(folio.is_ready(), true);
         let last_offset = ((mm::PAGE_SIZE / bs - 1) / 2) * 2 * bs;
@@ -409,18 +427,21 @@ pub(crate) mod file_loading {
 #[ktest::suite(fixture = Owner, suite_resources = DeviceInventory, context = "Thread", min_cpus = 2, tags("fs-failed-loading"), resources("root"), timeout_ms = 30000)]
 pub(crate) mod failed_loading {
     use super::*;
+
     /// 两个登记 waiter 收同 inode Checksum，失败占位被移除且下一次真正重载。
     #[test]
     #[ktest(tags("fs-bad-inode-loading", "B12", "B14"))]
     fn inode_checksum_wakes_all(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         inode_flight(context, fixture, true)
     }
+
     /// extent CRC 失败完成同原 file folio，所有消费者收到 Checksum。
     #[test]
     #[ktest(tags("fs-bad-extent-loading", "B13", "B14"))]
     fn page_checksum_wakes_all(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
         page_failure(context, fixture, true)
     }
+
     /// 无 CRC 的传统块越界保持 Corrupt，失败页可 clean prune 后真实重读失败。
     #[test]
     #[ktest(tags("fs-bad-mapping-loading", "B13", "B14"))]

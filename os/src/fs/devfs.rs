@@ -20,6 +20,7 @@ const CONTROLLING_TTY_RDEV: u64 = 5 << u8::BITS;
 const KMSG_RDEV: u64 = (1 << u8::BITS) | 11;
 const KTRACE_RDEV: u64 = (240 << u8::BITS) | 1;
 const TESTHOOK_RDEV: u64 = (240 << u8::BITS) | 2;
+
 const HOOK_MESSAGE_BYTES: usize = 512;
 const DEVICE_IO_CHUNK: usize = 512;
 
@@ -134,6 +135,7 @@ fn copy_hook_message(
     if length == 0 || bytes.len() < length {
         return Err(FsError::InvalidOperation);
     }
+
     let mut copied = 0;
     while copied < length {
         let count = source.pull(&mut bytes[copied..length])?;
@@ -164,6 +166,7 @@ fn dispatch_hook_message(message: &[u8]) -> Result<(), FsError> {
     {
         return Err(FsError::InvalidOperation);
     }
+
     if before {
         contest_hooks::before(case)
     } else {
@@ -498,8 +501,10 @@ impl FileLike for TestHookFile {
     ) -> Result<usize, FsError> {
         require_write(self.flags())?;
         require_hook_control(caller)?;
+
         let mut bytes = [0; HOOK_MESSAGE_BYTES];
         let length = copy_hook_message(source, &mut bytes)?;
+
         dispatch_hook_message(&bytes[..length])?;
         Ok(length)
     }

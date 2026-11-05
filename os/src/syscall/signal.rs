@@ -30,6 +30,7 @@ pub(crate) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     if request.number == 133 {
         return suspend(user, request);
     }
+
     let raw = request.arguments;
     let result = match request.number {
         129..=131 => send(user, request.number, raw),
@@ -103,6 +104,7 @@ fn action(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("sigaction has no MM");
     let identity = user.identity().expect("sigaction has no identity");
     let replacement = if raw[1] == 0 {
@@ -116,10 +118,12 @@ fn action(user: &UserThread, raw: [usize; 6]) -> SysResult {
             mask: word(&bytes, 16),
         })
     };
+
     let previous = identity
         .graph()
         .update_action(&identity, raw[0] as i32 as usize, replacement)
         .map_err(signal_error)?;
+
     if raw[2] != 0 {
         let mut bytes = [0u8; 24];
         bytes[0..8].copy_from_slice(&(previous.handler as u64).to_le_bytes());
@@ -135,6 +139,7 @@ fn mask(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("sigprocmask has no MM");
     let signals = user.signals().expect("sigprocmask has no signals");
     let mut old = signals.mask();
@@ -148,6 +153,7 @@ fn mask(user: &UserThread, raw: [usize; 6]) -> SysResult {
         };
         old = signals.replace_mask(replacement);
     }
+
     if raw[2] != 0 {
         copyout(&mm, raw[2], &old.to_le_bytes())?;
     }
@@ -159,6 +165,7 @@ fn pending(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[1] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("sigpending has no MM");
     let bits = user.signals().expect("sigpending has no signals").pending();
     copyout(&mm, raw[0], &bits.to_le_bytes())?;
@@ -180,11 +187,13 @@ fn altstack(user: &UserThread, raw: [usize; 6]) -> SysResult {
             size: word(&bytes, 16) as usize,
         })
     };
+
     let previous = user
         .signals()
         .expect("sigaltstack has no signals")
         .altstack(sp, replacement)
         .map_err(signal_error)?;
+
     if raw[1] != 0 {
         let mut bytes = [0u8; 24];
         bytes[0..8].copy_from_slice(&(previous.base as u64).to_le_bytes());
@@ -205,6 +214,7 @@ fn suspend(user: &UserThread, request: Request) -> Outcome {
         let value = sigset(&mm, request.arguments[0])?;
         let signals = user.signals().expect("sigsuspend has no signals");
         user.save_mask(signals.replace_mask(value));
+
         loop {
             let waiter = Waiter::new_interruptible();
             if signals.interruption_pending(WaitMode::Interruptible) {
@@ -216,6 +226,7 @@ fn suspend(user: &UserThread, request: Request) -> Outcome {
         }
         Ok(())
     })();
+
     match result {
         Ok(()) => Outcome::Restart(Restart::NoHandler { request }),
         Err(error) => Outcome::Return(error.result()),
@@ -227,6 +238,7 @@ fn timedwait(user: &UserThread, raw: [usize; 6]) -> SysResult {
     if raw[3] != SIGSET_BYTES {
         return Err(Errno::InvalidArgument);
     }
+
     let mm = user.mm().expect("sigtimedwait has no MM");
     let set = sigset(&mm, raw[0])? & !UNBLOCKABLE;
     let deadline = if raw[2] == 0 {
@@ -234,6 +246,7 @@ fn timedwait(user: &UserThread, raw: [usize; 6]) -> SysResult {
     } else {
         Some(timeout(&mm, raw[2])?)
     };
+
     let signals = user.signals().expect("sigtimedwait has no signals");
     let mut selected = signals.take_waited(set);
     if selected.is_none() && deadline.is_none_or(|limit| time::now() < limit) {
@@ -259,6 +272,7 @@ fn timedwait(user: &UserThread, raw: [usize; 6]) -> SysResult {
         }
         signals.end_waited(old);
     }
+
     if let Some(info) = selected {
         if raw[1] != 0 {
             let mut bytes = [0u8; SIGINFO_BYTES];
@@ -286,6 +300,7 @@ fn queue(user: &UserThread, number: usize, raw: [usize; 6]) -> SysResult {
     if pid <= 0 || tid.is_some_and(|tid| tid <= 0) {
         return Err(Errno::InvalidArgument);
     }
+
     let mut bytes = [0u8; SIGINFO_BYTES];
     copyin(&mm, &mut bytes, address)?;
     let info = SignalInfo {
@@ -298,6 +313,7 @@ fn queue(user: &UserThread, number: usize, raw: [usize; 6]) -> SysResult {
             value: word(&bytes, 24) as usize,
         },
     };
+
     if let Some(tid) = tid {
         identity
             .graph()

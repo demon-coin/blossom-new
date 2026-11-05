@@ -17,6 +17,7 @@ use crate::sync::{SleepMutex, SpinLock};
 use crate::wait::WaitResult;
 
 const RECORD_CAPACITY: usize = TEXT_CAPACITY * 4 + 96;
+
 const LOGLEVEL_ERR: i32 = 3;
 const LOGLEVEL_WARNING: i32 = 4;
 const LOGLEVEL_INFO: i32 = 6;
@@ -58,6 +59,7 @@ impl RecordText {
             record.monotonic_ns / crate::time::NSEC_PER_USEC
         )
         .expect("kmsg header exceeded fixed capacity");
+
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for &byte in record.text().as_bytes() {
             if !(32..127).contains(&byte) || byte == b'\\' {
@@ -74,6 +76,7 @@ impl RecordText {
                 text.len += 1;
             }
         }
+
         text.bytes[text.len] = b'\n';
         text.len += 1;
         text
@@ -183,6 +186,7 @@ impl FileLike for KmsgFile {
                     return Err(FsError::Interrupted);
                 }
             }
+
             // park 前释放消费锁；醒来结束唯一 Waiter 后再竞争串行锁和复查序号。
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)

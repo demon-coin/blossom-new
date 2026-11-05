@@ -9,10 +9,12 @@ pub(super) const PRDT_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const IDENTIFY_WORDS: usize = 256;
 pub(super) const IDENTIFY_BYTES: usize = IDENTIFY_WORDS * core::mem::size_of::<u16>();
 pub(super) const H2D_FIS_BYTES: usize = 20;
+
 pub(super) const STATUS_BUSY: u32 = 1 << 7;
 pub(super) const STATUS_DRQ: u32 = 1 << 3;
 pub(super) const STATUS_DEVICE_FAULT: u32 = 1 << 5;
 pub(super) const STATUS_ERROR: u32 = 1;
+
 const READ_DMA_EXT: u8 = 0x25;
 const WRITE_DMA_EXT: u8 = 0x35;
 const READ_DMA: u8 = 0xc8;
@@ -22,10 +24,12 @@ const FLUSH_CACHE: u8 = 0xe7;
 const FIS_TYPE_REG_H2D: u8 = 0x27;
 const FIS_COMMAND: u8 = 1 << 7;
 const DEVICE_LBA: u8 = 1 << 6;
+
 const LBA28_BITS: u32 = 28;
 const LBA48_BITS: u32 = 48;
 const LBA28_MAX_COUNT: u64 = 1 << u8::BITS;
 const LBA48_MAX_COUNT: u64 = 1 << u16::BITS;
+
 const ID_CONFIG: usize = 0;
 const ID_CAPABILITY: usize = 49;
 const ID_COMMAND_SET_2: usize = 83;
@@ -33,6 +37,7 @@ const ID_LBA_CAPACITY: usize = 60;
 const ID_LBA_CAPACITY_2: usize = 100;
 const ID_SECTOR_SIZE: usize = 106;
 const ID_LOGICAL_SECTOR_SIZE: usize = 117;
+
 const ID_NON_ATA: u16 = 1 << 15;
 const ID_DMA_SUPPORTED: u16 = 1 << 8;
 const ID_LBA_SUPPORTED: u16 = 1 << 9;
@@ -60,6 +65,7 @@ impl Identify {
         {
             return Err(BlockError::Unsupported);
         }
+
         let extended_valid = words[ID_COMMAND_SET_2] & ID_VALID_MASK == ID_VALID;
         let lba48 = extended_valid && words[ID_COMMAND_SET_2] & ID_LBA48_SUPPORTED != 0;
         let logical_sectors = if lba48 {
@@ -78,6 +84,7 @@ impl Identify {
         if logical_sectors == 0 || address_limit < logical_sectors {
             return Err(BlockError::Corrupt);
         }
+
         let logical_bytes = if words[ID_SECTOR_SIZE] & (ID_VALID_MASK | ID_LONG_LOGICAL_SECTOR)
             == ID_VALID | ID_LONG_LOGICAL_SECTOR
         {
@@ -98,6 +105,7 @@ impl Identify {
         logical_sectors
             .checked_mul(u64::from(logical_bytes / SECTOR_BYTES as u32))
             .ok_or(BlockError::Corrupt)?;
+
         // FLUSH 和 LBA48 是独立能力，不能从寻址方式推定持久化命令可用。
         let flush = if extended_valid && words[ID_COMMAND_SET_2] & ID_FLUSH_EXT_SUPPORTED != 0 {
             Some(FLUSH_CACHE_EXT)
@@ -106,6 +114,7 @@ impl Identify {
         } else {
             None
         };
+
         Ok(Self {
             logical_bytes,
             logical_sectors,
@@ -144,6 +153,7 @@ impl Identify {
             }
             return self.flush.map(fis).ok_or(BlockError::Unsupported);
         }
+
         let offset = sector
             .checked_mul(SECTOR_BYTES)
             .ok_or(BlockError::InvalidRange)?;
@@ -151,6 +161,7 @@ impl Identify {
         if offset % logical != 0 || bytes as u64 % logical != 0 {
             return Err(BlockError::Misaligned);
         }
+
         let lba = offset / logical;
         let count = bytes as u64 / logical;
         let max_count = if self.lba48 {
@@ -165,6 +176,7 @@ impl Identify {
         if self.logical_sectors < end {
             return Err(BlockError::InvalidRange);
         }
+
         let opcode = match (operation, self.lba48) {
             (BlkOperation::Read, true) => READ_DMA_EXT,
             (BlkOperation::Write, true) => WRITE_DMA_EXT,
@@ -216,6 +228,7 @@ pub(super) fn self_check() {
         id.command(BlkOperation::Flush, 0, 0),
         Err(BlockError::Unsupported)
     );
+
     let lba = 0x0102_0304_u64;
     let read = id.command(BlkOperation::Read, lba * 8, 8192).unwrap();
     assert_eq!(&read[4..11], &[4, 3, 2, 0x40, 1, 0, 0]);
@@ -224,6 +237,7 @@ pub(super) fn self_check() {
         id.command(BlkOperation::Read, 1, 4096),
         Err(BlockError::Misaligned)
     );
+
     words[83] |= 1 << 12;
     assert_eq!(
         Identify::parse(&words)
@@ -232,6 +246,7 @@ pub(super) fn self_check() {
             .unwrap()[2],
         0xe7
     );
+
     words[83] |= 1 << 13;
     assert_eq!(
         Identify::parse(&words)
@@ -240,6 +255,7 @@ pub(super) fn self_check() {
             .unwrap()[2],
         0xea
     );
+
     words[117] = 0;
     assert!(Identify::parse(&words).is_err());
 }

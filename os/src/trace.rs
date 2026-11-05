@@ -12,6 +12,7 @@ use crate::task::{self, TaskId};
 use crate::{cpu, time};
 
 const CAPACITY: usize = 128;
+
 // 七个固定字段的十进制最大值及分隔符不超过 192 字节。
 const RECORD_TEXT_CAPACITY: usize = 192;
 const CPU_TEXT_CAPACITY: usize = 80;
@@ -103,6 +104,7 @@ pub(crate) fn record(kind: Kind, object: u64, value: u64) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
+
     // 进入 IRQ-save 后才能固定 CPU；STOP 的本核 CSD 不能越过本次完整提交。
     let _irq = IrqSaveGuard::new();
     let cpu = cpu::current().id;
@@ -127,6 +129,7 @@ pub(crate) fn start() -> Result<(), FsError> {
     if enabled() {
         return Err(FsError::Busy);
     }
+
     // 同一控制锁保证前次 STOP 的全部 CSD 已返回，不会与清环并行提交。
     for owner in cpu::actual_set().iter() {
         let mut ring = RINGS[owner].lock();
@@ -172,15 +175,18 @@ pub(crate) fn snapshot() -> Result<Vec<u8>, FsError> {
     if enabled() {
         return Err(FsError::Busy);
     }
+
     let cpus = cpu::count();
     let mut capacity = HEADER_TEXT_CAPACITY + cpus * CPU_TEXT_CAPACITY;
     for ring in &RINGS[..cpus] {
         capacity += ring.lock().retained() * RECORD_TEXT_CAPACITY;
     }
+
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| FsError::NoMemory)?;
+
     let mut text = SnapshotText(bytes);
     writeln!(
         text,

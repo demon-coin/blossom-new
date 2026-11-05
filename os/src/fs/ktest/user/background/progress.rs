@@ -30,6 +30,7 @@ fn redirty_observed(
                     && folio.writeback_sectors() != 0)
         },
     )?;
+
     if producer.result().is_some() {
         return Err(TestError(
             "redirty producer exited before the original completion",
@@ -50,6 +51,7 @@ impl BackgroundOwner {
         let deadline = time::now()
             .checked_add(time::Duration::from_secs(60))
             .ok_or(TestError("redirty producer deadline overflow"))?;
+
         self.write.consume_sync(1, move || {
             while !control.producer_stop.load(Ordering::Acquire) {
                 if deadline <= time::now() {
@@ -96,6 +98,7 @@ pub(super) mod cases {
         pages
             .try_reserve_exact(ROUND_PAGES)
             .map_err(|_| TestError("hot prefix original page observation OOM"))?;
+
         if metadata {
             records
                 .try_reserve_exact(32)
@@ -151,6 +154,7 @@ pub(super) mod cases {
                 ));
             }
         }
+
         let control = fixture.observe_rounds(metadata)?;
         {
             let _data = inode.mapping().lock_writeback();
@@ -204,6 +208,7 @@ pub(super) mod cases {
                 }
             }
         }
+
         let first = control.round(1)?;
         finite_round(context, first);
         let prefix = if metadata { 16 } else { 48 };
@@ -220,6 +225,7 @@ pub(super) mod cases {
                 .all(|(_, page)| page.dirty_sectors() != 0),
             true,
         );
+
         for round in 2..=3 {
             if metadata {
                 for (position, (_, record)) in records.iter().enumerate() {
@@ -246,6 +252,7 @@ pub(super) mod cases {
                     }
                 }
             }
+
             control.gate.complete();
             let completed = control.round(round)?;
             finite_round(context, completed);
@@ -267,12 +274,14 @@ pub(super) mod cases {
                 break;
             }
         }
+
         context.expect_eq(
             pages[prefix..]
                 .iter()
                 .all(|(_, page)| page.dirty_sectors() == 0),
             true,
         );
+
         fixture.release_rounds();
         checked(context, volume.sync())?;
         drained(&volume)?;
@@ -297,6 +306,7 @@ pub(super) mod cases {
         )?;
         let mapping = shared_alias(context, &file, 0)?;
         let control = fixture.observe_rounds(false)?;
+
         // 先让末页通过一次真实后台轮，原单向扫描到末尾后续点归零；同一轮尾门挡住后续扫描。
         context.expect_eq(
             file.write_at(((ROUND_PAGES - 1) * PAGE_SIZE) as u64, &[0x41]),
@@ -310,6 +320,7 @@ pub(super) mod cases {
             prepared.round_completed_bytes,
             prepared.round_accepted_bytes,
         );
+
         let before = disk.test_snapshot();
         let entry_slots = volume.dirty_inode_limit();
         // 原扫描互斥仅稳定入口集合，普通写仍通过正式 inode/invalidate/content 路径。
@@ -334,6 +345,7 @@ pub(super) mod cases {
                     && volume.writeback_domain().snapshot().round_selected_data == 48
             },
         )?;
+
         let producer = fixture.redirty(
             file.clone(),
             mapping.clone(),
@@ -346,6 +358,7 @@ pub(super) mod cases {
             folio.phys_addr(),
         );
         bytes_at(context, &file, 0, &[0x41, 0x52, 0x73])?;
+
         disk.test_resume_completions();
         let first = control.round(2)?;
         finite_round(context, first);
@@ -360,11 +373,13 @@ pub(super) mod cases {
         );
         context.expect_eq(dirty_inode_present(&volume, &inode), true);
         context.expect_eq(producer.result(), None);
+
         let produced = control.produced.load(Ordering::Acquire);
         until(
             "producer stopped while the completed round remained gated",
             || produced < control.produced.load(Ordering::Acquire),
         )?;
+
         control.gate.complete();
         let second = control.round(3)?;
         finite_round(context, second);
@@ -377,6 +392,7 @@ pub(super) mod cases {
             before.data_submitted < disk.test_snapshot().data_submitted,
             true,
         );
+
         control.producer_stop.store(true, Ordering::Release);
         fixture.write.join_consumers()?;
         context.expect_eq(producer.result(), Some(Ok(())));
@@ -413,14 +429,17 @@ pub(super) mod cases {
         )?;
         let mapping = shared_alias(context, &file, 0)?;
         let control = fixture.observe_rounds(false)?;
+
         context.expect_eq(file.write_at(95 * PAGE_SIZE as u64, &[0x45]), Ok(1));
         let background = control.round(1)?;
         finite_round(context, background);
+
         for index in 0..8 {
             context.expect_eq(file.write_at((index * PAGE_SIZE) as u64, &[0x41]), Ok(1));
         }
         context.expect_eq(file.write_at(64 * PAGE_SIZE as u64, &[0x64]), Ok(1));
         let before = volume.writeback_domain().snapshot();
+
         disk.test_hold_file_writeback(&folio);
         let syncing = file.clone();
         let sync = fixture.write.consume_sync(0, move || {
@@ -430,6 +449,7 @@ pub(super) mod cases {
             "explicit range did not wait for its accepted original data",
             || disk.test_file_writeback_is_held(&folio) && sync.blocked(),
         )?;
+
         let producer = fixture.redirty(
             file.clone(),
             mapping,
@@ -437,6 +457,7 @@ pub(super) mod cases {
             64 * PAGE_SIZE as u64,
         )?;
         redirty_observed(&control, &producer, &folio)?;
+
         disk.test_resume_completions();
         until(
             "explicit range chased future Dirty instead of ending its entry selection",
@@ -460,11 +481,13 @@ pub(super) mod cases {
         context.expect_eq((8 * PAGE_SIZE) as u64 <= accepted, true);
         context.expect_eq(accepted <= (9 * PAGE_SIZE) as u64, true);
         context.expect_eq(after.rounds, background.rounds);
+
         let produced = control.produced.load(Ordering::Acquire);
         until(
             "range producer no longer advances after sync returned",
             || produced < control.produced.load(Ordering::Acquire),
         )?;
+
         control.producer_stop.store(true, Ordering::Release);
         fixture.write.join_consumers()?;
         context.expect_eq(producer.result(), Some(Ok(())));

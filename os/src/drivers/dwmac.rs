@@ -40,6 +40,7 @@ const FRAME_MIN: usize = smoltcp::wire::ETHERNET_HEADER_LEN;
 const FRAME_MAX: usize = ETHERNET_FRAME_CAPACITY;
 const RX_BUDGET: usize = 16;
 const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+
 const MAC_CONFIG: usize = 0;
 const MAC_ADDRESS_ENABLE: u32 = 1 << 31;
 const MAC_FILTER_MULTICAST: u32 = 1 << 4;
@@ -50,6 +51,7 @@ const DMA_BUS_MODE: usize = 0x1000;
 const DMA_SOFTWARE_RESET: u32 = 1;
 const DMA_BURST_LENGTH: u32 = 8;
 const DMA_RESET_TIMEOUT: Duration = Duration::from_secs(2);
+
 const DWMAC4_PACKET_FILTER: usize = 0x8;
 const DWMAC4_TX_FLOW_CONTROL: usize = 0x70;
 const DWMAC4_RX_FLOW_CONTROL: usize = 0x90;
@@ -75,6 +77,7 @@ const DWMAC4_DMA_TX_RING_LENGTH: usize = 0x112c;
 const DWMAC4_DMA_RX_RING_LENGTH: usize = 0x1130;
 const DWMAC4_DMA_INTERRUPT_ENABLE: usize = 0x1134;
 const DWMAC4_DMA_STATUS: usize = 0x1160;
+
 const DWMAC4_STATUS_ACK_MASK: u32 = 0xffff;
 const DWMAC4_DMA_NORMAL_INTERRUPT: u32 = 1 << 15;
 const DWMAC4_DMA_ABNORMAL_INTERRUPT: u32 = 1 << 14;
@@ -106,6 +109,7 @@ const DWMAC4_MTL_RX_STORE_FORWARD: u32 = 1 << 5;
 const DWMAC4_MTL_TX_WEIGHT_DEFAULT: u32 = 0x10;
 const DWMAC4_RX_QUEUE_DCB: u32 = 2;
 const DWMAC4_MULTICAST_BROADCAST_QUEUE: u32 = 1 << 20;
+
 const DWMAC1000_FRAME_FILTER: usize = 0x4;
 const DWMAC1000_FLOW_CONTROL: usize = 0x18;
 const DWMAC1000_VERSION: usize = 0x20;
@@ -122,6 +126,7 @@ const DWMAC1000_DMA_STATUS: usize = 0x1014;
 const DWMAC1000_DMA_CONTROL: usize = 0x1018;
 const DWMAC1000_DMA_INTERRUPT_ENABLE: usize = 0x101c;
 const DWMAC1000_DMA_HW_FEATURE: usize = 0x1058;
+
 const DWMAC1000_STATUS_ACK_MASK: u32 = 0x1ffff;
 const DWMAC1000_DMA_NORMAL_INTERRUPT: u32 = 1 << 16;
 const DWMAC1000_DMA_ABNORMAL_INTERRUPT: u32 = 1 << 15;
@@ -145,16 +150,19 @@ const DWMAC1000_DMA_RX_STORE_FORWARD: u32 = 1 << 25;
 const DWMAC1000_DMA_TX_STORE_FORWARD: u32 = 1 << 21;
 const DWMAC1000_DMA_SECOND_FRAME: u32 = 1 << 2;
 const DWMAC1000_MAC_INTERRUPT_DISABLE: u32 = 0x60f;
+
 const MAC_VERSION_MASK: u32 = 0xff;
 const DWMAC_CORE_5_10: u32 = 0x51;
 const DWMAC_CORE_5_20: u32 = 0x52;
 const DWMAC_CORE_3_70: u32 = 0x37;
+
 const STARFIVE_INTERFACE_BITS: u32 = 3;
 const STARFIVE_INTERFACE_MASK: u32 = (1 << STARFIVE_INTERFACE_BITS) - 1;
 const STARFIVE_INTERFACE_RGMII: u32 = 1;
 const STARFIVE_INTERFACE_RMII: u32 = 4;
 const STARFIVE_TX_CLOCK_INDEX: usize = 3;
 pub(crate) const DWMAC1000_MMIO_MIN_BYTES: usize = DWMAC1000_DMA_HW_FEATURE + REGISTER_BYTES;
+
 const RGMII_GIGABIT_CLOCK_HZ: u64 = 125_000_000;
 const MII_FAST_ETHERNET_CLOCK_HZ: u64 = 25_000_000;
 const MII_ETHERNET_CLOCK_HZ: u64 = MII_FAST_ETHERNET_CLOCK_HZ / 10;
@@ -411,6 +419,7 @@ impl Registers {
                 );
                 self.write(DWMAC4_RX_QUEUE_CONTROL0, DWMAC4_RX_QUEUE_DCB);
                 self.write(DWMAC4_RX_QUEUE_CONTROL1, DWMAC4_MULTICAST_BROADCAST_QUEUE);
+
                 // 接受广播、全部组播与 MAC0 精确匹配，硬件不处理协议校验或 FCS stripping。
                 self.write(
                     DWMAC4_PACKET_FILTER,
@@ -419,6 +428,7 @@ impl Registers {
                 self.write(DWMAC4_TX_FLOW_CONTROL, 0);
                 self.write(DWMAC4_RX_FLOW_CONTROL, 0);
                 self.write(DWMAC4_INTERRUPT_ENABLE, 0);
+
                 self.write(DMA_BUS_MODE, DWMAC4_DMA_DESCRIPTOR_CACHE);
                 self.write(
                     DWMAC4_DMA_CHANNEL_CONTROL,
@@ -433,6 +443,7 @@ impl Registers {
                     (DMA_BURST_LENGTH << DWMAC4_DMA_BURST_SHIFT)
                         | ((BUFFER_LEN as u32) << DWMAC4_DMA_RX_BUFFER_SHIFT),
                 );
+
                 self.write(
                     DWMAC4_DMA_TX_BASE_HIGH,
                     (inner.tx_ring.address(0) >> u32::BITS) as u32,
@@ -458,6 +469,7 @@ impl Registers {
                         "GMAC enhanced descriptors are unavailable",
                     ));
                 }
+
                 // 增强格式32B，DSL单位为32bit字；非一致64B槽需跳八字，ATDS必须置位。
                 self.write(
                     DMA_BUS_MODE,
@@ -475,6 +487,7 @@ impl Registers {
                         | DWMAC1000_DMA_TX_STORE_FORWARD
                         | DWMAC1000_DMA_SECOND_FRAME,
                 );
+
                 self.write(DWMAC1000_INTERRUPT_MASK, DWMAC1000_MAC_INTERRUPT_DISABLE);
                 self.write(
                     DWMAC1000_FRAME_FILTER,
@@ -679,6 +692,7 @@ impl Dwmac {
         {
             return Err(GmacError::Resource("GMAC MMIO resource is incomplete"));
         }
+
         let interrupt = irq::map_source(resources.interrupt_source).map_err(GmacError::Irq)?;
         // SAFETY: 唯一规范化资源与各 provider 的完整永久映射由本接口调用者保证。
         unsafe { board_setup::apply_setup(&resources.setup, Duration::ZERO) }
@@ -702,6 +716,7 @@ impl Dwmac {
                 "selected GMAC hardware version is unsupported",
             ));
         }
+
         let mac = resources
             .mac_address
             .unwrap_or_else(|| registers.mac_address());
@@ -710,6 +725,7 @@ impl Dwmac {
                 "GMAC has no valid DT or hardware MAC address",
             ));
         }
+
         registers.stop_dma();
         let csr_divider = if generation == Generation::Dwmac4 {
             if resources.setup.clocks.count == 0 {
@@ -728,6 +744,7 @@ impl Dwmac {
         // PHY 已撤销掉电/隔离并保持无载波时的 RXC，才能请求首次依赖 RXC 的 SWR。
         registers.request_reset();
         registers.wait_reset()?;
+
         let line = boot::info().board.cache_line_size;
         if !resources.dma_coherent
             && (line == 0
@@ -748,6 +765,7 @@ impl Dwmac {
             resources.dma_coherent,
         )?;
         let inner = prepare_inner(domain, generation, resources.dma_coherent)?;
+
         let nic = Arc::try_new(Self {
             state: SpinLock::new(State {
                 phase: Phase::Prepared,
@@ -773,6 +791,7 @@ impl Dwmac {
             phy,
         })
         .map_err(|_| GmacError::NoMemory)?;
+
         let context = Arc::as_ptr(&nic) as usize;
         let work = Work::try_new(net.work_queue(), cpu, progress_callback, context)
             .map_err(|_| GmacError::NoMemory)?;
@@ -795,11 +814,13 @@ impl Dwmac {
             unsafe { irq::register(self.interrupt, irq_callback, Arc::as_ptr(self) as *mut ()) }
                 .map_err(GmacError::Irq)?;
         *self.registration.lock() = Some(registration);
+
         self.state.lock().must_reset = true;
         if let Err(error) = self.publish() {
             self.record_failure(error);
             return Err(error);
         }
+
         {
             let mut state = self.state.lock();
             state.phase = Phase::Live;
@@ -848,6 +869,7 @@ impl Dwmac {
             inner.tx_claim = (index + 1) % RING_LEN;
             (index, slot.page.take().unwrap(), inner.domain)
         };
+
         let mut lease = SlotLease {
             nic: self,
             receive: false,
@@ -862,12 +884,14 @@ impl Dwmac {
                 unsafe { slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), frame_len) };
             writer(bytes);
         }
+
         // SAFETY: writer 已返回且没有 CPU 别名，lease 保完整原页，停止路径等待 Preparing 尾部。
         if let Err(error) = unsafe { lease.page.as_mut().unwrap().begin_device_access(domain) } {
             let error = GmacError::from(error);
             self.record_failure(error);
             return Err(error);
         }
+
         let result = {
             let mut state = self.state.lock();
             let live = state.phase == Phase::Live;
@@ -916,6 +940,7 @@ impl Dwmac {
             }
             self.progress.get().unwrap().as_ref().close_sync();
         }
+
         // writer 在锁外；停止不持短锁等待这些真实执行尾部，通知已由同锁串行。
         loop {
             let busy = {
@@ -938,6 +963,7 @@ impl Dwmac {
             self.registers.request_reset();
             self.registers.wait_reset()?;
         }
+
         // Work、producer 和 IRQ 均已结束，锁外同步最多64页；错误仍保留原槽拥有。
         for receive in [true, false] {
             for index in 0..RING_LEN {
@@ -966,6 +992,7 @@ impl Dwmac {
                 }
             }
         }
+
         let owner = {
             let mut state = self.state.lock();
             state.must_reset = false;
@@ -1000,6 +1027,7 @@ impl Dwmac {
             slot.state = SlotState::DeviceOwned;
             inner.rx_ring.arm_rx(index, slot.address)?;
         }
+
         let state = self.state.lock();
         self.registers
             .configure(state.inner.as_ref().unwrap(), self.mac)
@@ -1053,6 +1081,7 @@ impl Dwmac {
                     net.kick_egress();
                 }
             }
+
             let mut received = 0;
             while received < RX_BUDGET && self.receive_one()? {
                 received += 1;
@@ -1091,6 +1120,7 @@ impl Dwmac {
         // SAFETY: 对应单一描述符真实 OWN 清零，硬件已结束本 payload；Work 是唯一消费者，
         // 槽保留 Processing 到同步结束，stop_sync 先等当前 Work 全尾。
         unsafe { lease.page.as_mut().unwrap().finish_device_access() }?;
+
         let mut state = self.state.lock();
         let inner: &mut Inner = state.inner.as_mut().unwrap();
         inner.tx[index].page = lease.page.take();
@@ -1155,6 +1185,7 @@ impl Dwmac {
             state.statistics.rx_errors = state.statistics.rx_errors.wrapping_add(1);
             state.statistics.rx_dropped = state.statistics.rx_dropped.wrapping_add(1);
         }
+
         if self.state.lock().phase != Phase::Live {
             return Ok(true);
         }
@@ -1226,6 +1257,7 @@ impl Dwmac {
                 net.kick_egress();
             }
         }
+
         let state = self.state.lock();
         if state.phase == Phase::Live {
             self.link_timer
@@ -1430,6 +1462,7 @@ unsafe fn configure_interface(
             "GMAC interface syscon field is invalid",
         ));
     }
+
     let address = arch::mmio_address(resources.syscon.start) + offset;
     let mode = if resources.phy_mode == boot::PhyMode::Rmii {
         STARFIVE_INTERFACE_RMII

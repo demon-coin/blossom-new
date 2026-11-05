@@ -27,6 +27,7 @@ pub(super) mod cases {
         );
         let inode = fixture.inodes.last().unwrap().clone();
         let before = checked(context, file.stat())?;
+
         let alias = shared_alias(context, &file, page_offset)?;
         let image = fixture.shared_image(context, b"s")?;
         let mm = image.mm.clone();
@@ -42,6 +43,7 @@ pub(super) mod cases {
         }
         fixture.start_shared(context, image)?;
         fixture.phase(&mm, 0, 1)?;
+
         let mut attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
@@ -63,10 +65,12 @@ pub(super) mod cases {
             (polluted.size, polluted.blocks),
             (before.size, before.blocks),
         );
+
         context.expect_eq(
             mm.fault(SOURCE + 4096, UserAccess::Read),
             Err(VmError::BeyondEof),
         );
+
         context.expect_eq(
             checked(context, file.write_at(page_offset + 512, &[0x73]))?,
             1,
@@ -80,6 +84,7 @@ pub(super) mod cases {
             alias.mapping(SHARED_ALIAS).unwrap().permissions.write,
             false,
         );
+
         let grants = mm.ktest_mkwrite_count();
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
@@ -88,6 +93,7 @@ pub(super) mod cases {
         bytes_at(context, &file, page_offset + 128, &[0x74])?;
         context.expect_eq(checked(context, file.stat())?.size, page_offset + 513);
         context.expect_eq(folio.dirty_sectors() != 0, true);
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         drop((mm, alias, folio));
@@ -110,12 +116,14 @@ pub(super) mod cases {
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-map", 2)?;
         let inode = fixture.inodes.last().unwrap().clone();
+
         let alias = shared_alias(context, &file, 0)?;
         context.expect_eq(alias.copyout(SHARED_ALIAS + 3, &[0x84]).copied, 1);
         let image = fixture.shared_image(context, b"r")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
         fixture.phase(&mm, 0, 1)?;
+
         let remote = fixture.user.running.as_ref().unwrap().target.unwrap();
         mapped_bytes(context, &alias, SHARED_ALIAS, &[0x81]);
         context.expect_eq(mm.mapping(SOURCE).unwrap().permissions.write, true);
@@ -127,6 +135,7 @@ pub(super) mod cases {
         )?;
         let cleaner = fixture.user.running.as_ref().unwrap().coordinator;
         context.expect_eq(remote != cleaner, true);
+
         let cleaned = Arc::try_new(SpinLock::new(None))
             .map_err(|_| TestError("remote cleaner result OOM"))?;
         let recorded = cleaned.clone();
@@ -154,6 +163,7 @@ pub(super) mod cases {
             false,
         );
         context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
         context.expect_eq(grants < mm.ktest_mkwrite_count(), true);
@@ -164,6 +174,7 @@ pub(super) mod cases {
             "W16 remote-cpu={} cleaner-cpu={} real-user-w-store=1 post-csd-mkwrite=1 dirty=1",
             remote, cleaner
         ));
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         drop((mm, alias, folio));
@@ -197,6 +208,7 @@ pub(super) mod cases {
             context,
             old.mapping_inode().unwrap().file_page(0, &mut old_attempt),
         )?;
+
         let image = fixture.shared_image(context, b"m")?;
         let mm = image.mm.clone();
         let ready =
@@ -212,6 +224,7 @@ pub(super) mod cases {
         })
         .map_err(|_| TestError("prepare hook OOM"))?;
         mm.ktest_set_mkwrite_hook(Some(hook));
+
         fixture.start_shared(context, image)?;
         until("real mkwrite prepare did not pause", || {
             ready.load(Ordering::Acquire)
@@ -233,6 +246,7 @@ pub(super) mod cases {
                 .is_none_or(|leaf| !leaf.permissions.write),
             true,
         );
+
         vm(
             context,
             mm.mmap(MmapRequest {
@@ -262,10 +276,12 @@ pub(super) mod cases {
         bytes_at(context, &old, 0, &[0])?;
         bytes_at(context, &replacement, 0, &[0x81])?;
         context.expect_eq(old_folio.phys_addr() != replacement_folio.phys_addr(), true);
+
         WriteOwner::release(&mm, 1)?;
         fixture.phase(&mm, 0, 2)?;
         bytes_at(context, &replacement, 1, &[0x82])?;
         bytes_at(context, &old, 1, &[1])?;
+
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
         drop((mm, old_folio, replacement_folio));
@@ -297,6 +313,7 @@ pub(super) mod cases {
         };
         let error = probe.fault(SHARED_ALIAS, UserAccess::Write);
         fixture.user.release_pressure();
+
         context.expect_eq(evidence, (true, true));
         context.expect_eq(error, Err(VmError::File(FsError::NoMemory)));
         context.expect_eq(probe.mapping(SHARED_ALIAS).unwrap().physical, original);
@@ -304,6 +321,7 @@ pub(super) mod cases {
             probe.mapping(SHARED_ALIAS).unwrap().permissions.write,
             false,
         );
+
         vm(context, probe.fault(SHARED_ALIAS, UserAccess::Write))?;
         context.diagnostic(format_args!("W17 real-prepare-pause=1 same-va-remap=1 old-not-committed=1 real-prepare-oom=1 truncate-tested=0"));
         Ok(())
@@ -325,6 +343,7 @@ pub(super) mod cases {
             context,
             file.mapping_inode().unwrap().file_page(0, &mut attempt),
         )?;
+
         let image = fixture.shared_image(context, b"c")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -342,6 +361,7 @@ pub(super) mod cases {
         vm(context, child_mm.protect(SOURCE, 4096, RO))?;
         vm(context, child_mm.protect(SOURCE, 4096, RW))?;
         context.expect_eq(child_mm.mapping(SOURCE).unwrap().permissions.write, false);
+
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         let sync_inode = inode.clone();
@@ -361,6 +381,7 @@ pub(super) mod cases {
         })?;
         context.expect_eq(mm.mapping(SOURCE).unwrap().permissions.write, false);
         context.expect_eq(child_mm.mapping(SOURCE).unwrap().permissions.write, false);
+
         let copying = child_mm.clone();
         let copy = task::prepare_kernel_on(cpu::current().id, move || {
             let progress = copying.copyout(SOURCE + 4, &[0x85]);
@@ -385,6 +406,7 @@ pub(super) mod cases {
             folio.phys_addr(),
         );
         context.expect_eq(folio.dirty_sectors() != 0, true);
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(folio.writeback_sectors(), 0);
@@ -393,6 +415,7 @@ pub(super) mod cases {
         mapped_bytes(context, &mm, SOURCE + 4, &[0x85]);
         bytes_at(context, &file, 4, &[0x85])?;
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
+
         let mut original = [0; 1];
         context.expect_eq(file.read_at(5, &mut original), Ok(1));
         let private = vm(context, Mm::try_new().map_err(VmError::from))?;
@@ -413,6 +436,7 @@ pub(super) mod cases {
         context.expect_eq(folio.dirty_sectors(), 0);
         bytes_at(context, &file, 5, &original)?;
         mapped_bytes(context, &private, SHARED_ALIAS + 5, &[0xef]);
+
         WriteOwner::release(&mm, 3)?;
         until("shared fork child did not exit", || child.mm().is_none())?;
         bytes_at(context, &file, 2, &[0x83])?;
@@ -438,11 +462,13 @@ pub(super) mod cases {
         let other = fixture.open(context, b"/test/write-reserve", 2)?;
         let new_inode = fixture.inodes.last().unwrap().clone();
         context.expect_eq(checked(context, other.write_at(0, &[0; 4096]))?, 4096);
+
         for mode in [b"f" as &[u8], b"p", b"q"] {
             let image = fixture.shared_image(context, mode)?;
             let mm = image.mm.clone();
             fixture.start_shared(context, image)?;
             fixture.phase(&mm, 0, 1)?;
+
             let child = fixture.child(&mm)?;
             let child_mm = child.mm().ok_or(TestError("file futex child MM missing"))?;
             let private = mode[0] == b'p';
@@ -459,6 +485,7 @@ pub(super) mod cases {
                     .map_err(|_| TestError("file futex neighbor snapshot failed"))?;
                 context.expect_eq(neighbor.count, 0);
             }
+
             WriteOwner::release(&mm, 1)?;
             fixture.finish_shared(context)?;
             let cancelled = futex::test_snapshot(&child_mm, SHARED_ALIAS + 64, private, u32::MAX)
@@ -467,6 +494,7 @@ pub(super) mod cases {
             context.expect_eq(child.mm().is_none(), true);
             drop((child, child_mm, mm));
         }
+
         checked(context, crate::fs::writeback::sync_inode(&old_inode))?;
         checked(context, crate::fs::writeback::sync_inode(&new_inode))?;
         let image = fixture.shared_image(context, b"u")?;
@@ -484,6 +512,7 @@ pub(super) mod cases {
             .futex_read()
             .key(SHARED_ALIAS + 64, false)
             .map_err(|_| TestError("old file futex key failed"))?;
+
         // 只建无驻留的身份观察范围；旧 node 与 key 均保 inode，不保文件原页。
         let identity = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("old futex identity MM OOM"))?;
@@ -501,6 +530,7 @@ pub(super) mod cases {
                 .unwrap()
                 .file_page(0, &mut prepare_attempt),
         )?);
+
         new_inode.mapping().prune_unused();
         let mut pressure = PagePressure::prepare()?;
         context.expect_eq(old_inode.mapping().prune_unused(), 1);
@@ -521,6 +551,7 @@ pub(super) mod cases {
         }
         let recycled =
             recycled.ok_or(TestError("released file PFN was not actually reacquired"))?;
+
         // 先归还其他候选并排空 PCP，目标仍保活；最后归还目标后立即走生产 canonical miss。
         drop(pressure);
         mm::drain_all_pages();
@@ -532,6 +563,7 @@ pub(super) mod cases {
             .file_page(0, &mut reuse_attempt);
         let reused = checked(context, reused)?;
         context.expect_eq(reused.phys_addr(), old_physical);
+
         vm(
             context,
             mm.mmap(MmapRequest {
@@ -555,6 +587,7 @@ pub(super) mod cases {
             .map_err(|_| TestError("new file futex key failed"))?;
         context.expect_eq(old_key.matches(&new_key), false);
         context.expect_eq(old_inode.ptr_eq(&new_inode), false);
+
         vm(context, identity.fault(SOURCE, UserAccess::Read))?;
         let still_waiting = futex::test_snapshot(&identity, SOURCE + 64, false, u32::MAX)
             .map_err(|_| TestError("old live futex identity snapshot failed"))?;
@@ -563,6 +596,7 @@ pub(super) mod cases {
         let isolated = futex::test_snapshot(&mm, SOURCE + 64, false, u32::MAX)
             .map_err(|_| TestError("reused PFN futex identity snapshot failed"))?;
         context.expect_eq(isolated.count, 0);
+
         WriteOwner::release(&mm, 1)?;
         fixture.finish_shared(context)?;
         let cancelled = futex::test_snapshot(&identity, SOURCE + 64, false, u32::MAX)

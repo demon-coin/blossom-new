@@ -11,9 +11,11 @@ use crate::timer::get_time_sec;
 use core::mem::size_of;
 use log::{error, info, warn};
 use num_enum::FromPrimitive;
+
 pub fn sys_shutdown() -> isize {
     shutdown()
 }
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Eq, PartialEq, FromPrimitive)]
 #[repr(u32)]
@@ -36,6 +38,7 @@ pub enum SyslogAction {
 pub fn sys_syslog(type_: u32, buf: *mut u8, len: u32) -> isize {
     const LOG_BUF_LEN: usize = 4096;
     const LOG: &str = "<5>[    0.000000] Linux version 5.10.102.1-microsoft-standard-WSL2 (rtrt@TEAM-NPUCORE) (gcc (Ubuntu 9.4.0-1ubuntu1~20.04) 9.4.0, GNU ld (GNU Binutils for Ubuntu) 2.34) #1 SMP Thu Mar 10 13:31:47 CST 2022";
+
     let token = current_user_token();
     let type_ = SyslogAction::from(type_);
     let len = LOG.len().min(len as usize);
@@ -79,6 +82,7 @@ pub fn sys_uname(buf: *mut u8) -> isize {
             Err(errno) => return errno,
         },
     );
+
     // A little stupid but still efficient.
     const FIELD_OFFSET: usize = 65;
     buffer.write_at(FIELD_OFFSET * 0, b"NPUcore\0");
@@ -140,6 +144,7 @@ pub fn sys_sysinfo(info: *mut Sysinfo) -> isize {
     const SEC_5_MIN: usize = SEC_1_MIN * 5;
     const SEC_15_MIN: usize = SEC_1_MIN * 15;
     const UNIMPLEMENT: usize = 0;
+
     let token = current_user_token();
     let procs = procs_count();
     if copy_to_user(
@@ -275,6 +280,7 @@ pub fn sys_prlimit(
                 _ => todo!(),
             }
         }
+
         if !new_limit.is_null() {
             let rlimit = &mut RLimit {
                 rlim_cur: 0,
@@ -302,10 +308,12 @@ pub fn sys_prlimit(
     }
     SUCCESS
 }
+
 pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
     if len != crate::task::RobustList::HEAD_SIZE {
         return EINVAL;
     }
+
     let task = current_task().unwrap();
     let mut inner = task.acquire_inner_lock();
     inner.robust_list.head = head;

@@ -7,6 +7,7 @@ use crate::mm::PAGE_SIZE;
 
 const PROGRAM: &[u8] = b"/test/selftests/process/exec_stack";
 const STACK_BASE: usize = 0x3500_0000;
+
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -49,6 +50,7 @@ pub(crate) mod behavior {
         let mm = Mm::try_new().map_err(|_| TestError("offline stack Mm preparation failed"))?;
         mm.map_stack(STACK_BASE, 2 * PAGE_SIZE, RW, RW)
             .map_err(|_| TestError("offline initial stack registration failed"))?;
+
         let initial = mm.copyout(STACK_BASE, &[0x35]);
         context.expect_eq((initial.copied, initial.error), (1, None));
         context.expect_eq(mm.fault(STACK_BASE + PAGE_SIZE, UserAccess::Write), Ok(()));

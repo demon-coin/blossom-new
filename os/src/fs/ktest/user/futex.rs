@@ -72,6 +72,7 @@ impl UserOwner {
             .graph()
             .lookup_thread(pid)
             .ok_or(TestError("futex root binding disappeared"))?;
+
         Self::futex_phase(&mm, &root, 1)?;
         let address = if mode[0] == b'w' {
             0x4600_0000
@@ -83,6 +84,7 @@ impl UserOwner {
         }
         let child = self.futex_child(&mm, 0)?;
         let child_mm = child.mm().ok_or(TestError("futex child MM disappeared"))?;
+
         match mode[0] {
             b'w' => {
                 Self::futex_waiting(&child_mm, &child, address, true, u32::MAX)?;
@@ -116,6 +118,7 @@ impl UserOwner {
                 mm.store_user_u32(FUTEX_CONTROL + 12, 1)
                     .map_err(|_| TestError("futex alias checkpoint release failed"))?;
                 Self::futex_phase(&mm, &root, 2)?;
+
                 let alias = Self::futex_waiting(&child_mm, &child, 0x4500_0040, false, u32::MAX)?;
                 let original = futex::test_snapshot(&mm, address, false, u32::MAX)
                     .map_err(|_| TestError("shared futex original key lookup failed"))?;
@@ -145,6 +148,7 @@ impl UserOwner {
                 until("futex restart handler did not execute", || {
                     mm.load_user_u32(FUTEX_CONTROL + 32) == Ok(1) || child.mm().is_none()
                 })?;
+
                 let restarted = Self::futex_waiting(&child_mm, &child, address, true, u32::MAX)?;
                 context.expect_eq(first.first_wait_id == restarted.first_wait_id, false);
                 context.expect_eq(restarted.first_deadline, None);
@@ -160,6 +164,7 @@ impl UserOwner {
                     .identity()
                     .expect("deadline child has no identity")
                     .tid();
+
                 self.graph()
                     .send_kernel(child_pid, crate::task::signal::SIGSTOP)
                     .map_err(|_| TestError("futex deadline stop request failed"))?;
@@ -195,6 +200,7 @@ impl UserOwner {
                 let stopped = stopped.ok_or(TestError("futex stopped event is absent"))?;
                 context.expect_eq(stopped.code, 5);
                 context.expect_eq(stopped.status, 19);
+
                 mm.store_user_u32(FUTEX_CONTROL + 12, 1)
                     .map_err(|_| TestError("futex timeout unmap release failed"))?;
                 Self::futex_phase(&mm, &root, 2)?;
@@ -206,6 +212,7 @@ impl UserOwner {
                     "user-futex-deadline first-deadline={} now={} stopped={} timeout-page-unmapped=1",
                     deadline.as_nanos(), crate::time::now().as_nanos(), stopped.status
                 ));
+
                 self.graph()
                     .send_kernel(child_pid, crate::task::signal::SIGCONT)
                     .map_err(|_| TestError("futex deadline continue request failed"))?;
@@ -243,6 +250,7 @@ impl UserOwner {
                     mm.store_user_u32(FUTEX_CONTROL + 12, phase)
                         .map_err(|_| TestError("futex requeue checkpoint release failed"))?;
                 }
+
                 for (phase, mask, signal) in [(4u32, 4u32, true), (6, 8, false)].iter().copied() {
                     Self::futex_phase(&mm, &root, phase)?;
                     let waiting = self.futex_child(&mm, 0)?;
@@ -290,6 +298,7 @@ impl UserOwner {
             }
             _ => unreachable!("unknown futex fixture mode"),
         }
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         let cancelling = event.status != 0;
@@ -297,6 +306,7 @@ impl UserOwner {
             self.graph().request_root_exit(9);
         }
         self.reap_children(context, cancelling)?;
+
         context.expect_eq(mm.user_count(), 0);
         context.diagnostic(format_args!(
             "user-futex-result mode={:?} status={} joined=1 mm-users={}",

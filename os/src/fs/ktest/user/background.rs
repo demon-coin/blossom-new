@@ -104,6 +104,7 @@ impl BackgroundOwner {
                 "background wave requires the ordinary 4KiB root image",
             ));
         }
+
         checked(context, file.truncate(0))?;
         let (free_blocks, free_inodes) = allocation_counts(context, &volume)?;
         context.diagnostic(format_args!(
@@ -119,6 +120,7 @@ impl BackgroundOwner {
                 "background wave requires actual free data and mapping blocks",
             ));
         }
+
         let input = [INITIAL_BYTE; PAGE_SIZE];
         for index in 0..pages {
             if checked(context, file.write_at((index * PAGE_SIZE) as u64, &input))? != PAGE_SIZE {
@@ -127,6 +129,7 @@ impl BackgroundOwner {
                 ));
             }
         }
+
         checked(context, file.sync_range(0..u64::MAX, false))?;
         drained(&volume)?;
         context.expect_eq(
@@ -191,6 +194,7 @@ impl Fixture<UserSuite> for BackgroundOwner {
         if let Some(control) = &self.control {
             control.producer_stop.store(true, Ordering::Release);
         }
+
         for disk in &self.write.user.path.owner.disks {
             disk.test_resume_completions();
         }
@@ -208,11 +212,13 @@ impl Fixture<UserSuite> for BackgroundOwner {
             drop(observer.take());
         }
         drop(self.lane.take());
+
         self.write.join_consumers()?;
         if let Some(watch) = self.retired.as_ref() {
             checked(context, watch.wait_retired())?;
         }
         drop(self.retired.take());
+
         self.control.take();
         drop(self.source.take());
         <WriteOwner as Fixture<UserSuite>>::quiesce(&mut self.write, context)
@@ -256,6 +262,7 @@ fn finite_round(context: &mut TestContext<'_>, snapshot: WritebackSnapshot) {
         snapshot.round_selected_data + snapshot.round_selected_metadata <= 64,
         true,
     );
+
     context.expect_eq(0 < snapshot.round_accepted_bytes, true);
     context.expect_eq(
         snapshot.round_accepted_bytes <= (64 * PAGE_SIZE) as u64,

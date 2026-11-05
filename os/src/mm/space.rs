@@ -255,6 +255,7 @@ impl PteDomain {
         if (source.range.end - source.range.start) as u64 <= relative {
             return (false, 0);
         }
+
         let address = source.range.start + relative as usize;
         let mut state = self.lock();
         let Some(page) = state.pages.find(address) else {
@@ -341,6 +342,7 @@ impl PteDomain {
         if (source.range.end - source.range.start) as u64 <= relative {
             return 0;
         }
+
         let address = source.range.start + relative as usize;
         let mut state = self.lock();
         let Some(page) = state.pages.find(address) else {
@@ -739,6 +741,7 @@ impl Mm {
         let range = vma::checked_range(address, PAGE_SIZE).map_err(table_error)?;
         let vma = Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous, None)
             .map_err(table_error)?;
+
         // SAFETY: 调用者保证完整初始化的独占 order0 页，无其他映射、设备或内容借用；
         // 此处消费原归还权，后续访问仅沿本 Mm 的原始访问和硬件权限协议。
         let backing = unsafe { AnonPageRef::from_owned(pages) };
@@ -746,6 +749,7 @@ impl Mm {
             .map_err(table_error)?;
         let needed = self.table.lock().table.needed_tables(address);
         let mut prepared = PreparedTables::try_new(needed)?;
+
         let mut mmap = self.mmap.write();
         let retired = self.insert_vma(&mut mmap, vma).map_err(table_error)?;
         {
@@ -760,6 +764,7 @@ impl Mm {
             assert!(previous.is_none(), "owned page replaced an existing leaf");
             state.pages.push(page);
         }
+
         drop(mmap);
         drop(retired);
         drop(prepared);
@@ -851,6 +856,7 @@ impl Mm {
         if range.end < range.start {
             return Err(VmError::InvalidRange);
         }
+
         let mut cursor = range.start;
         let mut unmapped = false;
         while cursor < range.end {
@@ -922,6 +928,7 @@ impl Mm {
                 request.maximum,
             )?;
         }
+
         let mut mmap = self.mmap.write();
         let (address, replace) = match request.address {
             MmapAddress::Hint(hint) => (mmap.choose_address(hint, length)?, false),
@@ -932,6 +939,7 @@ impl Mm {
         if !replace && !mmap.vacant(&range) {
             return Err(VmError::Occupied);
         }
+
         let backing = match request.source {
             MmapSource::PrivateAnonymous => VmaBacking::Anonymous,
             MmapSource::SharedAnonymous => VmaBacking::SharedAnonymous {
@@ -982,6 +990,7 @@ impl Mm {
         let Ok(previous) = page_end(old) else {
             return old;
         };
+
         let mut retired = None;
         let mut inserted = None;
         match previous.cmp(&end) {
@@ -1013,6 +1022,7 @@ impl Mm {
             },
             CmpOrdering::Equal => {}
         }
+
         mmap.heap_end = request;
         drop(mmap);
         drop(inserted);
@@ -1036,13 +1046,16 @@ impl Mm {
                 }
                 Err(error) => return Err(error),
             };
+
             if access == UserAccess::Write && source.vma.is_shared_file() {
                 if self.mkwrite(&source, address, &mut attempt)? {
                     return Ok(());
                 }
                 continue;
             }
+
             let preparation = prepare_fault(&source, base, access, &mut attempt);
+
             let mmap = self.mmap.write();
             let current = mmap.find(address).ok_or(VmError::Unmapped)?;
             if !current.allows(access) {
@@ -1086,6 +1099,7 @@ impl Mm {
                     return Err(error);
                 }
             };
+
             let content = file.as_ref().map(|folio| folio.lock_content());
             if let Some(content) = &content {
                 let data = source
@@ -1119,6 +1133,7 @@ impl Mm {
                     }
                 }
             }
+
             {
                 let _ranges = source
                     .vma
@@ -1142,7 +1157,9 @@ impl Mm {
                     assert_eq!(old.map(|leaf| leaf.physical), source.observed);
                 }
             }
+
             sync_all();
+
             let old = {
                 let _ranges = source
                     .vma
@@ -1177,10 +1194,12 @@ impl Mm {
                 state.pages.push(page);
                 old
             };
+
             sync_all();
             if let Some(folio) = &file {
                 folio.mark_accessed();
             }
+
             drop(content);
             drop(mmap);
             drop(old);
@@ -1243,6 +1262,7 @@ impl Mm {
             .checked_add((base - data.range.start) as u64)
             .ok_or(VmError::InvalidRange)?;
         let index = offset / PAGE_SIZE as u64;
+
         let preparation = (|| {
             if data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset {
                 return Err(VmError::BeyondEof);
@@ -1272,6 +1292,7 @@ impl Mm {
             let tables = PreparedTables::try_new_reclaim(source.needed, attempt)?;
             Ok((prepared, page, tables))
         })();
+
         let mmap = self.mmap.write();
         let current = mmap.find(address).ok_or(VmError::Unmapped)?;
         if !current.allows(UserAccess::Write) {
@@ -1282,6 +1303,7 @@ impl Mm {
             drop(preparation);
             return Ok(false);
         }
+
         {
             let state = self.table.lock();
             let page = state.pages.find(base);
@@ -1299,6 +1321,7 @@ impl Mm {
                 return Ok(false);
             }
         }
+
         let (prepared, mut page, mut tables) = preparation?;
         let invalidate = data.inode.lock_invalidate().map_err(VmError::File)?;
         let mut content = prepared.folio().lock_content();
@@ -1347,6 +1370,7 @@ impl Mm {
             #[cfg(feature = "ktest")]
             self.mkwrites.fetch_add(1, Ordering::Relaxed);
         }
+
         prepared.folio().mark_accessed();
         drop(content);
         drop(invalidate);
@@ -1477,6 +1501,7 @@ impl Mm {
         let snapshot = mmap.snapshot(&child.table)?;
         let addresses = self.resident_addresses(&(0..arch::USER_ADDRESS_END))?;
         *child.mmap.write() = snapshot;
+
         for &address in &addresses {
             let vma = mmap.find(address).expect("resident page has no VMA");
             let (backing, cow, source) = {
@@ -1537,6 +1562,7 @@ impl Mm {
                     .range_ready(0, PAGE_SIZE)
                     .map_err(|error| VmError::File(error.into()))?;
             }
+
             loop {
                 let ranges = vma
                     .file_range
@@ -1580,6 +1606,7 @@ impl Mm {
             drop(content);
             drop(prepared);
         }
+
         for &address in &addresses {
             let vma = mmap.find(address).expect("fork resident has no VMA");
             if !vma.is_private() {
@@ -1597,6 +1624,7 @@ impl Mm {
             unsafe { state.table.protect_leaf(address, physical, permissions) }
                 .expect("fork protection is not representable");
         }
+
         sync_all();
         drop(mmap);
         Ok(child)
@@ -1615,6 +1643,7 @@ impl Mm {
         let vmas = mmap.rewrite(&range, Some(permissions))?;
         let addresses = self.resident_addresses(&range)?;
         let old_vmas = self.publish_vmas(&mut mmap, vmas, None)?;
+
         for &address in &addresses {
             let vma = mmap.find(address).expect("protected resident has no VMA");
             let mut state = self.table.lock();
@@ -1628,6 +1657,7 @@ impl Mm {
             unsafe { state.table.protect_leaf(address, physical, permissions) }
                 .expect("protection is not representable");
         }
+
         if !addresses.is_empty() {
             sync_all();
         }
@@ -1685,6 +1715,7 @@ impl Mm {
             }
             count
         };
+
         let mut sources = Vec::new();
         sources
             .try_reserve_exact(count)
@@ -1712,6 +1743,7 @@ impl Mm {
                 cursor = page.next.as_deref();
             }
         }
+
         let old = core::mem::replace(&mut mmap.vmas, vmas);
         let mut changed = false;
         for (address, saved) in &mut sources {
@@ -1745,6 +1777,7 @@ impl Mm {
         }
         Ok((old, sources))
     }
+
     /// 写侧先备齐候选索引及退休容器，再撤叶并同步所有 CPU；旧拥有交回调用者锁外释放。
     fn replace_range(
         &self,
@@ -1757,6 +1790,7 @@ impl Mm {
         let mut tables = RetiredTables::default();
         let mut discarded = ResidentPages::default();
         let old_vmas = self.publish_vmas(mmap, vmas, Some(range))?;
+
         #[cfg(feature = "ktest")]
         {
             let hook = self.vma_unmap_hook.lock().clone();
@@ -1779,6 +1813,7 @@ impl Mm {
             };
             tables.append(retired);
         }
+
         if !addresses.is_empty() {
             sync_all();
         }

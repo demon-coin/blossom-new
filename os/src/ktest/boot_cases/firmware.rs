@@ -9,6 +9,7 @@ use core::mem::MaybeUninit;
 const CAPACITY: usize = 2 * 1024 * 1024;
 const FDT_WORD_BYTES: usize = core::mem::size_of::<u32>();
 const FDT_ALIGN_MASK: usize = FDT_WORD_BYTES - 1;
+
 const FDT_TOTALSIZE: usize = FDT_WORD_BYTES;
 const FDT_OFF_DT_STRUCT: usize = 2 * FDT_WORD_BYTES;
 const FDT_OFF_DT_STRINGS: usize = 3 * FDT_WORD_BYTES;
@@ -19,6 +20,7 @@ const FDT_HEADER_BYTES: usize = 10 * FDT_WORD_BYTES;
 const FDT_PROPERTY_BYTES: usize = 3 * FDT_WORD_BYTES;
 const FDT_PROP: usize = 3;
 const FDT_NOP: u32 = 4;
+
 static COPY_LOCK: SpinLock<()> = SpinLock::new(());
 static mut COPY: [u8; CAPACITY] = [0; CAPACITY];
 static mut ACTUAL: MaybeUninit<boot::BootInfo> = MaybeUninit::uninit();
@@ -95,6 +97,7 @@ impl Dtb {
                 .and_then(|n| n.checked_sub(FDT_PROPERTY_BYTES))
                 .expect("DTB property offset overflow")
         };
+
         let word = |field: usize| {
             let end = field
                 .checked_add(FDT_WORD_BYTES)
@@ -185,6 +188,7 @@ impl Dtb {
                 u32::try_from(word).expect("DTB inserted field exceeds u32"),
             )
         });
+
         self.bytes.copy_within(offset..self.length, value);
         self.bytes[name_start..name_end - 1].copy_from_slice(name.as_bytes());
         self.bytes[name_end - 1] = 0;
@@ -221,6 +225,7 @@ impl Dtb {
         assert!(structure <= header && structure_end <= strings && strings <= self.length);
         assert!(word(FDT_OFF_MEM_RSVMAP) < structure);
         assert_eq!(offset & FDT_ALIGN_MASK, 0);
+
         let old_padded = old_length
             .checked_add(FDT_ALIGN_MASK)
             .expect("DTB property overflow")
@@ -265,6 +270,7 @@ impl Dtb {
                 u32::try_from(value.len()).expect("DTB property exceeds u32"),
             ),
         ];
+
         self.bytes.copy_within(old_end..self.length, new_end);
         self.bytes[offset..value_end].copy_from_slice(value);
         self.bytes[value_end..new_end].fill(0);
@@ -415,6 +421,7 @@ pub(crate) mod cases {
         let live = boot::info();
         let parsed = parse(&fixture.bytes[..fixture.length], fixture.actual, live.bsp_hardware_id);
         same_resources(context, &parsed, live);
+
         let kernel = boot::kernel_region();
         assert!(live.memory[..live.memory_count]
             .iter()
@@ -434,6 +441,7 @@ pub(crate) mod cases {
                 .iter()
                 .zip(&live.reserved_no_map[..live.reserved_count])
                 .any(|(actual, actual_no_map)| region == actual && no_map == actual_no_map)));
+
         for region in &live.memory[..live.memory_count] {
             assert!(region.start < region.end);
             context.diagnostic(format_args!(
@@ -475,6 +483,7 @@ pub(crate) mod cases {
         let live = boot::info();
         let parsed = parse(&fixture.bytes[..fixture.length], fixture.actual, live.bsp_hardware_id);
         same_resources(context, &parsed, live);
+
         for (logical, hardware) in live.hardware_ids[..live.cpu_count].iter().enumerate() {
             context.expect_eq(crate::cpu::get(logical).hardware_id, *hardware);
             assert!(!live.hardware_ids[..logical].contains(hardware));
@@ -517,6 +526,7 @@ pub(crate) mod cases {
         let value_length = length.checked_add(1).expect("bootargs length overflow");
         fixture.replace_property(offset, old_length, &command[..value_length]);
         assert!(platform::ktest_validate(&fixture.bytes[..fixture.length]).is_ok());
+
         let result = platform::ktest_discover_tree(
             &fixture.bytes[..fixture.length],
             live.raw_args,
@@ -566,6 +576,7 @@ pub(crate) mod cases {
             assert!(split_bytes <= ram.end.checked_sub(protected_end).expect("RAM end overflow"));
             ram.end.checked_sub(split_bytes).expect("RAM tail overflow")
         };
+
         let mut replacement = [0u8; (boot::MAX_MEMORY_REGIONS + 1) * 16];
         let (offset, old_length, replacement_length) = {
             let tree = fdt::Fdt::new(&fixture.bytes[..fixture.length]).expect("actual DTB invalid");
@@ -618,6 +629,7 @@ pub(crate) mod cases {
         };
         fixture.replace_property(offset, old_length, &replacement[..replacement_length]);
         assert!(platform::ktest_validate(&fixture.bytes[..fixture.length]).is_ok());
+
         let result = platform::ktest_discover_tree(
             &fixture.bytes[..fixture.length], live.raw_args, live.bsp_hardware_id,
             live.dtb.start, fixture.actual,
@@ -671,6 +683,7 @@ pub(crate) mod cases {
         expected.reserved_count = boot::MAX_RESERVED_REGIONS;
         context.expect_eq(&actual.reserved[..], &expected.reserved[..]);
         context.expect_eq(&actual.reserved_no_map[..], &expected.reserved_no_map[..]);
+
         let start = ram.start.checked_add(boot::MAX_RESERVED_REGIONS.checked_mul(4096)
             .expect("last reservation offset overflow")).expect("last reservation address overflow");
         let overflow = boot::Region {
@@ -705,6 +718,7 @@ pub(crate) mod cases {
             boot::Region { start: second, end: second + page },
             boot::Region { start: base, end: base + page },
         ]);
+
         let size = page + page / 2;
         let selected = platform::ktest_find_reserved_region(
             info, size, page, boot::Region { start: base, end: base + 3 * page }, false,
@@ -731,6 +745,7 @@ pub(crate) mod cases {
         info.reserve(info.dtb).unwrap();
         info.reserve(info.initrd.unwrap()).unwrap();
         info.reserve(boot::Region { start: base + 2 * page, end: base + 3 * page }).unwrap();
+
         let first = platform::ktest_find_reserved_region(info, page, page, window, false)
             .expect("dynamic reservation failed").expect("dynamic reservation absent");
         context.expect_eq(first, boot::Region { start: base + 3 * page, end: base + 4 * page });
@@ -764,11 +779,13 @@ pub(crate) mod cases {
         } else {
             info.reserve(occupied).unwrap();
         }
+
         let blocked = platform::ktest_find_reserved_region(
             info, 64, 64, boot::Region { start: base + 0x940, end: base + 0xb40 },
             !existing_no_map,
         ).expect("same-page selection failed");
         context.expect_eq(blocked, None);
+
         let selected = platform::ktest_find_reserved_region(
             info, 64, 64, boot::Region { start: base + 0x940, end: base + 2 * page },
             !existing_no_map,
@@ -851,6 +868,7 @@ pub(crate) mod cases {
                 }
             }
         }
+
         for logical in 0..live.cpu_count {
             let length = lengths[logical];
             assert!(length == 4 || length == 8);
@@ -864,6 +882,7 @@ pub(crate) mod cases {
                 .iter().position(|id| *id == *hardware).unwrap();
             *hardware = boot::MAX_CPUS + 1 + logical * 3;
         }
+
         let bsp = boot::MAX_CPUS + 1 + bsp_logical * 3;
         expected.bsp_hardware_id = bsp;
         let actual = parse(&fixture.bytes[..fixture.length], fixture.actual, bsp);
@@ -895,12 +914,14 @@ pub(crate) mod cases {
         for token in fixture.bytes[start..end].chunks_exact_mut(4) {
             token.copy_from_slice(&4u32.to_be_bytes());
         }
+
         let actual = parse(&fixture.bytes[..fixture.length], fixture.actual, hardware);
         same_resources(context, &actual, &original);
     }
 }
     };
 }
+
 /// RV 直映扣洞和活动对象边界使用同一独占固件副本验证。
 #[cfg(target_arch = "riscv64")]
 #[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
@@ -937,6 +958,7 @@ pub(crate) mod no_map {
             })
             .unwrap();
         }
+
         let mut actual = [boot::Region::default(); 3];
         let mut count = 0;
         for (start, end) in [(0, 0x10000), (0x20000, 0x28000), (0x100000, 0x102000)] {
@@ -1002,6 +1024,7 @@ pub(crate) mod no_map {
                 .unwrap();
             }
         }
+
         let (fragments, tables) = arch::ktest_ram_mapping_budget(info);
         context.expect_eq(
             fragments,
@@ -1046,6 +1069,7 @@ pub(crate) mod no_map {
         })
         .unwrap();
         assert!(arch::validate_boot_no_map(info, kernel).is_ok());
+
         for target in [kernel, info.dtb, info.initrd.unwrap()] {
             info.reserved_count = 2;
             info.reserve_no_map(boot::Region {
@@ -1055,6 +1079,7 @@ pub(crate) mod no_map {
             .unwrap();
             assert!(arch::validate_boot_no_map(info, kernel).is_err());
         }
+
         info.reserved_count = 2;
         info.reserve_no_map(boot::Region {
             start: base + 0x4000,
@@ -1062,6 +1087,7 @@ pub(crate) mod no_map {
         })
         .unwrap();
         assert!(arch::validate_boot_no_map(info, kernel).is_err());
+
         info.reserved_count = 2;
         info.reserve_no_map(boot::Region {
             start: kernel.end,
@@ -1112,6 +1138,7 @@ firmware_cases! {
                 _ => unreachable!(),
             }
         }
+
         assert!(platform::ktest_discover_tree(
             &fixture.bytes[..fixture.length],
             live.raw_args,
@@ -1158,6 +1185,7 @@ pub(crate) mod dma_policy {
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
             Ok(false),
         );
+
         fixture.put_property("/", "dma-noncoherent", &[]);
         fixture.remove_property("/", "dma-coherent");
         fixture.put_property("/chosen", "dma-coherent", &[]);
@@ -1165,6 +1193,7 @@ pub(crate) mod dma_policy {
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false),
             Ok(true),
         );
+
         fixture.remove_property("/chosen", "dma-noncoherent");
         fixture.remove_property("/chosen", "dma-coherent");
         context.expect_eq(
@@ -1193,6 +1222,7 @@ pub(crate) mod dma_policy {
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),
             Ok(false),
         );
+
         fixture.remove_property("/cpus", "dma-noncoherent");
         fixture.put_property("/cpus", "dma-coherent", &[]);
         fixture.put_property("/", "dma-noncoherent", &[]);
@@ -1222,18 +1252,21 @@ pub(crate) mod dma_policy {
                 true,
             );
         }
+
         fixture.put_property("/chosen", "interconnects", &0u32.to_be_bytes());
         context.expect_eq(
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
                 .is_err(),
             true,
         );
+
         fixture.put_property("/chosen", "interconnects", &(PROVIDER - 2).to_be_bytes());
         context.expect_eq(
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", false)
                 .is_err(),
             true,
         );
+
         fixture.put_property("/chosen", "interconnects", &link);
         fixture.put_property("/cpus", "#interconnect-cells", &[2]);
         context.expect_eq(
@@ -1261,6 +1294,7 @@ pub(crate) mod dma_policy {
                 .is_err(),
             true,
         );
+
         fixture.put_property("/chosen", "dma-noncoherent", &[]);
         context.expect_eq(
             platform::ktest_dma_coherent(&fixture.bytes[..fixture.length], "/chosen", true),

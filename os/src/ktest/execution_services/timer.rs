@@ -158,6 +158,7 @@ fn arithmetic() -> (usize, usize) {
         None
     );
     let phase = usize::from(next.as_nanos() == 32);
+
     let delay = Duration::from_millis(1);
     let before = clock::now();
     let after = timers::after(delay).expect("checked after");
@@ -216,6 +217,7 @@ fn test_sleep() {
     );
     assert_eq!((future, deadline_kept, early), (1, 1, 0));
     assert_eq!(wakes, 3);
+
     let old_task = scenario().sleep_task.lock().take().unwrap();
     assert_eq!(sched::test_state(&old_task), State::Exited);
     assert_eq!(Arc::strong_count(&old_task), 1);
@@ -286,6 +288,7 @@ fn paused_stop(
         true,
         "sync canceller prepared",
     );
+
     testing::arm_pause(timer.as_ref(), point);
     assert!(timer
         .as_ref()
@@ -304,6 +307,7 @@ fn paused_stop(
         assert!(state.running && state.queued);
     }
     assert_eq!(timer.as_ref().try_cancel(), CancelResult::Busy);
+
     scenario().release_cancel();
     wait_before(
         || {
@@ -330,6 +334,7 @@ fn paused_stop(
             Err(ArmError::Closed)
         );
     }
+
     assert!(
         !scenario().fail_after_cancel.load(Ordering::Acquire),
         "controlled timer coordinator failure"
@@ -364,6 +369,7 @@ fn test_cancel(point: Option<testing::PausePoint>) {
     assert!(testing::snapshot(timer.as_ref()).queued);
     let queued = usize::from(timer.as_ref().try_cancel() == CancelResult::Cancelled);
     assert_eq!(queued, 1);
+
     let before = scenario().callbacks.load(Ordering::Acquire);
     let busy_before = scenario().busy.load(Ordering::Acquire);
     let mut inflight = 0;
@@ -419,6 +425,7 @@ fn test_rearm_close() {
     );
     timer.as_ref().cancel_sync();
     assert_eq!(timer.as_ref().try_cancel(), CancelResult::Idle);
+
     assert!(timer
         .as_ref()
         .arm(deadline(Duration::from_secs(1)))
@@ -436,6 +443,7 @@ fn test_rearm_close() {
     );
     timer.as_ref().cancel_sync();
     let reused = usize::from(scenario().callbacks.load(Ordering::Acquire) == callbacks_before + 3);
+
     let _overlap = if 1 < cpu::count() {
         let (running, blocked) = paused_stop(&timer, testing::PausePoint::Tail, true, true);
         assert_eq!(running, blocked);
@@ -543,6 +551,7 @@ fn test_remote() {
                     false,
                     "remote protected program pause",
                 );
+
                 // 停点内入口数不会推进；下一入口只证明本次 handler/等待调用已经返回，不算 ISA。
                 let entered = cpu::test_idle_waits(target);
                 let early = deadline(Duration::from_millis(100));
@@ -586,6 +595,7 @@ fn test_remote() {
                     idle += waits;
                     break;
                 }
+
                 // 合法 skip 完整撤掉本轮登记，下一轮沿同一节点重排；不能吞掉未返回的 ISA 完成。
                 early_timer.as_ref().cancel_sync();
                 assert_eq!(scenario().remote_early.load(Ordering::Acquire), 0);
@@ -657,11 +667,13 @@ fn tree_cases() {
             assert_eq!(members, step + 1);
             assert!(0 < black_height);
         }
+
         for step in 0..24 {
             let index = (step * 17) % 48;
             assert!(!nodes[index].as_ref().arm(base).unwrap());
             assert_eq!(testing::validate_tree(0).0, 48);
         }
+
         for step in 0..48 {
             let index = match pattern {
                 1 => step,
@@ -722,6 +734,7 @@ fn test_coarse() {
     );
     let rejected = testing::snapshot(nodes[0].as_ref());
     assert!(!rejected.queued && !rejected.running);
+
     let jump_start;
     let jump_end;
     {
@@ -763,6 +776,7 @@ fn test_coarse() {
     }
     let jump_ticks = jump_end.checked_sub(jump_start).unwrap();
     assert!(2 <= jump_ticks);
+
     let expected = armed - cancelled;
     wait_before(
         || scenario().coarse_fired.load(Ordering::Acquire) == expected,
@@ -780,6 +794,7 @@ fn test_coarse() {
         );
         assert_unique(node);
     }
+
     let fired = scenario().coarse_fired.load(Ordering::Acquire);
     assert_eq!(scenario().coarse_early.load(Ordering::Acquire), 0);
     wait_services_blocked();
@@ -830,6 +845,7 @@ struct Scenario {
     coarse_deadlines: [AtomicU64; 256],
     coarse_hits: [AtomicUsize; 256],
 }
+
 static CURRENT: core::sync::atomic::AtomicPtr<Scenario> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -843,10 +859,12 @@ fn scenario() -> Arc<Scenario> {
         Arc::from_raw(pointer)
     }
 }
+
 struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
+
 impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
     fn set_up(
@@ -895,12 +913,14 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
             .is_ok());
         Ok(Self { state, initial })
     }
+
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
         self.state.nodes.stop()?;
         Ok(())
     }
+
     /// runner已join每个原Task；尾票归还以后才释放context/owner并比较完整两账。
     fn tear_down(self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         let mut owner = core::mem::ManuallyDrop::new(self);
@@ -915,6 +935,7 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
         if testing::validate_tree(0).0 != 0 {
             return Err(::ktest::TestError("precise timer tree did not converge"));
         }
+
         let initial = owner.initial;
         let pointer = CURRENT.swap(core::ptr::null_mut(), Ordering::AcqRel);
         assert_eq!(pointer, Arc::as_ptr(&owner.state).cast_mut());
@@ -957,6 +978,7 @@ impl Scenario {
         }
     }
 }
+
 impl ServiceFixture {
     /// 同核观察在原fixed-0 Task执行，实际timer/子任务拥有仍归catch外fixture。
     fn fixed(
@@ -970,6 +992,7 @@ impl ServiceFixture {
 #[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "timer"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
+
     /// 已过期和零延迟不创建多余WaitId；每种输入重新准备fixture。
     #[test]
     #[case("zero", None)]
@@ -984,6 +1007,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 相位推进、边界相等、零周期和溢出均使用原checked算法。
     #[test]
     fn periodic_arithmetic(
@@ -995,6 +1019,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 三次真实提前通知替换等待身份，四次Blocked仍使用同一绝对期限与原栈timer。
     #[test]
     fn stack_sleep_original_deadline(
@@ -1006,6 +1031,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// queued撤链、回调内Busy和尾部之后Idle必须来自同一个真实节点。
     #[test]
     fn callback_busy(
@@ -1017,6 +1043,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 两个真实远核窗口各自让同步取消Task在原finished源Blocked，释放后才返回。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -1032,6 +1059,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 原取消者已消费gate并等待真实回调尾时令控制者失败，cleanup不得再制造第二票。
     #[test]
     #[ktest(
@@ -1048,6 +1076,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 同节点self-rearm不重入，cancel后可复用，close拒绝后续登记并同步running加queued。
     #[test]
     fn rearm_reuse_close(
@@ -1059,6 +1088,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 每核触发真实 precise 回调，远核另在提交停点验证更早节点与 ISA 返回。
     #[test]
     fn earlier_remote_deadline(
@@ -1070,6 +1100,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 生产红黑树的相同期、逆序、任意撤链与更新逐步保持成员、黑高和缓存首项。
     #[test]
     fn precise_tree_invariants(
@@ -1081,6 +1112,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 真counter跨三个仍在未来的非空wheel桶，256登记160取消96BH回调和预算续批守恒。
     #[test]
     fn real_wheel_bucket_jump(

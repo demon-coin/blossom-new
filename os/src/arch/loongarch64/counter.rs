@@ -29,10 +29,12 @@ pub fn establish_counter_epoch() {
         !COUNTER_EPOCH_READY.load(Ordering::Acquire),
         "counter epoch is already established"
     );
+
     let raw = read_counter().wrapping_sub(counter_compensation());
     let offset = 0u64.wrapping_sub(raw);
     // SAFETY: BSP 启动段处于 PLV0、IRQ 关闭，尚无本核时间采样。
     unsafe { write_counter_compensation(offset) };
+
     COUNTER_EPOCH.store(offset, Ordering::Release);
     COUNTER_EPOCH_READY.store(true, Ordering::Release);
 }
@@ -46,6 +48,7 @@ pub unsafe fn apply_counter_epoch() {
         COUNTER_EPOCH_READY.load(Ordering::Acquire),
         "counter epoch is not established"
     );
+
     let offset = COUNTER_EPOCH.load(Ordering::Acquire);
     // SAFETY: 调用者保证本核尚未依赖旧补偿。
     unsafe { write_counter_compensation(offset) };

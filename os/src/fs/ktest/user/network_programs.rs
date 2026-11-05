@@ -47,6 +47,7 @@ impl Fixture for NetworkSuite {
         <UserSuite as Fixture>::tear_down(self.resources, context)
     }
 }
+
 impl Fixture<NetworkSuite> for UserOwner {
     /// 借同一库存并保活整组真实网络，停止责任仍由 suite owner 承担。
     fn set_up(context: &mut TestContext<'_>, suite: &NetworkSuite) -> Result<Self, TestError> {
@@ -71,9 +72,11 @@ impl Fixture<NetworkSuite> for UserOwner {
         <Self as Fixture<UserSuite>>::tear_down(self, context)
     }
 }
+
 #[ktest::suite(fixture = UserOwner, suite_resources = NetworkSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod network_programs {
     use super::*;
+
     /// 普通 pipe 与 lo TCP 产生固定事件，用户 ioctl 冻结后核旧 OFD 字节独立。
     #[test]
     #[ktest(tags("observation-user", "trace", "network-user"))]
@@ -275,6 +278,7 @@ pub(crate) mod network_programs {
     ) -> TestResult {
         fixture.network_mode(context, NetworkMode::LargeLoopback)
     }
+
     /// 原生 C 核 socket 的真实有限等待、共享选项、child 继承与信号重启差异。
     #[test]
     #[ktest(

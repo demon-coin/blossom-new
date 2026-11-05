@@ -20,12 +20,14 @@ use crate::wait::WaitResult;
 use crate::{cpu, mm, sched, task};
 
 use crate::fs::{O_CLOEXEC as CLOEXEC, O_NONBLOCK as NONBLOCK};
+
 const ADDRESS: usize = 0x4700_0000;
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
     execute: false,
 };
+
 type Metadata = crate::workqueue::testing::MetadataStats;
 type WatchWeak = Weak<dyn Send + Sync>;
 /// 保存子任务自己发表的弱身份，观察拥有不延长 Task 生命周期。
@@ -194,6 +196,7 @@ impl Fixture<EpollSuite> for EpollOwner {
             gate.complete();
         }
         drop(self.owner.take());
+
         drop(self.reader.take());
         drop(self.writer.take());
         self.join(context);
@@ -205,6 +208,7 @@ impl Fixture<EpollSuite> for EpollOwner {
         let before = self.before;
         let metadata = self.metadata;
         drop(self);
+
         recovered(context, "epoll-case-last-release", before)?;
         let actual = crate::workqueue::testing::metadata_stats();
         context.diagnostic(format_args!(
@@ -355,6 +359,7 @@ pub(crate) mod events {
             ),
             Err(FsError::Exists),
         );
+
         let mut events = [EpollEvent::default(); 4];
         context.expect_eq(
             mask(context, fixture.owner())?,
@@ -365,6 +370,7 @@ pub(crate) mod events {
         let mut bytes = [0; PIPE_BUF];
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 7);
         context.expect_eq(&bytes[..7], b"already");
+
         for _ in 0..16 {
             checked(context, fixture.writer().write(&[0x5d; PIPE_BUF]))?;
         }
@@ -398,6 +404,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 1);
         context.expect_eq(events[0], event(PollMask::POLLOUT.0, data + 1));
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
+
         checked(
             context,
             fixture
@@ -414,6 +421,7 @@ pub(crate) mod events {
             ),
             Err(FsError::NotFound),
         );
+
         // ERR 不依赖用户兴趣；读 OFD 末释放撤其自身 watch 后通知写端真实源。
         checked(
             context,
@@ -465,6 +473,7 @@ pub(crate) mod events {
         )?;
         let first_watch = watch(fixture.epoll(), &held, fd as i32);
         let dup_watch = watch(fixture.epoll(), &held, duplicate as i32);
+
         checked(context, table.close(fd))?;
         checked(context, child.close(fd))?;
         let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
@@ -502,6 +511,7 @@ pub(crate) mod events {
                 1,
             );
         }
+
         checked(context, table.close(duplicate))?;
         checked(context, child.close(duplicate))?;
         drop(fixture.reader.take());
@@ -513,6 +523,7 @@ pub(crate) mod events {
         let mut bytes = [0; 7];
         context.expect_eq(checked(context, held.read(&mut bytes))?, 7);
         context.expect_eq(&bytes, b"oldtail");
+
         drop(held);
         context.expect_eq(old_weak.upgrade().is_none(), true);
         context.expect_eq(first_watch.upgrade().is_none(), true);
@@ -558,6 +569,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 2);
         context.expect_eq(&bytes[..2], b"cd");
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
+
         checked(
             context,
             fixture.epoll().control(
@@ -576,6 +588,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 1);
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 2);
         context.expect_eq(&bytes[..2], b"EF");
+
         checked(
             context,
             fixture.epoll().control(
@@ -643,6 +656,7 @@ pub(crate) mod events {
         )?;
         checked(context, fixture.writer().write(b"a"))?;
         checked(context, writer.write(b"tail"))?;
+
         let release = fixture.gate()?;
         let done = fixture.gate()?;
         let task_release = Arc::clone(&release);
@@ -658,6 +672,7 @@ pub(crate) mod events {
                 1
             }
         })?;
+
         let mut delivered = None;
         let mut consumed = [0; 1];
         let result = fixture.epoll().scan(1, &mut |event| {
@@ -673,6 +688,7 @@ pub(crate) mod events {
         context.expect_eq(delivered, Some(event(PollMask::POLLIN.0, 0xd001)));
         context.expect_eq(&consumed, b"a");
         fixture.join(context);
+
         let mut events = [EpollEvent::default(); 4];
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 2);
         context.expect_eq(
@@ -733,6 +749,7 @@ pub(crate) mod events {
         )?;
         checked(context, fixture.writer().write(b"first"))?;
         checked(context, writer.write(b"second"))?;
+
         let memory = Mm::try_new().map_err(|_| TestError("epoll user MM OOM"))?;
         memory
             .map_anonymous(ADDRESS, PIPE_BUF, RW, RW)
@@ -750,6 +767,7 @@ pub(crate) mod events {
             &partial[..],
             &encoded(event(PollMask::POLLIN.0, first))[..8],
         );
+
         let output = ADDRESS + PIPE_BUF - 16;
         let mut address = output;
         let mut complete = 0;
@@ -777,6 +795,7 @@ pub(crate) mod events {
         context.expect_eq(bytes, encoded(event(PollMask::POLLIN.0, second)));
         let mut events = [EpollEvent::default(); 2];
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
+
         checked(
             context,
             fixture.epoll().control(
@@ -837,6 +856,7 @@ pub(crate) mod events {
         poll.clear_triggered();
         checked(context, fixture.writer().write(b"wake"))?;
         context.expect_eq(poll.triggered(), true);
+
         let inside = fixture.gate()?;
         let release = fixture.gate()?;
         let parked = fixture.gate()?;
@@ -855,6 +875,7 @@ pub(crate) mod events {
                 1
             }
         })?;
+
         inside.wait();
         let task_poll = Arc::clone(&poll);
         let task_parked = Arc::clone(&parked);
@@ -875,6 +896,7 @@ pub(crate) mod events {
         until("epoll query did not block on real scan mutex", || {
             fixture.blocked(1)
         })?;
+
         release.complete();
         fixture.join(context);
         context.expect_eq(table.len(), 1);
@@ -884,6 +906,7 @@ pub(crate) mod events {
         context.expect_eq(&bytes, b"wake");
         let mut events = [EpollEvent::default(); 1];
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
+
         drop(table);
         poll.clear_triggered();
         checked(context, fixture.writer().write(b"after unregister"))?;
@@ -959,6 +982,7 @@ pub(crate) mod events {
             }
             context.expect_eq(lifetime.upgrade().is_none(), true);
             poll.clear_triggered();
+
             // 原源继续产生真实字节，旧 epoll hook 已同步撤完，不能再触达旧 poll context。
             let before = produced.load(Ordering::Acquire);
             let mut bytes = [0; 257];
@@ -989,6 +1013,7 @@ pub(crate) mod events {
                 context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
             }
         }
+
         drop(table);
         let owner: FileRef = checked(context, EpollFile::try_new(0))?;
         fixture.owner = Some(owner);
@@ -1069,6 +1094,7 @@ pub(crate) mod events {
         let target = Arc::downgrade(fixture.reader());
         drop(fixture.reader.take());
         checked(context, fixture.writer().write(b"last"))?;
+
         let mut delivered = None;
         let mut query_holds_last = false;
         let mut write_while_pinned = None;
@@ -1129,6 +1155,7 @@ pub(crate) mod events {
             (0, 0, 0, 0, 0, 0),
         );
         context.expect_eq(stat.inode < checked(context, cloexec.stat())?.inode, true);
+
         let mut untouched = [0xa5; 3];
         context.expect_eq(
             fixture.owner().read(&mut untouched),
@@ -1161,6 +1188,7 @@ pub(crate) mod events {
             fixture.owner().ioctl(0xffff, 0, FileIoContext::Kernel),
             Err(FsError::NotTty),
         );
+
         context.expect_eq(
             fixture.epoll().control(
                 fixture.owner(),
@@ -1231,6 +1259,7 @@ pub(crate) mod events {
                 Some(event(PollMask::POLLIN.0, base + fd as u64)),
             )?;
         }
+
         scan_data(context, fixture.epoll(), &mut seen[..count], base)?;
         let mut old_bytes = [0; 20];
         context.expect_eq(
@@ -1240,6 +1269,7 @@ pub(crate) mod events {
         context.expect_eq(old_bytes.as_slice(), bytes.as_slice());
         // 全部 LT 候选已陈旧，自身 poll 必须一次走完真实增长规模的扫描拥有链。
         context.expect_eq(mask(context, fixture.owner())?, PollMask::default());
+
         checked(context, fixture.writer().write(bytes))?;
         let middle_fd = count / 2;
         let middle = watch(fixture.epoll(), fixture.reader(), middle_fd as i32);
@@ -1253,6 +1283,7 @@ pub(crate) mod events {
             middle_fd,
             Some(event(PollMask::POLLIN.0, base + middle_fd as u64)),
         )?;
+
         checked(context, table.close(first))?;
         let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
         let reused = checked(context, table.reserve(count + 1))?
@@ -1285,6 +1316,7 @@ pub(crate) mod events {
             replacement.len(),
         );
         context.expect_eq(new_bytes.as_slice(), replacement.as_slice());
+
         for fd in (1..count).rev() {
             let lifetime = watch(fixture.epoll(), fixture.reader(), fd as i32);
             control_fd(context, fixture, &table, EPOLL_CTL_DEL, fd, None)?;
@@ -1341,6 +1373,7 @@ pub(crate) mod events {
             lifetimes.push(watch(fixture.epoll(), fixture.reader(), fd as i32));
         }
         scan_data(context, fixture.epoll(), &mut seen, base)?;
+
         let poll = checked(context, PollContext::try_new())?;
         let sink: Arc<dyn PollNotify> = poll.clone();
         let mut sources = checked(context, PollTable::new(sink, 2))?;
@@ -1349,6 +1382,7 @@ pub(crate) mod events {
             fixture.owner().pollable().unwrap().poll(Some(&mut sources)),
         )?;
         poll.clear_triggered();
+
         let owner = Arc::downgrade(fixture.owner());
         drop(fixture.owner.take());
         context.expect_eq(owner.upgrade().is_none(), true);
@@ -1401,6 +1435,7 @@ pub(crate) mod events {
             let lifetime = watch(fixture.epoll(), &reader, fd as i32);
             targets.push((writer, Arc::downgrade(&reader), lifetime));
         }
+
         let mut seen = delivery_slots(count)?;
         let result = fixture.epoll().scan(count, &mut |item| {
             if item.data < base || base + count as u64 <= item.data {
@@ -1423,6 +1458,7 @@ pub(crate) mod events {
             seen[fd] = true;
             Ok(())
         });
+
         context.expect_eq(checked(context, result)?, count);
         context.expect_eq(seen.iter().all(|slot| *slot), true);
         for (writer, target, lifetime) in targets {
@@ -1462,6 +1498,7 @@ pub(crate) mod events {
             )?;
         }
         let extra = checked(context, table.dup(first, count + 1))?;
+
         let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let evidence = pressure.exhaust();
         let creation_error = EpollFile::try_new(0).err();
@@ -1488,12 +1525,14 @@ pub(crate) mod events {
             Ok(())
         });
         drop(pressure);
+
         context.expect_eq(evidence, (true, true));
         context.expect_eq(creation_error, Some(FsError::NoMemory));
         context.expect_eq(add_error, Err(FsError::NoMemory));
         context.expect_eq(absent, true);
         context.expect_eq(checked(context, scanned)?, count);
         context.expect_eq(seen[..count].iter().all(|slot| *slot), true);
+
         control_fd(
             context,
             fixture,

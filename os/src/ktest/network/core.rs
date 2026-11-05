@@ -28,6 +28,7 @@ pub(crate) mod core {
         let end = time::now()
             .checked_add(time::Duration::from_secs(5))
             .unwrap();
+
         while sent < input.len() || received < input.len() {
             if sent < input.len() {
                 let mut source = WriteBuffer::kernel(&input[sent..]);
@@ -67,6 +68,7 @@ pub(crate) mod core {
             timer::sleep(time::Duration::from_millis(1));
         }
         context.expect_eq(output, input);
+
         let tail = b"final tcp tail";
         let mut source = WriteBuffer::kernel(tail);
         context.expect_eq(
@@ -123,6 +125,7 @@ pub(crate) mod core {
                 endpoint.dispatch(time::now(), |packet| fixture.enqueue(packet)),
             )?;
         }
+
         let mut attempted = None;
         let failure = fixture.client.lock().dispatch(time::now(), |packet| {
             attempted = Some(packet.tcp()?.1.seq_number);
@@ -133,11 +136,13 @@ pub(crate) mod core {
             fixture.client.lock().deadline(time::now()),
             ProtocolDeadline::Now,
         );
+
         for _ in 0..LOOPBACK_CAPACITY {
             fixture
                 .take_packet()
                 .ok_or(TestError("full queue lost an accepted packet"))?;
         }
+
         let mut submitted = None;
         operation(
             context,
@@ -169,6 +174,7 @@ pub(crate) mod core {
         memory
             .map_anonymous(ADDRESS, 4096, RW, RW)
             .map_err(|_| TestError("network user page mapping failed"))?;
+
         let input = b"real tcp fault boundary";
         let mut source = WriteBuffer::kernel(input);
         context.expect_eq(
@@ -178,6 +184,7 @@ pub(crate) mod core {
         fixture.until(context, || {
             fixture.server.lock().receive_queue() == input.len()
         })?;
+
         let mut target = operation(
             context,
             ReadBuffer::user(&memory, ADDRESS + 4096 - 7, input.len()),
@@ -187,6 +194,7 @@ pub(crate) mod core {
             IoProgress::Ready(7),
         );
         context.expect_eq(fixture.server.lock().receive_queue(), input.len());
+
         let mut target = operation(
             context,
             ReadBuffer::user(&memory, ADDRESS + 4096 - 7, input.len()),
@@ -207,6 +215,7 @@ pub(crate) mod core {
             IoProgress::Ready(input.len() - 7),
         );
         context.expect_eq(&output[..input.len() - 7], &input[7..]);
+
         let progress = memory.copyout(ADDRESS + 4096 - 9, b"nine real");
         context.expect_eq(progress.copied, 9);
         context.expect_eq(progress.error, None);

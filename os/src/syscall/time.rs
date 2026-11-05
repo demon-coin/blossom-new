@@ -12,12 +12,14 @@ use crate::timer;
 use crate::wait::WaitResult;
 
 const TIMER_ABSTIME: usize = 1;
+
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 const CLOCK_REALTIME_COARSE: i32 = 5;
 const CLOCK_MONOTONIC_COARSE: i32 = 6;
+
 const RUSAGE_SELF: i32 = 0;
 const RUSAGE_CHILDREN: i32 = -1;
 const RUSAGE_THREAD: i32 = 1;
@@ -28,6 +30,7 @@ pub(super) fn dispatch(user: &UserThread, request: Request) -> Outcome {
     user.user_time()
         .expect("time syscall has no user time")
         .flush_cpu_timers();
+
     let raw = request.arguments;
     let result = match request.number {
         101 | 115 => return sleep(user, request),
@@ -97,10 +100,12 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
         if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
             return Err(Errno::Unsupported);
         }
+
         let mm = user.mm().expect("sleep has no MM");
         let mut bytes = [0; 16];
         error::copyin(&mm, &mut bytes, address)?;
         let ns = decode_time(&bytes, NSEC_PER_SEC, 1)?;
+
         let deadline = if absolute && clock == CLOCK_REALTIME {
             time::realtime_deadline(ns)
         } else if absolute {
@@ -122,6 +127,7 @@ fn sleep(user: &UserThread, request: Request) -> Outcome {
             },
         ))
     })();
+
     match parsed {
         Ok((deadline, remaining)) => resume_sleep(user, request, deadline, remaining),
         Err(error) => Outcome::Return(error.result()),
@@ -236,12 +242,14 @@ fn setitimer(user: &UserThread, raw: [usize; 6]) -> SysResult {
         interval_ns: decode_time(&bytes[..16], USEC_PER_SEC, NSEC_PER_USEC)?,
         value_ns: decode_time(&bytes[16..], USEC_PER_SEC, NSEC_PER_USEC)?,
     };
+
     let old = user
         .user_time()
         .expect("setitimer has no time")
         .group()
         .set_itimer(which, value)
         .ok_or(Errno::Overflow)?;
+
     if raw[2] != 0 {
         error::copyout(&mm, raw[2], &itimerval(old))?;
     }
@@ -282,6 +290,7 @@ fn getrusage(user: &UserThread, raw: [usize; 6]) -> SysResult {
         RUSAGE_THREAD => time.snapshot(),
         _ => return Err(Errno::InvalidArgument),
     };
+
     let mut bytes = [0; 144];
     bytes[..16].copy_from_slice(&timeval(value.user_ns, false));
     bytes[16..32].copy_from_slice(&timeval(value.kernel_ns, false));

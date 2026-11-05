@@ -38,6 +38,7 @@ mod domain {
             DmaDomain::new(u64::MAX, 0, PAGE_SIZE, u64::MAX, 64, true),
             Err(DmaError::AddressLimit)
         );
+
         let domain = DmaDomain::new(0xffff, 0x1000, 0x2000, 0x8000, 64, true).unwrap();
         assert_eq!(domain.map(0x1001, 1).unwrap().value(), 0x8001);
         assert_eq!(domain.map(0x1fff, 2), Err(DmaError::AddressLimit));
@@ -122,6 +123,7 @@ mod ownership {
         let bounds = unsafe { payload.cpu_copy_range(1, 64) }.map(|_| ());
         // SAFETY: 上述所有同步调用已返回，未导出其他访问者。
         unsafe { payload.finish_cpu_access() };
+
         assert_eq!(copied, Ok(()));
         assert_eq!(reverse, Err(DmaError::InvalidRange));
         assert_eq!(bounds, Err(DmaError::InvalidRange));
@@ -149,6 +151,7 @@ mod ownership {
                 error: None,
             })
         };
+
         let wb = {
             let mut content = folio.lock_content();
             content.copy_from(0, &[0x31u8; 512]).unwrap();
@@ -193,6 +196,7 @@ mod ownership {
                 error: None,
             })
         };
+
         assert_eq!(output, [0x72u8; 512]);
         assert_eq!(folio.writeback_sectors(), 0);
         assert_eq!(folio.dirty_sectors(), 1);
@@ -222,6 +226,7 @@ mod ownership {
             control.region().cpu.as_ptr() as usize,
             crate::arch::phys_to_virt(physical)
         );
+
         let kernel = crate::boot::kernel_region();
         let reserved = DmaDomain::new(
             u64::MAX,

@@ -39,6 +39,7 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
         }
         sched::yield_now();
     }
+
     mm::shrink_all();
     mm::drain_all_pages();
     Ok(mm::stats())
@@ -63,6 +64,7 @@ impl Fixture for PressureFixture {
             child_exited: AtomicBool::new(false),
         })
         .map_err(|_| TestError("NoMemory: admission observation"))?;
+
         Ok(Self {
             baseline,
             held,
@@ -101,6 +103,7 @@ impl Fixture for PressureFixture {
             self.state.reentrant_body_runs.load(Ordering::Acquire),
             self.state.child_exited.load(Ordering::Acquire),
         ));
+
         let baseline = self.baseline;
         drop(self);
         let after = settled()?;
@@ -109,6 +112,7 @@ impl Fixture for PressureFixture {
             "admission six-domains-before={:?} six-domains-after={:?}",
             baseline, after
         ));
+
         Ok(())
     }
 }
@@ -138,6 +142,7 @@ impl Drop for SleepingCapture {
             before == Some(self.owner) && task::current_task_id() == Some(self.owner),
             Ordering::Release,
         );
+
         let state = Arc::clone(&self.state);
         let result = crate::ktest::spawn_on(0, move |_| {
             state.reentrant_body_runs.fetch_add(1, Ordering::AcqRel);
@@ -180,6 +185,7 @@ mod children {
             }
             sched::yield_now();
         }
+
         let capture = SleepingCapture {
             state: Arc::clone(&fixture.state),
             owner: task::current_task_id().ok_or(TestError("admission requires ordinary Task"))?,
@@ -195,6 +201,7 @@ mod children {
             mm::alloc_pages(0, false).is_none(),
             "admission pressure was not real OOM"
         );
+
         let result = crate::ktest::spawn_on(0, move |_| {
             capture.state.body_runs.fetch_add(1, Ordering::AcqRel);
             drop(capture);

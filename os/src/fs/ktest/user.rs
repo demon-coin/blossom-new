@@ -228,6 +228,7 @@ impl UserOwner {
                 self.net.clone(),
             ),
         )?;
+
         let coordinator = cpu::current().id;
         let target = (coordinator + 1) % cpu::count();
         let prepared =
@@ -236,6 +237,7 @@ impl UserOwner {
                     context.diagnostic(format_args!("user-program-prepare error={:?}", error));
                     TestError("user program task preparation failed")
                 })?;
+
         if reserve_parent_fd {
             let files = prepared
                 .user()
@@ -269,6 +271,7 @@ impl UserOwner {
             });
             ready.wait();
         }
+
         let pid = prepared.pid();
         let join = prepared.publish().map_err(|error| {
             context.diagnostic(format_args!("user-program-publish error={:?}", error));
@@ -346,6 +349,7 @@ impl UserOwner {
                 context.diagnostic(format_args!("user-named-load error={:?}", error));
                 TestError("named user image failed")
             })?;
+
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
         let fs_context = self.path.context().clone();
         self.start_program(
@@ -356,6 +360,7 @@ impl UserOwner {
             reserve_parent_fd,
             credentials,
         )?;
+
         let event = self.wait(context)?;
         let cancelling = event.status != expected_status;
         if cancelling {
@@ -412,6 +417,7 @@ impl UserOwner {
             context.diagnostic(format_args!("user-program-wait error={:?}", error));
             TestError("user child wait failed")
         })?;
+
         let RunningProgram {
             pid,
             target,
@@ -423,6 +429,7 @@ impl UserOwner {
         if let Some(expected_task) = expected_task {
             context.expect_eq(event.task_id, expected_task);
         }
+
         let task_status = join.join();
         if let Some(target) = target {
             context.expect_eq(event.cpu, target);
@@ -481,6 +488,7 @@ impl Fixture<UserSuite> for UserOwner {
         if let Some(graph) = &self.graph {
             graph.request_root_exit(9);
         }
+
         // 用户wait仍可能等原盘完成；只恢复消费，不提前释放DMA拥有。
         for disk in &self.path.owner.disks {
             disk.test_resume_completions();
@@ -488,6 +496,7 @@ impl Fixture<UserSuite> for UserOwner {
         if self.running.is_some() {
             self.wait(context)?;
         }
+
         if let Some(observer) = self.observer.take() {
             let _ = observer.join();
         }
@@ -495,6 +504,7 @@ impl Fixture<UserSuite> for UserOwner {
             self.reap_children(context, true)?;
             self.lifecycle_child_left_stack()?;
         }
+
         if self.observation_trace {
             checked(context, crate::trace::stop())?;
             self.observation_trace = false;
@@ -503,6 +513,7 @@ impl Fixture<UserSuite> for UserOwner {
         if self.tty_io.active() {
             return Err(TestError("TTY UART stage is still active at quiesce"));
         }
+
         drop(self.graph.take());
         self.release_pressure();
         <PathOwner as Fixture<DeviceInventory>>::quiesce(&mut self.path, context)
@@ -523,6 +534,7 @@ impl Fixture<UserSuite> for UserOwner {
         let before = self.metadata_before;
         drop(self.net);
         <PathOwner as Fixture<DeviceInventory>>::tear_down(self.path, context)?;
+
         let after = metadata_stats();
         context.diagnostic(format_args!(
             "user-resources metadata-before={:?} metadata-after={:?}",

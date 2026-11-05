@@ -8,11 +8,13 @@ impl UserOwner {
     /// 从只读盘运行目标事件程序，普通退出和整棵用户树的离栈回收仍由原身份图完成。
     pub(super) fn events_abi(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
         self.prepare(context)?;
+
         let event = if matches!(mode, b"b" | b"s") {
             self.events_blocked(context, mode)?
         } else {
             self.run_named(context, PROGRAM, mode, false, 0)?
         };
+
         context.expect_eq(event.status, 0);
         if event.status != 0 {
             return Err(TestError("ordinary event ABI program failed"));
@@ -36,6 +38,7 @@ impl UserOwner {
             false,
             Credentials::ROOT,
         )?;
+
         let pid = self
             .running
             .as_ref()
@@ -48,6 +51,7 @@ impl UserOwner {
         let executor = user
             .executor()
             .ok_or(TestError("event root executor disappeared"))?;
+
         for phase in 1..=3 {
             until("event root did not block in the requested syscall", || {
                 mm.load_user_u32(FUTEX_CONTROL) == Ok(phase)
@@ -61,6 +65,7 @@ impl UserOwner {
                 mode, phase
             ));
         }
+
         drop(executor);
         drop(user);
         let event = self.wait(context)?;
@@ -71,6 +76,7 @@ impl UserOwner {
             "user-events mode={:?} syscall-result={} status={}",
             mode, result, event.status
         ));
+
         drop(mm);
         let cancelling = event.status != 0;
         if cancelling {

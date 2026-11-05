@@ -40,6 +40,7 @@ fn read_next(cursor: &mut Cursor) -> ReadRecord {
         if let Some(record) = cursor.read() {
             return record;
         }
+
         let record = {
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
@@ -107,12 +108,14 @@ fn run() -> i32 {
         )
         .expect("log metadata formatting failed");
         assert!(!header.is_truncated(), "log header capacity exhausted");
+
         let header = header.as_bytes();
         let body = record.text().as_bytes();
         let length = header.len() + body.len() + 1;
         let mut offset = 0;
         #[cfg(feature = "ktest")]
         testing::begin_record(record.seq, length, current.lost);
+
         while offset < length {
             let remaining = if offset < header.len() {
                 &header[offset..]

@@ -42,6 +42,7 @@ impl UserOwner {
         )?
         .ok_or(TestError("fresh file candidate retired before publication"))?;
         let read = read.ok_or(TestError("fresh canonical file page already filled"))?;
+
         self.warm_signal_program(context)?;
         let image = self.load_named(context, b"/test/bin/user-signal", b"r")?;
         #[cfg(target_arch = "riscv64")]
@@ -63,6 +64,7 @@ impl UserOwner {
         let executor = user
             .executor()
             .ok_or(TestError("file reader executor disappeared"))?;
+
         until("user file reader did not block on canonical page", || {
             let mut marker_bytes = [0u8; 8];
             let progress = mm.copyin(&mut marker_bytes, marker);
@@ -84,10 +86,12 @@ impl UserOwner {
             signals.interruption_pending(crate::wait::WaitMode::Interruptible),
             true,
         );
+
         checked(context, fill_file_page(&inode, 0, read, &invalidate))?;
         checked(context, folio.wait_ready().map_err(FsError::Io))?;
         drop(invalidate);
         drop(prepared);
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         self.reap_children(context, false)?;
@@ -143,6 +147,7 @@ impl UserOwner {
             result
         })
         .map_err(|_| TestError("infinite same-CPU observer preparation failed"))?;
+
         self.observer = Some(observer.publish());
         // 所有目标CPU的Ready工作在用户开始前发表，观察者发表的IPI不能代替timer抢占。
         let join = prepared
@@ -155,9 +160,11 @@ impl UserOwner {
             expected_task: Some(join.task_id()),
             join,
         });
+
         ready.wait();
         let advanced = self.observer.take().unwrap().join();
         context.expect_eq(advanced, 1);
+
         struct RemoteKill {
             graph: Arc<TaskGraph>,
             pid: usize,
@@ -201,6 +208,7 @@ impl UserOwner {
                 context.diagnostic(format_args!("user-remote-kill-send error={:?}", error));
                 TestError("remote user kill request failed")
             })?;
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 9);
         context.expect_eq(0 < event.user_timer_interrupts, true);
@@ -266,6 +274,7 @@ impl UserOwner {
             mm.store_user_u32(marker + 8, phase + 1)
                 .map_err(|_| TestError("clone checkpoint release failed"))?;
         }
+
         let event = self.wait(context)?;
         context.expect_eq(event.status, 0);
         self.reap_children(context, event.status != 0)?;
@@ -290,6 +299,7 @@ impl UserOwner {
             context.expect_eq(event.status, 0);
             return Ok(());
         }
+
         let pid = mm
             .read_usize(marker)
             .map_err(|_| TestError("suspend checkpoint PID is inaccessible"))?;
@@ -311,6 +321,7 @@ impl UserOwner {
         if child.mm().is_none() {
             return Err(TestError("suspend child exited before signal checkpoint"));
         }
+
         self.graph()
             .send_kernel(pid, crate::task::signal::SIGSTOP)
             .map_err(|_| TestError("suspend child stop request failed"))?;
@@ -342,6 +353,7 @@ impl UserOwner {
         let stopped = stopped.ok_or(TestError("suspend stopped event is absent"))?;
         context.expect_eq(stopped.code, 5);
         context.expect_eq(stopped.status, 19);
+
         mm.store_user_u32(marker + 8, 2)
             .map_err(|_| TestError("suspend parent unmap release failed"))?;
         until(
@@ -359,6 +371,7 @@ impl UserOwner {
             "signal-suspend-checkpoint temporary-mask=0x800 stopped={} parent-unmapped=1",
             stopped.status
         ));
+
         self.graph()
             .send_kernel(pid, crate::task::signal::SIGCONT)
             .map_err(|_| TestError("suspend child continue request failed"))?;

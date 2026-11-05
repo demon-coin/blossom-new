@@ -47,6 +47,7 @@ impl UserOwner {
         let executor = user
             .executor()
             .ok_or(TestError("TTY root executor disappeared"))?;
+
         match mode {
             b"r" => {
                 self.tty_stage(
@@ -230,6 +231,7 @@ impl UserOwner {
             }
             _ => return Err(TestError("unknown TTY user mode")),
         }
+
         until("TTY root did not reach the final close gate", || {
             mm.load_user_u32(FUTEX_CONTROL) == Ok(99)
         })?;
@@ -237,6 +239,7 @@ impl UserOwner {
             .map_err(|_| TestError("TTY close gate is not writable"))?;
         drop(executor);
         drop(user);
+
         let event = self.wait(context)?;
         let result = mm
             .load_user_u32(FUTEX_CONTROL + 12)
@@ -255,6 +258,7 @@ impl UserOwner {
         if cancelling {
             return Err(TestError("ordinary TTY ABI program failed"));
         }
+
         tty::flush_work();
         checked(
             context,
@@ -285,6 +289,7 @@ impl UserOwner {
         if matches!(waiting, TtyWait::OutputFull) {
             checked(context, tty::flow(0))?;
         }
+
         let wire = !rx.is_empty() || !tx.is_empty();
         if wire {
             self.tty_io
@@ -302,6 +307,7 @@ impl UserOwner {
         if matches!(waiting, TtyWait::OutputFull) {
             checked(context, tty::flow(1))?;
         }
+
         until("TTY root did not complete the UART stage", || {
             mm.load_user_u32(FUTEX_CONTROL + 8) == Ok(phase)
         })?;

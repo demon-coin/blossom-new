@@ -12,6 +12,7 @@ struct State {
 }
 
 struct ChildDrop(Arc<State>);
+
 impl Drop for ChildDrop {
     /// 子任务必须真实退出 Rust 主体，不能由父用手动计数代替析构。
     fn drop(&mut self) {
@@ -24,6 +25,7 @@ struct ReturnFixture {
     child: Option<crate::ktest::context::ChildHandle>,
     quiesced: bool,
 }
+
 impl Fixture for ReturnFixture {
     /// 建立本例独立拥有型资源；不访问磁盘，也不故意制造 OOM。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -40,6 +42,7 @@ impl Fixture for ReturnFixture {
             quiesced: false,
         })
     }
+
     /// 框架已请求合作停止；保留资源直到真实 join 完成，不提前释放子任务可见状态。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         assert!(!self.quiesced);
@@ -48,6 +51,7 @@ impl Fixture for ReturnFixture {
         context.diagnostic(format_args!("fatal-return quiesce once"));
         Ok(())
     }
+
     /// join 后检查真实离栈及独占资源所有权，再执行并观察一次完整析构。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert!(self.quiesced);
@@ -55,6 +59,7 @@ impl Fixture for ReturnFixture {
         assert_eq!(self.state.child_drops.load(Ordering::Acquire), 1);
         assert_eq!(Arc::strong_count(&self.state), 1);
         context.diagnostic(format_args!("fatal-return join observed child Drop once"));
+
         let state = self.state.clone();
         drop(self);
         assert_eq!(state.fixture_drops.load(Ordering::Acquire), 1);
@@ -63,6 +68,7 @@ impl Fixture for ReturnFixture {
         Ok(())
     }
 }
+
 impl Drop for ReturnFixture {
     /// 真实对象释放只在框架安全清理时发生，主体和静止化不会代行此责任。
     fn drop(&mut self) {
@@ -96,6 +102,7 @@ mod expected {
         while fixture.state.entered.load(Ordering::Acquire) == 0 {
             crate::sched::yield_now();
         }
+
         assert_eq!(fixture.state.child_drops.load(Ordering::Acquire), 0);
         assert_eq!(fixture.state.fixture_drops.load(Ordering::Acquire), 0);
         context.diagnostic(format_args!("fatal-return body returning Ok without fatal"));

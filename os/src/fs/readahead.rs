@@ -153,6 +153,7 @@ pub(crate) fn prepare(
     if requested == 0 {
         return Ok(());
     }
+
     let index = position / PAGE_SIZE as u64;
     let in_page = (position % PAGE_SIZE as u64) as usize;
     let requested = (requested.min(RA_PAGES * PAGE_SIZE) + in_page).div_ceil(PAGE_SIZE);
@@ -166,6 +167,7 @@ pub(crate) fn prepare(
     let Some(mut window) = window else {
         return Ok(());
     };
+
     let size = inode.metadata_snapshot()?.size;
     window.end = window.end.min(size.div_ceil(PAGE_SIZE as u64));
     if window.end <= window.start {
@@ -198,6 +200,7 @@ fn submit_window(
             Ok(())
         };
     }
+
     let mut candidates: [Option<PreparedFile>; RA_PAGES] = [const { None }; RA_PAGES];
     let mut demand_error = None;
     for (slot, index) in window.clone().enumerate() {
@@ -212,6 +215,7 @@ fn submit_window(
             }
         }
     }
+
     let result = (|| {
         let _invalidate = inode.lock_invalidate()?;
         window.end = window
@@ -263,6 +267,7 @@ fn submit_window(
         let _ = volume.claim().read_folio_batch(&mut ranges);
         demand_error.map_or(Ok(()), Err)
     })();
+
     drop(candidates);
     result
 }

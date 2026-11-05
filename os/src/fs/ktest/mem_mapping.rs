@@ -11,6 +11,7 @@ use crate::mm::user_table::PagePermissions;
 
 const ADDRESS: usize = 0x4a00_0000;
 const PRIVATE_ADDRESS: usize = ADDRESS + 2 * crate::mm::PAGE_SIZE;
+
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -74,6 +75,7 @@ pub(crate) mod mapping {
             ),
         )?;
         checked(context, file.write(b"original"))?;
+
         let mm = Mm::try_new().map_err(|error| {
             context.diagnostic(format_args!("memory-mapping MM error={error:?}"));
             TestError("memory-mapping MM construction failed")
@@ -126,6 +128,7 @@ pub(crate) mod mapping {
         let mut unchanged = [0; 8];
         checked(context, file.read_at(0, &mut unchanged))?;
         context.expect_eq(&unchanged, b"sriginal");
+
         let shared_pfn = mm.mapping(ADDRESS).map(|mapping| mapping.physical);
         let mut attempt = mm::reclaim::ReclaimAttempt::new();
         let page = checked(
@@ -168,6 +171,7 @@ pub(crate) mod mapping {
             Err(VmError::BeyondEof),
         );
         context.expect_eq(memory.used_pages(), 1);
+
         drop(file);
         drop(mm);
         fixture.vfs().prune_unused();

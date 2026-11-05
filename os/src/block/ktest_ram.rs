@@ -102,6 +102,7 @@ impl Request {
         if len == 0 || mm::PAGE_SIZE < len {
             return Err(TestError("RAM request exceeds one original page"));
         }
+
         let pages =
             mm::alloc_pages(0, true).ok_or(TestError("RAM request original page unavailable"))?;
         let direction = if operation == BlkOperation::Write {
@@ -122,6 +123,7 @@ impl Request {
             .try_reserve_exact(1)
             .map_err(|_| TestError("RAM payload owner allocation failed"))?;
         memory.push(mapped);
+
         // SAFETY: 原页独占且已清零，Write 的完整范围又写入图样；CPU 裸别名均已结束。
         // 回调只访问已收权来源，等待独立同盘 Read 与外部 gate，不等待自身或本盘 stop。
         let bio = unsafe { Bio::try_new(disk, operation, sector, memory, 0, endio) }
@@ -225,6 +227,7 @@ impl Ram {
                 return Err(TestError("RAM disk preparation failed"));
             }
         };
+
         let callback = match Arc::try_new(Callback {
             disk: disk.clone(),
             gate: Completion::new(),
@@ -251,6 +254,7 @@ impl Ram {
             );
             *slot = Some(callback.clone());
         }
+
         let activation_error = disk.start().err();
         if let Some(error) = activation_error {
             context.diagnostic(format_args!(
@@ -329,6 +333,7 @@ impl Ram {
                 .map_err(|_| TestError("RAM private cache retained an external owner"))?;
         }
         self.caches.fill_with(|| None);
+
         self.disk
             .stop()
             .map_err(|_| TestError("RAM stop did not converge; retaining original backing"))?;
@@ -409,6 +414,7 @@ mod views {
                 },
             )?;
         }
+
         for (sector, tag) in [(8, 0x19), (15, 0x37), (16, 0xa3), (23, 0xc5)] {
             fixture.expect_io(
                 context,
@@ -428,6 +434,7 @@ mod views {
             .read_exact_at(7 * 512, &mut bytes)
             .map_err(|_| TestError("RAM view final sector read failed"))?;
         context.expect_eq(bytes, [0x37; 512]);
+
         let before = fixture.disk.test_snapshot().submitted;
         let mut rejected =
             Request::prepare(&fixture.disk, BlkOperation::Write, 15, 1024, 0xee, None)?;
@@ -501,6 +508,7 @@ mod views {
                 error: None,
             },
         )?;
+
         let mut held = Request::prepare(
             &fixture.disk,
             BlkOperation::Write,
@@ -534,6 +542,7 @@ mod views {
             },
         )?;
         context.expect_eq(fixture.disk.test_snapshot().submitted, before);
+
         fixture.callback.gate.complete();
         held.expect_result(
             context,
@@ -548,6 +557,7 @@ mod views {
         })?;
         context.expect_eq(fixture.callback.calls.load(Ordering::Acquire), 1);
         context.expect_eq(fixture.callback.returned.load(Ordering::Acquire), true);
+
         fixture.expect_io(
             context,
             &root,
@@ -597,6 +607,7 @@ mod views {
                 },
             )?;
         }
+
         let a = BlockView::new(fixture.disk.clone(), 16, 2)
             .map_err(|_| TestError("RAM retired view unavailable"))?;
         let b = BlockView::new(fixture.disk.clone(), 18, 2)
@@ -638,6 +649,7 @@ mod views {
             .map_err(|_| TestError("RAM adjacent dirty update failed"))?;
         let dirty = right.folio().dirty_sectors();
         context.expect_eq(dirty, 0b0000_1100);
+
         context.expect_eq(fixture.caches[0].as_ref().unwrap().prune_unused(), 0);
         drop(a_claim);
         drop(fixture.caches[0].take());
@@ -667,6 +679,7 @@ mod views {
         context.expect_eq(a_ready, Err(BlockError::NotReady));
         context.expect_eq(b_ready, Ok(()));
         context.expect_eq(right.folio().dirty_sectors(), dirty);
+
         fixture.expect_io(
             context,
             &a,
@@ -679,6 +692,7 @@ mod views {
                 error: None,
             },
         )?;
+
         let reopened = Disk::claim_fs(&a, AccessMode::ReadOnly)
             .map_err(|_| TestError("RAM retired range did not reopen"))?;
         fixture.caches[0] = Some(
@@ -727,6 +741,7 @@ mod views {
                 error: None,
             },
         )?;
+
         let outer = BlockView::new(fixture.disk.clone(), 16, 6)
             .map_err(|_| TestError("RAM outer readonly view unavailable"))?;
         let middle = BlockView::new(fixture.disk.clone(), 18, 2)
@@ -755,6 +770,7 @@ mod views {
             .unwrap()
             .get(0, 1024, None)
             .map_err(|_| TestError("RAM middle metadata block read failed"))?;
+
         drop(outer_claim);
         drop(fixture.caches[0].take());
         context.expect_eq(live.folio().range_ready(0, 1024), Err(BlockError::NotReady));
@@ -766,6 +782,7 @@ mod views {
             live.with_read(|bytes| bytes.iter().all(|byte| *byte == 0x35)),
             Ok(true),
         );
+
         for (sector, tag) in [(16, 0x56), (20, 0x78)] {
             fixture.expect_io(
                 context,
@@ -792,6 +809,7 @@ mod views {
                 error: Some(BlockError::ReadOnly),
             },
         )?;
+
         let reopened = Disk::claim_fs(&outer, AccessMode::ReadOnly)
             .map_err(|_| TestError("RAM overlapping readonly range did not reopen"))?;
         fixture.caches[0] = Some(
@@ -835,6 +853,7 @@ mod views {
                 },
             )?;
         }
+
         let mut claims = Vec::new();
         claims
             .try_reserve_exact(4)
@@ -852,6 +871,7 @@ mod views {
             );
             claims.push(claim);
         }
+
         let first = fixture.caches[0]
             .as_ref()
             .unwrap()
@@ -889,6 +909,7 @@ mod views {
                 Ok(true),
             );
         }
+
         context.expect_eq(
             left.update(&claims[3], |bytes| bytes.fill(0xee)),
             Err(BlockError::InvalidRange),

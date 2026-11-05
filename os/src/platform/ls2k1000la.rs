@@ -49,10 +49,12 @@ const EFI_FDT_GUID: [u8; 16] = [
 
 #[cfg(target_arch = "loongarch64")]
 const UHI_FDT_HANDOFF: usize = usize::MAX - 1;
+
 const LIOINTC_FIRST_PARENT_CAUSE: u32 = 2;
 const LIOINTC_LAST_PARENT_CAUSE: u32 = 3;
 const LIOINTC_REGISTER_BYTES: usize = 0x40;
 const LIOINTC_ISR_BYTES: usize = 2 * core::mem::size_of::<u32>();
+
 const PCI_BDF_MASK: u32 = ((u8::MAX as u32) << PCI_BUS_SHIFT)
     | (((PCI_DEVICE_COUNT - 1) as u32) << PCI_DEVICE_SHIFT)
     | (((PCI_FUNCTION_COUNT - 1) as u32) << PCI_FUNCTION_SHIFT);
@@ -71,6 +73,7 @@ pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParamet
             command_line: None,
         });
     }
+
     let command_line = if args[0] <= 1 && args[1] != 0 {
         Some(physical(args[1])?)
     } else {
@@ -109,6 +112,7 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
     }
     // SAFETY: 调用者保证头部声明的存储范围可读且不变；长度仅作表示范围校验，不证明可读性。
     unsafe { firmware_bytes(address, header_size)? };
+
     let count = usize::try_from(u64::from_le_bytes(
         header[EFI_NR_TABLES_OFFSET..EFI_NR_TABLES_OFFSET + 8]
             .try_into()
@@ -126,6 +130,7 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
         .ok_or("EFI configuration table array size overflows")?;
     // SAFETY: 调用者保证 nr_tables 个 EFI64 表项可读且不变；乘法及地址表示范围在借用前检查。
     let tables = unsafe { firmware_bytes(tables_address, size)? };
+
     let mut dtb = None;
     for entry in tables.chunks_exact(EFI_CONFIG_TABLE_SIZE) {
         if entry[..EFI_CONFIG_TABLE_POINTER_OFFSET] != EFI_FDT_GUID {
@@ -203,6 +208,7 @@ pub(super) fn discover<'a>(
         if banks[index].is_some() {
             return Err("FDT LIOINTC parent cause is duplicated");
         }
+
         let mut registers = regions(node)?;
         let main = registers
             .next()
@@ -220,6 +226,7 @@ pub(super) fn discover<'a>(
         {
             return Err("FDT LIOINTC register geometry is unsupported");
         }
+
         let map = property(node, "loongson,parent_int_map")?;
         if map.len() != 4 * FDT_CELL_BYTES {
             return Err("FDT LIOINTC parent masks are truncated");
@@ -239,6 +246,7 @@ pub(super) fn discover<'a>(
         };
         banks[index] = Some(node);
     }
+
     let banks = [
         banks[0].ok_or("FDT LIOINTC0 is missing")?,
         banks[1].ok_or("FDT LIOINTC1 is missing")?,
@@ -254,8 +262,10 @@ pub(super) fn discover<'a>(
     {
         return Err("FDT LA264 hardware CPU ID exceeds the dual-core board");
     }
+
     let rtc = unique(tree, "loongson,ls2k1000-rtc")?;
     info.rtc = single_region(tree, rtc)?;
+
     let pmc = unique(tree, "loongson,ls2k1000-pmc")?;
     info.board.pmc = single_region(tree, pmc)?;
     for node in pmc.children() {
@@ -266,6 +276,7 @@ pub(super) fn discover<'a>(
             info.board.poweroff = Some(power_action(node, info.board.pmc)?);
         }
     }
+
     discover_pci(tree, banks, info)
 }
 
@@ -360,6 +371,7 @@ fn discover_pci<'a>(
     if hosts.next().is_some() {
         return Err("FDT Loongson PCI host is duplicated");
     }
+
     identity_address(tree, host)?;
     let mut registers = regions(host)?;
     info.pci.configuration = registers.next().ok_or("FDT Loongson CFG0 is missing")??;
@@ -377,6 +389,7 @@ fn discover_pci<'a>(
     }
     info.pci.bus_start = 0;
     info.pci.bus_end = word(buses, FDT_CELL_BYTES)?;
+
     let ranges = property(host, "ranges")?;
     if ranges.is_empty() || ranges.len() % PCI_RANGE_BYTES != 0 {
         return Err("FDT Loongson PCI ranges are truncated");
@@ -404,6 +417,7 @@ fn discover_pci<'a>(
         };
         info.pci.range_count += 1;
     }
+
     info.pci.intx_mask = [PCI_BDF_MASK, 0, 0, 0];
     let sata = host
         .children()
@@ -418,6 +432,7 @@ fn discover_pci<'a>(
         ports_implemented: resources::optional_number(sata, "ports-implemented")?,
         ..AhciResources::default()
     });
+
     let mac = host
         .children()
         .find(|node| node.name == "ethernet@3,0" && enabled(*node))
@@ -501,11 +516,13 @@ fn discover_mmio<'a>(
     if bus.property("device_type").and_then(|p| p.as_str()) == Some("pci") {
         return Err("FDT AHCI PCI identity cannot be used as MMIO");
     }
+
     let registers = single_region(tree, sata)?;
     device_region(registers, info)?;
     if registers.end - registers.start < crate::drivers::ahci::MMIO_BYTES {
         return Err("FDT AHCI MMIO window is too short");
     }
+
     let dma_mask = sata
         .property("dma-mask")
         .map(|p| cells(p.value).map(|value| value as u64))
@@ -521,6 +538,7 @@ fn discover_mmio<'a>(
         dma_mask,
         ports_implemented: resources::optional_number(sata, "ports-implemented")?,
     });
+
     let mac = resources::alias(tree, "ethernet0")?;
     if !(compatible(mac, "snps,dwmac-3.70a") || compatible(mac, "snps,arc-dwmac-3.70a")) {
         return Err("FDT ethernet0 is not a DWMAC1000 MMIO binding");

@@ -86,6 +86,7 @@ impl Scheduler {
                 (*(*self.ready_tail).scheduling.get()).ready_next = task;
             }
             self.ready_tail = task;
+
             // idle 与 ready 在同一调度锁下发表，纯唤醒即使迟到也不能抢占下一 Running Task。
             // 本核离栈后会直接 pick，额外的自重调度会在下一 Task 开 IRQ 时重新制造提示。
             let local = cpu::current();
@@ -279,6 +280,7 @@ pub fn cond_resched() -> bool {
     if !crate::arch::irq_enabled() {
         return false;
     }
+
     let requested = {
         let _irq = IrqSaveGuard::new();
         let local = cpu::current();
@@ -374,12 +376,14 @@ pub(crate) fn set_affinity(task: &Task, allowed: cpu::CpuSet) {
             State::Running(_) | State::Blocked | State::Exited => {}
         }
     }
+
     if task.id() == crate::task::current_task().id() {
         if !affinity_complete(task) {
             yield_now();
         }
         return;
     }
+
     loop {
         if affinity_complete(task) {
             return;
@@ -427,6 +431,7 @@ fn prepare_switch(
             }
             !notified
         };
+
         if committed {
             accounting::task_leave();
             time::task_switch_out();
@@ -665,6 +670,7 @@ fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
         };
         (scheduler.finish(task, owner), changed)
     };
+
     if affinity_changed {
         AFFINITY_CHANGED.wake_all();
     }
@@ -681,6 +687,7 @@ fn finish_current(previous_mm: Option<Arc<crate::mm::space::Mm>>) {
         }
         drop(resources);
         drop(task);
+
         join.complete(result);
         drop(join);
         crate::arch::irq_save();
@@ -700,6 +707,7 @@ pub fn run() -> ! {
     crate::arch::irq_save();
     accounting::start_scheduler();
     time::activate_current_cpu();
+
     loop {
         let next = {
             let local = cpu::current();
@@ -760,6 +768,7 @@ fn idle_once() {
         crate::arch::enable_interrupts();
         crate::arch::irq_save();
     }
+
     let _scheduler = SCHED_LOCK.lock();
     local.idle.store(false, Ordering::Release);
 }

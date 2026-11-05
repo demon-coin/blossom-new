@@ -235,6 +235,7 @@ pub(super) fn jh7110_clock_inputs<'a>(
     if !compatible(syscrg, "starfive,jh7110-syscrg") {
         return Err("FDT selected UART clock does not use the system CRG");
     }
+
     let (pll_reference, pll) = named_clock(tree, syscrg, "pll0_out")?;
     if !compatible(pll, "starfive,jh7110-pll") || pll_reference.id != 0 {
         return Err("FDT system PLL0 input binding is invalid");
@@ -245,6 +246,7 @@ pub(super) fn jh7110_clock_inputs<'a>(
             return Err("FDT system PLL outputs do not share the selected PLL provider");
         }
     }
+
     let raw = property(pll, "clocks")?;
     let mut at = 0;
     let (_, oscillator) = reference(tree, raw, &mut at, "#clock-cells")?;
@@ -262,6 +264,7 @@ pub(super) fn jh7110_clock_inputs<'a>(
     if oscillator_hz == 0 {
         return Err("FDT JH7110 oscillator frequency is zero");
     }
+
     Ok(BoardClockInputs {
         oscillator_hz: Some(oscillator_hz),
         pll_registers: pll_reference.provider,
@@ -288,6 +291,7 @@ pub(super) fn clocks<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceCloc
         };
         result.count += 1;
     }
+
     if let Some(assigned) = node.property("assigned-clocks") {
         let rates = node.property("assigned-clock-rates");
         let parents = node.property("assigned-clock-parents");
@@ -356,6 +360,7 @@ pub(super) fn setup<'a>(tree: &'a Fdt<'a>, node: Node<'a>) -> Result<DeviceSetup
             result.reset_count += 1;
         }
     }
+
     if let Some(raw) = node.property("pinctrl-0") {
         if raw.value.len() % FDT_CELL_BYTES != 0 {
             return Err("FDT pinctrl phandles are truncated");
@@ -421,6 +426,7 @@ pub(super) fn discover_uart<'a>(
     if !matches!(width, 1 | 4) || 2 < shift {
         return Err("FDT UART register access geometry is unsupported");
     }
+
     let mut uart_clocks = clocks(tree, uart)?;
     let mut frequency = optional_number(uart, "clock-frequency")?.map(u64::from);
     if info.platform == Platform::VisionFive2 {
@@ -448,6 +454,7 @@ pub(super) fn discover_uart<'a>(
         uart_clocks.entries[0].parent = Some(osc);
         uart_clocks.entries[0].rate = frequency;
     }
+
     let stdout = cstr(property(chosen, "stdout-path")?)?;
     let baud = if let Some(options) = stdout.split_once(':').map(|(_, options)| options) {
         let mut baud = 0u32;
@@ -474,6 +481,7 @@ pub(super) fn discover_uart<'a>(
     if frequency == Some(0) || (info.platform != Platform::QemuVirt && frequency.is_none()) {
         return Err("FDT UART input clock is missing or zero");
     }
+
     info.uart = crate::boot::UartResources {
         reg_io_width: width,
         reg_shift: shift,
@@ -506,6 +514,7 @@ pub(super) fn gmac<'a>(
         "rmii" => PhyMode::Rmii,
         _ => return Err("FDT GMAC PHY mode is unsupported"),
     };
+
     let mac = node
         .property("mac-address")
         .or_else(|| node.property("local-mac-address"));
@@ -521,6 +530,7 @@ pub(super) fn gmac<'a>(
             Ok(value)
         })
         .transpose()?;
+
     let dma_mask = node
         .property("dma-mask")
         .map(|p| cells(p.value).map(|value| value as u64))

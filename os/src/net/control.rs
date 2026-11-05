@@ -10,16 +10,19 @@ use crate::net::NetStackRef;
 
 const SIOCADDRT: u32 = 0x890b;
 const SIOCDELRT: u32 = 0x890c;
+
 const SIOCGIFFLAGS: u32 = 0x8913;
 const SIOCSIFFLAGS: u32 = 0x8914;
 const SIOCGIFADDR: u32 = 0x8915;
 const SIOCSIFADDR: u32 = 0x8916;
 const SIOCGIFNETMASK: u32 = 0x891b;
 const SIOCSIFNETMASK: u32 = 0x891c;
+
 const IFF_UP: u16 = 0x1;
 const IFF_BROADCAST: u16 = 0x2;
 const IFF_LOOPBACK: u16 = 0x8;
 const IFF_RUNNING: u16 = 0x40;
+
 const IFREQ_LEN: usize = 40;
 const RTENTRY_LEN: usize = 120;
 const IFNAME_LEN: usize = 16;
@@ -61,6 +64,7 @@ pub(crate) fn ioctl(
     {
         return Err(FsError::NotPermitted);
     }
+
     let mm = user.mm().ok_or(FsError::BadAddress)?;
     match request {
         SIOCADDRT | SIOCDELRT => route_ioctl(net, &mm, request, argument),
@@ -79,6 +83,7 @@ fn interface_ioctl(
     // LP64 ifreq 名称最多十五字节，最后一字节由内核终止；union 在偏移十六处。
     bytes[IFNAME_LEN - 1] = 0;
     let id = interface_name(&bytes[..IFNAME_LEN])?;
+
     match request {
         SIOCGIFFLAGS => {
             let interface = net.interface_snapshot(id)?;
@@ -103,6 +108,7 @@ fn interface_ioctl(
             } else {
                 prefix_mask(interface.prefix_len)
             };
+
             // sockaddr 的端口及 padding 明确初始化，地址保持网络字节序。
             bytes[16..32].fill(0);
             bytes[16..18].copy_from_slice(&AF_INET.to_le_bytes());
@@ -114,6 +120,7 @@ fn interface_ioctl(
             if flags & !(IFF_UP | IFF_LOOPBACK | IFF_BROADCAST | IFF_RUNNING) != 0 {
                 return Err(FsError::Unsupported);
             }
+
             net.set_interface_up(id, flags & IFF_UP != 0)?;
             Ok(0)
         }
@@ -152,6 +159,7 @@ fn route_ioctl(
     if destination != [0; 4] || prefix != 0 {
         return Err(FsError::Unsupported);
     }
+
     let flags = word(&bytes, RT_FLAGS_OFFSET);
     if flags & !(RTF_UP | RTF_GATEWAY) != 0 {
         return Err(FsError::Unsupported);
@@ -167,6 +175,7 @@ fn route_ioctl(
     {
         return Err(FsError::Unsupported);
     }
+
     let device = long(&bytes, RT_DEVICE_OFFSET) as usize;
     let interface = if device == 0 {
         None
@@ -174,6 +183,7 @@ fn route_ioctl(
         let name = copy_device_name(mm, device)?;
         Some(interface_name(&name)?)
     };
+
     net.change_default_route(
         DefaultRouteRequest { interface, gateway },
         request == SIOCADDRT,

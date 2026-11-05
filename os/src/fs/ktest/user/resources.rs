@@ -22,6 +22,7 @@ pub(crate) mod resource_limits {
         identities
             .try_reserve_exact(600)
             .map_err(|_| TestError("resource candidate list allocation failed"))?;
+
         for index in 0..600 {
             let prepared = graph
                 .prepare_process(
@@ -35,6 +36,7 @@ pub(crate) mod resource_limits {
             context.expect_eq(prepared.identity().tid(), index + 1);
             identities.push(Some(prepared));
         }
+
         let old = identities[511]
             .as_ref()
             .expect("missing reserved PID")
@@ -57,6 +59,7 @@ pub(crate) mod resource_limits {
         );
         context.expect_eq(graph.lookup_pid(&old).is_none(), true);
         context.expect_eq(graph.try_wait(None, 512, false), Err(ProcessError::NoChild));
+
         drop((replacement, identities, old, graph));
         Ok(())
     }

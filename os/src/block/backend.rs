@@ -72,6 +72,7 @@ impl SlotControl {
                 error: Some(error.into()),
             };
         }
+
         let used = used as usize;
         let expected = if operation == BlkOperation::Read {
             bytes + VIRTIO_STATUS_BYTES
@@ -158,6 +159,7 @@ impl Backend {
             .try_reserve_exact(usize::from(limits.queue_depth))
             .map_err(|_| BlockError::NoMemory)?;
         heads.resize(usize::from(limits.queue_depth), None);
+
         let mut segments = Vec::new();
         segments
             .try_reserve_exact(usize::from(limits.tag_count))
@@ -167,6 +169,7 @@ impl Backend {
             .try_reserve_exact(usize::from(limits.tag_count))
             .map_err(|_| BlockError::NoMemory)?;
         requests.resize(usize::from(limits.tag_count), None);
+
         for _tag in 0..limits.tag_count {
             let mut sg = Vec::new();
             sg.try_reserve_exact(limits.max_segments).map_err(|_| {
@@ -194,6 +197,7 @@ impl Backend {
         if region.end <= region.start || (region.end - region.start) % SECTOR_BYTES as usize != 0 {
             return Err(BlockError::InvalidRange);
         }
+
         let pending = pending_queue()?;
         Ok(Self::Ram {
             region,
@@ -622,6 +626,7 @@ pub(super) fn virtio_limits(info: BlkInfo) -> Result<QueueLimits, BlockError> {
     {
         return Err(BlockError::InvalidRange);
     }
+
     let logical = u64::from(info.logical_block_size);
     let raw = (u64::from(info.max_segment_bytes) * u64::from(info.max_segments))
         .min(u64::from(u32::MAX) - VIRTIO_STATUS_BYTES as u64);
@@ -630,6 +635,7 @@ pub(super) fn virtio_limits(info: BlkInfo) -> Result<QueueLimits, BlockError> {
     if max_bytes == 0 {
         return Err(BlockError::Unsupported);
     }
+
     Ok(QueueLimits {
         capacity_sectors: info.capacity_sectors,
         max_bytes,

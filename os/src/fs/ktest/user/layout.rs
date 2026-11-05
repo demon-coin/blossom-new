@@ -107,6 +107,7 @@ fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError
         3,
         "disk ELF PHNUM"
     );
+
     let phoff = elf_word(&header, 32);
     let mut table = [0; 168];
     read_file(context, file, phoff, &mut table)?;
@@ -156,6 +157,7 @@ fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError
         phdr + table.len() <= text.start + text.filesz,
         "PHDR is outside text file bytes"
     );
+
     let data = segments[1];
     assert!(data.filesz < data.memsz, "real writable LOAD has no BSS");
     assert_ne!(
@@ -306,6 +308,7 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
         0,
         "envp terminator"
     );
+
     #[cfg(target_arch = "riscv64")]
     let hwcap = (1 << 8) | (1 << 12) | 1 | (1 << 5) | (1 << 3) | (1 << 2);
     #[cfg(target_arch = "loongarch64")]
@@ -394,6 +397,7 @@ fn snapshot(
         .map_err(|_| TestError("NoMemory: ELF cache byte snapshot"))?;
     bytes.resize(count, 0);
     read_file(context, file, start, &mut bytes)?;
+
     let pages = count.div_ceil(PAGE_SIZE);
     let mut folios = Vec::new();
     folios
@@ -452,6 +456,7 @@ fn verify_private_write(
         }
         cursor += count;
     }
+
     for (block, expected) in before.chunks(observed.len()).enumerate() {
         let offset = file_start + (block * observed.len()) as u64;
         read_file(context, file, offset, &mut observed[..expected.len()])?;
@@ -537,6 +542,7 @@ struct ByteCheck {
 
 const DIRECT_PATH: &[u8] = b"/plain/direct";
 const DIRECT_STATUS: i32 = 37 << 8;
+
 const DIRECT_DATA: usize = 0x20000;
 const LARGE_BSS: usize = 64 * 1024 * 1024 + PAGE_SIZE;
 const DISTANT_DATA: usize = 0x12000000;
@@ -579,6 +585,7 @@ fn direct_elf(
         .try_reserve_exact(size)
         .map_err(|_| TestError("NoMemory: direct ELF file"))?;
     bytes.resize(size, 0);
+
     bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
     #[cfg(target_arch = "riscv64")]
@@ -605,6 +612,7 @@ fn direct_elf(
             bytes[base + 32..base + 40].copy_from_slice(&16u64.to_le_bytes());
         }
     }
+
     let mut offset = 8192;
     for (index, segment) in segments.iter().enumerate() {
         let base = 64 + index * phent;
@@ -652,6 +660,7 @@ fn prepare_direct(
         0,
         vfs.mount(&covered, Filesystem::Memory(memory), AccessMode::ReadWrite),
     )?;
+
     let file = checked(
         context,
         "direct ELF creation failed",
@@ -704,6 +713,7 @@ fn verify_direct_auxv(
         cursor += 8;
     }
     cursor += 8;
+
     let required = [(3, 0), (4, phent), (5, phnum), (9, entry)];
     let mut found = [false; 4];
     for _ in 0..32 {
@@ -765,6 +775,7 @@ pub(super) fn direct_low(
         }],
         extended,
     )?;
+
     let image = prepare_direct(context, fixture, &bytes)?;
     assert_eq!(image.context.pc, entry, "direct ELF low entry");
     let mut actual = [0; 16];
@@ -840,6 +851,7 @@ pub(super) fn direct_sparse(context: &mut TestContext<'_>, fixture: &mut UserOwn
         mm.mapping(0x8000000).is_none(),
         "sparse ELF hole was populated"
     );
+
     execute_direct(context, fixture, image, &checks)?;
     assert_eq!(
         bss_resident(&mm),
@@ -868,6 +880,7 @@ pub(super) fn direct_overlap(context: &mut TestContext<'_>, fixture: &mut UserOw
         address,
         expected: expected[address - DIRECT_DATA],
     });
+
     let payload = direct_payload(&checks)?;
     let bytes = direct_elf(
         0x10000,
@@ -899,11 +912,13 @@ pub(super) fn direct_overlap(context: &mut TestContext<'_>, fixture: &mut UserOw
         ],
         false,
     )?;
+
     let image = prepare_direct(context, fixture, &bytes)?;
     let mm = image.mm.clone();
     let mut actual = [0; 2 * PAGE_SIZE + 128];
     read_mm(context, &mm, DIRECT_DATA, &mut actual)?;
     assert_eq!(actual, expected, "overlapping LOAD file/BSS precedence");
+
     execute_direct(context, fixture, image, &checks)?;
     for address in addresses {
         expected[address - DIRECT_DATA] = 0x7e;

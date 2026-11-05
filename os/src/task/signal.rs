@@ -51,12 +51,15 @@ pub(crate) const SIGPROF: u8 = 27;
 pub(crate) const SIGWINCH: u8 = 28;
 pub(crate) const SIGSYS: u8 = 31;
 pub(crate) const SIGRTMIN: u8 = 32;
+
 pub(crate) const SIGINFO_BYTES: usize = 128;
 pub(crate) const SIGSET_BYTES: usize = core::mem::size_of::<u64>();
 const SI_KERNEL: i32 = 128;
+
 pub(crate) const SIG_DFL: usize = 0;
 pub(crate) const SIG_IGN: usize = 1;
 const SA_NOCLDSTOP: usize = 1;
+
 pub(crate) const CLD_EXITED: i32 = 1;
 pub(crate) const CLD_KILLED: i32 = 2;
 pub(crate) const CLD_DUMPED: i32 = 3;
@@ -65,6 +68,7 @@ pub(crate) const CLD_CONTINUED: i32 = 6;
 pub(crate) const SI_TKILL: i32 = -6;
 const SA_SIGINFO: usize = 4;
 pub(crate) const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
+
 pub(crate) const SA_ONSTACK: usize = 0x0800_0000;
 pub(crate) const SA_RESTART: usize = 0x1000_0000;
 pub(crate) const SA_NODEFER: usize = 0x4000_0000;
@@ -74,6 +78,7 @@ pub(crate) const SS_DISABLE: u32 = 2;
 const SA_NOCLDWAIT: usize = 2;
 const ACTION_FLAGS: usize =
     SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+
 const STOP_MASK: u64 =
     (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
 
@@ -157,6 +162,7 @@ impl SignalInfo {
         bytes[0..4].copy_from_slice(&(self.signum as i32).to_le_bytes());
         bytes[4..8].copy_from_slice(&self.errno.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.code.to_le_bytes());
+
         match self.payload {
             SignalPayload::Sender { pid, uid, value } => {
                 bytes[16..20].copy_from_slice(&(pid as i32).to_le_bytes());
@@ -482,6 +488,7 @@ impl SignalGroup {
         if group.members == 0 || (group.exit.is_some() && info.signum != SIGCONT) {
             return Ok(false);
         }
+
         let continued = info.signum == SIGCONT && group.stop_reported;
         let discard = match info.signum {
             SIGCONT => STOP_MASK,
@@ -494,6 +501,7 @@ impl SignalGroup {
             group.stop_reported = false;
             group.stopped = 0;
         }
+
         let mut blocked = false;
         let mut eligible = false;
         for thread in threads {
@@ -509,6 +517,7 @@ impl SignalGroup {
                 eligible |= (private.mask | private.real_blocked.unwrap_or(0)) & bit == 0;
             }
         }
+
         // 已经致命退出的停止成员仍须完成CONT恢复；不再为退出组增加pending。
         if group.exit.is_some() {
             return Ok(continued);
@@ -574,6 +583,7 @@ impl SignalGroup {
         {
             return Err(SignalError::InvalidSignal);
         }
+
         let binding = self.sighand.lock();
         let mut actions = binding.actions.lock();
         let previous = actions[signal - 1];
@@ -714,6 +724,7 @@ impl ThreadSignals {
             private.mask &= !bit;
             private.fault.get_or_insert(info);
         }
+
         self.notify_wait();
     }
 
@@ -736,6 +747,7 @@ impl ThreadSignals {
             private.mask = mask & !UNBLOCKABLE;
             old
         };
+
         self.group.notify();
         old
     }
@@ -781,6 +793,7 @@ impl ThreadSignals {
             private.mask = old & !UNBLOCKABLE;
             private.waited_set = 0;
         }
+
         self.group.notify();
     }
 
@@ -809,6 +822,7 @@ impl ThreadSignals {
             private.mask = mask & !UNBLOCKABLE;
             let _ = set_altstack(&mut private, altstack, restored_sp);
         }
+
         self.group.notify();
     }
 
@@ -843,6 +857,7 @@ impl ThreadSignals {
         if group.stop_signal.is_some() {
             return Some(SignalSelection::Stop);
         }
+
         loop {
             let allowed = !private.mask;
             let forced = private.fault.is_some();
@@ -871,6 +886,7 @@ impl ThreadSignals {
                 group.exit.get_or_insert(status);
                 return Some(SignalSelection::Exit(status));
             }
+
             if action.flags & SA_RESETHAND != 0 {
                 actions[info.signum as usize - 1].handler = SIG_DFL;
             }
@@ -920,6 +936,7 @@ impl ThreadSignals {
             assert!(private.wait.is_none(), "nested signal wait");
             private.wait = Some((id, waker, mode));
         }
+
         self.notify_wait();
     }
 
@@ -939,6 +956,7 @@ impl ThreadSignals {
                 None
             }
         };
+
         drop(removed);
     }
 
@@ -964,6 +982,7 @@ impl ThreadSignals {
                     .then(|| waker.clone())
             })
         };
+
         if let Some(waker) = waker {
             waker.notify();
         }
@@ -982,6 +1001,7 @@ impl ThreadSignals {
             let _siglock = binding.actions.lock();
             self.state.lock().exec_exit = true;
         }
+
         self.notify_wait();
     }
 
@@ -1017,6 +1037,7 @@ impl ThreadSignals {
             }
             mem::replace(&mut *binding, sighand)
         };
+
         drop(old);
     }
 }
@@ -1075,6 +1096,7 @@ fn interruption(
     if group.stop_signal.is_some() || private.fault.is_some() {
         return true;
     }
+
     let mut allowed = pending & !private.mask;
     while allowed != 0 {
         let index = allowed.trailing_zeros() as usize;
@@ -1095,6 +1117,7 @@ fn set_altstack(private: &mut ThreadState, stack: AltStack, sp: usize) -> Result
     if stack.enabled() && stack.size < crate::arch::SIGNAL_MIN_STACK {
         return Err(SignalError::StackTooSmall);
     }
+
     private.altstack = if stack.enabled() {
         stack
     } else {

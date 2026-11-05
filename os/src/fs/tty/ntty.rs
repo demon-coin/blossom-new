@@ -30,8 +30,10 @@ const BACKSPACE: u8 = 0x08;
 const BELL: u8 = 0x07;
 /// 禁用控制字符。
 const DISABLED_CHAR: u8 = 0;
+
 const TAB_WIDTH: usize = 8;
 const TAB_COLUMN_MASK: usize = TAB_WIDTH - 1;
+
 const ECHO_TAB_AFTER_TAB: u8 = 0x80;
 const ECHO_EXPANSION_BUDGET: usize = 64;
 
@@ -49,6 +51,7 @@ const ECHO_ERASE_TAB: u8 = 4;
 const ECHO_ERASE_LINE: u8 = 5;
 /// 回显操作：展开挂起重显快照，未完留头。
 const ECHO_REPRINT: u8 = 6;
+
 /// 回显项保存显式操作码与数据，不借 0 或 FF 表达空项。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EchoItem {
@@ -188,6 +191,7 @@ impl InputQueue {
                 self.committed -= 1;
             }
         }
+
         if self.pending_eof && self.len < INPUT_CAPACITY {
             self.pending_eof = false;
             self.bytes[self.head] = DISABLED_CHAR;
@@ -248,6 +252,7 @@ impl InputQueue {
                 return None;
             }
         }
+
         let byte = self.bytes[start];
         self.head = start;
         self.len -= count;
@@ -605,6 +610,7 @@ impl NttyState {
             self.overrun += 1;
             return (false, true);
         }
+
         if termios.lflag & ECHO != 0 {
             if self.input.edit_len() == 0 {
                 let _ = self.echo_set_canon();
@@ -637,6 +643,7 @@ impl NttyState {
         if termios.iflag & ISTRIP != 0 {
             byte &= 0x7f;
         }
+
         if termios.iflag & IXON != 0 && self.receive_flow_control(termios, byte) {
             return ReceiveOutcome::changes((false, true));
         }
@@ -659,6 +666,7 @@ impl NttyState {
                 };
             }
         }
+
         if self.stopped
             && !self.tco_stopped
             && termios.iflag & IXON != 0
@@ -680,6 +688,7 @@ impl NttyState {
             }
             return ReceiveOutcome::changes((false, true));
         }
+
         if byte == CARRIAGE_RETURN {
             if termios.iflag & IGNCR != 0 {
                 return ReceiveOutcome::default();
@@ -690,11 +699,13 @@ impl NttyState {
         } else if byte == LINE_FEED && termios.iflag & INLCR != 0 {
             byte = CARRIAGE_RETURN;
         }
+
         if termios.lflag & ICANON != 0 && self.receive_canonical(termios, byte) {
             return ReceiveOutcome::changes((true, true));
         }
         ReceiveOutcome::changes(self.store_data_byte(termios, byte))
     }
+
     /// 处理软件流控字符，返回是否消费。
     fn receive_flow_control(&mut self, termios: Termios, byte: u8) -> bool {
         if byte == termios.cc[VSTART] && byte != DISABLED_CHAR {
@@ -770,6 +781,7 @@ impl NttyState {
             self.reprint_line(termios);
             return true;
         }
+
         if byte == LINE_FEED {
             if termios.lflag & (ECHO | ECHONL) != 0 && !self.echo_reserve(1) {
                 self.overrun += 1;
@@ -852,6 +864,7 @@ impl NttyState {
             self.overrun += 1;
             return (false, true);
         }
+
         // 先落回显后存输入，保证输入满时回显已可见且不丢尾。
         if termios.lflag & ECHO != 0 {
             if self.input.edit_len() == 0 {
@@ -865,6 +878,7 @@ impl NttyState {
         } else if termios.lflag & ICANON != 0 && termios.lflag & ECHONL != 0 && byte == LINE_FEED {
             let _ = self.echo_raw(LINE_FEED);
         }
+
         let canonical = termios.lflag & ICANON != 0;
         // 0xFF 加倍需完整两格，先 reserve，失败不交残片。
         if byte == 0xff && termios.iflag & PARMRK != 0 {
@@ -950,6 +964,7 @@ impl NttyState {
             let _ = self.echo.push(ECHO_ERASE_LINE, 0);
             return;
         }
+
         if !self.echo_reserve(6) {
             self.overrun += 1;
             return;
@@ -979,6 +994,7 @@ impl NttyState {
             }
         }
     }
+
     /// 擦除一个字符并回显；调用者已 reserve，失败不删输入。
     fn erase_one(&mut self, termios: Termios) -> bool {
         let utf8 = termios.iflag & IUTF8 != 0;
@@ -1044,6 +1060,7 @@ impl NttyState {
         if edit == 0 {
             return;
         }
+
         let boundary = self.input.committed_index();
         let mut bytes = [0u8; INPUT_CAPACITY];
         let mut index = boundary;
@@ -1170,6 +1187,7 @@ impl NttyState {
                         if self.output.space() < expanded {
                             return true;
                         }
+
                         if control {
                             let _ = self.output.push(b'^');
                             self.column += 1;
@@ -1235,6 +1253,7 @@ impl NttyState {
             }
             return self.output.push(byte);
         }
+
         match byte {
             LINE_FEED => {
                 if termios.oflag & ONLRET != 0 {
@@ -1342,6 +1361,7 @@ impl NttyState {
             read += 1;
             write += 1;
         }
+
         // 清尾部残留标记，读指针仍在写指针前。
         let mut i = write;
         while i < len {
@@ -1350,6 +1370,7 @@ impl NttyState {
             self.input.eof[at] = false;
             i += 1;
         }
+
         self.input.head = (self.input.tail + write) % INPUT_CAPACITY;
         self.input.len = write;
         self.input.committed = 0;

@@ -27,22 +27,26 @@ const IIR: usize = 2;
 const LCR: usize = 3;
 const LSR: usize = 5;
 const MSR: usize = 6;
+
 pub(crate) const DATA_READY: u8 = 1;
 pub(crate) const UART_LSR_OVERRUN: u8 = 1 << 1;
 pub(crate) const UART_LSR_PARITY: u8 = 1 << 2;
 pub(crate) const UART_LSR_FRAME: u8 = 1 << 3;
 pub(crate) const UART_LSR_BREAK: u8 = 1 << 4;
 const TRANSMIT_READY: u8 = 0x20;
+
 const RECEIVE_INTERRUPT: u8 = 1;
 const TRANSMIT_INTERRUPT: u8 = 2;
 #[cfg(feature = "ktest")]
 const THRE_INTERRUPT: u8 = 2;
+
 const TX_BUDGET: usize = 16;
 const MCR: usize = 4;
 // DLL/DLM 与 DATA/IER 共用偏移，访问前必须先置 LCR 的 DLAB，之后立即恢复。
 const DLL: usize = 0;
 const DLM: usize = 1;
 const DLAB: u8 = 0x80;
+
 const TRANSMITTER_EMPTY: u8 = 0x40;
 const DW_USR: usize = 0x1f;
 const DW_BUSY: u8 = 1;
@@ -50,6 +54,7 @@ const LOOPBACK: u8 = 1 << 4;
 const LCR_STICK_PARITY: u8 = 1 << 5;
 const DATA_TERMINAL_READY: u8 = 1;
 const REQUEST_TO_SEND: u8 = 2;
+
 pub(crate) const UART_LCR_WLEN5: u8 = 0;
 pub(crate) const UART_LCR_WLEN6: u8 = 1;
 pub(crate) const UART_LCR_WLEN7: u8 = 2;
@@ -57,18 +62,22 @@ pub(crate) const UART_LCR_WLEN8: u8 = 3;
 pub(crate) const UART_LCR_STOP: u8 = 1 << 2;
 pub(crate) const UART_LCR_PARITY: u8 = 1 << 3;
 pub(crate) const UART_LCR_EPAR: u8 = 1 << 4;
+
 const FCR_ENABLE_FIFO: u8 = 1;
 const FCR_CLEAR_RECEIVER: u8 = 1 << 1;
 const FCR_CLEAR_TRANSMITTER: u8 = 1 << 2;
+
 // 保留 IIR 的 no-interrupt 位，DW busy-detect 的编码也使用最低位。
 const IIR_STATUS_MASK: u8 = 0x0f;
 const IIR_NO_INTERRUPT: u8 = 1;
 const IIR_MODEM_STATUS: u8 = 0;
 const IIR_BUSY: u8 = 7;
 const IIR_RX_TIMEOUT: u8 = 0x0c;
+
 const UART_CLOCK_DIVISOR: u64 = 16;
 const QEMU_RISCV_BAUD_BASE: u32 = 399_193;
 const QEMU_LOONGARCH_BAUD_BASE: u32 = 115_200;
+
 const RX_IRQ_BUDGET: usize = 16;
 
 // 整条应急消息最多读取这些次 LSR，不依赖时钟或其他 CPU 的进度。
@@ -261,6 +270,7 @@ pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
     );
     assert_eq!(info.interrupts.uart.start, crate::platform::EARLY_UART_BASE);
     assert!(matches!(info.uart.reg_io_width, 1 | 4));
+
     let baud_base = if info.platform == crate::boot::Platform::QemuVirt {
         if cfg!(target_arch = "riscv64") {
             QEMU_RISCV_BAUD_BASE
@@ -275,6 +285,7 @@ pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
         u32::try_from(clock / UART_CLOCK_DIVISOR).expect("UART baud base exceeds u32")
     };
     assert!(0 < baud_base, "UART input clock is zero");
+
     RESOURCES.call_once(|| PortResources {
         base: info.interrupts.uart.start,
         width: info.uart.reg_io_width,
@@ -322,6 +333,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
     if port.line_settings == Some((config.divisor, config.line_control)) {
         return (config.divisor, false);
     }
+
     let mut received = false;
     if dw_apb() {
         #[cfg(feature = "ktest")]
@@ -338,6 +350,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
             }
             spin_loop();
         }
+
         // BUSY 包含 RBR 数据。先隔离外部 RX，再保存残留采样，使空闲等待不依赖被阻止的 IRQ。
         write_register(MCR, saved_mcr | LOOPBACK);
         loop {
@@ -349,6 +362,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
             spin_loop();
         }
     }
+
     write_line_control(config.line_control | DLAB);
     write_register(DLL, config.divisor as u8);
     write_register(DLM, (config.divisor >> 8) as u8);
@@ -678,6 +692,7 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         0,
         "UART line control must not set DLAB"
     );
+
     let mut port = PORT.lock();
     let saved_ier = read_register(IER);
     let saved_mcr = read_register(MCR);
@@ -691,6 +706,7 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         mcr |= REQUEST_TO_SEND;
     }
     write_register(MCR, mcr);
+
     #[cfg(feature = "ktest")]
     let effective_receiver = if port.test_control_owned {
         config.receiver && port.quota.is_some()
@@ -720,9 +736,11 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         "UART line control left DLAB set"
     );
     drop(port);
+
     if received {
         crate::fs::tty::schedule_receive();
     }
+
     // 常规配置不以回读相等作为致命条件；保留完整差异作为硬件事实。
     if (snapshot.divisor != config.divisor
         || snapshot.line_control != config.line_control
@@ -785,6 +803,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
         if first_interrupt == IIR_MODEM_STATUS {
             let _ = read_register(MSR);
         }
+
         let mut produced = 0;
         #[cfg(feature = "ktest")]
         let tty_attached = port.tty_attached;
@@ -817,6 +836,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                 }
             }
         }
+
         let last_interrupt = read_register(IIR) & IIR_STATUS_MASK;
         let ier = read_register(IER);
         let ready = read_register(LSR) & TRANSMIT_READY != 0;
@@ -834,6 +854,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
         let _ = (first_interrupt, last_interrupt);
         (produced, notify_tx)
     };
+
     if 0 < produced {
         crate::fs::tty::schedule_receive();
     }

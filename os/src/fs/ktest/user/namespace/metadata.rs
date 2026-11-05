@@ -42,6 +42,7 @@ pub(super) mod cases {
         let original = [expected[17], expected[31]];
         expected[17] ^= 0x6e;
         expected[31] ^= 0xb1;
+
         let gate = Arc::try_new(crate::sync::Completion::new())
             .map_err(|_| TestError("metadata view start gate OOM"))?;
         let entered = Arc::try_new(AtomicUsize::new(0))
@@ -68,6 +69,7 @@ pub(super) mod cases {
                 || entered.load(Ordering::Acquire) == 2,
             )
         })();
+
         // 每个真实等待者消费一个 token；准备失败也先放行已发表任务再 join。
         gate.complete();
         gate.complete();
@@ -75,6 +77,7 @@ pub(super) mod cases {
         let current = full
             .with_read(|bytes| bytes == expected)
             .map_err(FsError::from);
+
         // 只恢复两个 boot 保留字节，不覆盖超级块或其它访问者的共同记录。
         let restored = short
             .update(volume.claim(), |bytes| {
@@ -94,6 +97,7 @@ pub(super) mod cases {
                 Some(Ok(())),
             );
         }
+
         checked(context, sync_metadata(&volume))?;
         context.diagnostic(format_args!(
             "W02 actual-ext4-block-bytes={} initial-super-page={} short-view-bytes={}/{} original-PFN={} participants=2 full-content-preserved=1 restored-only-boot-bytes=1",

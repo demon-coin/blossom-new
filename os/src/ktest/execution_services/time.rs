@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 fn until(predicate: impl FnMut() -> bool, name: &'static str) {
     wait(predicate, name).unwrap();
 }
+
 use crate::sync::{Completion, IrqSaveGuard, SpinLock};
 use crate::task::{self, State, Task};
 use crate::time::{self as clock, Duration, MonotonicInstant};
@@ -141,6 +142,7 @@ fn deferred_worker() -> i32 {
     assert!(scenario().peer_ran.load(Ordering::Acquire));
     until(|| peer.try_join().is_some(), "reschedule-peer-return");
     assert_eq!(peer.join().unwrap(), 101);
+
     // SAFETY: 当前绑定 CPU0 的普通任务不持锁；异常入口、永久 CpuLocal 和真实 timer
     // 已安装，受控整数测试不跨调度，退出恢复 IRQ 和当前 clockevent。
     let registers = unsafe { arch::test_integer_register_preservation() };
@@ -175,6 +177,7 @@ fn arithmetic_case(frequency: u64, mode: u8) {
         assert!(exact.abs_diff(ideal) <= (u128::from(delta) >> scale.shift) + 1);
         return;
     }
+
     let keeper = clock::testing::Timekeeper::new(frequency, u64::MAX, 1u64 << 63);
     let scale = keeper.scale();
     if mode == 3 {
@@ -199,6 +202,7 @@ fn arithmetic_case(frequency: u64, mode: u8) {
         }
         return;
     }
+
     let fixed = u128::from(scale.max_delta) * u128::from(scale.mult);
     let (ns, fraction) = scale
         .convert(scale.max_delta, 0)
@@ -335,6 +339,7 @@ fn test_timekeeper() {
     } else {
         None
     };
+
     until(
         || scenario().time_arrived.load(Ordering::Acquire) == readers + 1,
         "time-task-arrival",
@@ -369,6 +374,7 @@ fn accounting_worker() -> i32 {
     let stack = black_box(&local) as *const _ as usize;
     let old = scenario().account_task.lock().replace(Arc::clone(&current));
     assert!(old.is_none());
+
     let start = clock::now();
     let initial = accounting::current_execution_time();
     busy(Duration::from_millis(20));
@@ -382,6 +388,7 @@ fn accounting_worker() -> i32 {
     );
     let mut previous = accounting::current_execution_time();
     assert!(initial < previous);
+
     if 1 < cpu::count() {
         for target in [1usize, 0] {
             let hop_start = clock::now();
@@ -408,6 +415,7 @@ fn accounting_worker() -> i32 {
             scenario().migrations.fetch_add(1, Ordering::Relaxed);
         }
     }
+
     let execution = accounting::current_execution_time()
         .checked_sub(initial)
         .expect("task accounting regressed");
@@ -448,6 +456,7 @@ fn kick_worker(target: usize) -> i32 {
     let old = publication.replace(task::current_task());
     assert!(old.is_none());
     drop(publication);
+
     loop {
         slot.wake.wait();
         if slot.stop.load(Ordering::Acquire) {
@@ -547,6 +556,7 @@ fn kick_attempt(target: usize, attempt: usize, after: usize, end: u64) -> (usize
             "ipi-return-idle",
         );
     }
+
     let waits_before = cpu::test_wait_completions(target);
     scenario().kicks[target]
         .timer_before
@@ -623,6 +633,7 @@ fn test_idle_kicks() -> (usize, usize) {
         );
         rounds += verified;
         waits += completed_waits;
+
         scenario().kicks[target].request_stop();
         let handle = handles[target].take().expect("idle kick handle missing");
         until(|| handle.try_join().is_some(), "kick-task-return");
@@ -655,6 +666,7 @@ fn test_accounting() {
         },
         "account-task-parked",
     );
+
     let observer = account_task();
     let execution = observer.execution_time();
     let blocked_start = clock::now();
@@ -665,6 +677,7 @@ fn test_accounting() {
         .expect("offCPU time regressed")
         .as_nanos() as u64;
     assert!(0 < offcpu_ns);
+
     scenario().account_wake.complete();
     until(|| handle.try_join().is_some(), "account-task-return");
     assert_eq!(handle.join().unwrap(), 113);
@@ -672,6 +685,7 @@ fn test_accounting() {
     let wall_ns = scenario().wall_ns.load(Ordering::Acquire);
     assert!(0 < task_ns && task_ns < wall_ns);
     assert!(task_ns.checked_add(offcpu_ns).expect("interval overflow") <= wall_ns);
+
     let mut irq_ns = 0u64;
     let mut scheduler_ns = 0u64;
     let mut idle_ns = 0u64;
@@ -719,6 +733,7 @@ struct Scenario {
     csd_actions: AtomicUsize,
     kicks: [KickSlot; 4],
 }
+
 static CURRENT: core::sync::atomic::AtomicPtr<Scenario> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -732,10 +747,12 @@ fn scenario() -> Arc<Scenario> {
         Arc::from_raw(pointer)
     }
 }
+
 struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
+
 impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
     fn set_up(
@@ -774,12 +791,14 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
             .is_ok());
         Ok(Self { state, initial })
     }
+
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
         self.state.nodes.stop()?;
         Ok(())
     }
+
     /// runner已join每个原Task；尾票归还以后才释放context/owner并比较完整两账。
     fn tear_down(self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         let mut owner = core::mem::ManuallyDrop::new(self);
@@ -798,6 +817,7 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
                 return Err(::ktest::TestError("idle kick source did not converge"));
             }
         }
+
         let initial = owner.initial;
         let pointer = CURRENT.swap(core::ptr::null_mut(), Ordering::AcqRel);
         assert_eq!(pointer, Arc::as_ptr(&owner.state).cast_mut());
@@ -839,6 +859,7 @@ impl Scenario {
         }
     }
 }
+
 impl ServiceFixture {
     /// 固定协调者独立拥有同一Scenario，子入口不捕获fixture或TestContext借用。
     fn fixed(
@@ -898,6 +919,7 @@ pub(crate) mod cases {
                 clock::testing::rtc_calendar(138, fields(1, 19, 3, 14, 7)),
                 Some(2_147_483_647_000_000_000)
             );
+
             assert_eq!(
                 clock::testing::rtc_calendar(200, fields(2, 29, 0, 0, 0)),
                 None
@@ -915,6 +937,7 @@ pub(crate) mod cases {
                 clock::testing::rtc_calendar(u32::MAX, fields(1, 1, 0, 0, 0)),
                 None
             );
+
             for low in [
                 fields(0, 1, 0, 0, 0),
                 fields(13, 1, 0, 0, 0),
@@ -945,6 +968,7 @@ pub(crate) mod cases {
             assert!(after.as_nanos() < utc, "RTC epoch is absent from realtime");
             assert_eq!(clock::realtime_deadline(0), MonotonicInstant::from_nanos(0));
             crate::timer::sleep_until(clock::realtime_deadline(0));
+
             let utc_deadline = clock::realtime().checked_add(20_000_000).unwrap();
             let deadline = clock::realtime_deadline(utc_deadline);
             crate::timer::sleep_until(deadline);
@@ -953,6 +977,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 重新武装真实quantum后验证硬IRQ仅置请求、合法安全点切换与整数寄存器保存。
     #[test]
     fn deferred_quantum(
@@ -965,6 +990,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 四频率的回绕、长counter、分段余数和最大差值各自成为具名参数，并各自准备fixture。
     #[test]
     #[case("1000003_full_wrap", 1_000_003, 0)]
@@ -998,6 +1024,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 指定远核writer推进正在采样的同次generation，reader必须真实拒绝旧序号。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -1010,6 +1037,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 真reader/writer Task竞争唯一timekeeper并逐轮核对单调性与维护次数。
     #[test]
     fn concurrent_monotonic(
@@ -1021,6 +1049,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 同Task忙段、真正Blocked与迁核保持栈和身份，同时区分Task/IRQ/scheduler账。
     #[test]
     fn execution_accounting(
@@ -1032,6 +1061,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 每个远核真实ISA等待完成四轮，timer IRQ基线不增长，IPI新原因不得丢失。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -1046,6 +1076,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 末轮执行者仍在原栈时发停止票；控制者失败后也必须真join且耗尽完成源。
     #[test]
     #[ktest(

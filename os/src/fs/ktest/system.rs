@@ -104,6 +104,7 @@ impl SystemOwner {
         let vfs = Arc::try_new(vfs).map_err(|_| TestError("system VFS owner OOM"))?;
         let files = Arc::try_new(checked(context, FileTable::try_new())?)
             .map_err(|_| TestError("system file table owner OOM"))?;
+
         context.expect_eq(
             checked(
                 context,
@@ -134,6 +135,7 @@ impl SystemOwner {
             selection.root_mode,
             self.owner.disks[fixture_index(selection.root)].identity()
         ));
+
         self.vfs = Some(vfs);
         self.context = Some(fs_context);
         self.files = Some(files);
@@ -198,6 +200,7 @@ impl SystemOwner {
             },
         );
         context.expect_eq(sparse.bytes, 12325);
+
         let verified_data = verify_pattern(self, context, paths[1], false)?;
         context.expect_eq(verified_data, data);
         let verified_sparse = verify_pattern(self, context, paths[3], true)?;
@@ -365,6 +368,7 @@ fn raw_bio(disk: &Disk, operation: BlkOperation) -> Result<Bio, BlockError> {
             .map_err(|_| BlockError::NoMemory)?;
         memory.push(mapped);
     }
+
     let sector = if operation == BlkOperation::Flush {
         0
     } else {
@@ -469,6 +473,7 @@ pub(crate) mod arguments {
                 (whole_selector(root), extra.map(whole_selector), mode),
             );
         }
+
         for (bytes, rootdir) in [
             (b"rootdir=/".as_slice(), b"/".as_slice()),
             (b"rootdir=/bad rootdir=/test", b"/test"),
@@ -479,6 +484,7 @@ pub(crate) mod arguments {
         ] {
             context.expect_eq(checked(context, boot_devices(bytes))?.rootdir, rootdir);
         }
+
         for (bytes, init) in [
             (
                 b"root=/dev/vda init=/bin/init".as_slice(),
@@ -495,6 +501,7 @@ pub(crate) mod arguments {
         ] {
             context.expect_eq(checked(context, boot_devices(bytes))?.init, init);
         }
+
         for (bytes, error) in [
             (
                 b"root=/dev/vda init=".as_slice(),
@@ -517,6 +524,7 @@ pub(crate) mod arguments {
                 Some(error),
             );
         }
+
         for bytes in [
             b"root=".as_slice(),
             b"root=/dev/vdaa",
@@ -539,6 +547,7 @@ pub(crate) mod arguments {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-root"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod root {
     use super::*;
+
     /// 根目录来自同一磁盘的真实子目录；绝对路径与父组件都受返回上下文的完整 Path 约束。
     #[test]
     #[ktest(tags("fs-system-rootdir"))]
@@ -630,6 +639,7 @@ pub(crate) mod root {
         let selected = fixture.prepare(context)?;
         context.expect_eq(selected.extra, None);
         let summaries = fixture.tree(context, &ROOT_FILES)?;
+
         let data = checked(
             context,
             fixture
@@ -660,6 +670,7 @@ pub(crate) mod root {
         ] {
             context.expect_eq(fixture.summary(context, pathname)?, summaries[1]);
         }
+
         context.expect_eq(
             read_summary(
                 fixture.files(),
@@ -690,6 +701,7 @@ pub(crate) mod root {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-dual"), resources("root", "extra"), timeout_ms = 90000)]
 pub(crate) mod dual {
     use super::*;
+
     /// 两盘由本次固件参数明确选择，同号 identity inode 的对象、mapping 和内容必须隔离。
     #[test]
     #[ktest(tags("B01", "B16", "B24"))]
@@ -704,6 +716,7 @@ pub(crate) mod dual {
         context.expect_eq(selected.root == extra, false);
         fixture.tree(context, &ROOT_FILES)?;
         fixture.tree(context, &EXTRA_FILES)?;
+
         let first = checked(
             context,
             fixture
@@ -752,6 +765,7 @@ pub(crate) mod dual {
             .ptr_eq(second_inode),
             true,
         );
+
         let mut root_bytes = [0xa7; 64];
         let mut extra_bytes = [0xa7; 64];
         let mut offset = 0;
@@ -774,6 +788,7 @@ pub(crate) mod dual {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-unselected"), resources("root", "scratch"), timeout_ms = 90000)]
 pub(crate) mod unselected {
     use super::*;
+
     /// 未选择的 blank scratch 保留真实硬件实例，但正式 factory 不扫描其文件系统。
     #[test]
     #[ktest(tags("B01", "B24"))]
@@ -796,6 +811,7 @@ pub(crate) mod unselected {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-scratch"), resources("root", "extra", "scratch"), timeout_ms = 90000)]
 pub(crate) mod scratch {
     use super::*;
+
     /// 挂载盘由软件只读 claim 拒绝原写，未挂 scratch 实际写、读回与硬件 FLUSH 不串盘。
     #[test]
     #[ktest(tags("B10", "B24"))]
@@ -830,6 +846,7 @@ pub(crate) mod scratch {
             context.expect_eq(disk.test_snapshot().submitted, before);
             drop(memory);
         }
+
         let disk = &fixture.owner.disks[2];
         let unit = disk.limits().logical_block_size as usize;
         let (written, memory) = raw_io(disk, BlkOperation::Write)
@@ -842,6 +859,7 @@ pub(crate) mod scratch {
             },
         );
         drop(memory);
+
         let (read, memory) = raw_io(disk, BlkOperation::Read)
             .map_err(|_| TestError("system scratch Read-back failed"))?;
         if read
@@ -866,6 +884,7 @@ pub(crate) mod scratch {
             );
         }
         drop(memory);
+
         if disk.limits().flush {
             let (flushed, memory) = raw_io(disk, BlkOperation::Flush)
                 .map_err(|_| TestError("system scratch FLUSH failed"))?;
@@ -888,6 +907,7 @@ pub(crate) mod scratch {
             );
             context.diagnostic(format_args!("fs-system-scratch sector=128 bytes={} write-readback=1 hardware-flush=unsupported hardware-flush-covered=0", unit));
         }
+
         fixture.tree(context, &ROOT_FILES)?;
         fixture.tree(context, &EXTRA_FILES)?;
         Ok(())
@@ -897,6 +917,7 @@ pub(crate) mod scratch {
 #[ktest::suite(fixture = SystemOwner, suite_resources = DeviceInventory, context = "Thread", tags("fs-system", "fs-system-missing"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod missing {
     use super::*;
+
     /// 宿主明确传不存在的根名，客体真实 BootInfo 选择失败且不探测任何盘面。
     #[test]
     #[ktest(tags("B01"))]

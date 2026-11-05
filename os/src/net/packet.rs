@@ -21,6 +21,7 @@ pub(crate) const MAX_IPV4_UDP_PAYLOAD_LEN: usize =
     MAX_IP_PACKET_LEN - IPV4_HEADER_LEN - UDP_HEADER_LEN;
 pub(crate) const IPV6_UDP_HEADER_LEN: usize = IPV6_HEADER_LEN + UDP_HEADER_LEN;
 pub(crate) const MAX_IPV6_UDP_PAYLOAD_LEN: usize = MAX_IP_PACKET_LEN - IPV6_UDP_HEADER_LEN;
+
 #[cfg(feature = "ktest")]
 const DEFAULT_HOP_LIMIT: u8 = 64;
 
@@ -75,6 +76,7 @@ impl OwnedPacket {
         if ip_mtu < length || MAX_IP_PACKET_LEN < length {
             return Err(FsError::MessageTooLarge);
         }
+
         let mut storage = Vec::new();
         storage
             .try_reserve_exact(tcp.payload.len())
@@ -116,6 +118,7 @@ impl OwnedPacket {
         if MAX_IP_PACKET_LEN < length || (matches!(ip, IpRepr::Ipv6(_)) && mtu < length) {
             return Err(FsError::MessageTooLarge);
         }
+
         let mut storage = Vec::new();
         storage
             .try_reserve_exact(payload.len())
@@ -130,6 +133,7 @@ impl OwnedPacket {
             "TCP capture storage too small"
         );
         assert_eq!(ip.next_header(), IpProtocol::Tcp);
+
         storage.clear();
         storage.extend_from_slice(tcp.payload);
         Self {
@@ -151,6 +155,7 @@ impl OwnedPacket {
             "UDP capture storage too small"
         );
         assert_eq!(ip.next_header(), IpProtocol::Udp);
+
         storage.clear();
         storage.extend_from_slice(payload);
         Self {
@@ -287,6 +292,7 @@ pub(crate) fn return_capture_storage(owner: &CaptureStorage, mut bytes: Vec<u8>)
             mem::swap(&mut *storage, &mut bytes);
         }
     }
+
     drop(bytes);
 }
 

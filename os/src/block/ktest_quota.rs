@@ -217,6 +217,7 @@ fn devices(
             "quota requires exact declared root/extra raw device count",
         ));
     }
+
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(count)
@@ -246,6 +247,7 @@ fn bio(
     if unit > mm::PAGE_SIZE {
         return Err(TestError("quota logical block exceeds original page"));
     }
+
     let pages =
         mm::alloc_pages(0, true).ok_or(TestError("quota original zero page unavailable"))?;
     let direction = if operation == BlkOperation::Write {
@@ -263,6 +265,7 @@ fn bio(
         .try_reserve_exact(1)
         .map_err(|_| TestError("quota original owner vector failed"))?;
     memory.push(mapped);
+
     // SAFETY: 全零原页完整初始化且无裸别名；A 仅等待独立 B，不等待自身/stop/复用槽。
     let bio = unsafe { Bio::try_new(disk, operation, 400, memory, 0, Some(EndIo::Task(callback))) }
         .map_err(|_| {
@@ -301,6 +304,7 @@ impl Pressure {
             );
             self.pages.push(page);
         }
+
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
             let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
                 .expect("quota heap pressure layout");
@@ -317,6 +321,7 @@ impl Pressure {
                 self.heap[index] = pointer as usize;
             }
         }
+
         mm::drain_all_pages();
         let pages_failed = black_box(mm::alloc_pages(0, false)).is_none();
         let mut heap_failed = true;
@@ -425,6 +430,7 @@ impl Owner {
                 "Reject requires writable raw working copy; no Write issued",
             ));
         }
+
         let mut disks = Vec::new();
         let mut legacy = Vec::new();
         disks
@@ -455,6 +461,7 @@ impl Owner {
                 }
             }
         }
+
         let resources = (|| {
             // 原33回归与新增普通quota+1边界分别具名，双盘总是使用实际共享额度+1。
             let a_count = if count == 1
@@ -496,6 +503,7 @@ impl Owner {
                 tasks.push(None);
                 pending.push(bio);
             }
+
             let mut stop_tasks = Vec::new();
             let mut stop_results = Vec::new();
             stop_tasks
@@ -537,6 +545,7 @@ impl Owner {
                 stop_results: SpinLock::new(stop_results),
             })
             .map_err(|_| TestError("quota observation allocation failed"))?;
+
             let a_disk = disks[0].clone();
             let prepared_a = task::prepare_kernel_on(0, move || {
                 for bio in pending {
@@ -597,11 +606,13 @@ impl Owner {
                     return Err(error);
                 }
             };
+
         assert!(
             ACTIVE.lock().is_none(),
             "previous quota callbacks still own locator"
         );
         *ACTIVE.lock() = Some(observation.clone());
+
         let mut activation_error = false;
         for disk in &disks {
             if disk.start().is_err() {
@@ -734,6 +745,7 @@ impl Owner {
                 context.expect_eq(Arc::ptr_eq(&observed, &previous), false);
             }
         }
+
         self.disks[b].ktest_hold_used();
         self.used_target = super::tests::used_index(&self.disks[b], self.legacy[b]).wrapping_add(1);
         self.submitter = Some(self.prepared_b.take().expect("quota prepared B").publish());
@@ -786,6 +798,7 @@ impl Owner {
         context.expect_eq(self.observation.peer.is_complete(), false);
         context.expect_eq(self.observation.peer_calls.load(Ordering::Acquire), 0);
         context.expect_eq(self.observation.blocked(), count);
+
         // 在 B 的真实 SG/descriptor/生成者与全部观察/stop 栈已经存在后才开始 OOM。
         let oom_evidence = if self.oom {
             Some(self.pressure.exhaust())
@@ -805,6 +818,7 @@ impl Owner {
         } else {
             Ok(())
         };
+
         self.disks[b].ktest_release_used();
         let progressed = until(
             "quota B and all A did not progress with original execution resources",
@@ -818,6 +832,7 @@ impl Owner {
         self.pressure.release();
         stopped_wait?;
         progressed?;
+
         // OOM 放压之前不发表其它盘 stop，避免先归还原控制栈稀释 B 恢复前的真实压力。
         if self.oom {
             self.start_stop(b);
@@ -855,6 +870,7 @@ impl Owner {
         if b != 0 {
             context.expect_eq(self.counts(0), self.before_a);
         }
+
         for (completion, original) in self.completions.iter().zip(&self.observation.originals) {
             reclaim(
                 context,
@@ -928,6 +944,7 @@ impl Owner {
                 return Err(TestError("quota producer returned failure"));
             }
         }
+
         drop(self.prepared_a.take());
         drop(self.prepared_b.take());
         self.claim.take();
@@ -980,6 +997,7 @@ impl Owner {
                 }
             }
         }
+
         // 所有 producer 已结束，所有盘 slot/progress 已 close/join；最后关闭原共享域。
         self.queue.close_sync();
         context.expect_eq(self.queue.ktest_reserved_workers(), 0);
@@ -989,6 +1007,7 @@ impl Owner {
         }
         self.observation.peer.test_flush_finalizer();
         context.expect_eq(self.observation.peer.ktest_finalizer_joined(), true);
+
         // stop 与域真实 native join 之后才摘当前 EndIo 定位槽。
         let active = ACTIVE
             .lock()
@@ -1196,6 +1215,7 @@ mod reserved {
     fn unsubmitted_domain_close(context: &mut TestContext<'_>, fixture: &mut Unsubmitted) {
         context.expect_eq(fixture.queue.ktest_reserved_workers(), 1);
         context.expect_eq(fixture.work.ktest_reserved_joined(), false);
+
         fixture.queue.close_sync();
         fixture.closed = true;
         context.expect_eq(fixture.queue.ktest_reserved_workers(), 0);

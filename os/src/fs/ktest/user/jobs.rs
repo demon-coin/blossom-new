@@ -55,6 +55,7 @@ impl UserOwner {
             None,
         )?;
         context.expect_eq(jobs_word(&mm, 32)?, 3);
+
         self.jobs_stage(
             context,
             &mm,
@@ -87,6 +88,7 @@ impl UserOwner {
             Some(0),
         )?;
         self.jobs_orphan(context, &mm)?;
+
         self.finish_jobs(context, mm, b"j")
     }
 
@@ -115,6 +117,7 @@ impl UserOwner {
                 "setsid child did not leave its original execution stack",
             ));
         }
+
         jobs_phase(&mm, 1)?;
         let leader = self.jobs_thread(&mm, 16)?;
         let identity = leader
@@ -150,6 +153,7 @@ impl UserOwner {
         if new_pgid.number() != old_number || Arc::ptr_eq(&old_pgid, &new_pgid) {
             return Err(TestError("PGID number was not reused by a distinct object"));
         }
+
         let delivered = self
             .graph()
             .send_process_group(&old_pgid, crate::task::signal::SIGUSR1);
@@ -177,6 +181,7 @@ impl UserOwner {
             old_number
         ));
         drop(old_pgid);
+
         self.jobs_stage(
             context,
             &mm,
@@ -274,6 +279,7 @@ impl UserOwner {
         ) {
             jobs_blocked(&executor, &group, matches!(waiting, JobsWait::ChildStopped))?;
         }
+
         let wire = !rx.is_empty() || !tx.is_empty();
         if wire {
             // RX 延迟给协调者实际观察 child 的生产 Blocked 窗口，不替代该观察。
@@ -292,6 +298,7 @@ impl UserOwner {
         if wire {
             self.tty_io.finish()?;
         }
+
         context.diagnostic(format_args!(
             "user-jobs phase={} rx={} tx={} native-blocked={} native-stopped={} user-wait-stops={}",
             phase,
@@ -302,6 +309,7 @@ impl UserOwner {
             jobs_word(mm, 32)?,
         ));
         drop((user, executor, group));
+
         if let Some((observer, expected)) = completion {
             let actual = observer.join();
             context.expect_eq(actual, expected);
@@ -339,6 +347,7 @@ impl UserOwner {
         );
         self.lifecycle_child = Some(executor.join_observer());
         drop((executor, identity, user));
+
         jobs_gate(mm, 8)?;
         jobs_done(mm, 8)?;
         let middle_status = middle_join.join();
@@ -346,6 +355,7 @@ impl UserOwner {
         if middle_status != 0 {
             return Err(TestError("orphan middle parent did not exit normally"));
         }
+
         let event = self.graph().wait(None, pid).map_err(|error| {
             context.diagnostic(format_args!("user-jobs orphan-wait error={:?}", error));
             TestError("orphan HUP exit was not available to the real kernel parent")
@@ -393,6 +403,7 @@ impl UserOwner {
         if event.status != 0 {
             return Err(TestError("ordinary jobs ABI program failed"));
         }
+
         self.reap_children(context, false)?;
         tty::flush_work();
         checked(

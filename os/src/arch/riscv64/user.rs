@@ -89,11 +89,13 @@ pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
         0,
         "kernel FP must be disabled before user entry"
     );
+
     // SAFETY: 调用者承担当前 Task、独占现场、活动 MM 与映射寿命；IRQ 与 FS 已核对。
     // 汇编只在此调用内保存受信续接 SP/TP/GP，用户 trap 返回后已清零 sscratch 并关闭 FS。
     unsafe {
         rv_run_user(context);
     }
+
     if context.scause & CAUSE_IRQ_FLAG != 0 {
         rv_dispatch_interrupt(context.scause, context.pc, context.gpr[2], context.stval);
         return UserTrap::Interrupt;

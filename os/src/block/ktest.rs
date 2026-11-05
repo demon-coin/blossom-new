@@ -123,6 +123,7 @@ fn scratch() -> Result<VirtioDevice, TestError> {
             "stop fixture requires exactly one attached scratch disk",
         ));
     }
+
     if let Some(candidate) = inventory.mmio_blocks.first() {
         // SAFETY: host 为本例只挂独占 scratch；一次真实库存和永久映射有效，无其它 owner。
         unsafe { VirtioDevice::prepare_mmio(candidate) }
@@ -145,6 +146,7 @@ fn bio(
     if unit > mm::PAGE_SIZE {
         return Err(TestError("scratch logical block exceeds original page"));
     }
+
     let mut pages =
         mm::alloc_pages(0, true).ok_or(TestError("scratch original page allocation failed"))?;
     if operation == BlkOperation::Write {
@@ -167,6 +169,7 @@ fn bio(
         .try_reserve_exact(1)
         .map_err(|_| TestError("scratch owner vector allocation failed"))?;
     memory.push(mapped);
+
     // SAFETY: 唯一原页且 Write 已完整初始化；Task callback 只借收权页并等外部 gate，
     // 无回调等待自身 stop，无裸 CPU 别名；Read 结果不授权读未初始化尾部。
     let bio = unsafe { Bio::try_new(disk, operation, 128, memory, 0, callback) }.map_err(|_| {
@@ -203,6 +206,7 @@ impl Owner {
                 "uncertain_write requires writable scratch; no raw write issued",
             ));
         }
+
         let (ring, pdu) = device.control_regions();
         let controls = (ring.device.value(), ring.len, pdu.device.value(), pdu.len);
         let queue = WorkQueue::try_new(WorkQueueConfig {
@@ -218,6 +222,7 @@ impl Owner {
                 return Err(TestError("scratch Disk preparation failed"));
             }
         };
+
         let resources = (|| {
             let observation = Observation::prepare()?;
             let operation = if scenario == Scenario::Retirement {
@@ -262,6 +267,7 @@ impl Owner {
                     return Err(error);
                 }
             };
+
         let completion = pending.completion();
         let rejected_completion = rejected.completion();
         if scenario == Scenario::Normal {
@@ -272,6 +278,7 @@ impl Owner {
             );
             *locator = Some(observation.clone());
         }
+
         let activation_error = disk.start().err();
         if let Some(error) = activation_error {
             // 仍返回实际 owner 给 typed quiesce；不能 setup Err 后 Drop 可能已发表的 DMA。
@@ -349,6 +356,7 @@ impl Owner {
         until("real Task callback did not Block", || {
             self.observation.callback_blocked()
         })?;
+
         self.start_stop();
         until("normal stop did not enter Draining and Block", || {
             let draining = self.disk.queue.lock().phase == QueuePhase::Draining;
@@ -367,6 +375,7 @@ impl Owner {
             false,
         );
         context.expect_eq(*self.observation.stop_result.lock(), None);
+
         self.disk
             .submit_bio(self.rejected.take().expect("prebuilt Draining rejection"));
         until("Draining rejection did not complete", || {
@@ -382,6 +391,7 @@ impl Owner {
             },
         )?;
         context.expect_eq(self.disk.queue.lock().ktest_stop.published, 1);
+
         self.observation.release_callback.complete();
         until("accepted callback and stop tail did not finish", || {
             self.completion.is_complete()
@@ -433,6 +443,7 @@ impl Owner {
             context.expect_eq(q.writing_slots, 1);
         }
         context.expect_eq(self.completion.is_complete(), false);
+
         self.disk.request_retire(BlockError::DeviceFault);
         self.start_stop();
         until("controlled Write retirement did not converge", || {
@@ -442,6 +453,7 @@ impl Owner {
                     .as_ref()
                     .is_some_and(|join| join.try_join() == Some(0))
         })?;
+
         Self::reclaim(
             context,
             &self.completion,
@@ -475,6 +487,7 @@ impl Owner {
                     .is_some_and(|join| join.try_join() == Some(0))
             },
         )?;
+
         context.expect_eq(
             *self.observation.stop_result.lock(),
             Some(Err(BlockError::StopUnconfirmed)),
@@ -562,6 +575,7 @@ impl Owner {
                 return Err(TestError("stop Task returned failure"));
             }
         }
+
         match self.disk.stop() {
             Ok(()) | Err(BlockError::DeviceFault) => {}
             Err(BlockError::StopUnconfirmed) => {

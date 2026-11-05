@@ -144,6 +144,7 @@ impl Pending {
         if info.signum < SIGRTMIN && self.bits & bit != 0 {
             return Ok(());
         }
+
         let index = info.signum as usize - 1;
         if prepared.node.is_some() {
             let target = target.expect("queued signal has no target account");
@@ -166,6 +167,7 @@ impl Pending {
         if bits == 0 {
             return None;
         }
+
         let index = bits.trailing_zeros() as usize;
         let removed = if self.reserve[index].is_some() && self.before_reserve[index] == 0 {
             Removed {
@@ -184,6 +186,7 @@ impl Pending {
                 node: Some(node),
             }
         };
+
         if self.queues[index].len == 0 && self.reserve[index].is_none() {
             self.bits &= !(1u64 << index);
         }

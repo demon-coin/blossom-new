@@ -79,6 +79,7 @@ pub fn alloc_pages(order: usize, zeroed: bool) -> Option<OwnedPages> {
     } else {
         buddy::allocate(order)
     }?;
+
     let mut pages = OwnedPages { block };
     if zeroed {
         let len = pages.len();
@@ -102,6 +103,7 @@ pub fn alloc_pages_in(
     let start = physical_start.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
     let end = physical_end / PAGE_SIZE;
     let block = buddy::allocate_in(order, start, end)?;
+
     let mut pages = OwnedPages { block };
     if zeroed {
         let len = pages.len();

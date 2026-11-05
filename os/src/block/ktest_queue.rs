@@ -163,6 +163,7 @@ fn devices(inventory: &DeviceInventory, count: usize) -> Result<Vec<VirtioDevice
             "queue fixture attached device count differs from declared resources",
         ));
     }
+
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(count)
@@ -240,6 +241,7 @@ impl Request {
             remaining -= length;
             offset = 0;
         }
+
         // SAFETY: 原页独占、Write 完整初始化、构造后没有 CPU 裸别名；Task 回调只借已收权页，
         // 等独立父或外部 gate，不等待自身 stop。模型用例从不将其地址发表到设备。
         let bio = unsafe { Bio::try_new(disk, operation, sector, memory, 0, end_io) }
@@ -371,6 +373,7 @@ impl Owner {
                 "readonly device case requires --read-only scratch",
             ));
         }
+
         let legacy = matches!(device.identity(), VirtioIdentity::Mmio { version: 1, .. });
         let queue = WorkQueue::try_new(WorkQueueConfig {
             max_active: usize::from(info.tag_count) + 1,
@@ -412,6 +415,7 @@ impl Owner {
                 return Err(TestError("queue fixed request preparation failed"));
             }
         };
+
         let resources = (|| {
             let extra = if let Some(device) = inventory.pop() {
                 Some(
@@ -452,6 +456,7 @@ impl Owner {
                         "available real tags cannot exceed the actual production used budget",
                     ));
                 }
+
                 let count = match scenario {
                     Scenario::Multi => 8,
                     Scenario::Tag | Scenario::Descriptor => fill + 1,
@@ -489,6 +494,7 @@ impl Owner {
                 joins
                     .try_reserve_exact(task_count)
                     .map_err(|_| TestError("queue producer join allocation failed"))?;
+
                 for ordinal in 0..count {
                     let (operation, sector, bytes, offset) = match scenario {
                         Scenario::Multi => (
@@ -591,6 +597,7 @@ impl Owner {
                         &disk, operation, sector, bytes, offset, end_io,
                     )?);
                 }
+
                 if matches!(
                     scenario,
                     Scenario::Progress | Scenario::ProgressBatch | Scenario::Generation
@@ -672,6 +679,7 @@ impl Owner {
                 return Err(error);
             }
         };
+
         if matches!(
             scenario,
             Scenario::Callback
@@ -684,6 +692,7 @@ impl Owner {
             assert!(slot.is_none(), "previous queue callback owner remains");
             *slot = Some(observation.clone());
         }
+
         let mut activation_error = disk.start().err();
         if let Some(extra) = &extra {
             if let Err(error) = extra.start() {
@@ -848,6 +857,7 @@ impl Owner {
         for request in &self.requests {
             context.expect_eq(request.completion.is_complete(), false);
         }
+
         self.disk.test_resume_completions();
         for request in &self.requests {
             request.success(context, Some(tag))?;
@@ -873,6 +883,7 @@ impl Owner {
             self.fill,
         );
         context.expect_eq(self.disk.test_snapshot().inflight, self.fill);
+
         self.publish_tasks();
         until("extra producer never entered real resource Blocked", || {
             self.observation.blocked(0)
@@ -912,6 +923,7 @@ impl Owner {
             true,
         );
         self.used(before.submitted + self.fill)?;
+
         self.disk.test_resume_completions();
         for request in &self.requests {
             request.success(context, Some(tag))?;
@@ -942,6 +954,7 @@ impl Owner {
         }
         self.used(before.submitted + self.fill)?;
         context.expect_eq(self.disk.test_snapshot().completed, before.completed);
+
         self.disk.test_resume_completions();
         for request in &self.requests {
             request.success(context, Some(tag))?;
@@ -978,6 +991,7 @@ impl Owner {
             Some(BlockError::Busy),
         );
         self.used(generated.submitted)?;
+
         self.disk.test_resume_completions();
         self.requests[0].success(context, Some(tag))?;
         self.drained()
@@ -1039,6 +1053,7 @@ impl Owner {
         );
         context.expect_eq(self.disk.test_snapshot().inflight, 1);
         context.expect_eq(self.disk.test_snapshot().completed, before.completed);
+
         self.observation.gate.complete();
         self.requests[0].success(context, Some(tag))?;
         self.drained()?;
@@ -1069,6 +1084,7 @@ impl Owner {
             self.used(before.submitted + 2)?;
             self.disk.test_resume_via_progress();
         }
+
         for request in &self.requests {
             request.success(context, tag)?;
         }
@@ -1130,6 +1146,7 @@ impl Owner {
         )?;
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
         drop(claim);
+
         self.submit(1);
         self.requests[1].success(context, None)?;
         self.submit(2);
@@ -1206,6 +1223,7 @@ impl Owner {
         }
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
         drop(ro);
+
         self.claim = Some(
             Disk::claim_fs(
                 &crate::block::BlockView::whole(self.disk.clone()),
@@ -1227,6 +1245,7 @@ impl Owner {
             None,
         )?;
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
+
         self.disk.test_suspend_completions();
         let used = super::tests::used_index(&self.disk, self.legacy);
         self.claim
@@ -1249,6 +1268,7 @@ impl Owner {
             Some(BlockError::Busy),
         );
         context.expect_eq(self.disk.stop(), Err(BlockError::Busy));
+
         self.observation.gate.complete();
         self.requests[3].success(context, None)?;
         self.drained()?;
@@ -1259,6 +1279,7 @@ impl Owner {
             true,
         );
         context.expect_eq(self.observation.callback_tail.load(Ordering::Acquire), true);
+
         self.claim = Some(
             Disk::claim_fs(
                 &crate::block::BlockView::whole(self.disk.clone()),
@@ -1358,6 +1379,7 @@ impl Owner {
             limits.validate(BlkOperation::Read, 0, unit, [segment], 1),
             Err(BlockError::Unsupported),
         );
+
         let wrong = crate::mm::dma::PayloadRange {
             direction: BufferDirection::DriverToDevice,
             ..segment
@@ -1379,6 +1401,7 @@ impl Owner {
             ),
             Err(BlockError::Misaligned),
         );
+
         let mut logical = limits;
         logical.logical_block_size = 4096;
         context.expect_eq(
@@ -1391,6 +1414,7 @@ impl Owner {
             readonly.validate(BlkOperation::Write, 0, unit, [wrong], 0),
             Err(BlockError::ReadOnly),
         );
+
         let mut flush = limits;
         flush.flush = false;
         context.expect_eq(
@@ -1406,6 +1430,7 @@ impl Owner {
             flush.validate(BlkOperation::Flush, 0, unit, [segment], 0),
             Err(BlockError::InvalidRange),
         );
+
         let mut destination = [0x73_u8; 512];
         context.expect_eq(
             self.disk.read_exact_at(1, &mut destination),
@@ -1560,6 +1585,7 @@ impl Owner {
             }
             Ledger::WbInline | Ledger::WbReverse | Ledger::WbRejectedTail => unreachable!(),
         };
+
         self.requests[index].reclaim(context, expected, None)?;
         self.model_live = None;
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
@@ -1596,6 +1622,7 @@ impl Owner {
             };
             self.wb_folios.push(folio);
         }
+
         let mut identities = [0usize; 3];
         for (index, folio) in self.wb_folios.iter().enumerate() {
             let mut content = folio.lock_content();
@@ -1612,6 +1639,7 @@ impl Owner {
                     .map_err(|_| TestError("WB ledger mapping failed"))?,
             );
         }
+
         // SAFETY: WB 凭证保同一原 folio，全部字节初始化且无 VMA；控制账本从不把地址发表到硬件。
         // begin/child/generation 使用生产对象；每项控制完成代表本模型的唯一访问尾部。
         self.wb_active = Some(
@@ -1643,6 +1671,7 @@ impl Owner {
                 );
             }
         }
+
         let accepted = if mode == Ledger::WbRejectedTail {
             2 * unit
         } else {
@@ -1687,6 +1716,7 @@ impl Owner {
             }
             _ => unreachable!(),
         };
+
         context.expect_eq(completion.wait(), expected);
         let reclaimed = completion
             .take_memory()
@@ -1723,6 +1753,7 @@ impl Owner {
             mode == Ledger::WbRejectedTail,
         );
         context.expect_eq(self.disk.test_snapshot().submitted, before.submitted);
+
         drop((reclaimed, completion, parent));
         self.wb_active.take();
         self.sync_model_dirty()?;
@@ -1787,6 +1818,7 @@ impl Owner {
                     .take_memory()
                     .map_err(|_| TestError("WB scratch original payload missing"))?,
             );
+
             let mut readback = [0u8; mm::PAGE_SIZE];
             self.disk
                 .read_exact_at(32 * 512 + (index * unit) as u64, &mut readback[..unit])
@@ -1834,6 +1866,7 @@ impl Owner {
                 "controlled ledger obligations did not converge; retaining original fixture",
             ));
         }
+
         self.observation.gate.complete();
         if self.disk.queue.lock().phase == QueuePhase::Live {
             self.disk.test_resume_completions();
@@ -1856,6 +1889,7 @@ impl Owner {
                 BioInner::reject(&bio.inner, BlockError::QueueStopped);
             }
         }
+
         self.drained()?;
         drop(self.claim.take());
         self.disk
@@ -1868,6 +1902,7 @@ impl Owner {
         }
         self.join_tasks()?;
         self.queue.close_sync();
+
         if matches!(
             self.scenario,
             Scenario::Callback
@@ -2239,6 +2274,7 @@ mod fs_claim {
             },
             None,
         )?;
+
         let overlap = crate::block::BlockView::new(owner.disk.clone(), 512, 1024)
             .map_err(|_| TestError("overlap view construction failed"))?;
         context.expect_eq(
@@ -2254,11 +2290,13 @@ mod fs_claim {
             },
             None,
         )?;
+
         scratch.submit_bio(owner.requests[2].pending.take().unwrap());
         owner.requests[2].success(context, None)?;
         until("scratch raw slot tail did not finish", || {
             owner.disk.test_snapshot().inflight == 0
         })?;
+
         let scratch_claim = Disk::claim_fs(&scratch, AccessMode::ReadWrite)
             .map_err(|_| TestError("disjoint scratch claim blocked"))?;
         let mut bytes = [0x7b; 512];

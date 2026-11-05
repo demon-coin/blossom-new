@@ -24,6 +24,7 @@ use core::time::Duration;
 use smoltcp::socket::tcp::CongestionControl;
 
 pub const TCP_BUFFER_LEN: usize = 128 * 1024;
+
 pub(crate) const SOCK_STREAM: u32 = 1;
 pub(crate) const SOCK_DGRAM: u32 = 2;
 pub(crate) const SOCK_SEQPACKET: u32 = 5;
@@ -31,13 +32,16 @@ pub(crate) const SOCK_TYPE_MASK: u32 = 0xf;
 pub(crate) const SOCK_MAX: u32 = 11;
 pub(crate) const SOCK_NONBLOCK: u32 = O_NONBLOCK;
 pub(crate) const SOCK_CLOEXEC: u32 = O_CLOEXEC;
+
 pub(crate) const SHUT_RD: u32 = 0;
 pub(crate) const SHUT_WR: u32 = 1;
 pub(crate) const SHUT_RDWR: u32 = 2;
+
 pub(crate) const IPPROTO_TCP: i32 = 6;
 pub(crate) const IPPROTO_UDP: i32 = 17;
 pub(crate) const IPPROTO_IPV6: i32 = 41;
 pub(crate) const IPPROTO_MAX: i32 = 263;
+
 pub(crate) const SOL_SOCKET: i32 = 1;
 pub(crate) const SO_REUSEADDR: i32 = 2;
 pub(crate) const SO_TYPE: i32 = 3;
@@ -50,10 +54,12 @@ pub(crate) const SO_SNDTIMEO: i32 = 21;
 pub(crate) const SO_ACCEPTCONN: i32 = 30;
 pub(crate) const SO_PROTOCOL: i32 = 38;
 pub(crate) const SO_DOMAIN: i32 = 39;
+
 pub(crate) const MSG_PEEK: u32 = 0x2;
 pub(crate) const MSG_TRUNC: u32 = 0x20;
 pub(crate) const MSG_DONTWAIT: u32 = 0x40;
 pub(crate) const MSG_NOSIGNAL: u32 = 0x4000;
+
 pub(crate) const STREAM_PREFIX_LEN: usize = 4096;
 const BUFFER_HINT_MAX: u32 = 65536;
 const BUFFER_BUDGET_MIN: usize = 1024;
@@ -189,6 +195,7 @@ impl SocketFile {
         if !endpoint.belongs_to(&net) {
             return Err(FsError::InvalidOperation);
         }
+
         Self::allocate(net, Endpoint::Tcp(endpoint), flags, uid, gid)
     }
 
@@ -207,6 +214,7 @@ impl SocketFile {
                 return Err(FsError::NoMemory);
             }
         };
+
         let result = Arc::try_new(Self {
             endpoint: endpoint.clone(),
             net,
@@ -361,6 +369,7 @@ impl SocketFile {
             Endpoint::Tcp(endpoint) => endpoint,
             Endpoint::Unix(_) => return Err(FsError::Unsupported),
         };
+
         let deadline = self.deadline(false);
         let peer = peer.normalize(
             endpoint.family(),
@@ -379,6 +388,7 @@ impl SocketFile {
                 if !nonblock && self.connect_unclaimed.load(Ordering::Acquire) => {}
             Err(error) => return Err(error),
         }
+
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -396,6 +406,7 @@ impl SocketFile {
                 }
                 Ok(None) => {}
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::InProgress)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context
@@ -424,6 +435,7 @@ impl SocketFile {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let endpoint = self.tcp_endpoint()?;
         let deadline = self.deadline(true);
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
@@ -438,6 +450,7 @@ impl SocketFile {
             if self.flags() & O_NONBLOCK != 0 {
                 return Err(FsError::WouldBlock);
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context
@@ -470,6 +483,7 @@ impl SocketFile {
         if target.copied() == target.len() && !self.is_message_oriented() {
             return Ok(Self::stream_result(0));
         }
+
         let deadline = self.deadline(true);
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
@@ -483,6 +497,7 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context
@@ -552,10 +567,12 @@ impl SocketFile {
             }
             Endpoint::Tcp(_) | Endpoint::Unix(_) => {}
         }
+
         let mut prefix = [0u8; STREAM_PREFIX_LEN];
         let prepared = source.pull(&mut prefix)?;
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
+
         loop {
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
@@ -585,6 +602,7 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context
@@ -610,6 +628,7 @@ impl SocketFile {
         if MAX_IPV4_UDP_PAYLOAD_LEN < length {
             return Err(FsError::MessageTooLarge);
         }
+
         let mut payload = zeroed_bytes(length)?;
         let prepared = source.pull(&mut payload)?;
         if prepared < length {
@@ -617,6 +636,7 @@ impl SocketFile {
             source.pull(&mut [])?;
             unreachable!("incomplete datagram copy has no stored error");
         }
+
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
@@ -631,6 +651,7 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context
@@ -655,12 +676,14 @@ impl SocketFile {
         if endpoint.send_capacity() < length {
             return Err(FsError::MessageTooLarge);
         }
+
         let mut payload = zeroed_bytes(length)?;
         if source.pull(&mut payload)? < length {
             // 部分 copyin 的首个 fault 保存在 WriteBuffer，整条记录不得提交。
             source.pull(&mut [])?;
             unreachable!("incomplete UNIX record copy has no stored error");
         }
+
         let mut payload = Some(payload);
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
@@ -685,6 +708,7 @@ impl SocketFile {
             if self.nonblocking(flags) {
                 return Err(FsError::WouldBlock);
             }
+
             let deadline = Self::check_wait(deadline, interrupted, FsError::WouldBlock)?;
             if let Some((context, _)) = &waiting {
                 interrupted = context

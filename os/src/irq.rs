@@ -240,6 +240,7 @@ impl IrqRegistration {
             descriptor.slots[self.slot].enabled = false;
             descriptor.update_mask(self.number.0);
         }
+
         loop {
             {
                 let mut state = self.state.lock();
@@ -362,6 +363,7 @@ pub fn handle_external() {
                 }
             }
         }
+
         let mut handled = false;
         for &(slot, action) in calls[..count].iter().flatten() {
             // SAFETY: 源锁内已取得本 action 的执行引用；注册者直到 active=0 的同步注销
@@ -369,6 +371,7 @@ pub fn handle_external() {
             handled |= unsafe { (action.handler)(action.context) };
             SOURCES[number.0 as usize].lock().slots[slot].active -= 1;
         }
+
         let report = {
             let mut descriptor = SOURCES[number.0 as usize].lock();
             // SAFETY: source 来自本核尚未完成的真实 claim，固定 BSP 路由保证不会跨核完成；

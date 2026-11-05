@@ -77,9 +77,11 @@ impl Uart {
         .map_err(|_| TestError("multi-IRQ UART context allocation failed"))?;
         let source = irq::map_source(boot::info().interrupts.uart_source)
             .map_err(|_| TestError("multi-IRQ UART source invalid"))?;
+
         let initial = console::testing::take_uart_registration()?;
         console::disable_interrupts();
         initial.unregister_sync();
+
         // SAFETY: state 已稳定到 Arc 原地址，无其它 producer；返回后 fixture 保活到同步注销。
         let registration =
             unsafe { irq::register(source, action, Arc::as_ptr(&state).cast_mut().cast()) };
@@ -145,10 +147,12 @@ impl Uart {
             "multi-IRQ UART payload was not received by hardware IRQ",
             || before < console::received(),
         )?;
+
         self.token.disable_sync();
         context.expect_eq(console::received(), before + 1);
         context.expect_eq(console::last_byte(), byte);
         context.expect_eq(self.state.hits.load(Ordering::Acquire), hits + 1);
+
         self.finish()?;
         context.expect_eq(console::received(), before + 1);
         context.expect_eq(console::last_byte(), byte);
@@ -172,6 +176,7 @@ impl Uart {
         if console::received() == stage.before && control_byte()? != stage.byte {
             return Err(TestError("multi-IRQ cleanup payload mismatch"));
         }
+
         let mut line = [0u8; ACK_LINE_BYTES];
         let mut length = 0;
         loop {
@@ -185,6 +190,7 @@ impl Uart {
             line[length] = byte;
             length += 1;
         }
+
         let digits = line[..length]
             .strip_prefix(b"KTEST IO OK ")
             .ok_or(TestError("host rejected multi-IRQ UART IO"))?;
@@ -204,6 +210,7 @@ impl Uart {
         if Some(id) != active_case() {
             return Err(TestError("multi-IRQ UART ACK case mismatch"));
         }
+
         self.stage = None;
         Ok(())
     }

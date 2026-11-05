@@ -126,10 +126,12 @@ struct Control {
     tokens: Completion,
     consumed: AtomicUsize,
 }
+
 struct HeapOwner {
     pointer: *mut u8,
     layout: Layout,
 }
+
 impl Drop for HeapOwner {
     /// 唯一压力拥有者按原指针与原布局归还，不复制指针或伪造分配失败。
     fn drop(&mut self) {
@@ -137,6 +139,7 @@ impl Drop for HeapOwner {
         unsafe { dealloc(self.pointer, self.layout) };
     }
 }
+
 struct Waiting {
     initial: Baseline,
     state: Arc<Control>,
@@ -145,6 +148,7 @@ struct Waiting {
     objects: Vec<HeapOwner>,
     oom_pages: Option<usize>,
 }
+
 impl Fixture<SuiteBaseline> for Waiting {
     /// 每case全新源与计数；只有OOM例在仍有内存时预备全部压力拥有槽。
     fn set_up(context: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
@@ -169,6 +173,7 @@ impl Fixture<SuiteBaseline> for Waiting {
             consumed: AtomicUsize::new(0),
         })
         .map_err(|_| TestError("NoMemory: wait controls"))?;
+
         let mut handles = Vec::new();
         handles
             .try_reserve_exact(8)
@@ -192,6 +197,7 @@ impl Fixture<SuiteBaseline> for Waiting {
             oom_pages: None,
         })
     }
+
     /// 合作停止所有真实循环并通知它们已有等待；压力拥有留到原join离栈以后。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
@@ -231,6 +237,7 @@ impl Fixture<SuiteBaseline> for Waiting {
         }
         Ok(())
     }
+
     /// 原scope的真实join已结束；先去观察/压力/源，再核本次独立六域和metadata。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         let Self {
@@ -263,6 +270,7 @@ impl Fixture<SuiteBaseline> for Waiting {
             .slots
             .iter()
             .all(|slot| slot.task.lock().is_none() && slot.waker.lock().is_none()));
+
         drop(handles);
         objects.clear();
         pages.clear();
@@ -282,6 +290,7 @@ impl Fixture<SuiteBaseline> for Waiting {
         reclaimed(initial)
     }
 }
+
 impl Waiting {
     /// 观察handle归本fixture，真实原join责任仍由scope强拥有且不得丢失。
     fn spawn(
@@ -296,6 +305,7 @@ impl Waiting {
         self.handles.push(handle);
         Ok(index)
     }
+
     /// Any任务仍由生产准入选择CPU，控制Arc独立拥有而不借fixture栈。
     fn spawn_any(
         &mut self,
@@ -587,6 +597,7 @@ fn page_total() -> usize {
 #[::ktest::suite(fixture = Waiting, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "wait"), timeout_ms = 20000)]
 pub(crate) mod queue {
     use super::*;
+
     /// 四个生产Task共32次真实恢复，active最大一且ready成员不会重复。
     #[test]
     fn exclusive_ready_membership(_: &mut TestContext<'_>, fixture: &mut Waiting) -> TestResult {
@@ -613,6 +624,7 @@ pub(crate) mod queue {
                 ready_max = ready_max.max(ready);
             }
         }
+
         for handle in &fixture.handles {
             assert_eq!(join(handle)?, ROUNDS as i32);
         }
@@ -764,6 +776,7 @@ pub(crate) mod queue {
             fixture.spawn(1, move |state, token| drain_worker(state, token, index))?;
             blocked(&fixture.state.slots[index], 1);
         }
+
         let state = &fixture.state;
         let initial = state.drain_initial.load(Ordering::Acquire);
         assert_eq!(initial, 2);
@@ -782,6 +795,7 @@ pub(crate) mod queue {
         );
         assert_eq!(pops, initial, "wake_all exceeded initial member budget");
         assert_eq!(state.drain_rearms.load(Ordering::Acquire), initial);
+
         state.drain_running.store(false, Ordering::Release);
         assert_eq!(state.drain_queue.wake_all(), initial);
         for handle in &fixture.handles {
@@ -822,11 +836,13 @@ pub(crate) mod queue {
         let guard = state.payload.lock();
         let index = fixture.spawn(0, oom_worker)?;
         blocked(&state.slots[0], 1);
+
         mm::shrink_all();
         let pages = exhaust_pages(fixture);
         let class_nulls = exhaust_objects(fixture);
         assert_eq!(class_nulls, CLASSES.len());
         let mut nulls = 1 + class_nulls;
+
         state.start_oom.complete();
         blocked(&state.slots[0], 2);
         assert_eq!(sched::test_state(&state.slots[0].task()), State::Blocked);
@@ -842,6 +858,7 @@ pub(crate) mod queue {
         assert_eq!(*state.payload.lock(), 1);
         assert!(0 < pages);
         assert_eq!(nulls, 2 * (CLASSES.len() + 1));
+
         fixture.objects.clear();
         fixture.pages.clear();
         state.finish_oom.complete();
@@ -857,6 +874,7 @@ pub(crate) mod queue {
 #[::ktest::suite(fixture = Waiting, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "sync"), timeout_ms = 20000)]
 pub(crate) mod mutex {
     use super::*;
+
     /// 四真实竞争者在Acquire/Release下更新非原子payload，持guard park也不移交占有。
     #[test]
     fn ownership_visibility(_: &mut TestContext<'_>, fixture: &mut Waiting) -> TestResult {
@@ -873,6 +891,7 @@ pub(crate) mod mutex {
         for slot in &state.slots {
             blocked(slot, 1);
         }
+
         drop(guard);
         blocked(&state.slots[0], 2);
         assert!(state.payload.try_lock().is_none());
@@ -882,6 +901,7 @@ pub(crate) mod mutex {
         for handle in &fixture.handles {
             updates += join(handle)? as usize;
         }
+
         let visibility = *state.payload.lock();
         assert_eq!(visibility, TASKS * ROUNDS);
         assert_eq!(updates, visibility);
@@ -939,9 +959,11 @@ pub(crate) mod mutex {
         for slot in &fixture.state.slots {
             blocked(slot, 1);
         }
+
         for _ in 0..TASKS {
             fixture.state.tokens.complete();
         }
+
         let mut consumers = 0;
         for handle in &fixture.handles {
             consumers += join(handle)? as usize;

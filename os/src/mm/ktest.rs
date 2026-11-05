@@ -52,6 +52,7 @@ impl Fixture for PageFixture {
             held: [const { None }; 32],
         })
     }
+
     /// 真实 join 已完成后消费全部页，再核六域。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         for slot in &mut self.held {
@@ -85,6 +86,7 @@ impl Fixture for PressureFixture {
             heap: [const { None }; 3],
         })
     }
+
     /// 页、堆与 owning 表容量全部消费后，才核准备前六域。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         for slot in &mut self.heap {
@@ -96,6 +98,7 @@ impl Fixture for PressureFixture {
         for slot in &mut self.samples {
             drop(slot.take());
         }
+
         self.pressure.clear();
         let baseline = self.baseline;
         drop(self);
@@ -121,11 +124,13 @@ impl PressureFixture {
         }
         assert_eq!(free(), 0, "real pressure did not exhaust pages");
     }
+
     /// 用原页身份选择两个非相邻样本，不制造假碎片或复制归还权。
     fn nonadjacent(&mut self) -> (usize, usize) {
         for slot in &mut self.samples {
             *slot = Some(mm::alloc_pages(0, false).expect("fragment sample allocation failed"));
         }
+
         for first in 0..self.samples.len() {
             for second in first + 1..self.samples.len() {
                 if PAGE_SIZE
@@ -152,6 +157,7 @@ impl SlabObject {
     fn allocate() -> Self {
         Self::try_allocate().expect("SLUB allocation failed")
     }
+
     /// 真实 OOM 返回 None，成功对象立即由 typed owner 接管。
     fn try_allocate() -> Option<Self> {
         let object = Self(slub::allocate(CLASS)?);
@@ -170,6 +176,7 @@ impl SlabObject {
         }
         Some(object)
     }
+
     /// 检查仍由本值拥有的首尾签名及全部正文，不读已释放内容。
     fn check(&self) {
         let address = self.0.as_ptr() as usize;
@@ -210,6 +217,7 @@ impl Fixture for SlabFixture {
             pages: None,
         })
     }
+
     /// 先归还对象与页，再有限 flush/shrink/drain 核账。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         for slot in &mut self.held {
@@ -234,10 +242,12 @@ impl SlabFixture {
             }
         }
     }
+
     /// 借用 live 对象身份，不增加归还权。
     fn pointer(&self, index: usize) -> NonNull<u8> {
         self.held[index].as_ref().unwrap().0
     }
+
     /// 内容检查先于移动归还权，检查 panic 时 owning 槽仍可清理。
     fn release(&mut self, index: usize) {
         self.held[index].as_ref().unwrap().check();
@@ -269,11 +279,13 @@ impl HeapObject {
             layout,
         }
     }
+
     /// 只初始化消费者请求范围，不读取 rounded 容量。
     fn fill(&mut self, byte: u8) {
         // SAFETY: 本对象独占 live 请求范围，没有其他访问者。
         unsafe { self.pointer.as_ptr().write_bytes(byte, self.layout.size()) };
     }
+
     /// 检查已经初始化的请求前缀，所有访问结束后才能归还。
     fn check(&self, length: usize, byte: u8) {
         assert!(length <= self.layout.size());
@@ -282,6 +294,7 @@ impl HeapObject {
             assert_eq!(unsafe { self.pointer.as_ptr().add(offset).read() }, byte);
         }
     }
+
     /// 成功时提交新指针与布局，NULL 时保留原拥有和内容。
     fn resize(&mut self, size: usize) -> bool {
         assert!(0 < size, "realloc requires a nonzero size");
@@ -323,6 +336,7 @@ impl Fixture for HeapFixture {
             boxed: None,
         })
     }
+
     /// 消费真实容器 Drop 与堆权后核六域。
     fn tear_down(mut self, context: &mut TestContext<'_>) -> TestResult {
         for slot in &mut self.held {

@@ -50,6 +50,7 @@ const TCSBRK: u32 = 0x5409;
 const TCXONC: u32 = 0x540a;
 /// TCFLSH 命令。
 const TCFLSH: u32 = 0x540b;
+
 /// 控制终端与共同窗口 ABI 命令。
 const TIOCSCTTY: u32 = 0x540e;
 const TIOCGPGRP: u32 = 0x540f;
@@ -58,6 +59,7 @@ const TIOCGWINSZ: u32 = 0x5413;
 const TIOCSWINSZ: u32 = 0x5414;
 const TIOCNOTTY: u32 = 0x5422;
 const TIOCGSID: u32 = 0x5429;
+
 /// 工作每轮最多消费的软件采样数。
 const WORK_RX_BUDGET: usize = 64;
 /// 写出片段固定 512 字节。
@@ -180,6 +182,7 @@ pub fn initialize_service() -> Result<(), core::alloc::AllocError> {
         let mut state = STATE.lock();
         state.termios.cflag = (state.termios.cflag & !termios::CBAUD) | speed;
     }
+
     let read_head = Arc::try_new(PollWaitHead::new())?;
     let write_head = Arc::try_new(PollWaitHead::new())?;
     let hangup_head = Arc::try_new(PollWaitHead::new())?;
@@ -189,6 +192,7 @@ pub fn initialize_service() -> Result<(), core::alloc::AllocError> {
         reclaim: false,
     })?;
     let work = Work::try_new(&queue, 0, run_work, 0)?;
+
     SERVICE.call_once(move || Service {
         endpoint: Endpoint {
             state: &STATE,
@@ -255,6 +259,7 @@ fn run_work(_work: Pin<&Work>) {
                 }
             }
         }
+
         if !state.echo.is_empty() {
             write_changed = true;
         }
@@ -274,11 +279,13 @@ fn run_work(_work: Pin<&Work>) {
         }
     }
     drop(_copy);
+
     if let Some((graph, foreground)) = foreground {
         for &signum in &signals[..signal_count] {
             send_foreground(&graph, &foreground, signum);
         }
     }
+
     let pumped = pump_transmit(service, false);
     if pumped {
         progressed = true;
@@ -295,6 +302,7 @@ fn run_work(_work: Pin<&Work>) {
             .write_head
             .notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
     }
+
     // 只在有真实进度且可继续时重提；STOP/背压依 START RX/THRE 通知。
     if progressed {
         let state = service.endpoint.state.lock();
@@ -356,12 +364,14 @@ fn pump_transmit(service: &'static Service, force: bool) -> bool {
                 return pumped;
             }
         };
+
         if crate::console::try_write(&[byte]) == 0 {
             if crate::console::arm_tx_interrupt() {
                 let _ = service.work.as_ref().queue();
             }
             return pumped;
         }
+
         {
             let mut state = service.endpoint.state.lock();
             match peeked {
@@ -432,6 +442,7 @@ impl TtyFile {
         }
         Ok(())
     }
+
     /// 确需阻塞时建立有限源登记，之后必须重新扫描业务状态。
     fn prepare_wait(&self) -> Result<(Arc<PollContext>, PollTable), FsError> {
         let context = PollContext::try_new()?;
@@ -487,6 +498,7 @@ impl Pollable for TtyFile {
             table.register(&endpoint().read_head)?;
             table.register(&endpoint().write_head)?;
         }
+
         if self.hungup() {
             return Ok(PollMask::POLLIN
                 | PollMask::POLLOUT
@@ -522,6 +534,7 @@ pub fn open(
     if flags & O_DIRECTORY != 0 {
         return Err(FsError::NotDirectory);
     }
+
     let watches = Arc::try_new(WatchHead::new()).map_err(|_| FsError::NoMemory)?;
     let hangup_state = if console {
         None
@@ -542,6 +555,7 @@ pub fn open(
         hangup: None,
     })
     .map_err(|_| FsError::NoMemory)?;
+
     let copy = endpoint().copy.lock();
     let identity = match caller {
         FileIoContext::User(user) => user.identity(),
@@ -573,6 +587,7 @@ pub fn open(
             identity.graph().acquire_tty(identity, endpoint(), true)?;
         }
     }
+
     let snapshot = crate::console::configure_serial(config);
     {
         let mut state = endpoint().state.lock();
@@ -605,6 +620,7 @@ impl FileLike for TtyFile {
         if !self.check_read(caller)? {
             return Ok(0);
         }
+
         let Some(_reader) = acquire_reader(self, caller)? else {
             return Ok(0);
         };
@@ -670,6 +686,7 @@ impl FileLike for TtyFile {
                 (_, error) => error,
             })?;
         }
+
         let FileIoContext::User(user) = caller else {
             return Err(match command {
                 TCGETS | TCSETS | TCSETSW | TCSETSF | TCSBRK | TCXONC | TCFLSH | TIOCSCTTY
@@ -679,6 +696,7 @@ impl FileLike for TtyFile {
                 _ => FsError::NotTty,
             });
         };
+
         match command {
             TCGETS => ioctl_get(user, argument),
             TCSETS => ioctl_set(self, user, argument, TCSANOW, caller),
@@ -764,6 +782,7 @@ impl FileLike for TtyFile {
             return Ok(0);
         }
         self.check_write(caller)?;
+
         let interruptible = matches!(caller, FileIoContext::User(_));
         // 先快扫 writer 与空间，确需等待才建上下文；writer 竞争与队列满分开处理。
         let mut writer = match endpoint().writer.try_lock() {
@@ -794,6 +813,7 @@ impl FileLike for TtyFile {
                 return Err(FsError::Interrupted);
             }
         }
+
         let mut waiting = waiting;
         let _writer = writer.take().expect("tty writer was not acquired");
         let mut accepted = 0;
@@ -821,6 +841,7 @@ impl FileLike for TtyFile {
                     Err(error) => return progress(accepted, error),
                 }
             }
+
             // 持 writer 短取 copy/state 提交；输出满时释 copy/state 但保 writer 等空间。
             let consumed = {
                 let _copy = endpoint().copy.lock();
@@ -848,6 +869,7 @@ impl FileLike for TtyFile {
             endpoint()
                 .write_head
                 .notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
+
             if pending_off < pending_len {
                 if self.flags() & O_NONBLOCK != 0 {
                     return progress(accepted, FsError::WouldBlock);
@@ -916,6 +938,7 @@ fn acquire_reader(
     if file.flags() & O_NONBLOCK != 0 {
         return Err(FsError::WouldBlock);
     }
+
     let (context, _table) = file.prepare_wait()?;
     loop {
         context.clear_triggered();
@@ -941,6 +964,7 @@ fn acquire_writer(interruptible: bool, file: Option<&TtyFile>) -> Result<WriterG
     if let Some(guard) = endpoint().writer.try_lock() {
         return Ok(WriterGuard { inner: Some(guard) });
     }
+
     let context = PollContext::try_new()?;
     let sink: Arc<dyn PollNotify> = context.clone();
     let mut table = PollTable::new(sink, POLL_SOURCES)?;
@@ -1019,6 +1043,7 @@ fn canonical_read(
             }
             return Ok(target.copied() - start);
         }
+
         drop(copy);
         if file.flags() & O_NONBLOCK != 0 {
             return Err(FsError::WouldBlock);
@@ -1069,6 +1094,7 @@ fn deliver_raw(
         drop(copy);
         return RawDeliver::Delivered(Ok(0));
     }
+
     let before = target.copied();
     let result = target.push(&segment[..peeked]);
     let delivered = target.copied() - before;
@@ -1147,6 +1173,7 @@ fn noncanonical_min(
                 return progress(target.copied() - start, error);
             }
         }
+
         if file.flags() & O_NONBLOCK != 0 {
             return progress(target.copied() - start, FsError::WouldBlock);
         }
@@ -1193,6 +1220,7 @@ fn noncanonical_timeout(
                 return progress(target.copied() - start, error);
             }
         }
+
         if file.flags() & O_NONBLOCK != 0 {
             return progress(target.copied() - start, FsError::WouldBlock);
         }
@@ -1256,6 +1284,7 @@ fn noncanonical_min_timeout(
                 return progress(target.copied() - start, error);
             }
         }
+
         if file.flags() & O_NONBLOCK != 0 {
             return progress(target.copied() - start, FsError::WouldBlock);
         }
@@ -1316,6 +1345,7 @@ fn ioctl_set(
     if progress.error.is_some() || progress.copied != bytes.len() {
         return Err(FsError::BadAddress);
     }
+
     let termios = Termios::from_bytes(bytes)?;
     apply_termios(termios, action, caller, Some(file))?;
     Ok(0)
@@ -1352,6 +1382,7 @@ fn apply_termios(
     if action == TCSANOW {
         return commit_termios(termios, action, None, file);
     }
+
     drain_output(caller, file)?;
     loop {
         let writer = acquire_writer(matches!(caller, FileIoContext::User(_)), file)?;
@@ -1408,6 +1439,7 @@ fn commit_termios(
             .ok_or(FsError::InvalidOperation)?;
         (config, canonical, hung_up, restore, old_ixon)
     };
+
     let snapshot = crate::console::configure_serial(config);
     {
         let mut state = endpoint().state.lock();
@@ -1434,6 +1466,7 @@ fn commit_termios(
         state.divisor = snapshot.divisor;
     }
     drop(copy);
+
     endpoint()
         .read_head
         .notify(PollMask::POLLIN | PollMask::POLLRDNORM);
@@ -1472,6 +1505,7 @@ fn endpoint_flush(selector: u32, file: Option<&TtyFile>) -> Result<(), FsError> 
             _ => return Err(FsError::InvalidOperation),
         }
     }
+
     endpoint()
         .read_head
         .notify(PollMask::POLLIN | PollMask::POLLRDNORM);
@@ -1571,6 +1605,7 @@ fn drain_output(caller: FileIoContext<'_>, file: Option<&TtyFile>) -> Result<(),
             waiting = Some((context, table));
         }
     }
+
     // 软件队列已空，使用最近已确认的分频安排复查，不为 drain 再切换 DLAB。
     loop {
         check_hangup(file)?;
@@ -1639,6 +1674,7 @@ pub(crate) fn hangup_session(graph: &TaskGraph, session: &Arc<Pid>) {
     let Some(control) = graph.release_tty_session(endpoint(), session) else {
         return;
     };
+
     let config = {
         let mut state = endpoint().state.lock();
         state.flush_input();
@@ -1657,9 +1693,11 @@ pub(crate) fn hangup_session(graph: &TaskGraph, session: &Arc<Pid>) {
     };
     crate::console::configure_serial(config);
     crate::console::discard_received();
+
     endpoint().hangup_head.notify(PollMask::POLLHUP);
     let boundary = service().work.as_ref().capture_boundary();
     drop(copy);
+
     endpoint()
         .read_head
         .notify(PollMask::POLLIN | PollMask::POLLHUP);
@@ -1703,6 +1741,7 @@ fn ioctl_control(
     } else {
         None
     };
+
     let identity = user.identity().ok_or(FsError::NotTty)?;
     let copy = endpoint().copy.lock();
     if file.hungup() {
@@ -1712,6 +1751,7 @@ fn ioctl_control(
             FsError::DeviceIo
         });
     }
+
     match command {
         TIOCSCTTY => {
             crate::fs::file::require_read(file.flags()).map_err(|_| FsError::NotPermitted)?;
@@ -1762,6 +1802,7 @@ fn ioctl_winsize(file: &TtyFile, user: &UserThread, argument: usize) -> Result<u
     drop(current);
     let foreground = foreground_snapshot();
     drop(copy);
+
     if let Some((graph, foreground)) = foreground {
         send_foreground(&graph, &foreground, SIGWINCH);
     }

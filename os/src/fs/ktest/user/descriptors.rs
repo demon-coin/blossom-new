@@ -50,6 +50,7 @@ pub(crate) mod descriptor_growth {
         let ready_fd = checked(context, files.reserve(limit))?
             .publish(ready_writer, DescriptorFlags::default());
         context.expect_eq((fd, ready_fd), (3, 4));
+
         let arguments = Arguments::from_kernel(
             PROGRAM,
             &[PROGRAM, b"--poll-original"],
@@ -81,6 +82,7 @@ pub(crate) mod descriptor_growth {
             expected_task: Some(join.task_id()),
             join,
         });
+
         let mut ready = [0u8; 1];
         until("descriptor user did not announce poll", || {
             ready_reader.read(&mut ready) == Ok(1)
@@ -89,6 +91,7 @@ pub(crate) mod descriptor_growth {
         until("descriptor poll did not block", || {
             sched::test_state(&executor) == State::Blocked
         })?;
+
         checked(context, files.close(fd))?;
         context.expect_eq(old_reader.upgrade().is_some(), true);
         let (replacement, replacement_writer) = checked(context, pipe::try_new(0, 0, 0))?;
@@ -96,6 +99,7 @@ pub(crate) mod descriptor_growth {
             .publish(replacement, DescriptorFlags::default());
         context.expect_eq(reused, fd);
         context.expect_eq(checked(context, writer.write(b"X"))?, 1);
+
         let event = fixture.wait(context)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -103,6 +107,7 @@ pub(crate) mod descriptor_growth {
         }
         fixture.reap_children(context, event.status != 0)?;
         context.expect_eq(old_reader.upgrade().is_none(), true);
+
         drop((
             files,
             writer,

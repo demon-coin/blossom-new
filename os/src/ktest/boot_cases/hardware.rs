@@ -171,6 +171,7 @@ pub(crate) mod mapping {
                 expect_ram_mapping(context, info, region.start);
                 expect_ram_mapping(context, info, region.end - 1);
             }
+
             for (region, no_map) in info.reserved[..info.reserved_count]
                 .iter()
                 .zip(&info.reserved_no_map[..info.reserved_count])
@@ -192,6 +193,7 @@ pub(crate) mod mapping {
                     expect_ram_mapping(context, info, start + (end - start) / 2);
                 }
             }
+
             for region in [Some(boot::kernel_region()), Some(info.dtb), info.initrd]
                 .iter()
                 .flatten()
@@ -202,6 +204,7 @@ pub(crate) mod mapping {
                     context.expect_eq(physical, address);
                 }
             }
+
             let uart = info.interrupts.uart.start;
             let (physical, flags) =
                 translation(arch::mmio_address(uart)).expect("UART MMIO map missing");
@@ -284,6 +287,7 @@ pub(crate) mod rv_mapping {
                 Some((offset, 0xc7)),
             );
         }
+
         for leaf in 0..64 {
             for within in [0, GIB - 1] {
                 let offset = leaf * GIB + within;
@@ -293,6 +297,7 @@ pub(crate) mod rv_mapping {
                 );
             }
         }
+
         for leaf in 0..512 {
             for within in [0, IMAGE_LEAF - 1] {
                 let offset = leaf * IMAGE_LEAF + within;
@@ -302,6 +307,7 @@ pub(crate) mod rv_mapping {
                 );
             }
         }
+
         for address in [
             0,
             GIB - 1,
@@ -318,6 +324,7 @@ struct CpuFixture {
     results: Arc<[AtomicUsize; boot::MAX_CPUS]>,
     stop: Arc<AtomicBool>,
 }
+
 impl Fixture for CpuFixture {
     /// 每例拥有独立结果与停止门；真实子任务的离栈责任登记到当前框架 scope。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -329,11 +336,13 @@ impl Fixture for CpuFixture {
                 .map_err(|_| TestError("NoMemory: CPU stop"))?,
         })
     }
+
     /// 主体失败也合作关闭每个具体探测；join 在框架中确认真实 Task 已离栈。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.stop.store(true, Ordering::Release);
         Ok(())
     }
+
     /// 只有真实 join 之后才释放结果 owner 和观察 handle。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         assert!(self
@@ -344,6 +353,7 @@ impl Fixture for CpuFixture {
         Ok(())
     }
 }
+
 impl CpuFixture {
     /// 固定核子任务拥有结果对象；无父 fixture 借用逃逸到另一条栈。
     fn run(
@@ -365,6 +375,7 @@ impl CpuFixture {
         })?);
         Ok(())
     }
+
     /// 等待观测到全部实际完成，不把框架 child 失败当作成功结果。
     fn complete(&self, target: usize) -> TestResult {
         wait(
@@ -406,6 +417,7 @@ fn identity(target: usize, _: bool, _: u8, _: &AtomicBool) -> TestResult {
     if target == 0 {
         assert_eq!(local.hardware_id, boot::info().bsp_hardware_id);
     }
+
     let stack = 0usize;
     let address = arch::virt_to_phys(&stack as *const usize as usize);
     let (start, bytes) = crate::task::test_current_stack_range();
@@ -478,6 +490,7 @@ fn irq_save(target: usize, _: bool, _: u8, _: &AtomicBool) -> TestResult {
         drop(outer);
     }
     assert!(arch::irq_enabled());
+
     {
         let _initial = IrqSaveGuard::new();
         {
@@ -490,6 +503,7 @@ fn irq_save(target: usize, _: bool, _: u8, _: &AtomicBool) -> TestResult {
         assert!(!arch::irq_enabled());
     }
     assert!(arch::irq_enabled());
+
     {
         let mut guard = lock.lock();
         *guard = 7;
@@ -536,6 +550,7 @@ fn every_cpu(
     for target in 0..cpu::count() {
         fixture.run(target, operation, fp, fcc)?;
     }
+
     for target in 0..cpu::count() {
         fixture.complete(target)?;
         context.diagnostic(format_args!(
@@ -554,16 +569,19 @@ fn every_cpu(
 #[::ktest::suite(context = "Thread", fixture = CpuFixture, tags("boot", "cpu"), timeout_ms = 30000)]
 pub(crate) mod cpus {
     use super::*;
+
     /// 全部请求核数的基址、真实启动栈、Task栈与上线顺序。
     #[test]
     fn cpu_identity(context: &mut TestContext<'_>, fixture: &mut CpuFixture) -> TestResult {
         every_cpu(context, fixture, identity, false, 0)
     }
+
     /// 逐核真实 timer 的 deadline 和实际返回。
     #[test]
     fn programmed_timer(context: &mut TestContext<'_>, fixture: &mut CpuFixture) -> TestResult {
         every_cpu(context, fixture, timer, false, 0)
     }
+
     /// 浮点关闭现场独立验证，开启图样按目标架构分别注册。
     #[test]
     #[case("fp_off", false)]
@@ -574,11 +592,13 @@ pub(crate) mod cpus {
     ) -> TestResult {
         every_cpu(context, fixture, registers, fp, 0)
     }
+
     /// 每核真实嵌套IRQ-save与锁释放后恢复。
     #[test]
     fn irq_save_restore(context: &mut TestContext<'_>, fixture: &mut CpuFixture) -> TestResult {
         every_cpu(context, fixture, irq_save, false, 0)
     }
+
     /// 每核实际硬件 IPI 返回。
     #[test]
     fn hardware_self_ipi(context: &mut TestContext<'_>, fixture: &mut CpuFixture) -> TestResult {

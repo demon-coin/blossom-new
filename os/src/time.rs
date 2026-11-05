@@ -19,7 +19,9 @@ pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
 pub(crate) const NSEC_PER_MSEC: u64 = NSEC_PER_SEC / 1_000;
 pub(crate) const NSEC_PER_USEC: u64 = NSEC_PER_MSEC / 1_000;
 pub(crate) const USEC_PER_SEC: u64 = NSEC_PER_SEC / NSEC_PER_USEC;
+
 const CONVERSION_SECONDS: u64 = 3600;
+
 const QUANTUM: Duration = Duration::from_millis(10);
 
 /// TOY 只读日历字段与控制位，供共同时间层和板级 RTC 采样使用。
@@ -35,6 +37,7 @@ pub(crate) mod toy {
     pub(crate) const TOY_ENABLE: u32 = 1 << 11;
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_32KHZ_ENABLE: u32 = 1 << 8;
+
     pub(crate) const TOY_YEAR_BASE: u32 = 1900;
     pub(crate) const TOY_MONTH_SHIFT: u32 = 26;
     pub(crate) const TOY_MONTH_MASK: u32 = (1 << 6) - 1;
@@ -103,6 +106,7 @@ impl Scale {
             3 <= mask && mask & mask.wrapping_add(1) == 0,
             "invalid counter mask"
         );
+
         let required_cycles = frequency * CONVERSION_SECONDS;
         let (mult, shift) = (0..=u32::BITS)
             .rev()
@@ -119,6 +123,7 @@ impl Scale {
                 }
             })
             .expect("counter has no valid scale");
+
         let residue_mask = (1u64 << shift) - 1;
         let max_delta = ((u64::MAX - residue_mask) / mult).min(mask >> 1);
         let maintenance_delta = max_delta / 2;
@@ -285,6 +290,7 @@ impl Timekeeper {
             .load(Ordering::Relaxed)
             .checked_add(1)
             .expect("timekeeper update count exhausted");
+
         // 全部可能失败的算术在奇序号前结束；写侧关 IRQ，不能被本核 reader 打断。
         self.sequence.store(sequence + 1, Ordering::Relaxed);
         fence(Ordering::Release);
@@ -432,6 +438,7 @@ unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
                 TOY_ENABLE_MASK,
                 "RTC TOY could not be enabled"
             );
+
             // 年寄存器不锁存低字；跨年时整组重新采样，避免合成两年的日历。
             loop {
                 let year = rtc_register(info.rtc, TOY_READ1_REG);
@@ -463,8 +470,10 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     const HOURS_PER_DAY: i64 = 24;
     const MINUTES_PER_HOUR: i64 = 60;
     const SECONDS_PER_MINUTE: i64 = 60;
+
     // 三月起算的公历天数公式在 Unix epoch 的偏移。
     const UNIX_EPOCH_DAY_OFFSET: i64 = 719_499;
+
     let [year, month, day, hour, minute, second] = calendar.map(i64::from);
     if !(1..=12).contains(&month)
         || HOURS_PER_DAY <= hour
@@ -473,6 +482,7 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     {
         return None;
     }
+
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days = [
         31,
@@ -491,6 +501,7 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     if !(1..=days[(month - 1) as usize]).contains(&day) {
         return None;
     }
+
     // 将一、二月移至前一年末尾，闰日统一落在最后一月。
     let (year, month) = if month <= 2 {
         (year - 1, month + 10)
@@ -650,6 +661,7 @@ pub(crate) fn handle_timer() {
         }
         true
     });
+
     if active {
         crate::timer::handle_interrupt();
         reprogram_current();

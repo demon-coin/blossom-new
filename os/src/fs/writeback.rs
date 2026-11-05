@@ -156,6 +156,7 @@ fn sync_inode_selection(
     if storage.stopped(inode.disk_volume()?.writeback_domain()) {
         return Err(FsError::Io(BlockError::QueueStopped));
     }
+
     let result = {
         let mut writeback = inode.mapping().lock_writeback();
         let cursor = background.then_some(&mut *writeback);
@@ -164,6 +165,7 @@ fn sync_inode_selection(
     if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
         return result;
     }
+
     let refreshed = inode.refresh_dirty_obligation();
     result.and_then(|selected| refreshed.map(|()| selected))
 }
@@ -194,10 +196,12 @@ pub(crate) fn sync_metadata_with_storage(
         Some(aux) => aux.memory()?,
         None => Vec::new_in(BioAllocator::Heap),
     };
+
     let result = sync_metadata_locked(volume, storage);
     if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
         return result;
     }
+
     if let Some(context) = context {
         context.check()?;
     }
@@ -248,6 +252,7 @@ fn sync_metadata_pages_locked(
             .writeback_domain()
             .note_selection(selected_count, true);
     }
+
     let mut remaining = selected_count;
     let mut first_error = None;
     let mut unconfirmed = false;
@@ -257,6 +262,7 @@ fn sync_metadata_pages_locked(
         for (_, folio) in storage.selected.iter().flatten() {
             folio.wait_writeback();
         }
+
         for slot in 0..MAX_BATCH {
             let Some((byte_offset, folio)) = storage.selected[slot].take() else {
                 continue;
@@ -272,6 +278,7 @@ fn sync_metadata_pages_locked(
             remember_error(&mut first_error, result);
             cache.set_to_write(byte_offset, false);
         }
+
         let result = submit_ranges(volume.claim(), storage, volume.writeback_domain());
         unconfirmed |= result == Err(FsError::Io(BlockError::StopUnconfirmed));
         remember_error(&mut first_error, result);
@@ -280,6 +287,7 @@ fn sync_metadata_pages_locked(
         };
         cursor = next;
     }
+
     if !unconfirmed {
         if let Some(cursor) = background {
             *cursor = next_index;
@@ -300,6 +308,7 @@ fn sync_inode_locked(
     if start == end {
         return Ok(0);
     }
+
     let mapping = inode.mapping();
     let start = background.as_deref().copied().unwrap_or(start);
     let (selected_count, next_index) = if background.is_some() {
@@ -313,6 +322,7 @@ fn sync_inode_locked(
     if is_background {
         domain.note_selection(selected_count, false);
     }
+
     let mut remaining = selected_count;
     let mut cursor = start;
     let mut first_error = None;
@@ -350,6 +360,7 @@ fn sync_inode_locked(
                 }
             }
         }
+
         for slot in 0..MAX_BATCH {
             let Some(plan) = storage.plans[slot].take() else {
                 continue;
@@ -359,6 +370,7 @@ fn sync_inode_locked(
             remember_error(&mut first_error, result);
             mapping.set_to_write(plan.index, false);
         }
+
         let result = submit_ranges(volume.claim(), storage, domain);
         unconfirmed |= result == Err(FsError::Io(BlockError::StopUnconfirmed));
         remember_error(&mut first_error, result);
@@ -367,6 +379,7 @@ fn sync_inode_locked(
         };
         cursor = next;
     }
+
     if !unconfirmed {
         if let Some(cursor) = background {
             *cursor = next_index;
@@ -422,6 +435,7 @@ fn prepare_file_page(
     if storage.stopped(domain) {
         return Err(FsError::Io(BlockError::QueueStopped));
     }
+
     let mut content = match plan.folio.try_lock_content() {
         Some(content) => content,
         None => {
@@ -432,6 +446,7 @@ fn prepare_file_page(
     inode
         .mapping()
         .mkclean(plan.index, &plan.folio, &mut content);
+
     let size = volume.geometry().block_size;
     let dirty = plan.folio.dirty_sectors();
     for offset in (0..PAGE_SIZE).step_by(size) {
@@ -470,6 +485,7 @@ fn prepare_metadata_page(
             folio.lock_content()
         }
     };
+
     let mut pending = folio.dirty_sectors() & volume.metadata_cache().page_mask(byte_offset);
     while pending != 0 {
         let start = pending.trailing_zeros() as usize;
@@ -510,6 +526,7 @@ fn submit_ranges(
     if storage.ranges.is_empty() {
         return Ok(());
     }
+
     let boundary = storage.stop_sequence;
     claim
         .writeback_batch(

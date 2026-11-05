@@ -14,10 +14,12 @@ use crate::fs::{DirectoryCursor, DirectoryEntry, DirectoryPosition, FsError, Ino
 const DX_MAX_INDIRECT_LEVELS: usize = 2;
 const DX_EOF_COOKIE: u64 = 0x7fff_ffff_ffff_ffff;
 const DX_BLOCK_MASK: u32 = (1 << 28) - 1;
+
 const DIRENT_HEADER_BYTES: usize = 8;
 const DIRENT_ALIGNMENT: usize = 4;
 const DIRENT_ROUND: usize = DIRENT_ALIGNMENT - 1;
 const DIRENT_MIN_BYTES: usize = (DIRENT_HEADER_BYTES + 1 + DIRENT_ROUND) & !DIRENT_ROUND;
+
 const DX_ENTRY_BYTES: usize = 8;
 const DX_TAIL_BYTES: usize = 8;
 const DX_NODE_ENTRIES_OFFSET: usize = 8;
@@ -123,6 +125,7 @@ impl PreparedDirectoryEdit {
             blocks,
             flags,
         } = self;
+
         // 新目录块先有完整内容，旧根和索引只在其后才指向这些块。
         for new_block in [true, false] {
             for image in &images {
@@ -135,6 +138,7 @@ impl PreparedDirectoryEdit {
                     .expect("prepared writable directory block");
             }
         }
+
         if let Some(mapping) = mapping {
             mapping.publish(volume);
         }
@@ -260,6 +264,7 @@ struct DxPath {
     leaf: u64,
     lower_bound: u32,
 }
+
 /// 返回当前文件系统允许的最大 dx 间接层数。
 fn dx_max_indirect_levels(g: &Geometry) -> usize {
     if g.features_incompat & codec::FEATURE_INCOMPAT_LARGEDIR != 0 {
@@ -428,6 +433,7 @@ fn dx_probe(
     path.leaf = logical;
     Ok(path)
 }
+
 /// 按树内序查询下一叶区间下界；高于必须覆盖的 major 时不读取其子节点。
 fn next_dx_leaf(
     volume: &Ext4Volume,
@@ -549,6 +555,7 @@ pub(crate) fn verify_directory(
         }
         return Ok(DirectoryLayout::Index);
     }
+
     let end = if g.features_ro_compat & METADATA_CSUM != 0 {
         let end = data.len() - codec::DIR_TAIL_BYTES;
         if codec::le32(data, end)? != 0
@@ -563,6 +570,7 @@ pub(crate) fn verify_directory(
     } else {
         data.len()
     };
+
     let mut offset = 0;
     while offset < end {
         offset = record(g, data, offset, end)?.next;
@@ -606,6 +614,7 @@ fn verify_dx(
         }
         DX_NODE_ENTRIES_OFFSET
     };
+
     let limit = usize::from(codec::le16(data, offset)?);
     let count = usize::from(codec::le16(data, offset + 2)?);
     let tail_len = if g.features_ro_compat & METADATA_CSUM != 0 {
@@ -616,6 +625,7 @@ fn verify_dx(
     if limit != (data.len() - offset - tail_len) / DX_ENTRY_BYTES || count == 0 || limit < count {
         return Err(FsError::Corrupt);
     }
+
     let blocks = inode.size / g.block_size as u64;
     let mut previous_hash = 0u32;
     for index in 0..count {
@@ -632,6 +642,7 @@ fn verify_dx(
             return Err(FsError::Corrupt);
         }
     }
+
     if tail_len != 0 {
         let tail = offset + limit * DX_ENTRY_BYTES;
         // dx 尾的保留字节只参与 CRC，读取时不赋予零值约束。
@@ -662,6 +673,7 @@ fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record
     {
         return Err(FsError::Corrupt);
     }
+
     let name_offset = offset + DIRENT_HEADER_BYTES;
     let name = codec::bytes(data, name_offset, name_len)?;
     if number != 0 && (name.is_empty() || name.contains(&0) || name.contains(&b'/')) {
@@ -794,6 +806,7 @@ fn find_entry(
     if name.is_empty() || NAME_MAX < name.len() || name.contains(&0) || name.contains(&b'/') {
         return Err(FsError::InvalidName);
     }
+
     if inode.flags & INDEX == 0 {
         for logical in 0..inode.size / volume.geometry().block_size as u64 {
             if let Some(entry) = find_entry_in_block(volume, inode, map_root, logical, name)? {
@@ -805,6 +818,7 @@ fn find_entry(
     if name == b"." || name == b".." {
         return find_entry_in_block(volume, inode, map_root, 0, name);
     }
+
     let hash_version = root_hash_version(volume, inode, map_root)?;
     let (hash, _) = codec::directory_hash(volume.geometry(), hash_version, name)?;
     let mut path = dx_probe(volume, inode, map_root, hash)?;
@@ -913,6 +927,7 @@ fn next_indexed(
     if cursor.cookie() == DX_EOF_COOKIE {
         return Ok(None);
     }
+
     let g = volume.geometry();
     let version = root_hash_version(volume, inode, map_root)?;
     let mut best = None;
@@ -946,6 +961,7 @@ fn next_indexed(
             keep_two_candidates(&mut best, &mut following, candidate);
         }
     }
+
     let mut path = dx_probe(volume, inode, map_root, *major)?;
     loop {
         let logical = path.leaf;
@@ -999,6 +1015,7 @@ fn next_indexed(
             break;
         }
     }
+
     let Some(candidate) = best else {
         return Ok(None);
     };
@@ -1023,6 +1040,7 @@ fn next_indexed(
         name.extend_from_slice(&data[entry.name_offset..entry.name_offset + entry.name_len]);
         Ok::<_, FsError>(())
     })??;
+
     let next_cursor = match following {
         Some(next) => DirectoryCursor::Indexed {
             major: next.major,
@@ -1102,6 +1120,7 @@ pub(crate) fn next(
     }
     Ok(None)
 }
+
 struct DirectoryEditBuilder<'a> {
     volume: &'a Ext4Volume,
     inode: &'a InodeMetadata,
@@ -1196,6 +1215,7 @@ impl<'a> DirectoryEditBuilder<'a> {
                 flags: next_flags,
             });
         }
+
         let inode_data = inode.with_block(map_root);
         let mapping = volume.prepare_directory_mappings(&inode_data, map_root, &logical_blocks)?;
         let size = match next_logical.checked_mul(volume.geometry().block_size as u64) {
@@ -1222,6 +1242,7 @@ impl<'a> DirectoryEditBuilder<'a> {
                 return Err(FsError::FileTooLarge);
             }
         };
+
         let mut images = images;
         let mut failure = None;
         for image in &mut images {
@@ -1244,6 +1265,7 @@ impl<'a> DirectoryEditBuilder<'a> {
             cancel_unpublished_mappings(volume, mapping, &logical_blocks);
             return Err(error);
         }
+
         let root = *mapping.root();
         Ok(PreparedDirectoryEdit {
             mapping: Some(mapping),
@@ -1329,6 +1351,7 @@ fn write_record(
     {
         return Err(FsError::Corrupt);
     }
+
     let end = offset.checked_add(rec_len).ok_or(FsError::Corrupt)?;
     data.get_mut(offset..end).ok_or(FsError::Corrupt)?.fill(0);
     codec::put32(data, offset, number as u32);
@@ -1593,6 +1616,7 @@ fn write_dx_node(
     if entries.is_empty() || limit < entries.len() {
         return Err(FsError::NoSpace);
     }
+
     let image = builder.image(logical)?;
     if !root {
         image.bytes[..8].fill(0);
@@ -1620,6 +1644,7 @@ fn write_dx_node(
         let start = offset + position * DX_ENTRY_BYTES;
         image.bytes[start..start + 8].fill(0);
     }
+
     if g.features_ro_compat & METADATA_CSUM != 0 {
         codec::update_dx_checksum(
             inode,
@@ -1673,6 +1698,7 @@ fn load_dx_node(
     if count != frame.count || count <= frame.position {
         return Err(FsError::Corrupt);
     }
+
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(count)
@@ -1708,6 +1734,7 @@ fn insert_dx_block(
         if node.entries.len() <= node.limit {
             return write_dx_node(builder, node.logical, node.root, node.depth, &node.entries);
         }
+
         if node.root {
             if dx_max_indirect_levels(builder.volume.geometry()) < usize::from(node.depth) + 1 {
                 return Err(FsError::NoSpace);
@@ -1722,6 +1749,7 @@ fn insert_dx_block(
             }];
             return write_dx_node(builder, node.logical, true, node.depth + 1, &root);
         }
+
         if level == 0 {
             return Err(FsError::Corrupt);
         }
@@ -1765,6 +1793,7 @@ fn split_leaf(
     if records.is_empty() {
         return Err(FsError::NoSpace);
     }
+
     let (split, boundary, continued) = if records.len() == 1 {
         let old_hash = records[0].hash;
         if old_hash <= hash {
@@ -1792,6 +1821,7 @@ fn split_leaf(
         let boundary = records[split].hash;
         (split, boundary, records[split - 1].hash == boundary)
     };
+
     let new_logical = builder.reserve_logical()?;
     let mut left = empty_block(g.block_size)?;
     let mut right = empty_block(g.block_size)?;
@@ -1808,6 +1838,7 @@ fn split_leaf(
     if !insert_record(g, inode, target, end, name, number, kind)? {
         return Err(FsError::NoSpace);
     }
+
     builder.image(path.leaf)?.bytes = left;
     builder.push_new_image(new_logical, right)?;
     insert_dx_block(builder, path, boundary + u32::from(continued), new_logical)
@@ -1850,6 +1881,7 @@ fn make_indexed_directory(
         pack_leaf(g, inode, &root.bytes, &records, end, &mut leaf)?;
         (parent.number, leaf)
     };
+
     let leaf_logical = builder.reserve_logical()?;
     builder.push_new_image(leaf_logical, leaf)?;
     builder.next_flags |= INDEX;
@@ -1882,6 +1914,7 @@ fn make_indexed_directory(
         block: leaf_logical,
     }];
     write_dx_node(builder, 0, true, 0, &root_entries)?;
+
     let mut frames = [DxFrame::default(); DX_MAX_INDIRECT_LEVELS + 1];
     frames[0] = DxFrame {
         logical: 0,
@@ -1930,6 +1963,7 @@ fn add_to_builder(
         }
         return Ok(());
     }
+
     for logical in 0..inode.size / g.block_size as u64 {
         let inserted = {
             let image = builder.image(logical)?;
@@ -1943,6 +1977,7 @@ fn add_to_builder(
             return Ok(());
         }
     }
+
     if inode.size == g.block_size as u64 && g.features_compat & codec::FEATURE_COMPAT_DIR_INDEX != 0
     {
         return make_indexed_directory(builder, name, number, kind);
@@ -1970,6 +2005,7 @@ pub(crate) fn prepare_add(
     if find_entry(volume, inode, map_root, name)?.is_some() {
         return Err(FsError::Exists);
     }
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     add_to_builder(&mut builder, name, number, kind)?;
     builder.finish()
@@ -1985,6 +2021,7 @@ pub(crate) fn prepare_remove(
     check_directory(volume, inode)?;
     check_edit_name(name)?;
     let found = find_entry(volume, inode, map_root, name)?.ok_or(FsError::NotFound)?;
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     let g = volume.geometry();
     let image = builder.image(found.logical)?;
@@ -2009,6 +2046,7 @@ pub(crate) fn prepare_replace(
     check_edit_name(name)?;
     check_inode_number(volume.geometry(), number)?;
     let found = find_entry(volume, inode, map_root, name)?.ok_or(FsError::NotFound)?;
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     let g = volume.geometry();
     let image = builder.image(found.logical)?;
@@ -2069,6 +2107,7 @@ pub(crate) fn prepare_move(
     if existing.is_some_and(|entry| entry.number == source_number) {
         return DirectoryEditBuilder::new(volume, inode, map_root).finish();
     }
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     let g = volume.geometry();
     if let Some((target_number, _)) = target {
@@ -2123,6 +2162,7 @@ pub(crate) fn prepare_dotdot(
     if found.logical != 0 {
         return Err(FsError::Corrupt);
     }
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     let image = builder.image(0)?;
     let g = volume.geometry();
@@ -2216,6 +2256,7 @@ pub(crate) fn is_empty(
         }
         Ok::<_, FsError>(())
     })??;
+
     if inode.flags & INDEX != 0 {
         let mut empty = true;
         for_each_leaf(volume, inode, map_root, |logical| {
@@ -2248,6 +2289,7 @@ pub(crate) fn prepare_new_directory(
     }
     check_inode_number(g, inode.number)?;
     check_inode_number(g, parent_number)?;
+
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     if inode.flags & INDEX != 0 {
         if g.features_compat & codec::FEATURE_COMPAT_DIR_INDEX == 0 {

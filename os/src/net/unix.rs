@@ -26,6 +26,7 @@ pub enum UnixSocketType {
     Stream = SOCK_STREAM,
     SeqPacket = SOCK_SEQPACKET,
 }
+
 const SPACE_SHIFT: u32 = usize::BITS - STREAM_CAPACITY.leading_zeros();
 const BYTES_MASK: usize = (1 << SPACE_SHIFT) - 1;
 const SPACE_MASK: usize = BYTES_MASK << SPACE_SHIFT;
@@ -178,6 +179,7 @@ impl UnixPair {
             stopped: AtomicBool::new(false),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let [first_slot, second_slot] = slots;
         let first = Arc::try_new(UnixEndpoint {
             id: ids[0],
@@ -261,6 +263,7 @@ impl UnixPair {
                 reset,
             )
         };
+
         if changed {
             self.sources[receiver]
                 .notify(PollMask::POLLIN | PollMask::POLLRDNORM | PollMask::POLLRDHUP);
@@ -342,6 +345,7 @@ impl UnixEndpoint {
                 IoProgress::Blocked
             });
         }
+
         let space = ring.space();
         let before = target.copied();
         let result = ring.receive(target, peek);
@@ -352,6 +356,7 @@ impl UnixEndpoint {
         let writable =
             !state.sender_closed && !state.receiver_closed && space < state.buffer.space();
         drop(state);
+
         if !peek && writable {
             self.pair.sources[1 - self.side].notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
         }
@@ -372,6 +377,7 @@ impl UnixEndpoint {
         if source.is_empty() {
             return Ok(IoProgress::Ready(0));
         }
+
         let DirectionBuffer::Stream(ring) = &mut state.buffer else {
             unreachable!("record send uses owned messages");
         };
@@ -396,6 +402,7 @@ impl UnixEndpoint {
         }
         direction.publish(&state);
         drop(state);
+
         self.pair.sources[1 - self.side].notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         Ok(IoProgress::Ready(accepted))
     }
@@ -411,6 +418,7 @@ impl UnixEndpoint {
         if let Some(error) = self.pair.errors[self.side].lock().take() {
             return Err(error);
         }
+
         let length = payload
             .as_ref()
             .expect("UNIX record already submitted")
@@ -422,6 +430,7 @@ impl UnixEndpoint {
         if state.buffer.space() < needed {
             return Ok(IoProgress::Blocked);
         }
+
         let DirectionBuffer::SeqPacket { records, charge } = &mut state.buffer else {
             unreachable!("stream send uses byte prefixes");
         };
@@ -429,6 +438,7 @@ impl UnixEndpoint {
         *charge += needed;
         direction.publish(&state);
         drop(state);
+
         self.pair.sources[1 - self.side].notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         Ok(IoProgress::Ready(length))
     }
@@ -455,6 +465,7 @@ impl UnixEndpoint {
                 }),
             );
         }
+
         let writable = !state.sender_closed && !state.receiver_closed;
         let DirectionBuffer::SeqPacket { records, charge } = &mut state.buffer else {
             unreachable!("stream receive uses byte prefixes");
@@ -468,6 +479,7 @@ impl UnixEndpoint {
             direction.publish(&state);
         }
         drop(state);
+
         if !peek && writable {
             self.pair.sources[1 - self.side].notify(PollMask::POLLOUT | PollMask::POLLWRNORM);
         }

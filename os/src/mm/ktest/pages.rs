@@ -46,6 +46,7 @@ mod owned {
             let initial = free();
             f.held[0] =
                 Some(mm::alloc_pages(order, zeroed).expect("owned pages allocation failed"));
+
             let pages = f.held[0].as_mut().unwrap();
             let length = PAGE_SIZE << order;
             let start = pages.phys_addr();
@@ -65,6 +66,7 @@ mod owned {
                 unsafe { pages.as_mut_ptr().cast::<u8>().write_bytes(0xa5, length) };
             }
             assert_eq!(free(), initial - (1 << order));
+
             drop(f.held[0].take());
             assert_eq!(free(), initial);
             mm::drain_all_pages();
@@ -90,6 +92,7 @@ mod owned {
                 allocated += 1 << order;
                 assert_eq!(free(), initial - allocated);
             }
+
             for slot in f.held.iter_mut().rev() {
                 drop(slot.take());
             }
@@ -125,11 +128,13 @@ mod owned {
             }
             mm::drain_all_pages();
             assert_eq!(buddy::free_pages(), initial - high);
+
             for slot in &mut f.held[..high - 1] {
                 drop(slot.take());
             }
             assert_eq!(pcp::cpu_cached_pages(0), high - 1);
             assert_eq!(buddy::free_pages(), initial - high);
+
             drop(f.held[high - 1].take());
             assert_eq!(pcp::cpu_cached_pages(0), high - batch);
             assert_eq!(buddy::free_pages(), initial - high + batch);
@@ -201,6 +206,7 @@ mod pressure {
                 f.samples[a].as_ref().unwrap().phys_addr(),
                 f.samples[b].as_ref().unwrap().phys_addr(),
             ];
+
             f.exhaust();
             assert!(black_box(mm::alloc_pages(0, false)).is_none());
             drop(f.samples[a].take());
@@ -210,6 +216,7 @@ mod pressure {
             assert_eq!(pcp::cached_pages(), 0);
             assert!(black_box(mm::alloc_pages(1, false)).is_none());
             assert_eq!(free(), 2);
+
             f.samples[a] = Some(mm::alloc_pages(0, false).unwrap());
             assert_eq!(1 + pcp::cpu_cached_pages(0), 2);
             assert_eq!(buddy::free_pages(), 0);

@@ -17,6 +17,7 @@ pub(crate) const SIZES: [usize; 12] = [8, 16, 32, 64, 96, 128, 192, 256, 512, 10
 pub(crate) const NONE: usize = usize::MAX;
 pub(crate) const CPU_PARTIAL_LIMIT: usize = 2;
 pub(crate) const MIN_PARTIAL: usize = 2;
+
 const MAX_SLAB_ORDER: usize = 3;
 const MIN_OBJECTS_PER_CPU_SCALE: usize = 4;
 const WASTE_FRACTIONS: [usize; 4] = [16, 8, 4, 2];
@@ -346,6 +347,7 @@ fn put_node(class: usize, head: usize, shrink: bool) {
             None
         }
     };
+
     if let Some(state) = discarded {
         destroy(state);
     }
@@ -372,6 +374,7 @@ fn deactivate(class: usize, ticket: ActiveTicket) {
         }
         state.location = SlabLocation::Detached;
     }
+
     put_node(class, ticket.head, false);
 }
 
@@ -407,6 +410,7 @@ fn new_slab(class: usize) -> Option<usize> {
             None
         }
     })?;
+
     let head = backing.phys_addr() / PAGE_SIZE;
     let count = 1 << backing.order();
     let objects = backing.len() / geometry.stride;
@@ -422,6 +426,7 @@ fn new_slab(class: usize) -> Option<usize> {
         // index 在真实容量内，尚未发布对象，写入的首 word 不触及其他对象。
         unsafe { (pointer as *mut usize).write(next) };
     }
+
     {
         let mut slot = descriptor(head).usage();
         slot.install_slab(SlabState {
@@ -435,6 +440,7 @@ fn new_slab(class: usize) -> Option<usize> {
             previous: NONE,
         });
     }
+
     for pfn in head..head + count {
         descriptor(pfn).slab_head.store(head, Ordering::Release);
     }
@@ -493,10 +499,12 @@ pub(crate) fn allocate(class: usize) -> Option<NonNull<u8>> {
                 None
             }
         };
+
         if let Some(ticket) = exhausted {
             deactivate(class, ticket);
             continue;
         }
+
         let head = new_slab(class)?;
         {
             let _irq = IrqSaveGuard::new();
@@ -573,6 +581,7 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
         .slab()
         .expect("live object has no slab state")
         .cache;
+
     let drained = {
         let _irq = IrqSaveGuard::new();
         let owner = cpu::current().id;
@@ -640,6 +649,7 @@ pub(crate) unsafe fn deallocate(pointer: NonNull<u8>) {
             NONE
         }
     };
+
     put_partials(class, drained);
 }
 

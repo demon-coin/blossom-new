@@ -401,6 +401,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
     if group_count == 0 {
         return Err("page map has no RAM sections");
     }
+
     let section_count = groups[group_count - 1].end;
     let section_bytes = section_count
         .checked_mul(size_of::<Section<'static>>())
@@ -417,6 +418,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
         .checked_add(range_bytes)
         .ok_or("page root size overflows")?;
     let root = memory.allocate(backing_pages(root_bytes)?, 1)?;
+
     let section_descriptor_bytes = PAGES_PER_SECTION
         .checked_mul(size_of::<PageDesc>())
         .ok_or("section descriptor size overflows")?;
@@ -474,6 +476,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
         // SAFETY: root 已独占预留且按 Section 对齐；每个索引槽仅写入一次合法值。
         unsafe { root_pointer.add(section_index).write(descriptors) };
     }
+
     // SAFETY: 根数组全部槽已初始化，跨度不超过 root_bytes，永久且不再修改；
     // 后续快照仅写 root 的未被 sections 引用的尾部。
     let sections = unsafe { slice::from_raw_parts(root_pointer, section_count) };
@@ -488,6 +491,7 @@ pub(crate) unsafe fn initialize(memory: &mut BootMemory) -> Result<PageMap<'stat
             memory.metadata(),
         )
     };
+
     Ok(PageMap {
         sections,
         free,

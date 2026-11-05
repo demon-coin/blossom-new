@@ -15,13 +15,16 @@ use super::{read_exact, ExecError, MAX_PATH_BYTES, RWX};
 
 pub(super) const ELF_HEADER_BYTES: usize = 64;
 const PHDR_BYTES: usize = 56;
+
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_GNU_STACK: u32 = 0x6474_e551;
 const ET_DYN: u16 = 3;
+
 const PF_R: u32 = 4;
 const PF_W: u32 = 2;
 const PF_X: u32 = 1;
+
 pub(super) const MAIN_DYN_BASE: usize = 0x2000_0000;
 pub(super) const INTERP_DYN_BASE: usize = 0x3000_0000;
 
@@ -117,6 +120,7 @@ impl Elf {
             return Err(ExecError::Format);
         }
         file_range(phoff, table_bytes, size)?;
+
         let dynamic = word16(header, 16) == ET_DYN;
         let mut alignment = PAGE_SIZE;
         let mut segments = Vec::new();
@@ -151,6 +155,7 @@ impl Elf {
         if segments.is_empty() {
             return Err(ExecError::Format);
         }
+
         let bias = if dynamic {
             align_up(dyn_base, alignment)?
         } else {
@@ -169,6 +174,7 @@ impl Elf {
             }
             end = max(end, segment.end);
         }
+
         Ok(Self {
             interp,
             bias,
@@ -209,6 +215,7 @@ fn read_interpreter(file: &FileRef, ph: &ProgramHeader) -> Result<Vec<u8>, ExecE
     if ph.filesz < 2 || MAX_PATH_BYTES < ph.filesz {
         return Err(ExecError::Format);
     }
+
     let mut pathname = Vec::new();
     pathname
         .try_reserve_exact(ph.filesz)
@@ -316,8 +323,10 @@ pub(super) fn map_images(
                 .map(|segment| LoadSegment { file, segment }),
         );
     }
+
     let phdr = find_phdr(&loads, file, main);
     let plan = mapping_plan(&loads)?;
+
     for mapping in plan {
         let current = permissions(mapping.flags);
         match mapping.source {
@@ -340,6 +349,7 @@ pub(super) fn map_images(
             }
         }
     }
+
     main.phdr = phdr;
     Ok(())
 }
@@ -359,6 +369,7 @@ fn mapping_plan<'a>(loads: &[LoadSegment<'a>]) -> Result<Vec<Mapping<'a>>, ExecE
     }
     boundaries.sort_unstable();
     boundaries.dedup();
+
     let mut plan: Vec<Mapping<'a>> = Vec::new();
     plan.try_reserve_exact(boundaries.len())
         .map_err(|_| ExecError::NoMemory)?;
@@ -424,6 +435,7 @@ fn page_plan<'a>(loads: &[LoadSegment<'a>], base: usize) -> Option<(u32, Source<
     if !present {
         return None;
     }
+
     let (_, first) = contents_at(loads, base, end);
     let mut cursor = base;
     while cursor < end {
@@ -441,6 +453,7 @@ fn page_plan<'a>(loads: &[LoadSegment<'a>], base: usize) -> Option<(u32, Source<
         }
         cursor = stop;
     }
+
     let source = match first {
         None => Source::Anonymous,
         Some((file, offset)) if offset % PAGE_SIZE as u64 == 0 => Source::File(file, offset),
@@ -501,6 +514,7 @@ fn map_edge(
             cursor = stop;
         }
     }
+
     // SAFETY: 整页由初始清零及最终来源的精确文件读取完整初始化；所有原始切片已结束，
     // mm 尚未发表，pages 唯一拥有只消费一次，成功后数据和页表生命周期由 Mm 管理。
     unsafe { mm.map_owned(base, pages, current, RWX) }?;

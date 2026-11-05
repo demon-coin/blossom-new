@@ -39,6 +39,7 @@ impl State {
             .try_reserve_exact(slots)
             .map_err(|_| TestError("NoMemory: SMP page slots"))?;
         pages.resize_with(slots, || SpinLock::new(None));
+
         let mut identities = Vec::new();
         identities
             .try_reserve_exact(slots)
@@ -61,6 +62,7 @@ impl State {
             payload: SpinLock::new(None),
         })
     }
+
     /// 普通 Task 合作等待；超时返回真实错误并由 fixture 停止/框架 join。
     pub(crate) fn wait(
         &self,
@@ -79,6 +81,7 @@ impl State {
         }
         Ok(())
     }
+
     /// 已发表完成的参与者保住原 Task/栈到 quiesce，停点账务不与离栈析构竞争。
     pub(crate) fn park(&self, token: &crate::ktest::ChildToken) -> TestResult {
         while !self.stop.load(Ordering::Acquire) && !token.stop_requested() {
@@ -86,6 +89,7 @@ impl State {
         }
         Ok(())
     }
+
     /// 原子页身份采样只在发布停点，不复制释放权。
     fn unique_pages(&self, first: usize, count: usize) {
         assert!(count <= WORK);
@@ -109,6 +113,7 @@ impl State {
             }
         }
     }
+
     /// 申请完即发布 owning 槽，然后才核验身份和内容。
     pub(crate) fn allocate_object(&self, index: usize) {
         let object = SlabObject::allocate();
@@ -125,10 +130,12 @@ impl State {
             }
         }
     }
+
     /// 借用对象身份；消费者必须在发布停点保证 owning 槽不被远端消费。
     pub(crate) fn pointer(&self, index: usize) -> core::ptr::NonNull<u8> {
         self.objects[index].lock().as_ref().unwrap().0
     }
+
     /// 检查先于 take，析构在控制槽锁外执行真实异核归还。
     pub(crate) fn release_object(&self, index: usize) {
         self.objects[index].lock().as_ref().unwrap().check();
@@ -149,11 +156,13 @@ impl Fixture for SmpFixture {
             Arc::try_new(State::new()?).map_err(|_| TestError("NoMemory: SMP memory controls"))?;
         Ok(Self { baseline, state })
     }
+
     /// 关闭具体合作源；框架随后一次 stop_children 和真实 join 全部原 Task。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
         Ok(())
     }
+
     /// 所有原 Task 已离栈，消费仍存 owning 槽及控制容量后核六域。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         if Arc::strong_count(&self.state) != 1 {
@@ -167,6 +176,7 @@ impl Fixture for SmpFixture {
             let object = slot.lock().take();
             drop(object);
         }
+
         let payload = self.state.payload.lock().take();
         drop(payload);
         let baseline = self.baseline;
@@ -190,6 +200,7 @@ impl SmpFixture {
         })?;
         Ok(())
     }
+
     /// 控制者允许 scheduler 运行同核参与者；失收敛交框架 case-abort，绝不收活页。
     pub(crate) fn until(&self, mut ready: impl FnMut() -> bool) -> TestResult {
         let end = arch::read_counter().wrapping_add(arch::counter_frequency() * 15);
@@ -201,6 +212,7 @@ impl SmpFixture {
         }
         Ok(())
     }
+
     /// 发布停点的全部参与者已完成对应原动作。
     fn all_done(&self, phase: usize) -> TestResult {
         self.until(|| {
@@ -263,6 +275,7 @@ mod pages {
                 state.park(&token)
             })?;
         }
+
         f.until(|| f.state.ready.load(Ordering::Acquire) == cpu::count())?;
         mm::drain_all_pages();
         let initial = free();
@@ -272,6 +285,7 @@ mod pages {
         assert_eq!(free(), initial - 8 * cpu::count());
         mm::drain_all_pages();
         assert_eq!(pcp::cached_pages(), 0);
+
         f.state.phase.store(2, Ordering::Release);
         f.all_done(2)?;
         assert!(f.state.pages.iter().all(|p| p.lock().is_none()));
@@ -299,12 +313,14 @@ mod pages {
                 }
                 mm::drain_all_pages();
                 assert_eq!(buddy::free_pages(), initial - high);
+
                 for index in 0..high - 1 {
                     let pages = state.pages[id * WORK + index].lock().take();
                     drop(pages);
                 }
                 assert_eq!(pcp::cpu_cached_pages(id), high - 1);
                 assert_eq!(buddy::free_pages(), initial - high);
+
                 let pages = state.pages[id * WORK + high - 1].lock().take();
                 drop(pages);
                 assert_eq!(pcp::cpu_cached_pages(id), high - batch);
@@ -344,6 +360,7 @@ mod pages {
                 state.park(&token)
             })?;
         }
+
         f.until(|| f.state.ready.load(Ordering::Acquire) == cpu::count())?;
         mm::drain_all_pages();
         let initial = free();
@@ -353,6 +370,7 @@ mod pages {
             assert_eq!(pcp::cpu_cached_pages(id), batch);
         }
         assert_eq!(free(), initial);
+
         mm::drain_all_pages();
         assert_eq!(pcp::cached_pages(), 0);
         assert_eq!(buddy::free_pages(), initial);
@@ -392,6 +410,7 @@ mod pages {
                 state.park(&token)
             })?;
         }
+
         f.until(|| f.state.ready.load(Ordering::Acquire) == cpu::count() - 1)?;
         mm::drain_all_pages();
         let initial = free();
@@ -413,6 +432,7 @@ mod pages {
             mm::drain_all_pages();
             assert_eq!(pcp::cached_pages(), 0);
             assert_eq!(buddy::free_pages(), initial - high * (cpu::count() - 1));
+
             f.state.phase.store(phase + 1, Ordering::Release);
             f.until(|| {
                 mm::drain_all_pages();
@@ -518,6 +538,7 @@ mod objects {
             state.done[0].store(1, Ordering::Release);
             state.park(&token)
         })?;
+
         f.until(|| {
             f.state.done[0].load(Ordering::Acquire) == 1
                 && f.state.done[1].load(Ordering::Acquire) == 1

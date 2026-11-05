@@ -12,6 +12,7 @@ use alloc::sync::{Arc, Weak};
 mod lifecycle;
 mod numbers;
 mod resources;
+
 use core::pin::pin;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -41,6 +42,7 @@ pub(crate) const WCONTINUED: u32 = 8;
 pub(crate) const WNOWAIT: u32 = 0x0100_0000;
 pub(crate) const WALL: u32 = 0x4000_0000;
 pub(crate) const WCLONE: u32 = 0x8000_0000;
+
 pub(crate) const WAIT_SIGNAL_MASK: i32 = 0x7f;
 pub(crate) const WAIT_CORE_DUMP: i32 = 0x80;
 pub(crate) const EXIT_STATUS_MASK: i32 = 0xff;
@@ -430,6 +432,7 @@ impl TaskGraph {
             }
             slots.len()
         };
+
         self.notify_exiting_groups(capacity);
         Ok(())
     }
@@ -465,6 +468,7 @@ impl TaskGraph {
             number: reservation.index + 1,
         })
         .map_err(|_| ProcessError::NoMemory)?;
+
         let (pgid, sid) = match parent {
             Some(parent) => {
                 let relations = parent.relations.lock();
@@ -472,6 +476,7 @@ impl TaskGraph {
             }
             None => (pid.clone(), pid.clone()),
         };
+
         let system_init = self.root_role == RootRole::System && parent.is_none();
         let signals = SignalGroup::try_new(Arc::downgrade(self), pid.number, sighand, system_init)
             .map_err(|_| ProcessError::NoMemory)?;
@@ -494,6 +499,7 @@ impl TaskGraph {
             account,
         })
         .map_err(|_| ProcessError::NoMemory)?;
+
         let identity = Arc::try_new(UserIdentity {
             graph: self.clone(),
             group,
@@ -532,6 +538,7 @@ impl TaskGraph {
             signals,
         })
         .map_err(|_| ProcessError::NoMemory)?;
+
         Ok(PreparedIdentity {
             identity,
             parent: None,
@@ -590,6 +597,7 @@ impl TaskGraph {
                 }
                 slots.growth_requirement()
             };
+
             growth = Some(Numbers::prepare_growth(pages, directory)?);
         }
     }
@@ -606,6 +614,7 @@ impl TaskGraph {
                 }
             }
         }
+
         while let Some(mut execution) = discarded.take() {
             discarded = execution.next.take();
         }
@@ -622,6 +631,7 @@ impl TaskGraph {
                 .user
                 .clone()
         };
+
         user.upgrade()
     }
 
@@ -646,6 +656,7 @@ impl TaskGraph {
             }
             slot.thread.as_ref()?.user.clone()
         };
+
         user.upgrade()
     }
 
@@ -666,6 +677,7 @@ impl TaskGraph {
             assert!(Arc::ptr_eq(&process.group, &identity.group));
             identity.group.signals.mark_exit(status);
         }
+
         identity.group.signals.notify();
     }
 
@@ -700,6 +712,7 @@ impl TaskGraph {
             }
             slots.len()
         };
+
         self.notify_exiting_groups(capacity);
     }
 
@@ -746,6 +759,7 @@ impl TaskGraph {
             }
             (control, event)
         };
+
         if let Some(event) = event {
             self.notify_parent(&identity.group, event);
             self.waiters.wake_all();
@@ -818,6 +832,7 @@ impl TaskGraph {
             }
             selected
         };
+
         if let Some(retired) = retired.as_mut() {
             self.complete_retired_notification(retired);
         }
@@ -930,6 +945,7 @@ impl TaskGraph {
                 Err(FsError::NotPermitted)
             };
         }
+
         *control = Some(TerminalControl {
             graph: Arc::downgrade(&caller.graph),
             session: relations.sid.clone(),
@@ -983,6 +999,7 @@ impl TaskGraph {
         if (i32::MAX as usize) < number {
             return Err(FsError::InvalidOperation);
         }
+
         let retired = {
             let slots = self.slots.lock();
             self.terminal_caller(&slots, caller)?;
@@ -996,6 +1013,7 @@ impl TaskGraph {
                 }
                 relations.sid.clone()
             };
+
             let slot = slots
                 .get(number.checked_sub(1).ok_or(FsError::NoProcess)?)
                 .ok_or(FsError::NoProcess)?;
@@ -1004,6 +1022,7 @@ impl TaskGraph {
             if !Arc::ptr_eq(&target_sid, &session) {
                 return Err(FsError::NotPermitted);
             }
+
             let mut control = tty.control().lock();
             let control = control
                 .as_mut()
@@ -1013,6 +1032,7 @@ impl TaskGraph {
                 .ok_or(FsError::NotTty)?;
             core::mem::replace(&mut control.foreground, target.clone())
         };
+
         drop(retired);
         Ok(())
     }
@@ -1064,10 +1084,12 @@ impl TaskGraph {
         if signum == 0 || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);
         }
+
         let result = {
             let mut slots = self.slots.lock();
             deliver_process_group_locked(&mut slots, pgid, signum)
         };
+
         self.flush_group_notifications();
         result
     }
@@ -1117,12 +1139,14 @@ impl TaskGraph {
             if orphaned_process_group(&slots, &pgid) {
                 return Err(FsError::DeviceIo);
             }
+
             match deliver_process_group_locked(&mut slots, &pgid, signum) {
                 Ok(()) => Err(FsError::Interrupted),
                 Err(SignalError::NoProcess) => Err(FsError::NoProcess),
                 Err(error) => panic!("ordinary terminal signal failed: {:?}", error),
             }
         };
+
         self.flush_group_notifications();
         result
     }
@@ -1151,6 +1175,7 @@ impl TaskGraph {
                         .map(|notification| (process.group.clone(), notification, parent))
                 })
             };
+
             if let Some((group, notification, parent)) = pending {
                 self.complete_group_notification(&group, notification, parent.as_deref());
             }
@@ -1194,6 +1219,7 @@ impl TaskGraph {
         if (i32::MAX as usize) < pid || (i32::MAX as usize) < pgid {
             return Err(ProcessError::InvalidArgument);
         }
+
         let released = {
             let mut slots = self.slots.lock();
             self.live_parent(&slots, &caller.group)
@@ -1227,6 +1253,7 @@ impl TaskGraph {
             if Arc::ptr_eq(&group.relations.lock().sid, &group.pid) {
                 return Err(ProcessError::Permission);
             }
+
             let new_pgid = if pgid == pid {
                 group.pid.clone()
             } else {
@@ -1254,6 +1281,7 @@ impl TaskGraph {
             if Arc::ptr_eq(&old_pgid, &new_pgid) {
                 return Ok(());
             }
+
             let old_orphan = orphaned_process_group(&slots, &old_pgid);
             let new_orphan = orphaned_process_group(&slots, &new_pgid);
             attach_role(&mut slots, &new_pgid, PGID);
@@ -1263,6 +1291,7 @@ impl TaskGraph {
             notify_new_orphan_locked(&mut slots, &new_pgid, new_orphan);
             (old, released)
         };
+
         drop(released);
         self.flush_group_notifications();
         Ok(())
@@ -1282,6 +1311,7 @@ impl TaskGraph {
             {
                 return Err(ProcessError::Permission);
             }
+
             attach_role(&mut slots, &group.pid, PGID);
             attach_role(&mut slots, &group.pid, SID);
             let old_pgid = core::mem::replace(&mut relations.pgid, group.pid.clone());
@@ -1294,6 +1324,7 @@ impl TaskGraph {
             notify_unlinked_children_locked(&mut slots, caller.tgid(), &old_pgid, &old_sid);
             (old_pgid, old_sid, pgid, sid)
         };
+
         drop(released);
         self.flush_group_notifications();
         Ok(caller.tgid())
@@ -1319,6 +1350,7 @@ impl TaskGraph {
                 value: 0,
             },
         };
+
         let capacity = self.slots.lock().len();
         let mut found = false;
         let mut delivered = false;
@@ -1357,6 +1389,7 @@ impl TaskGraph {
                 Err(failure) => error = failure,
             }
         }
+
         if delivered {
             Ok(())
         } else if found {
@@ -1497,6 +1530,7 @@ impl TaskGraph {
         } else {
             PreparedSignal::kernel()
         };
+
         let result = (|| {
             let mut slots = self.slots.lock();
             let actual = slots[group.tgid() - 1]
@@ -1530,6 +1564,7 @@ impl TaskGraph {
             };
             Ok(event)
         })();
+
         group.signals.notify();
         if let Some(event) = result? {
             self.notify_parent(group, event);
@@ -1585,11 +1620,13 @@ impl TaskGraph {
                 thread.user.clone(),
             )
         };
+
         let mut prepared = if queued {
             PreparedSignal::user(info)?
         } else {
             PreparedSignal::kernel()
         };
+
         let result = (|| {
             let mut slots = self.slots.lock();
             let actual = slots
@@ -1626,6 +1663,7 @@ impl TaskGraph {
             };
             Ok(event)
         })();
+
         signals.notify_wait();
         group.signals.notify();
         if let Some(user) = user.upgrade() {
@@ -1664,6 +1702,7 @@ impl TaskGraph {
                     .map(|thread| &thread.signals),
             )?
         };
+
         identity.group.signals.notify();
         Ok(previous)
     }
@@ -1683,6 +1722,7 @@ impl TaskGraph {
                     })
                     .map(|thread| (thread.signals.clone(), thread.user.clone()))
             };
+
             if let Some((signals, user)) = member {
                 signals.notify_wait();
                 if let Some(user) = user.upgrade() {
@@ -1704,6 +1744,7 @@ impl TaskGraph {
                 .and_then(|pid| slots[pid - 1].process.as_ref())
                 .map(|process| process.group.clone())
         };
+
         send_parent_event(parent.as_deref(), event);
     }
 
@@ -1785,6 +1826,7 @@ impl PreparedIdentity {
                 }
                 None
             };
+
             let index = self.reservation.index;
             assert!(slots[index].reserved, "PID reservation disappeared");
             assert!(slots[index].pid.is_none(), "reserved PID already published");
@@ -1792,6 +1834,7 @@ impl PreparedIdentity {
                 execution.next.is_none(),
                 "prepared member is already linked"
             );
+
             let task_id = execution.join.task_id();
             slots[index].reserved = false;
             let tid = self.identity.tid_object();
@@ -1838,6 +1881,7 @@ impl PreparedIdentity {
             }
             self.reservation.active = false;
         }
+
         drop(old_relations);
         Ok(())
     }
@@ -1979,6 +2023,7 @@ fn reap_child(slots: &mut Numbers, index: usize, kernel_join: bool) -> Collected
             slots[index].completed = Some(execution);
         }
     }
+
     let notification_parent = retired
         .parent
         .filter(|_| matches!(retired.notification, Some(GroupNotification::Continued(_))))
@@ -1992,6 +2037,7 @@ fn reap_child(slots: &mut Numbers, index: usize, kernel_join: bool) -> Collected
             detach_role(slots, &relations.sid, SID),
         ]
     };
+
     CollectedChild {
         event,
         process: Some(retired),
@@ -2068,6 +2114,7 @@ fn release_terminal_locked(
     if !matches {
         return None;
     }
+
     for process in slots.iter().filter_map(|slot| slot.process.as_ref()) {
         let mut relations = process.group.relations.lock();
         if Arc::ptr_eq(&relations.sid, session)
@@ -2078,6 +2125,7 @@ fn release_terminal_locked(
             relations.controlling_tty = None;
         }
     }
+
     tty.control().lock().take()
 }
 

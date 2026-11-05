@@ -142,6 +142,7 @@ pub(super) mod cases {
             context,
             vfs.resolve(&fs_context, b"/mnt/extra", ResolveMode::Follow),
         )?;
+
         checked(
             context,
             vfs.mount(
@@ -154,6 +155,7 @@ pub(super) mod cases {
             context,
             vfs.resolve(&fs_context, b"/mnt/extra", ResolveMode::Follow),
         )?;
+
         let inode = checked(context, mounted.inode())?.clone();
         checked(
             context,
@@ -161,6 +163,7 @@ pub(super) mod cases {
         )?;
         checked(context, volume.sync())?;
         drained(&volume)?;
+
         let metadata = volume.metadata_cache().clone();
         let source = metadata
             .reserve()
@@ -183,12 +186,14 @@ pub(super) mod cases {
                 .ktest_node(block * PAGE_SIZE as u64)
                 .ok_or(TestError("cold metadata has no genuine Node Weak"))?,
         );
+
         let held = source.snapshot();
         drop(buffer);
         metadata.prune_unused();
         context.expect_eq(observer.as_ref().unwrap().upgrade().is_none(), true);
         context.expect_eq(source.snapshot().metadata_control_live, 1);
         context.expect_eq(source.metadata_folio(slot).phys_addr(), physical);
+
         context.expect_eq(vfs.unmount(&covered).err(), Some(FsError::Busy));
         drop(inode);
         drop(mounted);
@@ -198,6 +203,7 @@ pub(super) mod cases {
             vfs.resolve(&fs_context, b"/mnt/extra", ResolveMode::Follow),
         )?;
         context.expect_eq(after_unmount.ptr_eq(&covered), true);
+
         drop(after_unmount);
         drop(covered);
         drop(fs_context);
@@ -207,12 +213,14 @@ pub(super) mod cases {
         checked(context, watch.wait_retired())?;
         drop(watch);
         drop(fixture.retired.take());
+
         extra_disk.test_flush_completions();
         let stopped = volume.writeback_domain().snapshot();
         context.expect_eq(
             (stopped.active, stopped.pending, stopped.running),
             (false, false, false),
         );
+
         let weak_volume = Arc::downgrade(&volume);
         let weak_metadata = Arc::downgrade(&metadata);
         let weak_domain = Arc::downgrade(volume.writeback_domain());
@@ -235,6 +243,7 @@ pub(super) mod cases {
             Arc::as_ptr(&source), source.capacity(), slot, physical / PAGE_SIZE, original_pages,
             held, source.snapshot(), stopped, extra_disk.test_snapshot(), metadata_stats(),
         ));
+
         drop(metadata);
         drop(volume);
         drop(fixture.write.cold_volume.take());
@@ -244,6 +253,7 @@ pub(super) mod cases {
         context.expect_eq(weak_metadata.upgrade().is_none(), true);
         context.expect_eq(weak_domain.upgrade().is_none(), true);
         context.expect_eq(weak_source.strong_count(), 1);
+
         let before_put = mm::stats();
         let target = (cpu::current().id + 1) % cpu::count();
         // SAFETY: 真 Node Weak 仅结束 IndexAllocator 控制尾及同源无 owner 基准页，
@@ -303,6 +313,7 @@ pub(super) mod cases {
             true,
         );
         let before = domain.snapshot();
+
         // cache_open 时末槽回收仍保卷服务，旧 inode 的 evict 必须在零 lane 压力与 stop 之前完成。
         context.diagnostic(format_args!(
             "W34 stop-stage=old-canonical-evict source={:p} oom={} slots={} active={}",
@@ -321,6 +332,7 @@ pub(super) mod cases {
                 "old canonical slot survived active-domain eviction",
             ));
         }
+
         fixture.lane = Some(checked(
             context,
             source.acquire_wb_lane(|| false).map_err(FsError::from),
@@ -340,6 +352,7 @@ pub(super) mod cases {
             stopping.wait_retired()?;
             Ok(())
         })?;
+
         until("original storage borrower did not block on zero WB", || {
             borrower.blocked() && 0 < source.ktest_waiting()
         })?;
@@ -354,6 +367,7 @@ pub(super) mod cases {
             Arc::as_ptr(&source), source.snapshot().free_wb == 0, borrower.blocked(),
             source.ktest_waiting(), blocked.running, !watch.contains(2),
         ));
+
         control.gate.complete();
         until(
             "external stop did not wake and finish original borrower and callback",
@@ -373,6 +387,7 @@ pub(super) mod cases {
         context.expect_eq(stopped.running, false);
         context.expect_eq(stopped.pending, false);
         context.expect_eq(source.ktest_waiting(), 0);
+
         let reads = disk.test_snapshot().submitted;
         context.expect_eq(
             volume
@@ -382,10 +397,12 @@ pub(super) mod cases {
             Some(BlockError::NotReady),
         );
         context.expect_eq(disk.test_snapshot().submitted, reads);
+
         drop(fixture.lane.take());
         checked(context, watch.wait_retired())?;
         drop(watch);
         drop(fixture.retired.take());
+
         context.diagnostic(format_args!(
             "W34 stop-stage=new-canonical-bind source={:p} old-stop-sequence={} active={}",
             Arc::as_ptr(&source),
@@ -417,6 +434,7 @@ pub(super) mod cases {
                 .get(cold_block, volume.geometry().block_size, None)
                 .map_err(FsError::from),
         )?);
+
         let pressure = if oom {
             Some(
                 fixture
@@ -447,6 +465,7 @@ pub(super) mod cases {
             *actor_evidence.lock() = Some((allocation, start, finish, progress));
             Ok(())
         })?;
+
         until(
             "finite zero-submit/OOM round did not publish its actual finished boundary",
             || finite.result().is_some(),
@@ -472,6 +491,7 @@ pub(super) mod cases {
             (finish.round_selected_data, finish.round_selected_metadata),
             (0, 0),
         );
+
         // 第二次 owner 退休也先结束 canonical；同字节 Buffer 更新保原 metadata Dirty 与真实接受责任。
         drop(root);
         context.diagnostic(format_args!(
@@ -488,6 +508,7 @@ pub(super) mod cases {
                 "new canonical slot survived active-domain eviction",
             ));
         }
+
         let buffer = checked(
             context,
             volume
@@ -515,11 +536,13 @@ pub(super) mod cases {
                     && 0 < source.snapshot().control_live
             },
         )?;
+
         let accepted = disk.test_snapshot();
         context.diagnostic(format_args!(
             "W34 stop-stage=accepted-owner-retire source={:p} old-canonical-absent={} accepted-driver={:?} source-layout={:?}",
             Arc::as_ptr(&source), !next_watch.contains(2), accepted, source.snapshot(),
         ));
+
         let io_stopping = next.watch();
         let io_stopper = fixture.write.consume_sync(1, move || {
             drop(next);
@@ -532,6 +555,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq(io_stopper.result(), None);
         context.expect_eq(domain.wait_progress(accepted_boundary).stopped, true);
+
         disk.test_resume_completions();
         fixture.write.join_consumers()?;
         disk.test_flush_completions();
@@ -542,6 +566,7 @@ pub(super) mod cases {
         context.expect_eq(disk.test_snapshot().inflight, 0);
         context.expect_eq(source.snapshot().control_live, 0);
         context.expect_eq(source.snapshot().payload_live, 0);
+
         checked(context, next_watch.wait_retired())?;
         drop(next_watch);
         drop(fixture.retired.take());
@@ -550,6 +575,7 @@ pub(super) mod cases {
             Arc::as_ptr(&source), oom, allocation, before, blocked, stopped, start, finish, progress,
             accepted, disk.test_snapshot(), source.snapshot(),
         ));
+
         fixture.control.take();
         fixture.source.take();
         Ok(())
@@ -588,6 +614,7 @@ pub(super) mod cases {
         fixture.lane = Some(lane);
         let control = WaveControl::try_new()?;
         fixture.control = Some(control.clone());
+
         let ninth = checked(context, unchanged_metadata_writeback(&volume, 9))?;
         let record = Arc::try_new(SpinLock::new(None))
             .map_err(|_| TestError("ninth acceptance observation OOM"))?;
@@ -620,6 +647,7 @@ pub(super) mod cases {
             drop(lane);
             result.error.map_or(Ok(()), |error| Err(FsError::Io(error)))
         })?;
+
         let before = disk.test_snapshot();
         for index in 0..8 {
             let block = index as u64 + 1;
@@ -645,12 +673,14 @@ pub(super) mod cases {
             context.expect_eq((result.completed, result.error), (PAGE_SIZE, None));
             context.expect_eq(completion.test_acceptance().2, PAGE_SIZE);
         }
+
         disk.test_flush_completions();
         let completed = disk.test_snapshot();
         let held = source.snapshot();
         context.expect_eq(completed.inflight, 0);
         context.expect_eq(held.control_live, 8);
         context.expect_eq(held.payload_live, 8);
+
         let mut returned = [const { None }; 8];
         let mut payload_addresses = [0; 8];
         for (index, (memory, completion)) in returned.iter_mut().zip(&fixture.observers).enumerate()
@@ -674,6 +704,7 @@ pub(super) mod cases {
         drop(returned);
         context.expect_eq(source.snapshot().payload_live, 0);
         context.expect_eq(source.snapshot().control_live, 8);
+
         let mut weak = Some(fixture.observers[0].as_ref().unwrap().ktest_weak());
         drop(fixture.lane.take());
         control.gate.complete();
@@ -685,10 +716,12 @@ pub(super) mod cases {
         context.expect_eq(actor.result(), None);
         context.expect_eq(source.snapshot().free_wb, 0);
         context.expect_eq(blocked.metadata_submitted, completed.metadata_submitted);
+
         drop(fixture.observers[0].take());
         context.expect_eq(source.snapshot().control_live, 8);
         context.expect_eq(source.snapshot().free_wb, 0);
         context.expect_eq(actor.blocked(), true);
+
         let target = (cpu::current().id + 1) % cpu::count();
         // SAFETY: 真 Bio Weak 保有实际 BioAllocator 控制尾；返回 Vec 已 Drop，
         // driver/生成者尾已 flush，目标在线，末 put 只归控制 allocator，不睡眠或 join。
@@ -709,6 +742,7 @@ pub(super) mod cases {
             (PAGE_SIZE, PAGE_SIZE, None, true),
         );
         context.expect_eq(ninth_payload, payload_addresses[0]);
+
         disk.test_flush_completions();
         let after = source.snapshot();
         context.expect_eq(after.control_live, 7);
@@ -723,6 +757,7 @@ pub(super) mod cases {
             Arc::as_ptr(&source), volume.writeback_domain().snapshot().rounds, count, reserved, payload_addresses, ninth_payload,
             before, completed, blocked, disk.test_snapshot(), held, after, target,
         ));
+
         for observer in &mut fixture.observers {
             drop(observer.take());
         }
@@ -754,6 +789,7 @@ pub(super) mod cases {
         let cache = Arc::try_new(checked(context, InodeCache::try_new(4))?)
             .map_err(|_| TestError("retirement cache owner OOM"))?;
         let watch = cache.watch();
+
         let held = if path == 1 {
             let mut pressure = fixture
                 .write
@@ -768,6 +804,7 @@ pub(super) mod cases {
             let record = observed.clone();
             let original = cache.clone();
             let filesystem = volume.clone();
+
             let consumer = fixture.write.consume_sync(0, move || {
                 let evidence = pressure.exhaust();
                 let result = original.iget(&filesystem, 2).err();
@@ -806,6 +843,7 @@ pub(super) mod cases {
                 Some(inode)
             }
         };
+
         drop(cache);
         if let Some(inode) = held {
             context.expect_eq(watch.contains(inode.number()), true);
@@ -816,6 +854,7 @@ pub(super) mod cases {
         }
         checked(context, watch.wait_retired())?;
         drop(watch);
+
         let next = checked(context, InodeCache::try_new(4))?;
         let next_watch = next.watch();
         let inode = checked(context, next.iget(&volume, 2))?;
@@ -823,6 +862,7 @@ pub(super) mod cases {
             checked(context, inode.metadata_snapshot())?.kind,
             InodeKind::Directory,
         );
+
         drop(inode);
         drop(next);
         checked(context, next_watch.wait_retired())?;

@@ -17,6 +17,7 @@ use crate::sync::SpinLock;
 
 const MAXSYMLINKS: usize = 40;
 const DEFAULT_UMASK: u16 = 0o022;
+
 const OWNER_PERMISSION_SHIFT: u32 = 6;
 const GROUP_PERMISSION_SHIFT: u32 = 3;
 
@@ -210,6 +211,7 @@ impl FsContext {
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
+
     /// 返回当前进程文件创建掩码快照。
     pub fn umask(&self) -> u16 {
         self.umask
@@ -250,6 +252,7 @@ impl Vfs {
         if dentry_capacity == 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let mut mounts = Vec::new();
         mounts
             .try_reserve_exact(mount_capacity)
@@ -338,6 +341,7 @@ impl Vfs {
         if pathname.contains(&0) {
             return Err(FsError::InvalidName);
         }
+
         self.validate_start(context, start, pathname[0] == b'/')?;
         let mut current = if pathname[0] == b'/' {
             context.root.clone()
@@ -372,6 +376,7 @@ impl Vfs {
                 offset = end;
                 continue;
             }
+
             let dentry = current
                 .mount
                 .dcache
@@ -438,6 +443,7 @@ impl Vfs {
         if pathname.contains(&0) {
             return Err(FsError::InvalidName);
         }
+
         let trailing_slash = pathname.last() == Some(&b'/');
         let mut end = pathname.len();
         while 0 < end && pathname[end - 1] == b'/' {
@@ -479,6 +485,7 @@ impl Vfs {
                 links,
             )?
         };
+
         let component = if raw_name == b"." {
             LastComponent::Dot
         } else if raw_name == b".." {
@@ -533,6 +540,7 @@ impl Vfs {
                 Err(error) => return Err(error),
             }
         }
+
         let prepared = parent
             .mount
             .dcache
@@ -598,6 +606,7 @@ impl Vfs {
                 .take()
                 .expect("open preparation callback was consumed")(path, false);
         }
+
         let (requested_mode, umask) = create_mode.expect("create mode was checked above");
         let mut current_start = start.clone();
         let mut pending = Cow::Borrowed(pathname);
@@ -697,6 +706,7 @@ impl Vfs {
                         .expect("open preparation callback was consumed")(
                         path, true
                     )?;
+
                     let edit = directory.prepare_insert(
                         name.as_slice(),
                         inode.number(),
@@ -704,6 +714,7 @@ impl Vfs {
                         0,
                         now_ns,
                     )?;
+
                     let _published_inode = new_inode.publish();
                     directory.publish(edit);
                     prepared_dentry.publish();
@@ -762,6 +773,7 @@ impl Vfs {
                 return Err(FsError::Exists);
             }
         };
+
         let parent_inode = lookup.parent.inode()?.clone();
         let directory = parent_inode.directory_write()?;
         let parent_metadata = directory.metadata_snapshot();
@@ -781,6 +793,7 @@ impl Vfs {
             credentials.0,
             credentials.1,
         )?;
+
         let prepared_dentry = lookup
             .parent
             .mount
@@ -808,6 +821,7 @@ impl Vfs {
             1,
             now_ns,
         )?;
+
         let _published_inode = new_inode.publish();
         directory.publish(edit);
         prepared_dentry.publish();
@@ -830,6 +844,7 @@ impl Vfs {
                 return Err(FsError::Exists);
             }
         };
+
         let parent_inode = lookup.parent.inode()?.clone();
         let directory = parent_inode.directory_write()?;
         let parent_metadata = directory.metadata_snapshot();
@@ -852,6 +867,7 @@ impl Vfs {
             credentials.0,
             credentials.1,
         )?;
+
         let prepared_dentry = lookup
             .parent
             .mount
@@ -878,6 +894,7 @@ impl Vfs {
             0,
             now_ns,
         )?;
+
         let _published_inode = new_inode.publish();
         directory.publish(edit);
         prepared_dentry.publish();
@@ -899,6 +916,7 @@ impl Vfs {
                 return Err(FsError::IsDirectory);
             }
         };
+
         let parent_inode = lookup.parent.inode()?.clone();
         let directory = parent_inode.directory_write()?;
         let parent_metadata = directory.metadata_snapshot();
@@ -923,6 +941,7 @@ impl Vfs {
         if self.is_mountpoint(&target) {
             return Err(FsError::Busy);
         }
+
         let child = inode.inode_write()?;
         let child_metadata = child.metadata_snapshot();
         if child_metadata.links == 0 {
@@ -931,6 +950,7 @@ impl Vfs {
         let now_ns = crate::time::realtime();
         let child_edit = child.prepare_link_delta(-1, now_ns)?;
         let directory_edit = directory.prepare_remove(name.as_slice(), 0, now_ns)?;
+
         child.publish_metadata(child_edit);
         directory.publish(directory_edit);
         target.mount.dcache.unhash(&target.dentry);
@@ -953,6 +973,7 @@ impl Vfs {
                 return Err(FsError::Exists);
             }
         };
+
         let source_inode = source.inode()?.clone();
         let parent_inode = lookup.parent.inode()?.clone();
         let directory = parent_inode.directory_write()?;
@@ -989,6 +1010,7 @@ impl Vfs {
         if source_metadata.links == 0 {
             return Err(FsError::NotFound);
         }
+
         let prepared_dentry = lookup
             .parent
             .mount
@@ -1004,6 +1026,7 @@ impl Vfs {
             now_ns,
         )?;
         let prepared_dentry = prepared_dentry.bind_positive(source_inode.clone());
+
         source_guard.publish_metadata(source_edit);
         directory.publish(directory_edit);
         prepared_dentry.publish();
@@ -1025,6 +1048,7 @@ impl Vfs {
             LastComponent::DotDot => return Err(FsError::NotEmpty),
             LastComponent::Root => return Err(FsError::Busy),
         };
+
         let parent_inode = lookup.parent.inode()?.clone();
         let directory = parent_inode.directory_write()?;
         let parent_metadata = directory.metadata_snapshot();
@@ -1050,9 +1074,11 @@ impl Vfs {
         if !child.is_empty()? {
             return Err(FsError::NotEmpty);
         }
+
         let now_ns = crate::time::realtime();
         let child_edit = child.prepare_link_delta(-2, now_ns)?;
         let directory_edit = directory.prepare_remove(name.as_slice(), -1, now_ns)?;
+
         child.publish_metadata(child_edit);
         directory.publish(directory_edit);
         target.mount.dcache.unhash(&target.dentry);
@@ -1095,6 +1121,7 @@ impl Vfs {
                 });
             }
         };
+
         let same_parent = old.parent.ptr_eq(&new.parent);
         let _rename_guard = old.parent.filesystem().lock_rename();
         let source_first = same_parent
@@ -1180,6 +1207,7 @@ impl Vfs {
         )?;
         old.parent.check_writable()?;
         new.parent.check_writable()?;
+
         let source_inode = source_parent
             .lookup(&self.inodes, old_name.as_slice())?
             .ok_or(FsError::NotFound)?;
@@ -1243,6 +1271,7 @@ impl Vfs {
         {
             return Err(FsError::NotEmpty);
         }
+
         let source_directory = if source_is_directory {
             Some(source_inode.directory_write()?)
         } else {
@@ -1298,6 +1327,7 @@ impl Vfs {
                 None => (Some(source_inode.inode_write()?), None, None),
             }
         };
+
         let source_current = match source_directory_metadata {
             Some(metadata) => metadata,
             None => source_file
@@ -1454,6 +1484,7 @@ impl Vfs {
         if let Some(edit) = target_parent_edit {
             destination_parent.publish(edit);
         }
+
         source_path.mount.dcache.move_entry(
             &source_path.dentry,
             target_path.as_ref().map(|path| &path.dentry),
@@ -1478,6 +1509,7 @@ impl Vfs {
             let mounts = self.mounts.lock();
             self.check_mount(&mounts, covered, &filesystem)?;
         }
+
         let (dcache, root) = filesystem.dentry_namespace(&self.inodes, self.dcache.capacity())?;
         let candidate = Arc::try_new(Mount {
             filesystem,
@@ -1487,6 +1519,7 @@ impl Vfs {
             covered: Some(covered.clone()),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let inode = covered.inode()?;
         let directory = inode.directory_read()?;
         if directory.metadata_snapshot().links == 0
@@ -1536,6 +1569,7 @@ impl Vfs {
             let position = unmount_position(&mounts, covered, Some(&mount))?;
             mounts.swap_remove(position)
         };
+
         let dcache = victim.dcache.clone();
         let filesystem = victim.filesystem.clone();
         drop(victim);
@@ -1561,6 +1595,7 @@ impl Vfs {
         }
         filesystems.sort_unstable_by_key(Filesystem::identity_address);
         filesystems.dedup_by(|a, b| a.ptr_eq(b));
+
         let mut result = Ok(());
         for filesystem in &filesystems {
             if let Err(error) = filesystem.sync() {
@@ -1601,6 +1636,7 @@ impl Vfs {
             let mounts = self.mounts.lock();
             snapshot.extend(mounts.iter().cloned());
         }
+
         let mut text = Vec::new();
         for mount in &snapshot {
             let path = Path {
@@ -1739,6 +1775,7 @@ fn path_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, FsError> {
         mount = &mount.covered.as_ref().ok_or(FsError::NotFound)?.mount;
         count += 1;
     }
+
     let mut filesystems = Vec::new();
     filesystems
         .try_reserve_exact(count)
@@ -1753,6 +1790,7 @@ fn path_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, FsError> {
     }
     filesystems.sort_unstable_by_key(Filesystem::identity_address);
     filesystems.dedup_by(|a, b| a.ptr_eq(b));
+
     let mut guards = Vec::new();
     guards
         .try_reserve_exact(filesystems.len())
@@ -1762,11 +1800,13 @@ fn path_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, FsError> {
         .try_reserve_exact(PATH_MAX)
         .map_err(|_| FsError::NoMemory)?;
     bytes.resize(PATH_MAX, 0);
+
     for filesystem in &filesystems {
         guards.push(filesystem.lock_rename());
     }
     let result = collect_path_bytes(path, root, &mut bytes);
     drop(guards);
+
     let start = result?;
     let length = PATH_MAX - 1 - start;
     bytes.copy_within(start..PATH_MAX - 1, 0);
@@ -1812,6 +1852,7 @@ fn require_directory(path: &Path) -> Result<(), FsError> {
         Err(FsError::NotDirectory)
     }
 }
+
 /// 普通文件、目录和链接的写意图核挂载能力；字符及块设备数据面只核自身DAC。
 fn check_access_metadata(
     path: &Path,
@@ -1850,6 +1891,7 @@ fn check_inode_mode_access(
         }
         return Ok(());
     }
+
     let shift = if uid == metadata.uid {
         OWNER_PERMISSION_SHIFT
     } else if gid == metadata.gid {
@@ -1926,6 +1968,7 @@ fn try_raw_name(name: &[u8]) -> Result<Arc<Vec<u8>>, FsError> {
     if name.is_empty() || name.contains(&0) || name.contains(&b'/') {
         return Err(FsError::InvalidName);
     }
+
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(name.len())

@@ -9,6 +9,7 @@ const BANK_COUNT: u32 = 2;
 const SOURCE_COUNT: u32 = BANK_COUNT * LIOINTC_SOURCES_PER_BANK;
 const BOARD_CPU_COUNT: usize = 2;
 const ROUTE_PARENT_SHIFT: u32 = 4;
+
 const ENABLE_STATUS: usize = 0x24;
 const ENABLE: usize = 0x28;
 const DISABLE: usize = 0x2c;
@@ -39,6 +40,7 @@ fn write(resource: LioIntcResources, offset: usize, value: u32) {
 pub(super) fn initialize(info: &BootInfo) {
     assert_eq!(info.interrupts.source_count, SOURCE_COUNT);
     assert!(info.bsp_hardware_id < BOARD_CPU_COUNT);
+
     let _controller = EXTERNAL_CONTROLLER.lock();
     for resource in info.board.liointc {
         assert!((CPU_HWI0..=CPU_HWI1).contains(&resource.parent_interrupt));
@@ -61,6 +63,7 @@ pub(super) fn initialize(info: &BootInfo) {
 /// 按规范化 source 定位实际 bank 与单个位；不修改相邻设备。
 pub(super) fn set_enabled(source: u32, enabled: bool) {
     assert!(source < SOURCE_COUNT);
+
     let _controller = EXTERNAL_CONTROLLER.lock();
     let resource =
         crate::boot::info().board.liointc[source as usize / LIOINTC_SOURCES_PER_BANK as usize];
@@ -77,6 +80,7 @@ pub(super) fn claim() -> Option<u32> {
     let info = crate::boot::info();
     let hardware_id = crate::cpu::current().hardware_id;
     assert!(hardware_id < BOARD_CPU_COUNT);
+
     let _controller = EXTERNAL_CONTROLLER.lock();
     for (bank, resource) in info.board.liointc.iter().copied().enumerate() {
         let region = resource.isr[hardware_id];

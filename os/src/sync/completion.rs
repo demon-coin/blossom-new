@@ -53,6 +53,7 @@ impl Completion {
         if self.try_wait() {
             return;
         }
+
         loop {
             let consumed = {
                 let waiter = Waiter::new();

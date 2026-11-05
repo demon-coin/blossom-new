@@ -35,6 +35,7 @@ pub(crate) mod tmpfs_growth {
                 .vfs()
                 .mount(&covered, Filesystem::Memory(memory), AccessMode::ReadWrite),
         )?;
+
         fixture.run_selftest_named(context, PROGRAM, &[selection], Credentials::ROOT)
     }
 
@@ -46,6 +47,7 @@ pub(crate) mod tmpfs_growth {
     ) -> TestResult {
         let defaults = checked(context, TmpfsOptions::parse(b"", 1001))?;
         context.expect_eq(defaults.limits(1001), (500, 500));
+
         for (suffix, shift) in [
             (b'k', 10),
             (b'M', 20),
@@ -62,6 +64,7 @@ pub(crate) mod tmpfs_growth {
                 Some(((1u64 << shift) as usize).div_ceil(mm::PAGE_SIZE)),
             );
         }
+
         let options = checked(
             context,
             TmpfsOptions::parse(
@@ -72,8 +75,10 @@ pub(crate) mod tmpfs_growth {
         context.expect_eq(options.blocks, Some(251));
         context.expect_eq(options.inodes, Some(8));
         context.expect_eq(options.mode, Some(0o1777));
+
         let options = checked(context, TmpfsOptions::parse(b"size=0,nr_inodes=0", 1001))?;
         context.expect_eq((options.blocks, options.inodes), (Some(0), Some(0)));
+
         context.expect_eq(
             TmpfsOptions::parse(b"size=16E", 1001),
             Err(FsError::InvalidOperation),

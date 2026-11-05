@@ -13,6 +13,7 @@ impl UserOwner {
     ) -> TestResult {
         self.prepare_system(context)?;
         context.expect_eq(self.graph().root_role(), RootRole::System);
+
         let event = self.run_root_role(context, b"--pid1", Credentials::ROOT)?;
         context.expect_eq(event.pid, 1);
         context.expect_eq(event.status, 0);
@@ -25,6 +26,7 @@ impl UserOwner {
         {
             return Err(TestError("system root did not request PowerOff"));
         }
+
         // 日常 wait 已由用户完成；接受关机后的剩余组才允许由 kernel 最终回收。
         self.reap_children(context, true)?;
         context.diagnostic(format_args!(
@@ -52,10 +54,12 @@ impl UserOwner {
         } else {
             Credentials::ROOT
         };
+
         let event = self.run_root_role(context, b"--fixture-root", credentials)?;
         context.expect_eq(event.pid, 1);
         context.expect_eq(event.status, 9);
         context.expect_eq(self.graph().shutdown_operation(), None);
+
         self.reap_children(context, true)?;
         context.diagnostic(format_args!(
             "fixture-root pid={} status={} uid={} gid={} operation={:?}",
@@ -100,6 +104,7 @@ impl UserOwner {
             ),
         )?;
         checked(context, runtime.install_console())?;
+
         let coordinator = cpu::current().id;
         let target = (coordinator + 1) % cpu::count();
         let prepared =
@@ -120,6 +125,7 @@ impl UserOwner {
             expected_task: Some(join.task_id()),
             join,
         });
+
         self.wait(context)
     }
 }

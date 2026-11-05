@@ -72,6 +72,7 @@ fn observe_symlink_oom(
             state.lock().neighbor_bytes[..block_size].copy_from_slice(bytes);
         })?;
     }
+
     disk.test_flush_completions();
     let evidence = pressure.exhaust();
     let mut state = state.lock();
@@ -143,6 +144,7 @@ pub(super) mod cases {
         volume.release_unpublished_block(first);
         volume.release_unpublished_inode(allocation);
         let before = allocation_counts(context, &volume)?;
+
         let pressure = fixture
             .user
             .path
@@ -182,6 +184,7 @@ pub(super) mod cases {
                 }
             })
             .map_err(|_| TestError("symlink load hook OOM"))?;
+
         let vfs = view.vfs.clone();
         let fs_context = view.context.clone();
         let root = view.root.clone();
@@ -210,6 +213,7 @@ pub(super) mod cases {
         context.expect_eq(state.lock().preparation_error, None);
         context.expect_eq(state.lock().evidence, Some((true, true)));
         context.expect_eq(consumer.result(), Some(Err(FsError::NoMemory)));
+
         let (failed, prefix, neighbor, neighbor_bytes) = {
             let mut state = state.lock();
             (
@@ -256,6 +260,7 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::NotFound),
         );
+
         let target = [b'x'; mm::PAGE_SIZE];
         checked(
             context,
@@ -295,6 +300,7 @@ pub(super) mod cases {
                 .map_err(FsError::Io),
         )?;
         context.expect_eq(restored, true);
+
         checked(
             context,
             view.vfs
@@ -378,6 +384,7 @@ pub(super) mod cases {
             context.expect_eq(vfs.dcache().ktest_load_count(), before_loads + 1);
             Ok(())
         })();
+
         observer.hold_loader.store(false, Ordering::Release);
         observer.gate.complete();
         let reader_join = fixture.user.path.owner.join_tasks();
@@ -403,6 +410,7 @@ pub(super) mod cases {
             );
         }
         context.expect_eq(vfs.dcache().ktest_waiting(root.dentry(), b"w28-publish"), 0);
+
         let published = checked(
             context,
             vfs.resolve(&fs_context, b"/w28-publish", ResolveMode::Follow),
@@ -469,6 +477,7 @@ pub(super) mod cases {
         .ok_or(TestError(
             "controlled metadata corruption did not fail layout or CRC",
         ))?;
+
         let observer = fixture.user.path.owner.observer().clone();
         install_lookup_gate(context, &vfs, observer.clone(), b"w28-checksum")?;
         observer.hold_loader.store(true, Ordering::Release);
@@ -513,6 +522,7 @@ pub(super) mod cases {
             observer.gate.complete();
             Ok(())
         })();
+
         observer.hold_loader.store(false, Ordering::Release);
         observer.gate.complete();
         let joined = fixture.user.path.owner.join_tasks();
@@ -546,6 +556,7 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::NotFound),
         );
+
         checked(
             context,
             vfs.link_from(&source, &fs_context, &root, b"w28-checksum", (0, 0)),
@@ -582,6 +593,7 @@ pub(super) mod cases {
         for logical in 0..(mm::PAGE_SIZE as u64 / block_size) {
             checked(context, inode.map_block(logical))?;
         }
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -637,6 +649,7 @@ pub(super) mod cases {
             drop(folio);
             Ok(())
         })();
+
         disk.test_resume_completions();
         let readers = fixture.user.path.owner.join_tasks();
         let writers = fixture.join_consumers();
@@ -677,6 +690,7 @@ pub(super) mod cases {
                 address = Some(folio.phys_addr());
             }
         }
+
         let mut data = [0xa7; mm::PAGE_SIZE];
         context.expect_eq(checked(context, inode.read_at(0, &mut data))?, data.len());
         context.expect_eq(&data[..32], &[0x5a; 32]);
@@ -708,6 +722,7 @@ pub(super) mod cases {
         for logical in 0..(mm::PAGE_SIZE as u64 / block_size) {
             checked(context, inode.map_block(logical))?;
         }
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -745,6 +760,7 @@ pub(super) mod cases {
             context.expect_eq(folio.is_ready(), false);
             Ok(())
         })();
+
         disk.test_resume_completions();
         let readers = fixture.user.path.owner.join_tasks();
         disk.test_flush_completions();
@@ -772,6 +788,7 @@ pub(super) mod cases {
         drop(failed);
         context.expect_eq(0 < inode.mapping().prune_unused(), true);
         context.expect_eq(inode.mapping().len(), 0);
+
         let before_retry = disk.test_snapshot();
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, bytes.len());

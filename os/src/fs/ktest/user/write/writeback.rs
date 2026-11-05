@@ -15,6 +15,7 @@ impl UserOwner {
         if event.status != 0 {
             return Err(TestError("production writeback writer failed"));
         }
+
         let disk = self.path.owner.disk()?.clone();
         let root = self.path.vfs().root();
         let old_device = root.filesystem().device();
@@ -61,6 +62,7 @@ impl UserOwner {
                 "production writeback still has old FS or user owners",
             ));
         }
+
         drop((
             weak_cache,
             weak_volume,
@@ -74,6 +76,7 @@ impl UserOwner {
             return Err(TestError("production writeback old IO is still inflight"));
         }
         drop(self.path.owner.cache_watch.take());
+
         let reads_before = disk.test_snapshot().submitted;
         self.path.owner.cache = Some(
             Arc::try_new(checked(context, InodeCache::try_new(64))?)
@@ -90,6 +93,7 @@ impl UserOwner {
         context.expect_eq(root.filesystem().mode(), AccessMode::ReadOnly);
         context.expect_eq(root.filesystem().device() != old_device, true);
         drop(root);
+
         let event = self.run_named(context, PROGRAM, b"r", false, 0)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -116,6 +120,7 @@ impl UserOwner {
                 "production writeback cold reader issued no disk IO",
             ));
         }
+
         context.diagnostic(format_args!(
             "W35 production-writeback bytes=8229 writer-status=0 reader-status=0 old-cache-strong=0 old-volume-strong=0 old-metadata-strong=0 old-root-strong=0 old-vfs-strong=0 old-graph-strong=0 same-disk=1 cold-read-submitted={} disk-stopped=0",
             reads_after - reads_before
@@ -147,6 +152,7 @@ pub(super) mod cases {
             .div_ceil(PAGE_SIZE as u64)
             * PAGE_SIZE as u64;
         let end = base + 16 * PAGE_SIZE as u64;
+
         checked(
             context,
             inode.with_map_read(|metadata, root| {
@@ -166,6 +172,7 @@ pub(super) mod cases {
                 Ok(())
             }),
         )?;
+
         let mut folios: [Option<mm::FolioRef>; 16] = core::array::from_fn(|_| None);
         let mut held = Vec::new();
         let prepared = (|| -> Result<(u64, u64, u64, usize), TestError> {
@@ -185,6 +192,7 @@ pub(super) mod cases {
             else {
                 return Err(TestError("batch first file page not mapped"));
             };
+
             let target = first + PAGE_SIZE as u64 / block;
             let budget = volume.geometry().blocks_count - volume.geometry().first_data_block;
             // 本例没有并发分配者；second 的首 data 申请先于同次节点摘离，已占用目标此时不可申请。
@@ -236,6 +244,7 @@ pub(super) mod cases {
                 if target_state == Some(true) { "existing-unavailable" } else { "owned-token" },
                 reserved_bounds, held.len()
             ));
+
             let separators = held.len();
             let mut second = 0;
             for (index, slot) in folios.iter_mut().enumerate().skip(1) {
@@ -274,12 +283,14 @@ pub(super) mod cases {
             }
             Ok((first, target, second, separators))
         })();
+
         // 任一步失败均先显式归还全部未发表 token；已接受文件内容仍由原 fixture 真实同步。
         for separator in held.drain(..) {
             volume.release_unpublished_block(separator);
         }
         let (first, target, second, separators) = prepared?;
         context.expect_eq(first + PAGE_SIZE as u64 / block != second, true);
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -305,6 +316,7 @@ pub(super) mod cases {
                 .count(),
             true,
         );
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -317,6 +329,7 @@ pub(super) mod cases {
         );
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
+
         let mut verify_attempt = ReclaimAttempt::new();
         for (index, folio) in folios[..16].iter().enumerate() {
             bytes_at(
@@ -357,6 +370,7 @@ pub(super) mod cases {
                 && fixture.cold_volume.is_none()
                 && fixture.cold_cache.is_none()
         );
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let file = fixture.cold_open(context)?.0;
         let inode = fixture.inodes.last().unwrap().clone();
@@ -375,6 +389,7 @@ pub(super) mod cases {
         } else {
             [0, 2, 4, 6, 8]
         };
+
         let mut physical = [0u64; 5];
         for (index, logical) in logical.iter().copied().enumerate() {
             let offset = base + logical * block;
@@ -395,6 +410,7 @@ pub(super) mod cases {
         if !traditional {
             context.expect_eq(0 < mapped.depth, true);
         }
+
         let before = disk.test_snapshot();
         checked(context, file.sync_range(0..u64::MAX, false))?;
         let synced = disk.test_snapshot();
@@ -411,6 +427,7 @@ pub(super) mod cases {
             mm.map_file(SOURCE, 4096, RO, RO, file.clone(), base, false),
         )?;
         mapped_bytes(context, &mm, SOURCE, &[0x41]);
+
         let (reopened, reads_before) = fixture.cold_reopen(context, mm, file, inode, volume)?;
         let reloaded_inode = fixture.inodes.last().unwrap().clone();
         let mut reloaded_stat = checked(context, reopened.stat())?;
@@ -475,6 +492,7 @@ pub(super) mod cases {
             .div_ceil(PAGE_SIZE as u64)
             * PAGE_SIZE as u64;
         context.expect_eq(file.write_at(offset, &[0x31; 4096]), Ok(4096));
+
         let inode = fixture.inodes.last().unwrap().clone();
         // 普通增长可能给旧 EOF 尾页留下合法义务，先真实同步它，再只覆盖本例新页。
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
@@ -494,6 +512,7 @@ pub(super) mod cases {
                 .unwrap()
                 .file_page(offset / PAGE_SIZE as u64, &mut attempt),
         )?;
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -507,6 +526,7 @@ pub(super) mod cases {
                 && observed.blocked()
         })?;
         context.expect_eq(folio.dirty_sectors(), 0);
+
         let writing = file.clone();
         let mapping = alias.clone();
         let producer = fixture.consume_sync(1, move || {
@@ -534,6 +554,7 @@ pub(super) mod cases {
             (true, true),
         );
         bytes_at(context, &file, offset, &[0x31, 0x52, 0x73])?;
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -545,6 +566,7 @@ pub(super) mod cases {
                 .any(|dirty| dirty.ptr_eq(&inode)),
             true,
         );
+
         let first = disk.test_snapshot();
         checked(
             context,
@@ -587,6 +609,7 @@ pub(super) mod cases {
         let duplicate = checked(context, table.dup(fd, 1024))?;
         let duplicated = checked(context, table.lookup(duplicate))?;
         context.expect_eq(Arc::ptr_eq(&first, &duplicated), true);
+
         context.expect_eq(first.write_at(0, &[0x91; 4096]), Ok(4096));
         disk.test_fail_next_data(BlockError::Io);
         let error = Err(FsError::Io(BlockError::Io));
@@ -599,6 +622,7 @@ pub(super) mod cases {
         let seen = fixture.open(context, b"/test/write-reserve", 2)?;
         context.expect_eq(seen.sync_range(0..u64::MAX, false), Ok(()));
         context.expect_eq(disk.test_snapshot().data_submitted, failed.data_submitted);
+
         context.expect_eq(first.write_at(0, &[0xa2; 4096]), Ok(4096));
         disk.test_fail_next_data(BlockError::Io);
         context.expect_eq(crate::fs::writeback::sync_inode(&inode), error);
@@ -609,6 +633,7 @@ pub(super) mod cases {
         context.expect_eq(first.sync_range(0..u64::MAX, false), error);
         context.expect_eq(duplicated.sync_range(0..u64::MAX, false), Ok(()));
         context.expect_eq(second.sync_range(0..u64::MAX, false), error);
+
         let mut attempt = ReclaimAttempt::new();
         let folio = checked(
             context,
@@ -636,6 +661,7 @@ pub(super) mod cases {
             context,
             file.mapping_inode().unwrap().file_page(0, &mut attempt),
         )?;
+
         let image = fixture.shared_image(context, b"b")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -646,6 +672,7 @@ pub(super) mod cases {
             .lookup_thread(fixture.user.running.as_ref().unwrap().pid)
             .and_then(|user| user.executor())
             .ok_or(TestError("W12 user executor missing"))?;
+
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         let syncing = inode.clone();
@@ -656,6 +683,7 @@ pub(super) mod cases {
                 && disk.test_snapshot().inflight != 0
                 && first.blocked()
         })?;
+
         WriteOwner::release(&mm, 1)?;
         until("W12 sys82 did not really block on existing WB", || {
             sched::test_state(&executor) == State::Blocked
@@ -674,6 +702,7 @@ pub(super) mod cases {
                 .is_none(),
             true,
         );
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*first.result.lock(), Some(Ok(())));
@@ -702,6 +731,7 @@ pub(super) mod cases {
         if !disk.limits().flush {
             return Err(TestError("W13 requires negotiated real FLUSH"));
         }
+
         context.expect_eq(file.write_at(0, &[0xb3; 4096]), Ok(4096));
         let before = disk.test_snapshot();
         if flush {
@@ -726,9 +756,11 @@ pub(super) mod cases {
             file.mapping_inode().unwrap().file_page(0, &mut attempt),
         )?;
         context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
+
         disk.test_flush_completions();
         timer::sleep(time::Duration::from_millis(10));
         context.expect_eq(disk.test_snapshot().submitted, failed.submitted);
+
         context.expect_eq(file.sync_range(0..u64::MAX, false), Ok(()));
         let next = disk.test_snapshot();
         context.expect_eq(next.data_submitted, failed.data_submitted);
@@ -765,6 +797,7 @@ pub(super) mod cases {
                 .unwrap()
                 .file_page(1, &mut prepare_attempt),
         )?;
+
         let block = inode.block_size() as usize;
         let disk = fixture.user.path.owner.disk()?.clone();
         if block < PAGE_SIZE {
@@ -784,6 +817,7 @@ pub(super) mod cases {
                 (first.dirty_sectors(), first.writeback_sectors()),
                 (first_mask | neighbor_mask, 0),
             );
+
             let before_range = disk.test_snapshot();
             checked(context, file.sync_range(64..67, true))?;
             context.expect_eq(
@@ -807,6 +841,7 @@ pub(super) mod cases {
             );
             bytes_at(context, &file, 64, &[0xa6; 3])?;
             bytes_at(context, &file, block as u64 + 64, &[0xb7; 3])?;
+
             let before_neighbor = disk.test_snapshot();
             checked(
                 context,
@@ -835,6 +870,7 @@ pub(super) mod cases {
         } else {
             context.diagnostic(format_args!("W14 small-FS-block-range block-size={} branch-exercised=0 same-folio-neighbor-unavailable=1", block));
         }
+
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -846,6 +882,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq(mm.copyout(SOURCE + 29, &[0x77]).copied, 1);
         context.expect_eq(mm.copyout(SHARED_ALIAS + 29, &[0x88]).copied, 1);
+
         let before = disk.test_snapshot();
         vm(
             context,
@@ -860,6 +897,7 @@ pub(super) mod cases {
         context.expect_eq(disk.test_snapshot().submitted, before.submitted);
         context.expect_eq(second.dirty_sectors() != 0, true);
         context.expect_eq(first.dirty_sectors(), 0);
+
         context.expect_eq(
             mm.sync_mapping_range(SOURCE..SOURCE + 8192, true, false),
             Err(VmError::Unmapped),
@@ -873,6 +911,7 @@ pub(super) mod cases {
         bytes_at(context, &file, 29, &[0x66])?;
         mapped_bytes(context, &mm, SHARED_ALIAS + 29, &[0x88]);
         drop(mm);
+
         let image = fixture.shared_image(context, b"y")?;
         let user_mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -882,6 +921,7 @@ pub(super) mod cases {
         fixture.phase(&user_mm, 0, 2)?;
         context.expect_eq(disk.test_snapshot().submitted, no_io.submitted);
         context.expect_eq(second.dirty_sectors() != 0, true);
+
         WriteOwner::release(&user_mm, 2)?;
         fixture.finish_shared(context)?;
         context.diagnostic(format_args!("W14 nonzero-file-offset=1 range-only-page=1 private-and-async-no-IO=1 invalidate-no-purge=1 hole-ENOMEM-after-progress=1 ordinary-sys82-83-227-flags-and-range=1"));
@@ -904,6 +944,7 @@ pub(super) mod cases {
         context.expect_eq(file.write_at(0, &[0x22; 4096]), Ok(4096));
         let inode = fixture.inodes.last().unwrap().clone();
         checked(context, file.sync_range(0..u64::MAX, false))?;
+
         let image = fixture.shared_image(context, mode)?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -931,6 +972,7 @@ pub(super) mod cases {
             context,
             file.mapping_inode().unwrap().file_page(0, &mut attempt),
         )?;
+
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         disk.test_fail_next_data(BlockError::Io);
@@ -940,6 +982,7 @@ pub(super) mod cases {
                 && disk.test_snapshot().inflight != 0
                 && sched::test_state(&executor) == State::Blocked
         })?;
+
         let cursor = original.clone();
         let writing = file.clone();
         let unlocked = fixture.consume_sync(0, move || {
@@ -957,12 +1000,14 @@ pub(super) mod cases {
         )?;
         context.expect_eq(*unlocked.result.lock(), Some(Ok(())));
         context.expect_eq(folio.dirty_sectors() != 0, true);
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         fixture.phase(&mm, 0, 2)?;
         context.expect_eq(disk.test_completion_error_pending(), false);
         bytes_at(context, &file, 0, &[0x39, 0x33])?;
         context.expect_eq(original.seek(SeekFrom::Current(0)), Ok(1));
+
         if !disk.limits().flush {
             return Err(TestError("sync error probe requires device FLUSH"));
         }

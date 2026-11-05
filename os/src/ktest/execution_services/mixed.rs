@@ -116,6 +116,7 @@ fn participant(index: usize, timer: Pin<Arc<Timer>>, work: Pin<Arc<Work>>) -> i3
     let previous = slot.task.lock().replace(task::current_task());
     assert!(previous.is_none());
     drop(previous);
+
     for round in 0..ROUNDS {
         slot.timer_done.wait();
         if scenario().stop.load(Ordering::Acquire) {
@@ -124,6 +125,7 @@ fn participant(index: usize, timer: Pin<Arc<Timer>>, work: Pin<Arc<Work>>) -> i3
         slot.waited.fetch_add(1, Ordering::Relaxed);
         assert_eq!(slot.timer_callbacks.load(Ordering::Acquire), round + 1);
         assert_eq!(cpu::current().id, index);
+
         assert!(work
             .as_ref()
             .queue()
@@ -203,6 +205,7 @@ fn test_mixed() {
                 .expect("mixed participant allocation")
         })
     });
+
     let mut handles: [Option<ChildHandle>; MAX_CPUS] = [const { None }; MAX_CPUS];
     let mut tasks = 0;
     for (index, prepared) in IntoIterator::into_iter(prepared).enumerate() {
@@ -219,6 +222,7 @@ fn test_mixed() {
         .filter(|&index| initially_blocked(index, handles[index].as_ref().unwrap()))
         .count();
     assert_eq!(blocked, cpus);
+
     log::testing::wait_service_blocked();
     let seq_first = log::next_sequence();
     for timer in timers[..cpus].iter().flatten() {
@@ -232,6 +236,7 @@ fn test_mixed() {
         },
         "mixed participants stopped production",
     );
+
     for timer in timers[..cpus].iter().flatten() {
         timer.as_ref().close_sync();
     }
@@ -253,6 +258,7 @@ fn test_mixed() {
     }
     assert_eq!(stopped, 2 * cpus);
     assert_eq!(pending, 0);
+
     queue.close_sync();
     let _waiters = empty_sources(cpus);
     for handle in handles[..cpus].iter_mut() {
@@ -269,6 +275,7 @@ fn test_mixed() {
         wait_owned_tail(work);
     }
     drop((timers, works, queue, handles));
+
     let timer_callbacks = scenario().slots[..cpus]
         .iter()
         .map(|slot| slot.timer_callbacks.load(Ordering::Acquire))
@@ -290,6 +297,7 @@ fn test_mixed() {
     assert_eq!(work_callbacks, cpus * ROUNDS);
     assert_eq!(waited, 2 * cpus * ROUNDS);
     assert_eq!(drops, cpus);
+
     let catchup = log::next_sequence();
     let log_records = catchup.checked_sub(seq_first).unwrap();
     assert_eq!(log_records, (timer_callbacks + work_callbacks) as u64);
@@ -363,6 +371,7 @@ struct Scenario {
     stop: AtomicBool,
     slots: [Slot; MAX_CPUS],
 }
+
 static CURRENT: core::sync::atomic::AtomicPtr<Scenario> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -376,10 +385,12 @@ fn scenario() -> Arc<Scenario> {
         Arc::from_raw(pointer)
     }
 }
+
 struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
+
 impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
     fn set_up(
@@ -404,12 +415,14 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
             .is_ok());
         Ok(Self { state, initial })
     }
+
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
         self.state.nodes.stop()?;
         Ok(())
     }
+
     /// runner已join每个原Task；尾票归还以后才释放context/owner并比较完整两账。
     fn tear_down(self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         let mut owner = core::mem::ManuallyDrop::new(self);
@@ -421,6 +434,7 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
                 return Err(::ktest::TestError("mixed wait registrations remain"));
             }
         }
+
         let initial = owner.initial;
         let pointer = CURRENT.swap(core::ptr::null_mut(), Ordering::AcqRel);
         assert_eq!(pointer, Arc::as_ptr(&owner.state).cast_mut());
@@ -447,6 +461,7 @@ impl Scenario {
         }
     }
 }
+
 impl ServiceFixture {
     /// 混合协调者是原fixed-0 Task，参与者仍是每CPU真实PreparedChild，并独立拥有原节点。
     fn fixed(
@@ -460,6 +475,7 @@ impl ServiceFixture {
 #[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "integration", "klog"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
+
     /// 全部PreparedChild和原节点先准备后发表；每核八轮timer/work/Task完成与所有容量内日志逐条守恒。
     #[test]
     fn timer_work_task_log_convergence(

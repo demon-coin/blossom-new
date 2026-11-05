@@ -149,6 +149,7 @@ impl Bio {
                     mapped.segment(domain).map_err(BlockError::from)?;
                 }
             }
+
             let allocator = memory.allocator().control();
             let mut uninit = Arc::<BioInner, BioAllocator>::try_new_uninit_in(allocator)
                 .map_err(|_| BlockError::NoMemory)?;
@@ -196,6 +197,7 @@ impl Bio {
             }
             Ok(inner)
         })();
+
         match prepared {
             Ok(inner) => {
                 inner.state.lock().memory = Some(memory);
@@ -504,6 +506,7 @@ impl BioInner {
                 .take()
                 .expect("bio memory missing at admission")
         };
+
         let mut started = 0;
         let mut failure = None;
         for mapped in &mut memory {
@@ -537,6 +540,7 @@ impl BioInner {
                 }
             }
         }
+
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::Beginning);
         state.memory = Some(memory);
@@ -557,6 +561,7 @@ impl BioInner {
             .expect("bio child range overflow");
         assert!(end <= self.len);
         assert!(0 < length || self.operation == BlkOperation::Flush);
+
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::Active);
         assert!(state.generating, "bio child registered after generation");
@@ -652,6 +657,7 @@ impl BioInner {
             }
             state.end_obligation(bio.len)
         };
+
         if let Some((memory, result)) = completion {
             Self::complete(bio, memory, result, true, None, false);
         }
@@ -682,6 +688,7 @@ impl BioInner {
             state.generating = false;
             state.end_obligation(bio.len)
         };
+
         if let Some((memory, result)) = completion {
             return Self::complete(bio, memory, result, true, owner, true);
         }
@@ -734,6 +741,7 @@ impl BioInner {
                 };
             }
         }
+
         if queue_task && bio.needs_task() {
             let ticket = BioRawTicket::from_arc(Arc::clone(bio));
             let owned = ticket.pointer;
@@ -765,6 +773,7 @@ impl BioInner {
             );
             return true;
         }
+
         drop(bio.finalize(memory, result));
         false
     }
@@ -781,6 +790,7 @@ impl BioInner {
             }
             None => {}
         }
+
         let mut remaining = result.completed;
         for mapped in &mut memory {
             let completed = remaining.min(mapped.len());
@@ -794,6 +804,7 @@ impl BioInner {
                 })
             };
         }
+
         let claim = {
             let mut state = self.state.lock();
             assert_eq!(state.phase, Phase::Finishing);
@@ -830,6 +841,7 @@ fn finalizer_callback(work: Pin<&Work>) {
             state.completion_owner.take(),
         )
     };
+
     let bio = ticket.into_arc();
     let claim = bio.finalize(memory, result);
     if let Some(owner) = owner {

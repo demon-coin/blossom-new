@@ -1,6 +1,8 @@
 //! 唯一 UART 的同步测试协议；不经过可丢弃日志队列。
+
 use ::ktest::{CaseDesc, CaseOutcome, Failure, Phase, Status};
 use core::fmt::{self, Write};
+
 static OUTPUT: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
 /// 将同步格式化片段交给父提供的真实控制 UART。
@@ -24,8 +26,10 @@ fn json_escape(output: &mut impl Write, text: &str) -> fmt::Result {
     }
     Ok(())
 }
+
 /// 流式 JSON 字符串转义，不为长名称申请缓冲。
 pub(crate) struct Json(pub(crate) &'static str);
+
 impl fmt::Display for Json {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_char('"')?;
@@ -33,8 +37,10 @@ impl fmt::Display for Json {
         f.write_char('"')
     }
 }
+
 /// 输出 JSON 可空字符串。
 pub(crate) struct Nullable(pub(crate) Option<&'static str>);
+
 impl fmt::Display for Nullable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -52,6 +58,7 @@ impl Write for JsonEscape<'_, '_> {
     }
 }
 struct JsonFailure(Option<Failure>);
+
 impl fmt::Display for JsonFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -64,8 +71,10 @@ impl fmt::Display for JsonFailure {
         }
     }
 }
+
 /// 同一事件保存独立失败和 expect 计数，不用任一失败覆盖其它账本。
 struct AbortLedger<'a>(&'a CaseOutcome);
+
 impl fmt::Display for AbortLedger<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let outcome = self.0;
@@ -88,10 +97,12 @@ pub(crate) fn suite_begin(name: &str, count: usize) {
         name, count
     ));
 }
+
 /// 在任何 suite 或 case setup 之前登记开始。
 pub(crate) fn begin(id: u32) {
     write(format_args!("  # KTEST case-begin {}\n", id));
 }
+
 /// 公布真实阶段，caller 负责不重复或倒退。
 pub(crate) fn phase(id: u32, phase: Phase) {
     let name = match phase {
@@ -103,6 +114,7 @@ pub(crate) fn phase(id: u32, phase: Phase) {
     };
     write(format_args!("  # KTEST phase {} {}\n", id, name));
 }
+
 /// 只声明期望，不把元数据声明当作已经发生的故障。
 pub(crate) fn armed(id: u32, kind: &str) {
     write(format_args!("  # KTEST armed {} {}\n", id, kind));
@@ -132,11 +144,13 @@ impl Write for DiagnosticWriter<'_, '_> {
         Ok(())
     }
 }
+
 /// 同步诊断保持全文；每行进入非控制命名空间，不缓冲或重新分配作者消息。
 pub(crate) fn diagnostic(args: fmt::Arguments<'_>) {
     let _output = OUTPUT.lock();
     super::control_write(format_args!("{}\n", Diagnostic(args)));
 }
+
 /// 保存独立主、子、清理错误；仅一份实际结果。
 pub(crate) fn failures(outcome: &CaseOutcome) {
     for (name, failure) in [
@@ -152,6 +166,7 @@ pub(crate) fn failures(outcome: &CaseOutcome) {
         diagnostic(format_args!("expectations: {}", outcome.expectations));
     }
 }
+
 /// 发布唯一 KTAP 终态；调用方先完成适用的停止、join 和 fixture 清理。
 /// 静态 Skip 或准备失败可在 setup 结束，独立失败正文不进入结果单行。
 pub(crate) fn result(ordinal: usize, case: &CaseDesc, outcome: &CaseOutcome, skip: Option<&str>) {
@@ -176,6 +191,7 @@ pub(crate) fn result(ordinal: usize, case: &CaseDesc, outcome: &CaseOutcome, ski
     }
     super::control_write(format_args!("\n"));
 }
+
 /// 输出完整 Suite 终态后通过 QEMU 测试设备结束本次运行。
 pub(crate) fn complete(name: &str, passed: bool) -> ! {
     write(format_args!(
@@ -185,6 +201,7 @@ pub(crate) fn complete(name: &str, passed: bool) -> ! {
     ));
     crate::arch::test_shutdown()
 }
+
 /// 明确保存独立 SuiteError；未开始项由宿主记 NotRun，不伪造 case 结果。
 pub(crate) fn suite_error(name: &str, stage: &str, failure: Failure) -> ! {
     write(format_args!(
@@ -193,6 +210,7 @@ pub(crate) fn suite_error(name: &str, stage: &str, failure: Failure) -> ! {
     ));
     complete(name, false)
 }
+
 /// 未收敛实例只有 abort 终结；同一次锁内报告外层失败，再真实关机且不展开。
 pub(crate) fn case_abort(name: &str, id: u32, phase: Phase, outcome: &CaseOutcome) -> ! {
     let phase = match phase {
@@ -211,6 +229,7 @@ pub(crate) fn case_abort(name: &str, id: u32, phase: Phase, outcome: &CaseOutcom
     ));
     crate::arch::emergency_shutdown()
 }
+
 /// suite 哨兵保留独立 SuiteError；原因正文包含完整账本，不占用 case 身份。
 pub(crate) fn suite_abort(name: &str, stage: &str, outcome: &CaseOutcome) -> ! {
     let _output = OUTPUT.lock();
@@ -222,6 +241,7 @@ pub(crate) fn suite_abort(name: &str, stage: &str, outcome: &CaseOutcome) -> ! {
     ));
     crate::arch::emergency_shutdown()
 }
+
 /// 真实错误控制者调用；类型来自实际故障而非 armed 期望。
 /// 正文流式适配仍在一次无锁应急写入内完成，整条消息共享原 UART 有界预算。
 pub(crate) fn fatal_event(kind: &'static str, message: fmt::Arguments<'_>) -> ! {

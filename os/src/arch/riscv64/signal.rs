@@ -32,6 +32,7 @@ impl UserContext {
     pub(crate) fn setup_signal(&mut self, mm: &Mm, args: &SignalFrameArgs) -> Result<(), VmError> {
         let address = frame_address(self.gpr[2], args)?;
         let mut frame = [0u8; FRAME_SIZE];
+
         args.info.encode(&mut frame[..INFO_SIZE]);
         put_u64(&mut frame, ALTSTACK, args.altstack.base as u64);
         put_u32(&mut frame, ALTSTACK_FLAGS, args.altstack.flags);
@@ -49,6 +50,7 @@ impl UserContext {
             put_u64(&mut frame, FP + register * 8, self.fpr[register]);
         }
         put_u32(&mut frame, FCSR, self.fcsr as u32);
+
         // 清零缓冲同时给出 uc_flags/link、全部填充和无 V 的 END_MAGIC/END_HDR_SIZE。
         let progress = mm.copyout(address, &frame);
         if let Some(error) = progress.error {
@@ -77,6 +79,7 @@ impl UserContext {
             return Err(error);
         }
         debug_assert_eq!(progress.copied, FRAME_SIZE);
+
         // 此后端没有向量现场；未知扩展、非零保留字和错误终止大小均是坏帧。
         if get_u32(&frame, EXT_RESERVED) != 0
             || get_u32(&frame, EXT_HEADER) != 0

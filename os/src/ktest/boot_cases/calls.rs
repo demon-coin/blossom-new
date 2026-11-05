@@ -20,10 +20,12 @@ struct Control {
     returned: [AtomicBool; boot::MAX_CPUS],
     results: [AtomicUsize; boot::MAX_CPUS],
 }
+
 struct Calls {
     state: Arc<Control>,
     handles: [Option<ChildHandle>; boot::MAX_CPUS],
 }
+
 impl Fixture for Calls {
     /// 固定容量在任何真实请求发表前准备，主体失败仍由 fixture 保活所有门。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
@@ -45,12 +47,14 @@ impl Fixture for Calls {
             handles: core::array::from_fn(|_| None),
         })
     }
+
     /// 合作关闭等待门，已经发表的同步 call 必须实际返回，不能超时释放参数。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
         self.state.go.store(true, Ordering::Release);
         Ok(())
     }
+
     /// 框架已 join 全部原 Task，确认没有活同步请求才消费控制 owner。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         assert!(self
@@ -159,6 +163,7 @@ impl Calls {
             if token.stop_requested() || state.stop.load(Ordering::Acquire) {
                 return Ok(());
             }
+
             let _preempt = PreemptGuard::new();
             assert_eq!(cpu::current().id, sender);
             let mut payload = Payload {
@@ -186,6 +191,7 @@ impl Calls {
         })?);
         Ok(())
     }
+
     /// 启动门先等待本轮全部Task到达，保证pair/fan-in有真正并发发送者。
     fn release(&self, count: usize) -> TestResult {
         wait(
@@ -195,12 +201,14 @@ impl Calls {
         self.state.go.store(true, Ordering::Release);
         Ok(())
     }
+
     /// 消费真实离栈观测后核查目标身份、次数和不提前返回账本。
     fn finish(&self, context: &mut TestContext<'_>, sender: usize, target: usize) -> TestResult {
         wait(
             || self.handles[sender].as_ref().unwrap().try_join().is_some(),
             "synchronous call did not complete",
         )?;
+
         context.expect_eq(
             self.state.results[sender].load(Ordering::Acquire),
             target + 0x100,
@@ -228,12 +236,14 @@ fn pair_target(id: usize) -> usize {
 #[::ktest::suite(context = "Thread", fixture = Calls, tags("boot", "smp-call"), timeout_ms = 30000)]
 pub(crate) mod cases {
     use super::*;
+
     /// 每个实际核自调用，callback IRQ关闭且sender恢复开启。
     #[test]
     fn self_call(context: &mut TestContext<'_>, fixture: &mut Calls) -> TestResult {
         for id in 0..cpu::count() {
             fixture.sender(id, id, false, false, false)?;
         }
+
         fixture.release(cpu::count())?;
         for id in 0..cpu::count() {
             fixture.finish(context, id, id)?;
@@ -244,6 +254,7 @@ pub(crate) mod cases {
         );
         Ok(())
     }
+
     /// 每对在线 CPU 同时互发，奇数末核向 BSP 发送，所有调用者等待时仍服务 IPI。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -251,6 +262,7 @@ pub(crate) mod cases {
         for id in 0..cpu::count() {
             fixture.sender(id, pair_target(id), false, false, false)?;
         }
+
         fixture.release(cpu::count())?;
         for id in 0..cpu::count() {
             fixture.finish(context, id, pair_target(id))?;
@@ -263,6 +275,7 @@ pub(crate) mod cases {
         context.expect_eq(fixture.state.executed.load(Ordering::Acquire), targets);
         Ok(())
     }
+
     /// 全部核沿环向下一核发送，真实远端 callback 必须覆盖每个逻辑编号。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -270,6 +283,7 @@ pub(crate) mod cases {
         for id in 0..cpu::count() {
             fixture.sender(id, (id + 1) % cpu::count(), false, false, false)?;
         }
+
         fixture.release(cpu::count())?;
         for id in 0..cpu::count() {
             fixture.finish(context, id, (id + 1) % cpu::count())?;
@@ -280,6 +294,7 @@ pub(crate) mod cases {
         );
         Ok(())
     }
+
     /// 全部AP同时向BSP发送，每个发送者独立核一次结果可见性。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -287,12 +302,14 @@ pub(crate) mod cases {
         for id in 1..cpu::count() {
             fixture.sender(id, 0, false, false, false)?;
         }
+
         fixture.release(cpu::count() - 1)?;
         for id in 1..cpu::count() {
             fixture.finish(context, id, 0)?;
         }
         Ok(())
     }
+
     /// 单核自调用也经过同一有限callback暂停，不冒称远端路径。
     #[test]
     fn delayed_local(context: &mut TestContext<'_>, fixture: &mut Calls) -> TestResult {
@@ -302,6 +319,7 @@ pub(crate) mod cases {
         assert!(fixture.state.entered.load(Ordering::Acquire));
         Ok(())
     }
+
     /// AP调用BSP在真实callback暂停之后才返回，参数不能提前结束生命周期。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -312,6 +330,7 @@ pub(crate) mod cases {
         assert!(fixture.state.entered.load(Ordering::Acquire));
         Ok(())
     }
+
     /// 生产FIFO确认处理期间到达的两个新请求，原IPI处理循环必须再次取出它们。
     #[test]
     #[ktest(min_cpus = 4)]
@@ -320,6 +339,7 @@ pub(crate) mod cases {
         for id in 2..cpu::count() {
             fixture.sender(id, 0, false, false, true)?;
         }
+
         fixture.release(cpu::count() - 1)?;
         for id in 1..cpu::count() {
             fixture.finish(context, id, 0)?;

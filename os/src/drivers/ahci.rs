@@ -26,6 +26,7 @@ use registers::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 完整 ABAR 包含全局窗口和规范允许的全部端口窗口。
 pub(crate) const MMIO_BYTES: usize =
     registers::PORT_BASE + registers::MAX_PORTS as usize * registers::PORT_BYTES;
@@ -214,6 +215,7 @@ impl Ahci {
         if device_mask == 0 || device_mask & device_mask.wrapping_add(1) != 0 {
             return Err(BlockError::InvalidRange);
         }
+
         // SAFETY: 调用者保证本次资源为实际 ABAR，完整强序窗口和独占硬件的寿命覆盖控制器。
         let host = unsafe { Host::new(resources.registers) }?;
         let (cap, ports) = host.initialize(resources.ports_implemented)?;
@@ -230,6 +232,7 @@ impl Ahci {
             DMA_CACHE_LINE_BYTES,
             resources.dma_coherent,
         )?;
+
         let mut selected = None;
         for index in 0..registers::MAX_PORTS {
             if ports & (1 << index) == 0 {
@@ -259,6 +262,7 @@ impl Ahci {
             }
             return Ok(None);
         };
+
         let controls = Controls::allocate(domain)?;
         port.start_fis_rx(
             controls.list.region().device.value(),
@@ -306,6 +310,7 @@ impl Ahci {
             );
             return Err(BlockError::Unsupported);
         }
+
         // 构造 Arc 前收回设备访问权，保持识别命令准备期间控制页由 CPU 独占。
         // Arc 分配失败或命令准备提前返回时，控制页也只能在确认停止后释放。
         if !port.stop_polled() {
@@ -330,6 +335,7 @@ impl Ahci {
             waiters: WaitQueue::new(),
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         match controller.identify_polled() {
             Ok(identify) => {
                 Arc::get_mut(&mut controller)
@@ -475,6 +481,7 @@ impl Ahci {
         if let Err(error) = self.prepare_transfer(operation, sector, bytes, ranges) {
             return failed(error);
         }
+
         {
             let mut state = self.state.lock();
             if !state.published || !state.accepting {
@@ -491,6 +498,7 @@ impl Ahci {
             }
             self.issue(&mut state, true);
         }
+
         let deadline = time::now()
             .checked_add(COMMAND_TIMEOUT)
             .expect("AHCI command deadline overflow");
@@ -505,6 +513,7 @@ impl Ahci {
             self.request_reset();
             return failed(BlockError::StopUnconfirmed);
         }
+
         let transferred = match self.controls.transferred() {
             Ok(transferred) => transferred,
             Err(error) => {
@@ -561,6 +570,7 @@ impl Ahci {
         if ata::MAX_BYTES < bytes || ata::MAX_PRDT < ranges.len() {
             return Err(BlockError::InvalidRange);
         }
+
         let command = identify.command(operation, sector, bytes)?;
         let mut entries = 0;
         for range in ranges {
@@ -579,6 +589,7 @@ impl Ahci {
                 entries += 1;
             }
         }
+
         self.controls
             .command(&command, operation == BlkOperation::Write, entries)
     }
@@ -641,6 +652,7 @@ impl Ahci {
             ));
             // SAFETY: timeout/Waker 栈地址固定，退出本轮前同步取消等待真实回调尾部。
             unsafe { timeout.as_ref().arm_borrowed(deadline) }.expect("AHCI timeout rejected");
+
             self.acknowledge();
             let mut result = self.completion();
             if result.is_none() && time::now() < deadline {
@@ -654,6 +666,7 @@ impl Ahci {
             } else if result.is_none() {
                 result = Some(Err(BlockError::Io));
             }
+
             drop(registration);
             drop(waiter);
             timeout.as_ref().cancel_sync();
@@ -709,6 +722,7 @@ impl Ahci {
             )
         }?;
         self.controls.command(&ata::fis(ata::IDENTIFY), false, 1)?;
+
         {
             let mut state = self.state.lock();
             self.issue(&mut state, false);
@@ -726,6 +740,7 @@ impl Ahci {
         if !self.stop_bounded(false) {
             return Err(BlockError::StopUnconfirmed);
         }
+
         let transferred = self.controls.transferred()?;
         // SAFETY: ST/CR/FRE/FR 已完整停止，IDENTIFY owner 原页仍存活，期间无 CPU 访问。
         unsafe {
@@ -741,6 +756,7 @@ impl Ahci {
         if transferred != ata::IDENTIFY_BYTES {
             return Err(BlockError::ShortIo);
         }
+
         let mut words = [0; ata::IDENTIFY_WORDS];
         // SAFETY: 完成同步且完整停止后独占读取 512B；CPU 不保留越过本作用域的 DMA 切片。
         unsafe {

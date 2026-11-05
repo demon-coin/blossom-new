@@ -25,6 +25,7 @@ pub(crate) const PCI_FUNCTION_SHIFT: u32 = 8;
 pub(crate) const PCI_DEVICE_COUNT: u8 = 32;
 pub(crate) const PCI_FUNCTION_COUNT: u8 = 8;
 pub(crate) const PCI_INTX_PIN_COUNT: u8 = 4;
+
 /// 所选控制器的 source 表容量，PLIC 包含保留的零号源。
 pub const MAX_INTERRUPT_SOURCES: usize = if cfg!(blossom_platform = "visionfive2") {
     136 + 1
@@ -402,6 +403,7 @@ impl PciResources {
         {
             return Err("PCI INTx BDF or pin is out of range");
         }
+
         let child = [
             ((bus as u32) << PCI_BUS_SHIFT)
                 | ((device as u32) << PCI_DEVICE_SHIFT)
@@ -508,6 +510,7 @@ impl BootInfo {
         if MAX_RESERVED_REGIONS <= self.reserved_count {
             return Err("boot reservation capacity exceeded");
         }
+
         self.reserved[self.reserved_count] = region;
         self.reserved_no_map[self.reserved_count] = no_map;
         self.reserved_count += 1;

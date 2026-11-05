@@ -21,6 +21,7 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
     {
         return Err("TOY RTC resource window is invalid");
     }
+
     let base = mmio_address(region.start);
     // SAFETY: 调用契约保证真实 RTC 资源和永久映射，上面的检查覆盖全部 u32 寄存器；
     // BSP 独占控制寄存器，TOY enable 不写日历，不生成默认时间。
@@ -29,6 +30,7 @@ pub unsafe fn board_rtc_calendar(info: &BootInfo) -> Result<Option<[u32; 6]>, &'
         control.write_volatile(control.read_volatile() | TOY_ENABLE);
     }
     dma_barrier();
+
     for _ in 0..MAX_CALENDAR_SAMPLES {
         // SAFETY: year/read0 寄存器均在已验证且对齐的资源内，只有 BSP 访问；
         // 每组 volatile 读之间设备屏障保证硬件采样顺序，年变化时放弃该组。

@@ -54,6 +54,7 @@ pub(crate) mod stack {
         let before = table.ktest_udp_storage();
         let root_before = fixture.net.tables().ktest_udp_storage();
         context.expect_eq(before[0].0, before[0].1);
+
         let mut pressure = HeapPressure::prepare()?;
         fixture.net.work_queue().flush();
         let evidence = pressure.exhaust();
@@ -74,6 +75,7 @@ pub(crate) mod stack {
             .lookup_udp(SERVER, source)
             .map(|entry| entry.id());
         drop(pressure);
+
         context.diagnostic(format_args!(
             "UDP owner table capacity={} pressure={:?} insert={:?}",
             before[0].1, evidence, result
@@ -85,6 +87,7 @@ pub(crate) mod stack {
         context.expect_eq(old_present, true);
         context.expect_eq(unpublished, true);
         context.expect_eq(root_key, Some(first.id()));
+
         child_operation(table.insert_udp(Arc::clone(&candidate)))?;
         context.expect_eq(table.ktest_udp_storage()[0].0, before[0].0 + 1);
         context.expect_eq(
@@ -104,6 +107,7 @@ pub(crate) mod stack {
             );
             receive_exact(receiver, &payload, expected_source)?;
         }
+
         drop(table);
         for endpoint in &fillers {
             endpoint.close();
@@ -143,6 +147,7 @@ pub(crate) mod stack {
             receive_exact(&endpoint, &bytes, source)?;
             old.push(endpoint);
         }
+
         let before = fixture.net.tables().ktest_udp_storage();
         let start =
             Arc::try_new(Completion::new()).map_err(|_| TestError("UDP parallel start OOM"))?;
@@ -163,6 +168,7 @@ pub(crate) mod stack {
                 }
                 Ok(0)
             })?;
+
         ready.wait();
         start.complete();
         for index in 0..129u16 {
@@ -183,6 +189,7 @@ pub(crate) mod stack {
             before,
             fixture.net.tables().ktest_udp_storage()
         ));
+
         for (index, endpoint) in new.iter().enumerate() {
             let local = endpoint
                 .local()
@@ -194,6 +201,7 @@ pub(crate) mod stack {
             );
             receive_exact(endpoint, &bytes, source)?;
         }
+
         for endpoint in &new {
             endpoint.close();
         }
@@ -201,6 +209,7 @@ pub(crate) mod stack {
         drop((new, sender));
         socket_retired(&fixture.net)
     }
+
     /// IPv6 通配 port0 的同一租约覆盖 IPv4，V6ONLY port0 则允许同端口的 IPv4 绑定。
     #[test]
     fn udp_dual_stack_port_zero_reserves_both_protocol_faces(
@@ -225,6 +234,7 @@ pub(crate) mod stack {
             }),
             Err(FsError::AddressInUse),
         );
+
         let native = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv6))?;
         operation(context, native.set_v6_only(true))?;
         let native_local = operation(
@@ -239,6 +249,7 @@ pub(crate) mod stack {
             port: native_local.port,
         };
         context.expect_eq(operation(context, ipv4.bind(ipv4_local))?, ipv4_local);
+
         dual.close();
         native.close();
         ipv4.close();
@@ -349,6 +360,7 @@ pub(crate) mod stack {
                 Ok(0)
             })?);
         }
+
         observe(
             || ready.load(Ordering::Acquire) == 2,
             "automatic port participants did not reach start gate",
@@ -357,6 +369,7 @@ pub(crate) mod stack {
         for handle in handles {
             context.expect_eq(handle.join()?, 0);
         }
+
         let ports = ports.lock();
         context.expect_eq(ports.len(), 64);
         for (index, port) in ports.iter().enumerate() {
@@ -380,6 +393,7 @@ pub(crate) mod stack {
         )?;
         operation(context, client.connect(SERVER))?;
         let server = accepted(context, &listener, &client)?;
+
         let input: [u8; 1025] = ::core::array::from_fn(pattern);
         let mut output = [0u8; 1025];
         let mut sent = 0;
@@ -425,6 +439,7 @@ pub(crate) mod stack {
             timer::sleep(time::Duration::from_millis(1));
         }
         context.expect_eq(output, input);
+
         let tail = b"background final tail";
         context.expect_eq(
             operation(context, client.lock().send(&mut WriteBuffer::kernel(tail)))?,
@@ -494,6 +509,7 @@ pub(crate) mod stack {
         )?;
         let server_a = accepted(context, &listener_a, &client_a)?;
         let server_b = accepted(context, &listener_b, &client_b)?;
+
         let held = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("operation ownership observation allocation failed"))?;
         let held_by_a = Arc::clone(&held);
@@ -524,6 +540,7 @@ pub(crate) mod stack {
             || held.load(Ordering::Acquire),
             "A did not acquire actual operation guard",
         )?;
+
         let b = Arc::clone(&client_b);
         let target_cpu = b.work_cpu();
         let child = crate::ktest::spawn_result_on(target_cpu, move |_| {
@@ -557,6 +574,7 @@ pub(crate) mod stack {
         );
         context.expect_eq(output, ::core::array::from_fn(pattern));
         context.expect_eq(server_a.state(), State::Established);
+
         fixture.release.store(true, Ordering::Release);
         context.expect_eq(holder.join()?, 0);
         Ok(())
@@ -611,6 +629,7 @@ pub(crate) mod stack {
             context.expect_eq(record.original_len, payload.len());
             context.expect_eq(&bytes[..record.copied], payload);
         }
+
         let after = operation(context, fixture.net.statistics(InterfaceId::Loopback))?;
         context.expect_eq(after.rx_bytes.wrapping_sub(before.rx_bytes), 73);
         context.expect_eq(after.rx_packets.wrapping_sub(before.rx_packets), 2);
@@ -628,6 +647,7 @@ pub(crate) mod stack {
             )?,
             None,
         );
+
         udp.close();
         observe(
             || {
@@ -693,6 +713,7 @@ pub(crate) mod stack {
                 context.expect_eq(metadata.local_address, Some(address));
             }
             context.expect_eq(raw.can_recv(), false);
+
             raw.set_recv_budget(64);
             let first: [u8; 32] = ::core::array::from_fn(pattern);
             let second: [u8; 32] = ::core::array::from_fn(|index| pattern(index + 32));
@@ -730,6 +751,7 @@ pub(crate) mod stack {
                     .0,
                 &second[..],
             );
+
             raw.set_send_budget(32);
             let metadata = raw_udp::UdpMetadata {
                 endpoint: (source, CLIENT.port).into(),
@@ -804,6 +826,7 @@ pub(crate) mod stack {
             || listener_weak.upgrade().is_none(),
             "closed listener retained after retirement",
         )?;
+
         let mut nodes: Vec<Arc<UdpEndpoint>> = Vec::new();
         nodes
             .try_reserve_exact(129)
@@ -820,6 +843,7 @@ pub(crate) mod stack {
         }
         drop(nodes);
         socket_retired(&fixture.net)?;
+
         let recovered = operation(context, fixture.net.try_new_udp(AddressFamily::Ipv4))?;
         recovered.close();
         Ok(())
@@ -866,6 +890,7 @@ pub(crate) mod stack {
                 LOOPBACK_MTU,
             ),
         )?;
+
         let entered = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("egress gate observation allocation failed"))?;
         let gate_entered = Arc::clone(&entered);
@@ -924,6 +949,7 @@ pub(crate) mod stack {
                         return Err(TestError("egress queue exceeded actual packet capacity"))
                     }
                 };
+
                 child_operation(client.connect(InetEndpoint {
                     port: 45420,
                     ..SERVER
@@ -946,6 +972,7 @@ pub(crate) mod stack {
                 drop(unaccepted);
                 Ok(())
             })();
+
             release.store(true, Ordering::Release);
             let joined = child.join();
             result?;
@@ -957,6 +984,7 @@ pub(crate) mod stack {
         context.expect_eq(controller.join()?, 0);
         let server = accepted(context, &listener, &client)?;
         context.expect_eq(fixture.net.egress_waiting(client.id()), false);
+
         let input = b"capacity recovered stream";
         context.expect_eq(
             operation(context, client.lock().send(&mut WriteBuffer::kernel(input)))?,
@@ -1020,6 +1048,7 @@ pub(crate) mod stack {
                 .lock()
                 .send(&mut WriteBuffer::kernel(b"pending TCP shutdown")),
         )?;
+
         drop(fixture.owner.take());
         context.expect_eq(fixture.net.is_stopping(), true);
         context.expect_eq(client.state(), State::Closed);
@@ -1031,6 +1060,7 @@ pub(crate) mod stack {
             Err(FsError::NotConnected),
         );
         context.expect_eq(udp.local(), None);
+
         match fixture.net.try_new_udp(AddressFamily::Ipv4) {
             Err(FsError::NotConnected) => {}
             _ => return Err(TestError("stopped network accepted new endpoint ownership")),

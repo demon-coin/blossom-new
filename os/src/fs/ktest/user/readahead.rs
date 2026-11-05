@@ -19,6 +19,7 @@ const FULL_PAGES: usize = 64;
 const TAIL_BYTES: usize = 37;
 const FILE_BYTES: u64 = (FULL_PAGES * PAGE_SIZE + TAIL_BYTES) as u64;
 const FAULT_ADDRESS: usize = 0x4c00_0000;
+
 const RO: PagePermissions = PagePermissions {
     read: true,
     write: false,
@@ -60,6 +61,7 @@ fn prepare_file(
             return Err(TestError("readahead input write was short"));
         }
     }
+
     let offset = (FULL_PAGES * PAGE_SIZE) as u64;
     for (index, byte) in bytes[..TAIL_BYTES].iter_mut().enumerate() {
         *byte = pattern_byte(offset + index as u64);
@@ -163,6 +165,7 @@ fn batch_evidence(
     context.expect_eq(snapshot.captured_pages, pages);
     context.expect_eq(snapshot.accepted_bytes, pages * PAGE_SIZE);
     context.expect_eq(0 < snapshot.bios && 0 < snapshot.multi_page_bios, true);
+
     let first = checked(
         context,
         inode.map_block(start * (PAGE_SIZE / inode.block_size() as usize) as u64),
@@ -299,6 +302,7 @@ pub(crate) mod reads {
             context.expect_eq(demand.result(), None);
             context.expect_eq(disk.test_snapshot().completed, before.completed);
             batch_evidence(context, &inode, 0, 4, false)?;
+
             let previous = history(&first)?;
             let faulting = mm.clone();
             let fault = fixture.consume_sync(1, move || {
@@ -327,6 +331,7 @@ pub(crate) mod reads {
             context.expect_eq(matches_pattern(&bytes, 63 * PAGE_SIZE as u64), true);
             Ok(())
         })();
+
         disk.test_resume_completions();
         let joined = fixture.join_consumers();
         held?;
@@ -383,6 +388,7 @@ pub(crate) mod reads {
             context.expect_eq(disk.test_snapshot().completed, before_async.completed);
             batch_evidence(context, &inode, 4, 8, false)
         })();
+
         disk.test_resume_completions();
         let joined = fixture.join_consumers();
         asynchronous?;
@@ -418,6 +424,7 @@ pub(crate) mod reads {
             random_before.file_read_submitted < disk.test_snapshot().file_read_submitted,
             true,
         );
+
         checked(context, random.seek(SeekFrom::Start(52 * PAGE_SIZE as u64)))?;
         checked(context, read_page(&random, 52))?;
         context.expect_eq(
@@ -487,6 +494,7 @@ pub(crate) mod reads {
         let copied = mm.copyin(&mut bytes, FAULT_ADDRESS + PAGE_SIZE);
         context.expect_eq((copied.copied, copied.error), (PAGE_SIZE, None));
         context.expect_eq(matches_pattern(&bytes, 30 * PAGE_SIZE as u64), true);
+
         let random_history = history(&random)?;
         for page in 2..FULL_PAGES as u64 {
             checked(context, read_page(&first, page))?;
@@ -568,6 +576,7 @@ pub(crate) mod reads {
         drop(tail);
         finish_reads(&disk)?;
         prune_clean(context, &inode)?;
+
         let sequential = fixture.open(context, PATHNAME, 0)?;
         checked(context, read_page(&sequential, 0))?;
         batch_evidence(context, &inode, 0, 4, true)?;
@@ -583,6 +592,7 @@ pub(crate) mod reads {
             )?;
             context.expect_eq(trigger.result(), Some(Ok(())));
             batch_evidence(context, &inode, 4, 8, false)?;
+
             let original = inode
                 .mapping()
                 .cached_folio(4)
@@ -609,6 +619,7 @@ pub(crate) mod reads {
             context.expect_eq(disk.test_snapshot().completed, before.completed);
             Ok((original, truncate))
         })();
+
         disk.test_resume_completions();
         let joined = fixture.join_consumers();
         let (original, truncate) = blocked?;
@@ -693,6 +704,7 @@ pub(crate) mod reads {
                 "prefix regression requires one real two-page read slot",
             ));
         }
+
         let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(2)
@@ -739,6 +751,7 @@ pub(crate) mod reads {
             );
             memory.push(mapped);
         }
+
         let sector = checked(context, inode.disk_volume())?
             .view()
             .absolute_byte(first_block * block_size as u64, 2 * PAGE_SIZE)
@@ -761,6 +774,7 @@ pub(crate) mod reads {
             .submit_bio(bio);
         drop(invalidate);
         drop(prepared);
+
         let result = completion.wait();
         completion.test_flush_finalizer();
         finish_reads(&disk)?;
@@ -781,6 +795,7 @@ pub(crate) mod reads {
         context.expect_eq(after.submitted - before.submitted, 1);
         context.expect_eq(after.completed - before.completed, 1);
         context.expect_eq(after.inflight, 0);
+
         let first = originals[0].as_ref().unwrap();
         let failed = originals[1].as_ref().unwrap();
         context.expect_eq(first.phys_addr() == failed.phys_addr(), false);

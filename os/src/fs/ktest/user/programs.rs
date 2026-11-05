@@ -332,6 +332,7 @@ pub(crate) mod programs {
     fn runtime_clock(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.runtime_clock(context)
     }
+
     /// 根凭据从真实 C 程序消费限额、fork 与 exec 主栈范围，退出后沿原用户拥有者归还。
     #[test]
     #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
@@ -424,6 +425,7 @@ pub(crate) mod programs {
                 AccessMode::ReadOnly,
             ),
         )?;
+
         let event = fixture.run_named(context, b"/test/bin/user-device-map", b"raw", false, 0)?;
         context.expect_eq(event.status, 0);
         Ok(())
@@ -469,6 +471,7 @@ pub(crate) mod programs {
             checked(context, write::inode_allocation_bit(&volume, number))?,
             true,
         );
+
         if replace {
             drop(checked(
                 context,
@@ -518,6 +521,7 @@ pub(crate) mod programs {
             );
         }
         context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 0);
+
         let watch = fixture.path.owner.cache().watch();
         drop(inode);
         drop(path);
@@ -557,6 +561,7 @@ pub(crate) mod programs {
         context.expect_eq(denied.mode & 0o005, 0);
         context.expect_eq(no_search.kind, InodeKind::Directory);
         context.expect_eq(no_search.mode & 0o005, 0o004);
+
         let credentials = Credentials {
             uid: [1, 2, 3]
                 .iter()
@@ -573,6 +578,7 @@ pub(crate) mod programs {
             "user-access-credentials uid={} gid={} denied_owner={}:{} no_search_owner={}:{}",
             credentials.uid, credentials.gid, denied.uid, denied.gid, no_search.uid, no_search.gid
         ));
+
         let event = fixture.run_named_as(
             context,
             b"/test/bin/user-io",
@@ -647,6 +653,7 @@ pub(crate) mod programs {
         fixture.prepare(context)?;
         let event = fixture.run_named(context, b"/test/bin/user-signal", b"a", false, 0)?;
         context.expect_eq(event.status, 0);
+
         let reset = fixture.run_named(context, b"/test/bin/user-signal", b"x", false, 10)?;
         context.expect_eq(reset.status, 10);
         Ok(())
@@ -726,8 +733,10 @@ pub(crate) mod programs {
         fixture.prepare(context)?;
         let returned = fixture.run_named(context, b"/test/bin/user-signal", b"b", false, 11)?;
         context.expect_eq(returned.status, 11);
+
         let written = fixture.run_named(context, b"/test/bin/user-signal", b"w", false, 11)?;
         context.expect_eq(written.status, 11);
+
         let privileged = fixture.run_named(context, b"/test/bin/user-signal", b"k", false, 11)?;
         context.expect_eq(privileged.status, 11);
         Ok(())

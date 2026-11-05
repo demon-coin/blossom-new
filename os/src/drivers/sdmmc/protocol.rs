@@ -13,6 +13,7 @@ pub(super) const BOUNCE_BYTES: usize = 64 * 1024;
 const DESCRIPTOR_DATA_BYTES: usize = 4096;
 pub(super) const DESCRIPTORS: usize = BOUNCE_BYTES / DESCRIPTOR_DATA_BYTES;
 pub(super) const DESC_BYTES: usize = DESCRIPTORS * core::mem::size_of::<Descriptor>();
+
 pub(super) const OWN: u32 = 1 << 31;
 const FIRST_DESCRIPTOR: u32 = 1 << 3;
 const LAST_DESCRIPTOR: u32 = 1 << 2;
@@ -37,6 +38,7 @@ pub(super) const WRITE_MULTIPLE_BLOCK: u32 = 25;
 pub(super) const APP_OP_COND: u32 = 41;
 pub(super) const APP_SEND_SCR: u32 = 51;
 pub(super) const APP_CMD: u32 = 55;
+
 pub(super) const IF_COND_CHECK_PATTERN: u32 = 0xaa;
 pub(super) const IF_COND_VOLTAGE_27_36: u32 = 1 << 8;
 pub(super) const IF_COND_ARGUMENT: u32 = IF_COND_VOLTAGE_27_36 | IF_COND_CHECK_PATTERN;
@@ -44,6 +46,7 @@ pub(super) const IF_COND_RESPONSE_MASK: u32 = 0xfff;
 pub(super) const OCR_VOLTAGE_27_36: u32 = 0x00ff_8000;
 pub(super) const OCR_HIGH_CAPACITY: u32 = 1 << 30;
 pub(super) const OCR_POWER_UP_COMPLETE: u32 = 1 << 31;
+
 pub(super) const R1_APP_CMD: u32 = 1 << 5;
 const R1_STATUS_ERRORS: u32 = 0xfff9_a000;
 const R1_AUTHENTICATION_SEQUENCE_ERROR: u32 = 1 << 3;
@@ -52,18 +55,21 @@ const R1_READY_FOR_DATA: u32 = 1 << 8;
 const R1_STATE_SHIFT: u32 = 9;
 const R1_STATE_MASK: u32 = 15;
 const R1_STATE_TRAN: u32 = 4;
+
 const R6_COM_CRC_ERROR: u32 = 1 << 15;
 const R6_ILLEGAL_COMMAND: u32 = 1 << 14;
 const R6_ERROR: u32 = 1 << 13;
 pub(super) const R6_ERRORS: u32 = R6_COM_CRC_ERROR | R6_ILLEGAL_COMMAND | R6_ERROR;
 pub(super) const RCA_SHIFT: u32 = 16;
 pub(super) const RCA_MASK: u32 = (u16::MAX as u32) << RCA_SHIFT;
+
 pub(super) const SCR_BYTES: usize = core::mem::size_of::<u64>();
 pub(super) const SCR_STRUCTURE_SHIFT: u32 = 60;
 pub(super) const SCR_BUS_WIDTH_1: u64 = 1 << 48;
 pub(super) const SCR_BUS_WIDTH_4: u64 = 1 << 50;
 pub(super) const SD_BUS_WIDTH_4: u32 = 2;
 pub(super) const CSD_WRITE_PROTECT: u128 = (1 << 13) | (1 << 12);
+
 pub(super) const IDENTIFICATION_HZ: u32 = 400_000;
 const DEFAULT_SPEED_HZ: u32 = 25_000_000;
 
@@ -79,6 +85,7 @@ const CSD_V2_SIZE_SHIFT: u32 = 48;
 const CSD_V2_SIZE_MASK: u128 = 0x3f_ffff;
 const CSD_V2_CAPACITY_UNIT_BYTES: u64 = 512 * 1024;
 const CSD_V2_SECTORS_PER_SIZE: u64 = CSD_V2_CAPACITY_UNIT_BYTES / SECTOR_BYTES;
+
 const CSD_TRANSFER_SPEED_SHIFT: u32 = 96;
 const TRANSFER_SPEED_RESERVED: usize = 1 << 7;
 const TRANSFER_SPEED_UNIT_MASK: usize = 7;
@@ -246,6 +253,7 @@ pub(super) fn descriptors(
     {
         return Err(BlockError::InvalidRange);
     }
+
     let used = bytes.div_ceil(DESCRIPTOR_DATA_BYTES);
     for (index, descriptor) in table.iter_mut().enumerate() {
         *descriptor = if index < used {
@@ -288,9 +296,11 @@ mod behavior {
         assert_eq!(capacity(v2, true), Ok(16_777_216));
         assert_eq!(capacity(v1, true), Err(BlockError::Unsupported));
         assert_eq!(capacity(2u128 << 126, true), Err(BlockError::Unsupported));
+
         assert_eq!(address(0x7f_ffff, false), Ok(0xffff_fe00));
         assert_eq!(address(0x80_0000, false), Err(BlockError::InvalidRange));
         assert_eq!(address(u32::MAX as u64, true), Ok(u32::MAX));
+
         assert!(ready((4 << 9) | (1 << 8)));
         assert!(!ready((7 << 9) | (1 << 8)));
         assert_eq!(check_r1(1 << 22), Err(BlockError::Io));
@@ -327,6 +337,7 @@ mod behavior {
             fifo_geometry(0x240a, 2 << 7, 0, 0x207),
             Err(BlockError::InvalidRange)
         );
+
         assert_eq!(fifo_geometry(0x240a, 1 << 7, 0x100, 0x104), Ok((0x100, 4)));
         assert_eq!(
             fifo_geometry(0x2409, 1 << 7, 0x102, 0x108),
@@ -336,6 +347,7 @@ mod behavior {
             fifo_geometry(0x240a, 3 << 7, 0, 0x208),
             Err(BlockError::Unsupported)
         );
+
         assert_eq!(fifo_depth(Some(2), 0), Ok(2));
         assert_eq!(fifo_depth(Some(4096), 0), Ok(4096));
         assert_eq!(fifo_depth(Some(0), u32::MAX), Err(BlockError::Unsupported));

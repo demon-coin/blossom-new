@@ -57,6 +57,7 @@ pub(super) mod cases {
             3 => (2 * PAGE_SIZE + 9, PAGE_SIZE),
             _ => unreachable!(),
         };
+
         checked(context, file.truncate(0))?;
         for offset in (0..size).step_by(PAGE_SIZE) {
             let length = PAGE_SIZE.min(size - offset);
@@ -68,6 +69,7 @@ pub(super) mod cases {
                 length,
             );
         }
+
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("truncate shared MM owner OOM"))?;
         vm(
@@ -90,6 +92,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq(private.copyout(SHARED_ALIAS, &[0x83]).copied, 1);
         let private_pfn = private.mapping(SHARED_ALIAS).unwrap().physical;
+
         checked(context, file.seek(SeekFrom::Start((size + 17) as u64)))?;
         checked(context, file.truncate(prefix as u64))?;
         context.expect_eq(checked(context, file.stat())?.size, prefix as u64);
@@ -103,6 +106,7 @@ pub(super) mod cases {
         let mut eof = [0xa7];
         context.expect_eq(file.read_at(prefix as u64, &mut eof), Ok(0));
         context.expect_eq(eof, [0xa7]);
+
         // 页内 EOF 的有效页再次暖 W；精确页边界之前的整页写许可无需因增长撤销。
         context.expect_eq(mm.copyout(SOURCE + prefix - 1, &[0x65]).copied, 1);
         let old_tail = SOURCE + (prefix - 1) / PAGE_SIZE * PAGE_SIZE;
@@ -134,6 +138,7 @@ pub(super) mod cases {
         bytes_at(context, &file, (size - 1) as u64, &[0x7e])?;
         context.expect_eq(mm.copyout(SOURCE + size - 1, &[0]).copied, 1);
         truncate_contents(context, &file, Some(&mm), prefix, size)?;
+
         drop(private);
         let before_sync = disk.test_snapshot();
         checked(context, file.sync_range(0..u64::MAX, false))?;
@@ -148,6 +153,7 @@ pub(super) mod cases {
         let stat = checked(context, file.stat())?;
         let root = checked(context, inode.with_map_read(|_, root| Ok(*root)))?;
         let mapped = tree(context, &inode)?;
+
         let (reopened, reads_before) = fixture.cold_reopen(context, mm, file, inode, volume)?;
         let reloaded_inode = fixture.inodes.last().unwrap().clone();
         let mut reloaded_stat = checked(context, reopened.stat())?;
@@ -190,6 +196,7 @@ pub(super) mod cases {
             let before = checked(context, file.stat())?;
             let mut prefix = [0; 32];
             context.expect_eq(file.read_at(0, &mut prefix), Ok(prefix.len()));
+
             fixture.run(context, b"v")?;
             context.expect_eq(checked(context, file.stat())?, before);
             bytes_at(context, &file, 0, &prefix)?;
@@ -215,6 +222,7 @@ pub(super) mod cases {
                         },
                     ),
                 )?;
+
                 let event = fixture.user.run_named_as(
                     context,
                     PROGRAM_WRITE,
@@ -269,6 +277,7 @@ pub(super) mod cases {
             context,
             file.mapping_inode().unwrap().file_page(1, &mut attempt),
         )?;
+
         let image = fixture.shared_image(context, b"k")?;
         let mm = image.mm.clone();
         let file_offset = (PAGE_SIZE as u64).to_le_bytes();
@@ -279,6 +288,7 @@ pub(super) mod cases {
         {
             return Err(TestError("truncate file offset initialization failed"));
         }
+
         let controls = TruncateControls::new()?;
         fixture.truncate_controls = Some(controls.clone());
         let stages = controls.clone();
@@ -322,6 +332,7 @@ pub(super) mod cases {
                 .map_err(|_| TestError("unmap retirement hook OOM"))?;
             inode.mapping().ktest_set_unmap_hook(Some(hook));
         }
+
         let ready = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("truncate fault readiness OOM"))?;
         let gate =
@@ -340,6 +351,7 @@ pub(super) mod cases {
         } else {
             mm.ktest_set_fault_hook(Some(hook));
         }
+
         fixture.start_shared(context, image)?;
         fixture.phase(&mm, 0, 1)?;
         WriteOwner::release(&mm, 1)?;
@@ -365,6 +377,7 @@ pub(super) mod cases {
         until("W20 private preparer did not really block", || {
             sched::test_state(&executor) == State::Blocked
         })?;
+
         let truncating = file.clone();
         let observed = fixture.consume_sync(0, move || truncating.truncate(PAGE_SIZE as u64))?;
         until("W20 truncate did not finish first unmap", || {
@@ -372,6 +385,7 @@ pub(super) mod cases {
         })?;
         context.expect_eq(checked(context, file.stat())?.size, PAGE_SIZE as u64);
         context.expect_eq(mm.mapping(SOURCE), None);
+
         gate.complete();
         mm.ktest_set_fault_hook(None);
         mm.ktest_set_fork_hook(None);
@@ -407,6 +421,7 @@ pub(super) mod cases {
                 (false, false),
             );
         }
+
         controls.gates[0].complete();
         until("W20 cache phase did not reach second unmap", || {
             controls.phase.load(Ordering::Acquire) == 2
@@ -416,6 +431,7 @@ pub(super) mod cases {
             context.expect_eq(mm.mapping(SOURCE).is_some(), true);
             context.expect_eq(child_mm.mapping(SOURCE).is_some(), true);
         }
+
         controls.gates[1].complete();
         if !fork_snapshot {
             until(
@@ -447,6 +463,7 @@ pub(super) mod cases {
             child_mm.fault(SOURCE, UserAccess::Read),
             Err(VmError::BeyondEof),
         );
+
         bytes_at(context, &file, 0, &[0x65; PAGE_SIZE])?;
         inode.ktest_set_truncate_hook(None);
         inode.mapping().ktest_set_unmap_hook(None);
@@ -477,6 +494,7 @@ pub(super) mod cases {
         if !disk.limits().flush {
             return Err(TestError("W21 requires production FLUSH"));
         }
+
         checked(context, file.truncate(0))?;
         let block = volume.geometry().block_size;
         let traditional = checked(context, inode.metadata_snapshot())?.flags & codec::EXTENTS == 0;
@@ -509,6 +527,7 @@ pub(super) mod cases {
                     .file_page(offset / PAGE_SIZE as u64, &mut prepare_attempt),
             )?);
         }
+
         let old = tree(context, &inode)?;
         context.expect_eq(old.data, 5);
         context.expect_eq(0 < old.nodes, true);
@@ -521,6 +540,7 @@ pub(super) mod cases {
         let node_buffer = checked(context, volume.metadata_block(node))?;
         let node_folio = node_buffer.folio().clone();
         checked(context, file.sync_range(0..u64::MAX, false))?;
+
         let image = fixture.shared_image(context, b"j")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -543,6 +563,7 @@ pub(super) mod cases {
         })
         .map_err(|_| TestError("W21 truncate observer OOM"))?;
         inode.ktest_set_truncate_hook(Some(hook));
+
         if metadata {
             // 原节点条目和 CRC 保持合法；update 重新记其真实 Dirty，正式 metadata WB 写出旧树字节。
             checked(
@@ -559,6 +580,7 @@ pub(super) mod cases {
                 );
             }
         }
+
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
         let syncing_inode = inode.clone();
@@ -583,6 +605,7 @@ pub(super) mod cases {
             };
             submitted && snapshot.inflight != 0 && observed.blocked()
         })?;
+
         WriteOwner::release(&mm, 1)?;
         until(
             "W21 ordinary ftruncate did not block on original IO",
@@ -615,6 +638,7 @@ pub(super) mod cases {
         context.expect_eq(disk.test_snapshot().inflight != 0, true);
         context.expect_eq(observed.result.lock().is_none(), true);
         context.diagnostic(format_args!("W21 kind={} completion-consumption-paused=1 ordinary-sys46-blocked=1 first-unmap-observed={} old-data-and-node-bitmap-used=1 real-allocation-excludes-old-blocks=1 allocated-probe={} hardware-DMA-inflight-claim=0", if metadata { "metadata-node" } else { "data" }, first_unmap.load(Ordering::Acquire), allocated));
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -630,6 +654,7 @@ pub(super) mod cases {
                 Some(false),
             );
         }
+
         drop((node_buffer, node_folio));
         let replacement = [0xd7; PAGE_SIZE];
         for (logical, physical) in old.blocks.iter().copied().enumerate() {
@@ -664,6 +689,7 @@ pub(super) mod cases {
                 .all(|old| old.phys_addr() != fresh.phys_addr()),
             true,
         );
+
         checked(context, file.sync_range(0..u64::MAX, false))?;
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
@@ -678,6 +704,7 @@ pub(super) mod cases {
             )?;
             context.expect_eq(&device_bytes[..block], &replacement[..block]);
         }
+
         inode.ktest_set_truncate_hook(None);
         WriteOwner::release(&mm, 2)?;
         fixture.finish_shared(context)?;
@@ -706,6 +733,7 @@ pub(super) mod cases {
             Some(FsError::InvalidOperation),
         );
         let before = allocation_counts(context, &volume)?;
+
         let token = checked(context, volume.allocate_inode(0, 0o100600, 0, 0))?;
         let number = token.number();
         let inode = match cache.iget(&volume, number) {
@@ -749,6 +777,7 @@ pub(super) mod cases {
             checked(context, inode_allocation_bit(&volume, number))?,
             true,
         );
+
         let disk = fixture.user.path.owner.disk()?.clone();
         let ranges = checked(context, prepare_unlinked_original_writeback(&inode, &folio))?;
         disk.test_suspend_completions();
@@ -777,6 +806,7 @@ pub(super) mod cases {
                     && observed.blocked()
             },
         )?;
+
         fixture.inodes.clear();
         drop(inode);
         drop(fixture.cold_cache.take());
@@ -788,6 +818,7 @@ pub(super) mod cases {
             true,
         );
         context.expect_eq(checked(context, file.stat())?.size, PAGE_SIZE as u64);
+
         drop(file);
         mapped_bytes(context, &mm, SOURCE, &[0x91, 0x72]);
         checked(context, fixture.eviction.as_ref().unwrap().wait())?;
@@ -796,6 +827,7 @@ pub(super) mod cases {
             checked(context, inode_allocation_bit(&volume, number))?,
             true,
         );
+
         drop(mm);
         checked(context, fixture.eviction.as_ref().unwrap().wait())?;
         context.expect_eq(fixture.eviction.as_ref().unwrap().contains(number), true);
@@ -804,6 +836,7 @@ pub(super) mod cases {
             true,
         );
         context.expect_eq(folio.writeback_sectors() != 0, true);
+
         drop(folio);
         checked(context, fixture.eviction.as_ref().unwrap().wait())?;
         context.expect_eq(fixture.eviction.as_ref().unwrap().contains(number), true);
@@ -818,6 +851,7 @@ pub(super) mod cases {
             );
         }
         context.diagnostic(format_args!("inode-last-use number={} legitimate-published-nlink0=1 unhashed-real-OFD-and-VMA=1 cache-owner-ended=1 OFD-then-VMA-then-folio-ended=1 original-IO-credential-only-owns-inode=1 bitmap-and-size-preserved=1", number));
+
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -834,10 +868,12 @@ pub(super) mod cases {
                 Some(false),
             );
         }
+
         drop((linked, linked_inode));
         checked(context, fixture.eviction.as_ref().unwrap().wait_retired())?;
         let retired_counts = allocation_counts(context, &volume)?;
         context.expect_eq(retired_counts, before);
+
         let reused = checked(context, volume.allocate_inode(0, 0o100600, 123, 234))?;
         let reused_number = reused.number();
         let reloaded = volume.load_inode(reused_number, None);
@@ -854,6 +890,7 @@ pub(super) mod cases {
             ),
             (0, 0, 0, 123, 234),
         );
+
         checked(context, crate::fs::writeback::sync_metadata(&volume))?;
         disk.test_flush_completions();
         context.expect_eq(disk.test_snapshot().inflight, 0);
@@ -863,6 +900,7 @@ pub(super) mod cases {
         context.diagnostic(format_args!("inode-last-use number={} original-IO-and-Work-tails-ended=1 canonical-slot-removed=1 task-context-eviction=1 file-blocks-and-inode-bitmap-returned=1 actual-inode-number-reuse=1 production-metadata-sync=1", number));
         Ok(())
     }
+
     struct InodeReuseControls {
         phase: AtomicUsize,
         cancelled: AtomicBool,
@@ -933,6 +971,7 @@ pub(super) mod cases {
             );
             let allocated_counts = allocation_counts(context, &volume)?;
             context.expect_eq(allocated_counts, (before.0, before.1 - 1));
+
             let path = checked(
                 context,
                 linked
@@ -946,6 +985,7 @@ pub(super) mod cases {
             )?;
             drop(cold_vfs);
             context.expect_eq(checked(context, file.stat())?.links, 0);
+
             let paused = controls.clone();
             let hook: TruncateObserver = Arc::try_new(move |_: &InodeRef, phase| {
                 if phase != TruncatePhase::AfterStorageRelease {
@@ -973,6 +1013,7 @@ pub(super) mod cases {
             context.expect_eq(fixture.eviction.as_ref().unwrap().contains(number), true);
             context.expect_eq(disk.test_snapshot().inflight, 0);
             context.expect_eq(disk.test_completion_error_pending(), false);
+
             let (old_record, record_size) = inode_record_snapshot(context, &volume, number)?;
             let old_generation = checked(context, codec::le32(&old_record[..record_size], 100))?;
             context.expect_eq(old_generation, original_metadata.generation);
@@ -1023,6 +1064,7 @@ pub(super) mod cases {
             context.expect_eq(observed.blocked(), true);
             context.expect_eq(allocation.lock().is_none(), true);
             context.expect_eq(disk.test_completion_error_pending(), fail_metadata);
+
             disk.test_resume_completions();
             let eviction = fixture.eviction.as_ref().unwrap().wait();
             until("inode reuse metadata slot tail did not end", || {
@@ -1116,6 +1158,7 @@ pub(super) mod cases {
                 (0o100600, 123, 234),
             );
             context.expect_eq((metadata.links, metadata.size, metadata.blocks), (0, 0, 0));
+
             drop(reused.inode);
             checked(context, fixture.eviction.as_ref().unwrap().wait())?;
             disk.test_flush_completions();
@@ -1133,6 +1176,7 @@ pub(super) mod cases {
             ));
             Ok(())
         })();
+
         controls.cancelled.store(true, Ordering::Release);
         controls.gate.complete();
         disk.test_resume_completions();
@@ -1183,6 +1227,7 @@ pub(super) mod cases {
         } else {
             (None, None)
         };
+
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("mandatory retirement MM owner OOM"))?;
         vm(
@@ -1192,6 +1237,7 @@ pub(super) mod cases {
         mapped_bytes(context, &mm, SOURCE, &[0x4f; 32]);
         context.expect_eq(mm.mapping(SOURCE).unwrap().physical, old_folio.phys_addr());
         fixture.shared_mm = Some(mm.clone());
+
         let ready = Arc::try_new(AtomicBool::new(false))
             .map_err(|_| TestError("mandatory retirement ready OOM"))?;
         let gate = Arc::try_new(Completion::new())
@@ -1231,6 +1277,7 @@ pub(super) mod cases {
             })
             .map_err(|_| TestError("mandatory retirement ownership hook OOM"))?;
         old_inode.mapping().ktest_set_unmap_hook(Some(hook));
+
         let result = Arc::try_new(SpinLock::new(None::<Result<(), VmError>>))
             .map_err(|_| TestError("mandatory retirement result OOM"))?;
         let recorded = result.clone();
@@ -1278,6 +1325,7 @@ pub(super) mod cases {
             || ready.load(Ordering::Acquire),
         )?;
         context.expect_eq(mm.mapping(SOURCE).unwrap().physical, old_folio.phys_addr());
+
         let truncating = old.clone();
         let observed = fixture.consume_sync(1, move || truncating.truncate(0))?;
         until("old file rmap lost mandatory retirement source", || {
@@ -1290,6 +1338,7 @@ pub(super) mod cases {
         context.expect_eq(before.0, 1);
         context.expect_eq(2 <= before.1, true);
         context.expect_eq(old_inode.mapping().is_canonical(0, &old_folio), true);
+
         controls.gates[2].complete();
         until("mandatory old file retirement CSD did not finish", || {
             controls.unmap_phase.load(Ordering::Acquire) == 2
@@ -1301,6 +1350,7 @@ pub(super) mod cases {
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
         context.expect_eq(checked(context, old.stat())?.size, 0);
         context.expect_eq(mm.mapping(SOURCE), None);
+
         gate.complete();
         mm.ktest_set_vma_unmap_hook(None);
         fixture.prepare_gate.take();
@@ -1308,6 +1358,7 @@ pub(super) mod cases {
         context.expect_eq(*result.lock(), Some(Ok(())));
         old_inode.mapping().ktest_set_unmap_hook(None);
         fixture.truncate_controls.take();
+
         if replacement == 2 {
             context.expect_eq(mm.fault(SOURCE, UserAccess::Read), Err(VmError::Unmapped));
         } else {

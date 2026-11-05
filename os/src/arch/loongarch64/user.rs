@@ -89,14 +89,17 @@ pub unsafe fn run_user(context: &mut UserContext) -> UserTrap {
         0,
         "user entry requires kernel EUEN off"
     );
+
     // SAFETY: 调用者独占私有现场并保活当前 Mm；汇编保存本次真实 Rust SP，返回时恢复入口 CSR。
     unsafe { la_run_user(context) };
+
     assert!(!irq_enabled(), "user trap returned with IRQ enabled");
     assert_eq!(
         csr_read::<{ reg::CSR_EUEN }>(),
         0,
         "user trap returned with kernel FP enabled"
     );
+
     match (context.estat >> reg::ESTAT_ECODE_SHIFT) & reg::ESTAT_ECODE_MASK {
         0 => {
             handle_hardware_interrupt(context.estat);

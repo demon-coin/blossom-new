@@ -1,4 +1,5 @@
 //! 一次早期命令、同步 typed suite dispatch 和宿主一致的流式实例 seed。
+
 use super::{
     context::{ArcScope, BootGuard, RuntimeServices, ScopeGuard},
     registry::Registry,
@@ -15,7 +16,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const MAX_SELECTED_CASES: usize = 64;
 const COMMAND_CAPACITY: usize = 1024;
 const PEER_ACK_CAPACITY: usize = 64;
+
 static COMMAND_READ: AtomicBool = AtomicBool::new(false);
+
 /// 只有一个命令的有界静态 ID，不缓存全目录或名称。
 #[derive(Clone, Copy)]
 pub(crate) struct RunCommand {
@@ -26,11 +29,13 @@ pub(crate) struct RunCommand {
     count: usize,
     registry: Registry,
 }
+
 /// CPU/arch 已安装且 UART IRQ RX 尚未接管时调用；catalog 在这里真实退出。
 pub(crate) fn early() -> RunCommand {
     if COMMAND_READ.swap(true, Ordering::AcqRel) {
         super::context::fatal("test command read twice");
     }
+
     core::hint::black_box(super::boot_cases::anchors());
     core::hint::black_box(super::execution_core::anchors());
     core::hint::black_box(super::execution_services::anchors());
@@ -41,6 +46,7 @@ pub(crate) fn early() -> RunCommand {
     core::hint::black_box(crate::fs::ktest::anchors());
     core::hint::black_box(super::network::anchors());
     core::hint::black_box(crate::drivers::virtio_net::ktest::native::__ktest_anchor());
+
     let registry = Registry::load().unwrap_or_else(|e| super::context::fatal(e.0));
     let arch = if cfg!(target_arch = "riscv64") {
         "riscv64"
@@ -64,6 +70,7 @@ pub(crate) fn early() -> RunCommand {
         mode,
         panic
     ));
+
     let mut input = [0u8; COMMAND_CAPACITY];
     let mut len = 0;
     loop {
@@ -77,11 +84,13 @@ pub(crate) fn early() -> RunCommand {
             break;
         }
     }
+
     let text = core::str::from_utf8(&input[..len - 1])
         .unwrap_or_else(|_| super::context::fatal("test command is not UTF-8"));
     if text == "catalog" {
         registry.catalog(arch, crate::cpu::count() as u32, mode, panic);
     }
+
     let command = parse(text, registry).unwrap_or_else(|e| super::context::fatal(e.0));
     let suite = registry
         .suite(command.suite)
@@ -100,6 +109,7 @@ pub(crate) fn early() -> RunCommand {
     }
     command
 }
+
 /// 供父在 MM/Task 初始化前决定真实 Boot 或 Thread 路径。
 pub(crate) fn requested_context(command: &RunCommand) -> Context {
     command
@@ -109,6 +119,7 @@ pub(crate) fn requested_context(command: &RunCommand) -> Context {
         .defaults
         .context
 }
+
 /// 不初始化 MM、文件系统或调度器；需要这些的具体 Boot suite 自行真实取得。
 pub(crate) fn run_boot(command: RunCommand) -> ! {
     if requested_context(&command) != Context::Boot {
@@ -117,6 +128,7 @@ pub(crate) fn run_boot(command: RunCommand) -> ! {
     let _boot = BootGuard::enter();
     execute(command)
 }
+
 /// 在真实可迁核 Task 上同步运行整个 suite，不把 borrowed case closure 伪装 static。
 pub(crate) fn spawn_thread(command: RunCommand) -> Result<crate::task::JoinHandle, TestError> {
     if requested_context(&command) != Context::Thread {
@@ -125,6 +137,7 @@ pub(crate) fn spawn_thread(command: RunCommand) -> Result<crate::task::JoinHandl
     crate::task::spawn_kernel(move || execute(command))
         .map_err(|_| TestError("NoMemory: suite Task"))
 }
+
 /// 精确解析固定文法；拒绝多命令、重复项、空列表与所有整数溢出。
 fn parse(text: &str, registry: Registry) -> Result<RunCommand, TestError> {
     let mut fields = text.split(' ');
@@ -142,6 +155,7 @@ fn parse(text: &str, registry: Registry) -> Result<RunCommand, TestError> {
     if fields.next().is_some() {
         return Err(TestError("extra command fields"));
     }
+
     let mut command = RunCommand {
         suite,
         seed,
@@ -165,6 +179,7 @@ fn parse(text: &str, registry: Registry) -> Result<RunCommand, TestError> {
     }
     Ok(command)
 }
+
 /// 不借用外部 parser 或分配字符串的十进制溢出检查。
 fn number(text: &str) -> Result<u64, TestError> {
     if text.is_empty() {
@@ -232,6 +247,7 @@ struct Runner {
     passed: bool,
     peer: bool,
 }
+
 impl Runner {
     /// 静态不适用不构造 fixture；资源取得错误由具体生产 fixture 真实返回。
     fn applicability(&self, case: &CaseDesc) -> Option<&'static str> {
@@ -241,12 +257,14 @@ impl Runner {
         }
         None
     }
+
     /// 发布边界前独占控制 RX 并同步旧 IRQ/Work，精确回执后才恢复原 RX 状态；失败终止 VM。
     fn peer_boundary(&self, id: u32, prefix: &[u8], publish: impl FnOnce()) {
         if !self.peer {
             publish();
             return;
         }
+
         let receiver = crate::console::testing::claim_receive_control();
         crate::console::testing::synchronize_receive_irq()
             .unwrap_or_else(|error| super::context::fatal(error.0));
@@ -254,10 +272,12 @@ impl Runner {
         if !crate::console::testing::receive_queue_empty() {
             super::context::fatal("UART RX ring is not empty before peer boundary");
         }
+
         publish();
         peer_acknowledgement(id, prefix).unwrap_or_else(|error| super::context::fatal(error.0));
         crate::console::testing::release_receive_control(receiver);
     }
+
     /// setup 前发布当前项；需要 peer 的批次先取得真实 BEGIN 回执，才允许 case 准备和生产。
     fn begin(&mut self, id: u32) {
         if !self.begun {
@@ -266,6 +286,7 @@ impl Runner {
             self.begun = true;
         }
     }
+
     /// 静态 CPU 不适用不调用设备 setup，仍按本 VM 资源并集完成 BEGIN/END 后才推进下一项。
     fn static_prefix(&mut self) {
         while self.position < self.command.count {
@@ -290,6 +311,7 @@ impl Runner {
         }
     }
 }
+
 impl CaseRunner for Runner {
     /// typed dispatch 完成真实清理后保留原终态发布，宿主 END 回执先于位置推进和后继开始。
     fn run(
@@ -300,6 +322,7 @@ impl CaseRunner for Runner {
         if !core::ptr::eq(cases, self.suite.cases) {
             return Err(TestError("suite dispatch descriptor identity mismatch"));
         }
+
         while self.position < self.command.count {
             self.static_prefix();
             if self.position == self.command.count {
@@ -332,6 +355,7 @@ impl CaseRunner for Runner {
                 None
             };
             let _guard = scope.as_ref().map(ScopeGuard::install);
+
             let services = RuntimeServices::new(case, id, scope.as_ref(), self.suite.name);
             services.activate();
             // case 的 setup 控制已在正式 typed fixture 调用之前输出。
@@ -342,6 +366,7 @@ impl CaseRunner for Runner {
                 case_seed(self.command.seed, self.command.repeat, case.name),
                 self.command.repeat,
             );
+
             let outcome = dispatch(&mut context, id as usize);
             self.passed &= matches!(outcome.status, Status::Pass | Status::Skip);
             self.peer_boundary(id, b"KTEST PEER END ", || {
@@ -353,6 +378,7 @@ impl CaseRunner for Runner {
         Ok(())
     }
 }
+
 /// 调用正式 typed suite 入口，握手只用于含 net-user 的 Thread 批次，不改原终止路径。
 fn execute(command: RunCommand) -> ! {
     let suite = command
@@ -376,6 +402,7 @@ fn execute(command: RunCommand) -> ! {
             Failure::Returned(TestError("net-user peer boundary requires Thread context")),
         );
     }
+
     let runnable = command.cases[..command.count]
         .iter()
         .find(|&&id| runner.applicability(&suite.cases[id as usize]).is_none())
@@ -384,6 +411,7 @@ fn execute(command: RunCommand) -> ! {
         runner.static_prefix();
         report::complete(suite.name, runner.passed);
     };
+
     let case = &suite.cases[id as usize];
     let scope = if suite.defaults.context == Context::Thread {
         Some(ArcScope::new(u32::MAX).unwrap_or_else(|error| {
@@ -401,6 +429,7 @@ fn execute(command: RunCommand) -> ! {
         case_seed(command.seed, command.repeat, case.name),
         command.repeat,
     );
+
     let suite_outcome = (suite.run)(&mut context, &mut runner);
     let suite_failure = suite_outcome
         .setup
@@ -439,6 +468,7 @@ pub(crate) fn case_seed(seed: u64, repeat: u32, name: &str) -> u64 {
     let _ = write!(hash, "{}:{}:{}", seed, repeat, name);
     hash.finish()
 }
+
 const SHA256_BLOCK_BYTES: usize = 64;
 const SHA256_LENGTH_BYTES: usize = core::mem::size_of::<u64>();
 
@@ -448,6 +478,7 @@ struct Sha256 {
     used: usize,
     bytes: u64,
 }
+
 impl Sha256 {
     /// 只用于固定种子合同的标准 SHA-256 初态。
     fn new() -> Self {
@@ -461,6 +492,7 @@ impl Sha256 {
             bytes: 0,
         }
     }
+
     /// 任意长 UTF-8名称逐块输入，消息长度按SHA标准取模2^64。
     fn update(&mut self, mut data: &[u8]) {
         self.bytes = self.bytes.wrapping_add(data.len() as u64);
@@ -475,6 +507,7 @@ impl Sha256 {
             }
         }
     }
+
     /// 64轮标准压缩，只保留固定栈工作空间。
     fn compress(&mut self) {
         const K: [u32; 64] = [
@@ -501,6 +534,7 @@ impl Sha256 {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10));
         }
+
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
         for i in 0..64 {
             let t1 = h
@@ -519,10 +553,12 @@ impl Sha256 {
             b = a;
             a = t1.wrapping_add(t2);
         }
+
         for (state, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *state = state.wrapping_add(value);
         }
     }
+
     /// 标准1位填充与64位长度，只返回合同所需的前八字节大端值。
     fn finish(mut self) -> u64 {
         let bits = self.bytes.wrapping_mul(8);
@@ -534,6 +570,7 @@ impl Sha256 {
         ((self.state[0] as u64) << 32) | self.state[1] as u64
     }
 }
+
 impl core::fmt::Write for Sha256 {
     fn write_str(&mut self, value: &str) -> core::fmt::Result {
         self.update(value.as_bytes());

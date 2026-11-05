@@ -61,12 +61,14 @@ impl State {
         if self.buffers_ready {
             return Ok(());
         }
+
         let rx = UdpEndpoint::packet_buffer()?;
         let tx = UdpEndpoint::packet_buffer()?;
         let mut socket = udp::Socket::new(rx, tx);
         socket.set_recv_budget(self.receive_budget);
         socket.set_send_budget(self.send_budget);
         socket.set_hop_limit(self.socket.hop_limit());
+
         self.socket = socket;
         self.buffers_ready = true;
         Ok(())
@@ -186,6 +188,7 @@ impl Drop for OperationGuard<'_> {
             PollMask::default()
         };
         drop(self.state.take());
+
         let owner_waiting = {
             let mut input = self.endpoint.input.lock();
             core::mem::take(&mut input.owner_waiting)
@@ -219,6 +222,7 @@ impl UdpEndpoint {
         leases
             .try_reserve_exact(PACKET_RECORDS)
             .map_err(|_| FsError::NoMemory)?;
+
         let endpoint = Arc::try_new(Self {
             id,
             family,
@@ -254,6 +258,7 @@ impl UdpEndpoint {
             _slot: slot,
         })
         .map_err(|_| FsError::NoMemory)?;
+
         // UDP 不消耗 TCP 的协议 CPU 轮转序号；同一 Work 由原执行域调度。
         let work = Work::try_new(
             net.work_queue(),
@@ -392,6 +397,7 @@ impl UdpEndpoint {
             return Err(FsError::InvalidOperation);
         }
         self.check_family(&state, requested.address, AddressOperation::Bind)?;
+
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
         state.prepare_buffers()?;
@@ -404,6 +410,7 @@ impl UdpEndpoint {
             self.dual_stack(&state, requested),
         )?;
         let local = lease.local();
+
         net.tables().publish_udp(self.id, local, None)?;
         state.socket.set_endpoint(local.raw_listen());
         if matches!(local.address, IpAddress::Ipv6(address) if !address.is_unspecified()) {
@@ -460,6 +467,7 @@ impl UdpEndpoint {
             state.route_local = None;
             return Ok(());
         };
+
         if peer.port == 0 {
             return Err(FsError::InvalidOperation);
         }
@@ -469,6 +477,7 @@ impl UdpEndpoint {
             .as_ref()
             .map_or(self.family.unspecified(), |lease| lease.local().address);
         let route = net.resolve_route(peer.address, bound)?;
+
         state.prepare_buffers()?;
         let lease = match state.binding.as_ref() {
             Some(lease) => Arc::clone(lease),
@@ -478,6 +487,7 @@ impl UdpEndpoint {
             address: route.source,
             port: lease.local().port,
         };
+
         net.tables().publish_udp(self.id, local, Some(peer))?;
         state.socket.set_endpoint(local.raw_listen());
         state.binding = Some(lease);
@@ -508,6 +518,7 @@ impl UdpEndpoint {
         if protocol_limit < payload.len() || state.send_budget < payload.len() {
             return Err(FsError::MessageTooLarge);
         }
+
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
         let bound = state
@@ -520,6 +531,7 @@ impl UdpEndpoint {
         {
             return Err(FsError::MessageTooLarge);
         }
+
         state.prepare_buffers()?;
         if !state.socket.can_send_size(payload.len()) {
             return Ok(IoProgress::Blocked);
@@ -543,6 +555,7 @@ impl UdpEndpoint {
         };
         // 准入只保护绑定发表和关门；完整 payload 复制不得占用全域操作权。
         drop(_admission);
+
         match state.socket.send_slice(payload, metadata) {
             Ok(()) => {
                 assert!(state.leases.len() < PACKET_RECORDS);
@@ -567,6 +580,7 @@ impl UdpEndpoint {
             }
             input.packets.push_back(packet);
         }
+
         self.schedule();
         Ok(())
     }
@@ -589,6 +603,7 @@ impl UdpEndpoint {
                 flags: 0,
             }));
         }
+
         if peek {
             let (payload, metadata) = state.socket.peek().expect("UDP readable record");
             self.copy_datagram(target, payload, InetEndpoint::from_raw(metadata.endpoint))
@@ -789,11 +804,13 @@ impl UdpEndpoint {
         if net.is_stopping() || self.stopped.load(Ordering::Acquire) {
             return;
         }
+
         self.input.lock().owner_waiting = true;
         let Some(mut state) = self.state.try_lock() else {
             return;
         };
         self.input.lock().owner_waiting = false;
+
         let mut notification = PollMask::default();
         if !state.closed {
             self.process_input(&mut state, &mut notification);
@@ -805,6 +822,7 @@ impl UdpEndpoint {
                 notification |= PollMask::POLLERR;
             }
         }
+
         let pending_tx = !state.leases.is_empty();
         let closed = state.closed;
         let ended = closed && !pending_tx;
@@ -816,6 +834,7 @@ impl UdpEndpoint {
             None
         };
         drop(state);
+
         if !notification.is_empty() {
             self.source.notify(notification);
         }
@@ -831,6 +850,7 @@ impl UdpEndpoint {
             net.retire_udp(self.id);
             return;
         }
+
         let pending_input = !closed && !self.input.lock().packets.is_empty();
         if pending_input || (result.is_ok() && pending_tx) {
             self.schedule();
@@ -860,6 +880,7 @@ impl UdpEndpoint {
             {
                 continue;
             }
+
             let raw = packet.as_packet();
             let ip = raw.ip_repr();
             let IpPayload::Udp(repr, payload) = raw.payload() else {
@@ -892,6 +913,7 @@ impl UdpEndpoint {
             if !net.egress_ready(self.egress_wait())? {
                 return Err(FsError::WouldBlock);
             }
+
             let mut context = UdpContextState::new(None, None);
             let mut completed: Option<Result<(), FsError>> = None;
             state
@@ -913,6 +935,7 @@ impl UdpEndpoint {
                     completed = Some(result);
                     Ok::<(), FsError>(())
                 })?;
+
             let result = completed.expect("UDP lease has no corresponding TX record");
             state
                 .leases
@@ -950,6 +973,7 @@ impl UdpEndpoint {
             .expect("UDP work is not prepared")
             .as_ref()
             .close_sync();
+
         let binding = {
             let mut state = self.state.lock();
             state.closed = true;
@@ -966,6 +990,7 @@ impl UdpEndpoint {
             input.owner_waiting = false;
             core::mem::take(&mut input.packets)
         };
+
         if let Some(net) = self.stack.upgrade() {
             net.cancel_egress_wait(self.id);
             net.tables().unpublish_udp(self.id);

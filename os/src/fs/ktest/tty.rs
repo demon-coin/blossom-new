@@ -71,6 +71,7 @@ impl UartStage {
         if !crate::console::testing::receive_queue_empty() {
             return Err(TestError("tty RX ring is not empty before stage"));
         }
+
         crate::ktest::report::write(format_args!(
             "  # KTEST io {} duplex {} {:08x} {} {} {:08x} {}\n",
             id,
@@ -106,6 +107,7 @@ impl UartStage {
         crate::fs::tty::drain(FileIoContext::Kernel)
             .map_err(|_| TestError("tty drain failed before ACK"))?;
         crate::fs::tty::flush_work();
+
         let mut line = [0u8; 64];
         let mut length = 0;
         loop {
@@ -138,6 +140,7 @@ impl UartStage {
         if Some(id) != crate::ktest::active_case() {
             return Err(TestError("tty ACK case mismatch"));
         }
+
         let receiver = crate::fs::tty::termios().cflag & crate::fs::tty::termios::CREAD != 0;
         crate::console::testing::release_receive_control(receiver);
         self.owned = false;
@@ -447,6 +450,7 @@ pub(crate) mod cases {
             decode_pid(i32::MIN.to_le_bytes()),
             Err(FsError::InvalidOperation)
         );
+
         assert_eq!(Winsize::initial().to_bytes(), [24, 0, 80, 0, 0, 0, 0, 0]);
         let bytes = [1, 2, 3, 4, 5, 6, 7, 8];
         let size = Winsize::from_bytes(bytes);
@@ -455,6 +459,7 @@ pub(crate) mod cases {
             (0x201, 0x403, 0x605, 0x807)
         );
         assert_eq!(size.to_bytes(), bytes);
+
         let mut config = Termios::default();
         config.lflag |= TOSTOP;
         assert_eq!(Termios::from_bytes(config.to_bytes()), Ok(config));
@@ -491,6 +496,7 @@ pub(crate) mod cases {
             assert_eq!(bytes[0], b'n');
             state.flush_input();
         }
+
         state.termios.lflag = ICANON | ISIG | IEXTEN;
         state.receive_sample(RxSample {
             byte: state.termios.cc[VLNEXT],
@@ -507,6 +513,7 @@ pub(crate) mod cases {
             Some(2)
         );
         assert_eq!(state.input.len(), 1);
+
         state.termios.iflag = BRKINT;
         assert_eq!(
             state
@@ -529,6 +536,7 @@ pub(crate) mod cases {
             Some(2)
         );
         assert!(state.input.is_empty());
+
         state.termios.iflag |= IGNBRK;
         assert_eq!(
             state
@@ -539,6 +547,7 @@ pub(crate) mod cases {
                 .signal,
             None
         );
+
         state.termios.iflag = 0;
         state.termios.lflag = 0;
         assert_eq!(
@@ -566,6 +575,7 @@ pub(crate) mod cases {
                 Some(FsError::InvalidOperation)
             );
         }
+
         let vfs = fixture.vfs.as_ref().expect("tty view missing");
         let fs_context = fixture.context.as_ref().expect("tty context missing");
         let path = checked(
@@ -578,7 +588,9 @@ pub(crate) mod cases {
         );
         Ok(())
     }
+
     use crate::fs::SeekFrom;
+
     /// 默认 termios 的 36 字节编解码与 Linux 默认值一致。
     #[test]
     fn termios_codec_matches_linux_default(
@@ -663,6 +675,7 @@ pub(crate) mod cases {
         state.consume_canonical(length, eof);
         let (length, eof) = state.peek_canonical(&mut out);
         assert_eq!((length, eof), (0, false));
+
         state.input.clear();
         for &byte in b"ab\x04" {
             state.receive_sample(RxSample { byte, status: 0x01 });
@@ -672,6 +685,7 @@ pub(crate) mod cases {
         assert_eq!(&out[..length], b"ab");
         Ok(())
     }
+
     /// ERASE 擦除单字节。
     #[test]
     fn canonical_erase_single(
@@ -724,6 +738,7 @@ pub(crate) mod cases {
         assert_eq!(peeked, 1);
         assert_eq!(out[0], b'\n');
         state.consume_raw(peeked);
+
         state.input.clear();
         state.termios.iflag |= ISTRIP;
         state.receive_sample(RxSample {
@@ -786,6 +801,7 @@ pub(crate) mod cases {
         let termios = state.termios;
         assert!(state.output_byte(termios, b'\t'));
         assert_eq!(state.output.len(), 8);
+
         state.output.clear();
         let termios = state.termios;
         while state.output.space() != 1 {
@@ -1033,6 +1049,7 @@ pub(crate) mod cases {
             }
             assert!(progressed || offset == 4095);
         }
+
         state.receive_sample(RxSample {
             byte: 21,
             status: 0x01,
@@ -1042,6 +1059,7 @@ pub(crate) mod cases {
             byte: b'y',
             status: 0x01,
         });
+
         let mut groups = 0;
         let mut phase = 0;
         let mut seen_y = false;
@@ -1093,6 +1111,7 @@ pub(crate) mod cases {
             byte: b'Z',
             status: 0x01,
         });
+
         let mut offset = 0;
         let total = 4090 + 3 + 4090 + 1;
         loop {
@@ -1153,6 +1172,7 @@ pub(crate) mod cases {
         });
         assert_eq!(state.input.len(), 4096);
         assert!(overrun < state.overrun);
+
         // 短读 1 腾格，EOF 即发表，后继 Z 仍满应 overrun。
         let mut out = [0u8; 4096];
         let (length, eof) = state.peek_canonical(&mut out[..1]);
@@ -1165,6 +1185,7 @@ pub(crate) mod cases {
             status: 0x01,
         });
         assert!(overrun < state.overrun);
+
         // 读完旧记录余部，EOF 零记录在前，新 Z 换行后交付。
         let (length, eof) = state.peek_canonical(&mut out);
         assert_eq!(length, 4095);
@@ -1205,6 +1226,7 @@ pub(crate) mod cases {
         }
         assert_eq!(state.input.len(), 4096);
         assert!(state.poll_readable());
+
         let mut out = [0u8; 4096];
         let peeked = state.peek_raw(&mut out);
         assert_eq!(peeked, 4096);
@@ -1239,6 +1261,7 @@ pub(crate) mod cases {
         });
         assert!(state.poll_readable());
         assert_eq!(state.input.len(), 4096);
+
         let mut out = [0u8; 4096];
         let mut got = [0u8; 4096];
         let mut filled = 0;
@@ -1347,6 +1370,7 @@ pub(crate) mod cases {
         for _ in 0..4 {
             context.expect_eq(checked(context, file.write(&page))?, 1024);
         }
+
         let writer = file.clone();
         fixture.run(move || match writer.write(b"z") {
             Ok(1) => 0,
@@ -1355,6 +1379,7 @@ pub(crate) mod cases {
         until("tty writer did not really block", || fixture.blocked())?;
         checked(context, crate::fs::tty::flush(1))?;
         fixture.join(context);
+
         fixture.stage.begin(context, b"", b"z", 0, 0)?;
         checked(context, crate::fs::tty::flow(1))?;
         fixture.stage.finish()?;
@@ -1384,6 +1409,7 @@ pub(crate) mod cases {
         assert_eq!(state.peek_raw(&mut bytes), 6);
         assert_eq!(&bytes[..6], &[0xff, 0, 0xff, 0xff, 0, 0]);
         state.consume_raw(6);
+
         for _ in 0..4094 {
             state.receive_sample(RxSample {
                 byte: b'a',
@@ -1422,6 +1448,7 @@ pub(crate) mod cases {
         let mut bytes = [0; 4];
         assert_eq!(state.peek_canonical(&mut bytes), (2, false));
         assert_eq!(&bytes[..2], b"a\n");
+
         state.receive_sample(RxSample {
             byte: 0x93,
             status: 0x01,
@@ -1542,6 +1569,7 @@ pub(crate) mod cases {
             context,
             crate::fs::tty::set_termios(config, 2, FileIoContext::Kernel),
         )?;
+
         checked(context, crate::fs::tty::flow(0))?;
         let output = b"^A".repeat(2049);
         fixture.stage.begin(context, &[1; 2049], &output, 0, 0)?;
@@ -1554,6 +1582,7 @@ pub(crate) mod cases {
                 break;
             }
         }
+
         checked(context, crate::fs::tty::flush(0))?;
         fixture.release();
         checked(context, crate::fs::tty::flow(1))?;
@@ -1603,11 +1632,13 @@ pub(crate) mod cases {
                         assert_eq!(state.input.len(), INPUT_CAPACITY - 1);
                         assert_eq!(state.input.committed_len(), prefix.len());
                     }
+
                     if !prefix.is_empty() {
                         assert_eq!(state.peek_canonical(&mut bytes), (prefix.len(), false));
                         assert_eq!(&bytes[..prefix.len()], prefix);
                         state.consume_canonical(prefix.len(), false);
                     }
+
                     if extra == 0 {
                         let record_len = data_len + 2;
                         assert_eq!(state.peek_canonical(&mut bytes), (record_len, false));

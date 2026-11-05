@@ -7,13 +7,16 @@ use super::{ArmError, Timer};
 /// 粗定时器的一个基础 tick，对应 HZ=100。
 pub(crate) const TICK_NS: u64 = crate::time::NSEC_PER_SEC / WHEEL_HZ;
 const WHEEL_HZ: u64 = 100;
+
 const LEVELS: usize = 8;
 const BUCKET_BITS: usize = 6;
 const BUCKETS_PER_LEVEL: usize = 1 << BUCKET_BITS;
 const BUCKET_MASK: usize = BUCKETS_PER_LEVEL - 1;
 const LEVEL_SHIFT: usize = 3;
 const BUCKETS: usize = LEVELS * BUCKETS_PER_LEVEL;
+
 const UNLINKED: usize = usize::MAX;
+
 /// 允许的最大相对期限；末层仍为向上取整留出一个粒度。
 pub(super) const MAX_TIMEOUT_TICKS: u64 =
     (BUCKETS_PER_LEVEL as u64 - 2) << ((LEVELS - 1) * LEVEL_SHIFT);
@@ -115,6 +118,7 @@ impl Wheel {
         while level + 1 < LEVELS && ((BUCKET_MASK as u64) << (level * LEVEL_SHIFT)) <= delta {
             level += 1;
         }
+
         // 请求先落在 tick 内，再严格取下一个层粒度边界，避免 tick
         // 边缘和上层截断导致提前；不把长期限截短到支持范围。
         let shift = level * LEVEL_SHIFT;
@@ -151,6 +155,7 @@ impl Wheel {
         // SAFETY: 调用者保证 timer 有效，并独占其 expires，排除并发读写。
         let deadline = unsafe { (*(*timer).node.get()).expires };
         let (clk, bucket, effective_tick) = self.placement(deadline, now)?;
+
         let head = self.heads[bucket];
         // SAFETY: timer 未链接，已有 head 是本轮内仍存活的稳定节点；全部链节由调用者独占。
         unsafe {
@@ -232,10 +237,12 @@ pub(super) fn self_check() -> usize {
 
     /// 仅满足自检节点的构造接口；本自检只操作轮，不执行回调。
     fn callback(_: Pin<&Timer>) {}
+
     /// 将自检中受常量边界约束的 tick 换算为单调时刻。
     fn instant(tick: u64) -> MonotonicInstant {
         MonotonicInstant::from_nanos(tick * TICK_NS)
     }
+
     /// 在自检节点未链接且独占时设置下一次入轮期限。
     ///
     /// # Safety

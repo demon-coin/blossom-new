@@ -45,6 +45,7 @@ pub(super) fn discover<'a>(
         {
             return Err("FDT VF2 CPU is not an application U74 hart");
         }
+
         let ccache = unique(tree, "starfive,jh7110-ccache")?;
         let registers = region_at(tree, ccache, 0)?;
         device_region(registers, info)?;
@@ -56,9 +57,11 @@ pub(super) fn discover<'a>(
         {
             return Err("FDT JH7110 ccache geometry is unsupported");
         }
+
         info.board.clock_inputs = resources::jh7110_clock_inputs(tree, uart)?;
         info.board.mmc = discover_mmc(tree, controller, info)?;
         info.board.gmac = discover_gmac(tree, controller, info)?;
+
         let mut rtcs = tree
             .all_nodes()
             .filter(|node| enabled(*node) && compatible(*node, "starfive,jh7110-rtc"));
@@ -100,6 +103,7 @@ fn discover_mmc<'a>(
     if !compatible(mmc, "starfive,jh7110-mmc") {
         return Err("FDT mmc1 is not a JH7110 DW-MMC");
     }
+
     let registers = single_region(tree, mmc)?;
     device_region(registers, info)?;
     let interrupt_source = resources::first_irq(tree, mmc)?;
@@ -115,6 +119,7 @@ fn discover_mmc<'a>(
     if setup.clocks.count != 2 || setup.reset_count != 1 || setup.pin_count != 6 {
         return Err("FDT SDIO1 clock, reset or pin resources are incomplete");
     }
+
     let sysreg = property(mmc, "starfive,sysreg")?;
     if sysreg.len() != 4 * FDT_CELL_BYTES {
         return Err("FDT MMC sysreg binding is invalid");
@@ -152,6 +157,7 @@ fn discover_mmc<'a>(
     {
         return Err("FDT SDIO1 card interface is unsupported");
     }
+
     Ok(Some(resource))
 }
 
@@ -178,6 +184,7 @@ fn card_detect_gpio<'a>(
     {
         return Err("FDT SDIO card-detect provider is not a supported SYS GPIO controller");
     }
+
     let pin = word(raw.value, FDT_CELL_BYTES)?;
     let flags = word(raw.value, 2 * FDT_CELL_BYTES)?;
     if crate::drivers::board_setup::SYS_GPIO_COUNT <= pin || flags & !GPIO_ACTIVE_LOW != 0 {
@@ -205,12 +212,14 @@ fn discover_gmac<'a>(
     if !compatible(mac, "starfive,jh7110-dwmac") {
         return Err("FDT selected Ethernet device is not a JH7110 GMAC");
     }
+
     require_plic(tree, mac, controller)?;
     let mut resource = resources::gmac(tree, mac, true)?;
     resource.registers = single_region(tree, mac)?;
     device_region(resource.registers, info)?;
     resource.interrupt_source = resources::first_irq(tree, mac)?;
     device_source(resource.interrupt_source, info)?;
+
     let sysreg = property(mac, "starfive,syscon")?;
     if sysreg.len() != 3 * FDT_CELL_BYTES {
         return Err("FDT GMAC syscon binding is invalid");
@@ -223,6 +232,7 @@ fn discover_gmac<'a>(
         word(sysreg, FDT_CELL_BYTES)?,
         word(sysreg, 2 * FDT_CELL_BYTES)?,
     ];
+
     resources::require_names(
         mac,
         "clock-names",

@@ -91,6 +91,7 @@ impl Geometry {
         if len == 0 || physical <= self.first_data_block || self.blocks_count < end {
             return Err(FsError::Corrupt);
         }
+
         let first_group = (physical - self.first_data_block) / self.blocks_per_group;
         let last_group = (end - 1 - self.first_data_block) / self.blocks_per_group;
         for group in first_group..=last_group {
@@ -199,6 +200,7 @@ impl Ext4Volume {
             }
             return Ok(volume);
         }
+
         let capacity = view
             .limits()
             .capacity_sectors
@@ -217,6 +219,7 @@ impl Ext4Volume {
         if geometry.block_size % logical != 0 {
             return Err(FsError::Unsupported);
         }
+
         // 未识别的 RO-compatible 格式可以读取，不能授予当前后端写能力。
         let supported_ro = codec::FEATURE_RO_COMPAT_SPARSE_SUPER
             | codec::FEATURE_RO_COMPAT_LARGE_FILE
@@ -228,6 +231,7 @@ impl Ext4Volume {
         if mode == AccessMode::ReadWrite && geometry.features_ro_compat & !supported_ro != 0 {
             return Err(FsError::Unsupported);
         }
+
         let mut volume = Self {
             device: NEXT_DEVICE
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -261,12 +265,14 @@ impl Ext4Volume {
             })??;
             volume.groups.push(layout);
         }
+
         if mode == AccessMode::ReadWrite {
             metadata.prepare_reserve()?;
         }
         let volume = Arc::try_new(volume).map_err(|_| FsError::NoMemory)?;
         let writeback = WritebackDomain::try_new(&volume)?;
         volume.writeback.call_once(|| writeback);
+
         let mut published = metadata.filesystem.lock();
         if let Some(existing) = published.upgrade() {
             drop(published);
@@ -319,6 +325,7 @@ impl Ext4Volume {
                 result = result.and(current);
             }
         }
+
         result.and(writeback::sync_metadata(self))
     }
 
@@ -362,6 +369,7 @@ impl Ext4Volume {
         let Some(volume) = volume else {
             return;
         };
+
         volume.writeback_domain().stop_sync();
         let retired = {
             let mut binding = self.inode_domain.lock();
@@ -629,6 +637,7 @@ impl Ext4Volume {
             }
             offset += size;
         }
+
         // SAFETY: 每个小块已由真实 DMA 全尾收权或 CPU 零填充，EOF 尾也已初始化；
         // read 仍独占整页内容锁，设备及所有可变借用均已结束。
         unsafe {
@@ -688,6 +697,7 @@ impl Ext4Volume {
         if len == 0 || PAGE_SIZE < len {
             return Err(FsError::Corrupt);
         }
+
         let mut result = Vec::new();
         result
             .try_reserve_exact(len)
@@ -708,6 +718,7 @@ impl Ext4Volume {
                 offset += count;
             }
         }
+
         if result.contains(&0) {
             return Err(FsError::Corrupt);
         }
@@ -812,6 +823,7 @@ impl Ext4Volume {
                 return Err(FsError::NameTooLong);
             }
         }
+
         let mut attributes = old;
         attributes.mode = next.mode;
         attributes.uid = next.uid;
@@ -821,6 +833,7 @@ impl Ext4Volume {
         attributes.ctime = next.ctime;
         codec::validate_inode_metadata_update(&old, &attributes)?;
         codec::blocks_encoding(&self.geometry, next.blocks)?;
+
         let (record, offset) = allocation.record();
         let current = record.with_read(|bytes| {
             codec::decode_inode(
@@ -832,6 +845,7 @@ impl Ext4Volume {
         if InodeMetadata::from_data(&current) != old || current.block != old_root {
             return Err(FsError::Corrupt);
         }
+
         record
             .update(&self.claim, |bytes| {
                 let record = &mut bytes[offset..offset + self.geometry.inode_size];
@@ -1005,6 +1019,7 @@ impl Ext4Volume {
         {
             return Err(FsError::InvalidOperation);
         }
+
         let mut attributes = *old;
         attributes.mode = next.mode;
         attributes.uid = next.uid;
@@ -1018,6 +1033,7 @@ impl Ext4Volume {
         if (i64::MAX as u64) < next.size {
             return Err(FsError::FileTooLarge);
         }
+
         let (record, offset) = self.inode_record(old.number, None)?;
         let current = record.with_read(|bytes| {
             codec::decode_inode(

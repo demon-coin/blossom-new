@@ -36,6 +36,7 @@ pub const fn current() -> Platform {
         Platform::QemuVirt
     }
 }
+
 #[cfg(target_arch = "riscv64")]
 pub const EARLY_UART_BASE: usize = 0x1000_0000;
 #[cfg(target_arch = "loongarch64")]
@@ -64,11 +65,13 @@ const FDT_STRUCTURE_SIZE: usize = 9 * FDT_CELL_BYTES;
 const FDT_RESERVATION_ALIGNMENT: usize = core::mem::size_of::<u64>();
 const FDT_RESERVATION_BYTES: usize = 2 * FDT_RESERVATION_ALIGNMENT;
 const FDT_MAX_DEPTH: usize = 64;
+
 const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
 const FDT_PROPERTY: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
+
 const PCI_RANGE_BYTES: usize = 7 * FDT_CELL_BYTES;
 const PCI_RANGE_BUS_OFFSET: usize = FDT_CELL_BYTES;
 const PCI_RANGE_CPU_OFFSET: usize = 3 * FDT_CELL_BYTES;
@@ -77,9 +80,11 @@ const PCI_INTX_PARENT_OFFSET: usize = 4 * FDT_CELL_BYTES;
 const PCI_INTX_SOURCE_OFFSET: usize = PCI_INTX_PARENT_OFFSET + FDT_CELL_BYTES;
 const PCI_INTX_LEGACY_BYTES: usize = PCI_INTX_SOURCE_OFFSET + FDT_CELL_BYTES;
 const PCI_ECAM_BUS_SHIFT: u32 = 20;
+
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const VIRTIO_MMIO_WINDOW_BYTES: usize = 0x1000;
 const QEMU_PCI_INTX_MASK: [u32; 4] = [0x1800, 0, 0, 7];
+
 #[cfg(target_arch = "riscv64")]
 const GOLDFISH_RTC_WINDOW_BYTES: usize = 0x1000;
 #[cfg(target_arch = "loongarch64")]
@@ -123,6 +128,7 @@ fn block(bytes: &[u8], offset: usize, size: usize) -> Result<&[u8], &'static str
     if offset < FDT_HEADER_BYTES {
         return Err("FDT block overlaps the header");
     }
+
     let end = offset
         .checked_add(size)
         .ok_or("FDT block range overflows")?;
@@ -145,6 +151,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
     {
         return Err("FDT version is not v17");
     }
+
     let structure_start = word(bytes, FDT_STRUCTURE_OFFSET)? as usize;
     let strings_start = word(bytes, FDT_STRINGS_OFFSET)? as usize;
     let reserve_start = word(bytes, FDT_RESERVATIONS_OFFSET)? as usize;
@@ -161,6 +168,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
     if structure_start % FDT_CELL_BYTES != 0 || reserve_start % FDT_RESERVATION_ALIGNMENT != 0 {
         return Err("FDT structure or reservation block is unaligned");
     }
+
     let mut reserve_end = reserve_start;
     loop {
         let entry = block(bytes, reserve_end, FDT_RESERVATION_BYTES)?;
@@ -169,6 +177,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
             break;
         }
     }
+
     let spans = [
         (structure_start, structure_start + structure.len()),
         (strings_start, strings_start + strings.len()),
@@ -181,6 +190,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
+
     let mut at = 0;
     let mut depth = 0usize;
     let mut children = [false; FDT_MAX_DEPTH];
@@ -194,6 +204,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 if FDT_MAX_DEPTH - 1 <= depth || (depth == 0 && root_seen) {
                     return Err("FDT node depth exceeds capacity or has multiple roots");
                 }
+
                 let name = cstr(structure.get(at..).ok_or("FDT node name is truncated")?)?;
                 if !name.is_ascii() || (depth == 0 && !name.is_empty()) {
                     return Err("FDT node name or root is invalid");
@@ -204,6 +215,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 if structure.len() < at {
                     return Err("FDT node name padding is truncated");
                 }
+
                 if 0 < depth {
                     children[depth - 1] = true;
                 }
@@ -221,6 +233,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 if depth == 0 || children[depth - 1] {
                     return Err("FDT property is outside the property section");
                 }
+
                 let len = word(structure, at)? as usize;
                 let name_at = word(structure, at + FDT_CELL_BYTES)? as usize;
                 at += 2 * FDT_CELL_BYTES;
@@ -233,6 +246,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                 let value = structure
                     .get(at..end)
                     .ok_or("FDT property value is truncated")?;
+
                 if aliases[depth - 1] && (name.contains('/') || !cstr(value)?.starts_with('/')) {
                     return Err("FDT aliases require slash-free names and absolute paths");
                 }
@@ -251,6 +265,7 @@ fn validate(bytes: &[u8]) -> Result<(), &'static str> {
                         list = &list[text.len() + 1..];
                     }
                 }
+
                 at = end
                     .checked_add(FDT_CELL_BYTES - 1)
                     .ok_or("FDT property padding overflows")?
@@ -373,6 +388,7 @@ fn identity_address<'a>(tree: &'a Fdt<'a>, mut node: Node<'a>) -> Result<(), &'s
                 if child_cells != parent_cells || stride == 0 || ranges.len() % stride != 0 {
                     return Err("FDT bus ranges format is unsupported");
                 }
+
                 for resource in regions(node)? {
                     let resource = resource?;
                     let mut covered = false;
@@ -428,6 +444,7 @@ fn next_ram_region(info: &BootInfo, minimum: usize, limit: usize) -> Option<Regi
         .map(|ram| ram.start.max(minimum))
         .min()?;
     let mut end = start;
+
     loop {
         let next = memory
             .iter()
@@ -476,10 +493,12 @@ fn find_reserved_region(
 ) -> Result<Option<Region>, &'static str> {
     let kernel = crate::boot::kernel_region();
     let mut cursor = window.start.max(PAGE_SIZE);
+
     while let Some(ram) = next_ram_region(info, cursor, window.end) {
         let Some(mut start) = align_reserved_address(ram.start, alignment) else {
             return Ok(None);
         };
+
         while let Some(end) = start.checked_add(size).filter(|end| *end <= ram.end) {
             let candidate = Region { start, end };
             let mut next = start;
@@ -494,6 +513,7 @@ fn find_reserved_region(
             if candidate.overlaps(occupied) {
                 next = next.max(occupied.end);
             }
+
             if next == start {
                 return Ok(Some(candidate));
             }
@@ -527,6 +547,7 @@ fn discover_dynamic_reserved_memory(
     else {
         return Ok(());
     };
+
     let mut requests = reserved
         .children()
         .filter(|node| enabled(*node) && node.property("reg").is_none());
@@ -543,6 +564,7 @@ fn discover_dynamic_reserved_memory(
     {
         return Err("FDT reserved-memory cells do not match the root");
     }
+
     let address_width = address_cells as usize * FDT_CELL_BYTES;
     let size_width = size_cells as usize * FDT_CELL_BYTES;
     for node in core::iter::once(first).chain(requests) {
@@ -564,6 +586,7 @@ fn discover_dynamic_reserved_memory(
             return Err("FDT dynamic reserved-memory alignment is invalid");
         }
         let no_map = node.property("no-map").is_some();
+
         let region = if let Some(ranges) = node.property("alloc-ranges") {
             let stride = address_width + size_width;
             if ranges.value.len() % stride != 0 {
@@ -594,6 +617,7 @@ fn discover_dynamic_reserved_memory(
             )?
         }
         .ok_or("FDT dynamic reserved-memory has no available range")?;
+
         if no_map {
             info.reserve_no_map(region)?;
         } else {
@@ -620,18 +644,21 @@ fn discover_tree(
 ) -> Result<(), &'static str> {
     validate(bytes)?;
     let tree = Fdt::new(bytes).map_err(|_| "FDT parser rejected the input")?;
+
     info.dtb = Region::from_size(dtb_address, tree.total_size())?;
     info.reserve(info.dtb)?;
     #[cfg(target_arch = "loongarch64")]
     if current() == Platform::QemuVirt {
         info.reserve(Region::from_size(0, QEMU_LOONGARCH_DTB_PHYS)?)?;
     }
+
     for reservation in tree.memory_reservations() {
         info.reserve(Region::from_size(
             reservation.address() as usize,
             reservation.size(),
         )?)?;
     }
+
     if let Some(reserved) = tree
         .find_node("/reserved-memory")
         .filter(|node| enabled(*node))
@@ -660,6 +687,7 @@ fn discover_tree(
             }
         }
     }
+
     for node in tree.all_nodes().filter(|n| enabled(*n)) {
         if node.property("device_type").and_then(|p| p.as_str()) != Some("memory") {
             continue;
@@ -680,6 +708,7 @@ fn discover_tree(
             info.memory_count += 1;
         }
     }
+
     if info.memory_count == 0 {
         return Err("FDT has no RAM resources");
     }
@@ -689,6 +718,7 @@ fn discover_tree(
     {
         return Err("runtime DTB is outside the described RAM");
     }
+
     if info.platform != Platform::QemuVirt {
         let kernel = crate::boot::kernel_region();
         let ram = info.memory[..info.memory_count]
@@ -703,6 +733,7 @@ fn discover_tree(
             })?;
         }
     }
+
     let cpus = tree.find_node("/cpus").ok_or("FDT cpus node is missing")?;
     if !matches!(number(cpus, "#address-cells")?, 1 | 2) || number(cpus, "#size-cells")? != 0 {
         return Err("FDT CPU reg cell format is invalid");
@@ -711,6 +742,7 @@ fn discover_tree(
         if node.property("device_type").and_then(|p| p.as_str()) != Some("cpu") {
             continue;
         }
+
         let reg = property(node, "reg")?;
         if reg.len() != number(cpus, "#address-cells")? as usize * FDT_CELL_BYTES {
             return Err("FDT CPU reg is empty, truncated, or contains multiple IDs");
@@ -725,14 +757,17 @@ fn discover_tree(
         if info.cpu_count == MAX_CPUS {
             return Err("FDT CPU count exceeds the compiled capacity");
         }
+
         info.hardware_ids[info.cpu_count] = id;
         info.cpu_count += 1;
     }
+
     let bsp_index = info.hardware_ids[..info.cpu_count]
         .iter()
         .position(|id| *id == info.bsp_hardware_id)
         .ok_or("FDT enabled CPUs do not include the BSP")?;
     info.hardware_ids.swap(0, bsp_index);
+
     #[cfg(target_arch = "riscv64")]
     {
         info.counter_frequency = number(cpus, "timebase-frequency")
@@ -746,22 +781,26 @@ fn discover_tree(
     if info.counter_frequency == 0 {
         return Err("hardware counter frequency is zero");
     }
+
     let chosen = tree
         .find_node("/chosen")
         .ok_or("FDT chosen node is missing")?;
     discover_bootargs(chosen, info)?;
     discover_initrd(chosen, info)?;
+
     let uart = resources::stdout_uart(&tree, chosen)?;
     info.interrupts.uart = single_region(&tree, uart)?;
     if info.interrupts.uart.start != EARLY_UART_BASE {
         return Err("FDT chosen UART differs from the early UART");
     }
     resources::discover_uart(&tree, chosen, uart, info)?;
+
     match current() {
         Platform::QemuVirt => discover_qemu(&tree, cpus, uart, info)?,
         Platform::VisionFive2 => visionfive2::discover(&tree, cpus, uart, info)?,
         Platform::Ls2k1000la => ls2k1000la::discover(&tree, uart, info)?,
     }
+
     discover_dynamic_reserved_memory(&tree, info)?;
     Ok(())
 }
@@ -829,6 +868,7 @@ fn discover_bootargs(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'stat
     {
         return Err("FDT bootargs is not a bounded NUL-terminated command line");
     }
+
     info.bootargs[..value.len()].copy_from_slice(value);
     info.bootargs_len = value.len() - 1;
     Ok(())
@@ -853,6 +893,7 @@ unsafe fn discover_command_line(
     {
         return Err("firmware command line address overflows");
     }
+
     let mut length = 0;
     loop {
         if length == info.bootargs.len() {
@@ -864,6 +905,7 @@ unsafe fn discover_command_line(
         }
         length += 1;
     }
+
     // SAFETY: 调用者保活并保证存储不变且不与 info 重叠；刚才逐字节读到了长度内的完整命令行。
     let command = unsafe { core::slice::from_raw_parts(pointer, length) };
     if append
@@ -881,6 +923,7 @@ unsafe fn discover_command_line(
     if info.bootargs.len() <= end {
         return Err("firmware command line exceeds boot snapshot capacity");
     }
+
     if separator != 0 {
         info.bootargs[start] = b' ';
     }
@@ -903,6 +946,7 @@ fn discover_initrd(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static
         return Err("FDT initrd range is invalid");
     }
     let region = Region { start, end };
+
     if !info.memory[..info.memory_count]
         .iter()
         .any(|ram| ram.start <= start && end <= ram.end)
@@ -911,6 +955,7 @@ fn discover_initrd(chosen: Node<'_>, info: &mut BootInfo) -> Result<(), &'static
     {
         return Err("FDT initrd is outside RAM or overlaps boot data");
     }
+
     info.reserve(region)?;
     info.initrd = Some(region);
     Ok(())
@@ -948,6 +993,7 @@ fn discover_qemu(
             return Err("FDT EXTIOI CPU root interrupt exceeds the supported range");
         }
     }
+
     discover_pci(tree, controller, info)?;
     discover_virtio_mmio(tree, controller, info)?;
     discover_rtc(tree, info)
@@ -1003,6 +1049,7 @@ fn discover_rtc(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
         LS7A_RTC_WINDOW_BYTES,
         LS7A_RTC_WINDOW_BYTES,
     );
+
     let mut devices = tree
         .all_nodes()
         .filter(|node| enabled(*node) && compatible(*node, binding));
@@ -1010,6 +1057,7 @@ fn discover_rtc(tree: &Fdt<'_>, info: &mut BootInfo) -> Result<(), &'static str>
     if devices.next().is_some() {
         return Err("FDT has multiple enabled RTC devices");
     }
+
     let registers = single_region(tree, node)?;
     if registers.start % alignment != 0 || registers.end - registers.start != size {
         return Err("FDT RTC register window has invalid size or alignment");
@@ -1044,11 +1092,13 @@ fn discover_virtio_mmio(
         if info.virtio_mmio_count == MAX_VIRTIO_MMIO {
             return Err("FDT VirtIO-MMIO slot capacity exceeded");
         }
+
         require_controller(controller, "riscv,plic0", 1)?;
         let parent = interrupt_parent(tree, node)?;
         if parent.name.as_ptr() != controller.name.as_ptr() {
             return Err("FDT VirtIO-MMIO interrupt parent is not the selected PLIC");
         }
+
         let registers = single_region(tree, node)?;
         if registers.start % VIRTIO_MMIO_WINDOW_BYTES != 0
             || registers.end - registers.start != VIRTIO_MMIO_WINDOW_BYTES
@@ -1056,14 +1106,17 @@ fn discover_virtio_mmio(
             return Err("FDT VirtIO-MMIO register window is not one aligned page");
         }
         device_region(registers, info)?;
+
         let interrupt_source = irq(node, parent)?;
         device_source(interrupt_source, info)?;
+
         info.virtio_mmio[info.virtio_mmio_count] = VirtioMmioResource {
             registers,
             interrupt_source,
         };
         info.virtio_mmio_count += 1;
     }
+
     info.virtio_mmio[..info.virtio_mmio_count]
         .sort_unstable_by_key(|resource| resource.registers.start);
     Ok(())
@@ -1082,10 +1135,12 @@ fn discover_pci(
     if hosts.next().is_some() {
         return Err("FDT has multiple unsupported PCI hosts");
     }
+
     let configuration = single_region(tree, host)?;
     device_region(configuration, info)?;
     info.pci.configuration = configuration;
     info.pci.kind = PciConfiguration::Ecam;
+
     if number(host, "#address-cells")? != 3 || number(host, "#size-cells")? != 2 {
         return Err("FDT PCI ranges cell format is invalid");
     }
@@ -1093,6 +1148,7 @@ fn discover_pci(
     if parent.cell_sizes().address_cells != 2 {
         return Err("FDT PCI physical addresses are not two cells");
     }
+
     let buses = property(host, "bus-range")?;
     if buses.len() != 2 * FDT_CELL_BYTES {
         return Err("FDT PCI bus-range is truncated");
@@ -1102,6 +1158,7 @@ fn discover_pci(
     if info.pci.bus_end < info.pci.bus_start || (u8::MAX as u32) < info.pci.bus_end {
         return Err("FDT PCI bus-range is invalid");
     }
+
     let configuration_size =
         ((info.pci.bus_end - info.pci.bus_start + 1) as usize) << PCI_ECAM_BUS_SHIFT;
     if configuration.start % (1 << PCI_ECAM_BUS_SHIFT) != 0
@@ -1109,6 +1166,7 @@ fn discover_pci(
     {
         return Err("FDT PCI ECAM window does not match the declared bus range");
     }
+
     let ranges = property(host, "ranges")?;
     if ranges.is_empty() || ranges.len() % PCI_RANGE_BYTES != 0 {
         return Err("FDT PCI ranges is truncated");
@@ -1131,6 +1189,7 @@ fn discover_pci(
         )?;
         let bus = Region::from_size(bus_start, cpu.end - cpu.start)?;
         device_region(cpu, info)?;
+
         for old in &info.pci.ranges[..info.pci.range_count] {
             let old_io = old.flags & PCI_SPACE_CODE_MASK == PCI_SPACE_IO;
             let new_io = flags & PCI_SPACE_CODE_MASK == PCI_SPACE_IO;
@@ -1139,6 +1198,7 @@ fn discover_pci(
                 return Err("FDT PCI bus windows overlap in the same address space");
             }
         }
+
         info.pci.ranges[info.pci.range_count] = PciRange {
             flags,
             bus_start,
@@ -1146,6 +1206,7 @@ fn discover_pci(
         };
         info.pci.range_count += 1;
     }
+
     discover_pci_intx(tree, host, controller, info)?;
     Ok(())
 }
@@ -1163,6 +1224,7 @@ fn discover_pci_intx(
     if host.property("#interrupt-cells").is_some() && number(host, "#interrupt-cells")? != 1 {
         return Err("FDT PCI host interrupt cells do not describe one INTx pin");
     }
+
     let mask = property(host, "interrupt-map-mask")?;
     if mask.len() != PCI_INTX_PARENT_OFFSET {
         return Err("FDT PCI interrupt-map-mask is not four cells");
@@ -1173,6 +1235,7 @@ fn discover_pci_intx(
     if info.pci.intx_mask != QEMU_PCI_INTX_MASK {
         return Err("FDT PCI interrupt-map-mask differs from the selected host profile");
     }
+
     // 条目宽度由父控制器的 #interrupt-cells 决定：一个 cell 只写 source，
     // 两个 cell 追加 level-high flag；旧固件即使声明两个 cell 也只写 source。
     let map = property(host, "interrupt-map")?;
@@ -1194,6 +1257,7 @@ fn discover_pci_intx(
     } else {
         return Err("FDT PCI interrupt-map is not a complete route table");
     };
+
     for entry in map.chunks_exact(stride) {
         if info.pci.intx_route_count == info.pci.intx_routes.len() {
             return Err("FDT PCI INTx route capacity exceeded");
@@ -1207,6 +1271,7 @@ fn discover_pci_intx(
         if !(1..=u32::from(PCI_INTX_PIN_COUNT)).contains(&child[3]) {
             return Err("FDT PCI interrupt-map contains an invalid INTx pin");
         }
+
         let parent = tree
             .find_phandle(word(entry, PCI_INTX_PARENT_OFFSET)?)
             .ok_or("FDT PCI interrupt-map parent phandle has no controller")?;
@@ -1220,6 +1285,7 @@ fn discover_pci_intx(
         }
         let source = word(entry, PCI_INTX_SOURCE_OFFSET)?;
         device_source(source, info)?;
+
         if info.pci.intx_routes[..info.pci.intx_route_count]
             .iter()
             .any(|old| {
@@ -1228,6 +1294,7 @@ fn discover_pci_intx(
         {
             return Err("FDT PCI interrupt-map contains duplicate masked keys");
         }
+
         info.pci.intx_routes[info.pci.intx_route_count] = PciIntxRoute { child, source };
         info.pci.intx_route_count += 1;
     }
@@ -1248,6 +1315,7 @@ fn discover_plic(
         "riscv,plic0"
     };
     require_controller(plic, binding, 1)?;
+
     let sources = number(plic, "riscv,ndev")?;
     if info.interrupts.uart_source == 0 || sources < info.interrupts.uart_source {
         return Err("FDT UART source exceeds the PLIC capacity");
@@ -1258,6 +1326,7 @@ fn discover_plic(
         return Err("FDT PLIC register layout is unsupported");
     }
     info.interrupts.source_count = sources + 1;
+
     let mut handles = [0; MAX_CPUS];
     for cpu in cpus.children().filter(|n| enabled(*n)) {
         if cpu.property("device_type").and_then(|p| p.as_str()) != Some("cpu") {
@@ -1286,6 +1355,7 @@ fn discover_plic(
             return Err("FDT CPU interrupt phandle is zero or duplicated");
         }
     }
+
     let extended = property(plic, "interrupts-extended")
         .map_err(|_| "FDT PLIC interrupts-extended is missing")?;
     if extended.is_empty() || extended.len() % (2 * FDT_CELL_BYTES) != 0 {
@@ -1317,9 +1387,11 @@ fn discover_plic(
             found[logical] = true;
         }
     }
+
     if found[..info.cpu_count].iter().any(|present| !present) {
         return Err("FDT PLIC has no supervisor context for an enabled CPU");
     }
+
     let size = info.interrupts.controller.end - info.interrupts.controller.start;
     for context in &info.interrupts.plic_contexts[..info.cpu_count] {
         let claim_end = crate::arch::PLIC_CONTEXT_BASE
@@ -1333,6 +1405,7 @@ fn discover_plic(
             return Err("FDT PLIC context exceeds its register window");
         }
     }
+
     info.interrupts.root_interrupt = crate::arch::IRQ_S_EXT as u32;
     Ok(())
 }
@@ -1370,10 +1443,12 @@ pub unsafe fn discover(
     {
         return Err("firmware DTB physical address is zero or unaligned");
     }
+
     let pointer = crate::arch::phys_to_virt(physical) as *const u8;
     if (pointer as usize).checked_add(FDT_HEADER_BYTES).is_none() {
         return Err("firmware DTB header virtual address overflows");
     }
+
     // SAFETY: 调用者保证固件头部可读、不变且不与 BootInfo 重叠；物理地址已转换为当前 RAM 映射。
     let header = unsafe { core::slice::from_raw_parts(pointer, FDT_HEADER_BYTES) };
     if word(header, 0)? != FDT_MAGIC {
@@ -1386,11 +1461,14 @@ pub unsafe fn discover(
     {
         return Err("firmware DTB size is invalid or address overflows");
     }
+
     // SAFETY: 调用者保活固件声明的完整存储并保证可读且不变；长度、物理和虚拟地址范围已验证。
     let bytes = unsafe { core::slice::from_raw_parts(pointer, total) };
+
     // SAFETY: 调用者保证 BSP 在 IRQ 关闭且 AP 未释放时调用一次；永久槽尚无引用，借用持续到发布。
     let info = unsafe { crate::boot::prepare(raw_args, bsp_hardware_id) };
     discover_tree(bytes, info, physical)?;
+
     #[cfg(target_arch = "loongarch64")]
     if let Some(command_line) = parameters.command_line {
         // SAFETY: 调用者保活所选命令行至本次复制结束，并保证可读、不变、已映射且不与快照重叠。

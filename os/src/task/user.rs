@@ -126,6 +126,7 @@ impl UserRuntime {
         if third.fd() != 2 {
             return Err(FsError::InvalidOperation);
         }
+
         let flags = DescriptorFlags::default();
         first.publish(console.clone(), flags);
         second.publish(console.clone(), flags);
@@ -383,6 +384,7 @@ impl UserThread {
                 }
             })
         };
+
         drop(removed);
     }
 
@@ -394,6 +396,7 @@ impl UserThread {
         self.signals()
             .expect("exec has no signals")
             .reset_for_exec(runtime.0.sighand.clone());
+
         let old_mm = self.mm().expect("exec has no old MM");
         let clear_child_tid = {
             let mut process = self.process.lock();
@@ -401,10 +404,12 @@ impl UserThread {
             mem::take(&mut process.clear_child_tid)
         };
         clear_tid(&old_mm, clear_child_tid);
+
         let binding = MmUser::new(image.mm);
         let active = binding.mm().clone();
         self.restart.set(None);
         self.saved_mask.set(None);
+
         let (old_runtime, old_binding, old_active, completion) = {
             let _irq = IrqSaveGuard::new();
             let (old_runtime, completion) = {
@@ -422,6 +427,7 @@ impl UserThread {
             space::enter_current(Some(active));
             (old_runtime, old_binding, old_active, completion)
         };
+
         drop(old_runtime);
         drop(old_binding);
         drop(old_active);
@@ -512,11 +518,13 @@ impl UserThread {
             vfork,
             ..
         } = process;
+
         if let Some(binding) = &mm {
             clear_tid(binding.mm(), clear_child_tid);
         }
         drop(runtime);
         drop(mm);
+
         if let Some(completion) = vfork {
             completion.complete();
         }
@@ -800,6 +808,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             .expect("child entry has no MM")
             .copyout(address, &bytes);
     }
+
     let mut interrupts = 0usize;
     let signals = identity.signals();
     let mut restart = None;
@@ -812,6 +821,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
         user.user_time()
             .expect("user loop has no CPU time")
             .flush_cpu_timers();
+
         match signals.select() {
             Some(SignalSelection::Exit(status)) => {
                 identity.group().signals().notify();
@@ -852,6 +862,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
                 user.restore_saved_mask();
             }
         }
+
         let trap = {
             let _irq = IrqSaveGuard::new();
             if signals.interruption_pending(WaitMode::Interruptible)
@@ -861,6 +872,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             }
             user.run_user()
         };
+
         match trap {
             UserTrap::Interrupt => {
                 interrupts = interrupts
@@ -955,6 +967,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             }
         }
     };
+
     drop(identity);
     let identity = user.release_process();
     identity.graph().exit(
@@ -982,6 +995,7 @@ fn wait_control(identity: &UserIdentity) -> Option<i32> {
             SignalControl::Exit(status) => return Some(status),
             SignalControl::Stop => {}
         }
+
         let waiter = Waiter::new();
         let mut node = core::pin::pin!(crate::wait::WaitNode::new(waiter.waker()));
         // SAFETY: identity保活原图和控制源；node固定本Task栈，登记先于node和Waiter撤除，

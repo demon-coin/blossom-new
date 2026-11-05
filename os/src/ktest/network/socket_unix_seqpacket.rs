@@ -12,6 +12,7 @@ pub(crate) mod socket_unix_seqpacket {
     use crate::ktest::execution_services::SuiteBaseline;
     use crate::net::socket::{SocketFile, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, SHUT_WR};
     use crate::net::UnixSocketType;
+
     /// 有序记录不合并；PEEK、短读和零容量 recv 保原长，空消息与关闭 EOF 分别消费。
     #[test]
     fn unix_seqpacket_record_peek_truncation_empty_and_shutdown(
@@ -44,6 +45,7 @@ pub(crate) mod socket_unix_seqpacket {
                 bytes.len(),
             );
         }
+
         let mut prefix = [0u8; 2];
         let peek = operation(
             context,
@@ -69,6 +71,7 @@ pub(crate) mod socket_unix_seqpacket {
             (2, 5, 0x20),
         );
         context.expect_eq(&prefix, b"fi");
+
         let mut output = [0u8; 32];
         let next = operation(
             context,
@@ -174,6 +177,7 @@ pub(crate) mod socket_unix_seqpacket {
             ),
             Err(FsError::WouldBlock),
         );
+
         for bytes in [b"".as_slice(), b"tail".as_slice()] {
             context.expect_eq(
                 operation(
@@ -205,6 +209,7 @@ pub(crate) mod socket_unix_seqpacket {
             operation(context, receiver.poll(None))?.contains(PollMask::POLLRDHUP),
             true,
         );
+
         context.expect_eq(
             operation(
                 context,
@@ -232,6 +237,7 @@ pub(crate) mod socket_unix_seqpacket {
                 Err(FsError::BrokenPipe),
             );
         }
+
         drop((sender, receiver));
         socket_retired(&fixture.net)?;
         context.expect_eq(fixture.net.ktest_live_endpoints(), 0);
@@ -260,6 +266,7 @@ pub(crate) mod socket_unix_seqpacket {
         drop(sender);
         context.expect_eq(weak.upgrade().is_some(), true);
         context.expect_eq(fixture.net.ktest_live_endpoints(), 2);
+
         let mut payload = operation(context, crate::net::packet::zeroed_bytes(16385))?;
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte = pattern(index);
@@ -273,6 +280,7 @@ pub(crate) mod socket_unix_seqpacket {
             ),
             Err(FsError::MessageTooLarge),
         );
+
         let mut output = operation(context, crate::net::packet::zeroed_bytes(16384))?;
         context.expect_eq(
             operation(
@@ -299,6 +307,7 @@ pub(crate) mod socket_unix_seqpacket {
             (16384, 16384, 0),
         );
         context.expect_eq(output.as_slice(), &payload[..16384]);
+
         for bytes in [&payload[..8193], &payload[8193..16384]] {
             context.expect_eq(
                 operation(
@@ -326,6 +335,7 @@ pub(crate) mod socket_unix_seqpacket {
             ),
             Err(FsError::WouldBlock),
         );
+
         let mut first = [0u8; 1];
         let peek = operation(
             context,
@@ -360,6 +370,7 @@ pub(crate) mod socket_unix_seqpacket {
             operation(context, alias.poll(None))?.contains(PollMask::POLLOUT),
             true,
         );
+
         for _ in 0..31 {
             context.expect_eq(
                 operation(
@@ -387,6 +398,7 @@ pub(crate) mod socket_unix_seqpacket {
             ),
             Err(FsError::WouldBlock),
         );
+
         let second = operation(
             context,
             receiver.receive(
@@ -433,6 +445,7 @@ pub(crate) mod socket_unix_seqpacket {
             ),
             Err(FsError::WouldBlock),
         );
+
         drop(alias);
         context.expect_eq(weak.upgrade().is_none(), true);
         context.expect_eq(fixture.net.ktest_live_endpoints(), 1);

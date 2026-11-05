@@ -157,6 +157,7 @@ impl QueueLimits {
         if attributes != 0 {
             return Err(BlockError::Unsupported);
         }
+
         let direction = match operation {
             BlkOperation::Read => BufferDirection::DeviceToDriver,
             BlkOperation::Write => {
@@ -175,6 +176,7 @@ impl QueueLimits {
                 BufferDirection::DriverToDevice
             }
         };
+
         let mut sum = 0_usize;
         for segment in segments {
             if operation == BlkOperation::Flush
@@ -194,12 +196,14 @@ impl QueueLimits {
         if sum != total_bytes {
             return Err(BlockError::InvalidRange);
         }
+
         if operation == BlkOperation::Flush {
             return Ok(());
         }
         if total_bytes == 0 {
             return Err(BlockError::InvalidRange);
         }
+
         let offset = sector
             .checked_mul(SECTOR_BYTES)
             .ok_or(BlockError::InvalidRange)?;

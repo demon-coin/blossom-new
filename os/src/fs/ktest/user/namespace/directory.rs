@@ -18,6 +18,7 @@ use crate::mm::dma::MappedPages;
 use super::{directory_block, prepare_namespace_view, NamespaceView};
 
 const INDEX: u32 = 0x1000;
+
 const LONG_NAME_PREFIX: &[u8] = b"w27-\xff-";
 const PROMOTION_PREFIX_SIGNED: &[u8] = b"signed-";
 const PROMOTION_PREFIX_UNSIGNED: &[u8] = b"unsigned-";
@@ -110,6 +111,7 @@ fn name_for_split_leaf(
             widest = width;
         }
     }
+
     for _ in 0..HASH_CANDIDATE_LIMIT {
         let nonce = *next_nonce;
         *next_nonce = next_nonce.checked_add(1).ok_or(FsError::NoSpace)?;
@@ -185,6 +187,7 @@ fn verify_indexed_new_names(
         checked(context, file.seek(SeekFrom::Current(0)))?,
         committed_cookie,
     );
+
     let declined = checked(context, file.readdir())?
         .ok_or(TestError("indexed short delivery lost its final entry"))?;
     context.expect_eq(declined.next_cookie, declined_cookie);
@@ -220,6 +223,7 @@ fn select_unsigned_legacy_default(context: &mut TestContext<'_>, disk: &DiskRef)
             "legacy hash preparation has unsupported Disk geometry",
         ));
     }
+
     let start = 1024 / logical * logical;
     let end = 2048_usize.div_ceil(logical) * logical;
     let length = end - start;
@@ -241,6 +245,7 @@ fn select_unsigned_legacy_default(context: &mut TestContext<'_>, disk: &DiskRef)
         let checksum = codec::crc32c(!0, &superblock[..1020]);
         superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
     }
+
     let updated = checked(context, codec::decode_super(superblock, capacity))?;
     context.expect_eq(updated.default_hash_version, 3);
     context.expect_eq(updated.hash_unsigned, original.hash_unsigned);
@@ -318,6 +323,7 @@ fn htree_shape(
     if depth > 1 {
         return Err(FsError::Unsupported);
     }
+
     let root_count = usize::from(codec::le16(&root, 34)?);
     let root_limit = usize::from(codec::le16(&root, 32)?);
     let mut nodes = Vec::new();
@@ -425,6 +431,7 @@ fn raw_long_name(prefix: &[u8], nonce: u32) -> [u8; 255] {
     }
     name
 }
+
 /// 为已发表目录项准备独立字节拥有，不依赖 UTF-8 解释或意外分配。
 fn copy_name(name: &[u8]) -> Result<Vec<u8>, TestError> {
     let mut copy = Vec::new();
@@ -484,6 +491,7 @@ fn promote_legacy_directory(
         checked(context, inode.metadata_snapshot())?.flags & INDEX,
         0,
     );
+
     let geometry = view.volume.geometry();
     let tail = if geometry.features_ro_compat & codec::METADATA_CSUM != 0 {
         12
@@ -511,6 +519,7 @@ fn promote_legacy_directory(
     if trigger_len < prefix.len() + 8 || 255 < trigger_len {
         return Err(TestError("promotion trigger component is invalid"));
     }
+
     let mut names = Vec::new();
     names
         .try_reserve_exact(long_count + 3)
@@ -529,6 +538,7 @@ fn promote_legacy_directory(
             sync_namespace_batch(context, view.volume.disk(), source_file, &directory_file)?;
         }
     }
+
     let trigger = raw_long_name(prefix, u32::MAX);
     checked(
         context,
@@ -547,6 +557,7 @@ fn promote_legacy_directory(
         checked(context, inode.metadata_snapshot())?.flags & INDEX,
         INDEX,
     );
+
     let first = checked(context, directory_table.readdir(directory_fd))?.ok_or(TestError(
         "old-open directory lost its first entry after promotion",
     ))?;
@@ -562,6 +573,7 @@ fn promote_legacy_directory(
         let updated = checked(context, htree_shape(&view.volume, &inode, true))?;
         context.expect_eq(updated.root[28], hash_version);
     }
+
     let first_hash = checked(
         context,
         codec::directory_hash(geometry, hash_version, collision[0]),
@@ -578,6 +590,7 @@ fn promote_legacy_directory(
             return Err(TestError("fixed collision vector overlaps promotion names"));
         }
     }
+
     for name in collision {
         checked(
             context,
@@ -590,6 +603,7 @@ fn promote_legacy_directory(
             sync_namespace_batch(context, view.volume.disk(), source_file, &directory_file)?;
         }
     }
+
     context.expect_eq(
         checked(context, inode.metadata_snapshot())?.flags & INDEX,
         INDEX,
@@ -639,6 +653,7 @@ fn set_root_hash_version(
             ));
         }
     }
+
     bytes[28] = version;
     if geometry.features_ro_compat & codec::METADATA_CSUM != 0 {
         let count =
@@ -659,6 +674,7 @@ fn set_root_hash_version(
     {
         return Err(TestError("legacy hash version changed the root layout"));
     }
+
     let physical = match volume.map_block(&metadata, &map_root, 0, None) {
         Ok(BlockMapping::Mapped { physical, .. }) => physical,
         Ok(_) => return Err(TestError("legacy root block is not mapped")),
@@ -737,6 +753,7 @@ fn complete_directory_names(
         checked(context, file.seek(SeekFrom::Current(0)))?,
         accepted_cookie,
     );
+
     let declined =
         checked(context, file.readdir())?.ok_or(TestError("short directory entry was lost"))?;
     context.expect_eq(declined.next_cookie, declined_cookie);
@@ -751,6 +768,7 @@ fn complete_directory_names(
         &mut entries,
     )
     .map_err(|_| TestError("short directory entry changed before retry"))?;
+
     file.for_each_dirent(&mut |entry| {
         observe_directory_name(
             entry,
@@ -772,6 +790,7 @@ fn complete_directory_names(
     context.expect_eq(dots, 2);
     context.expect_eq(entries, names.len() + 2);
     context.expect_eq(seen.iter().all(|present| *present), true);
+
     let mut after_eof = 0;
     file.for_each_dirent(&mut |_| {
         after_eof += 1;
@@ -888,6 +907,7 @@ fn check_collision_cursors(
                 .any(|name| *name == second.name.as_slice()),
         true,
     );
+
     checked(
         context,
         table.seek(independent, SeekFrom::Start(first_cookie)),
@@ -902,6 +922,7 @@ fn check_collision_cursors(
     let continued = checked(context, table.readdir(independent))?
         .ok_or(TestError("SEEK_CUR(0) discarded collision continuation"))?;
     context.expect_eq(continued.name.as_slice(), second.name.as_slice());
+
     for descriptor in [fd, independent, duplicate] {
         checked(context, table.close(descriptor))?;
     }
@@ -1028,6 +1049,7 @@ fn cold_reopen_namespace(
     let mut bytes = [0xa7; 64];
     context.expect_eq(checked(context, inode.read_at(0, &mut bytes))?, bytes.len());
     context.expect_eq(&bytes, expected_bytes);
+
     let index_path = checked(
         context,
         vfs.resolve(&fs_context, b"/indexed", ResolveMode::Follow),
@@ -1070,6 +1092,7 @@ pub(super) mod cases {
                 .any(|seed| *seed != 0),
             true,
         );
+
         let source_inode = checked(context, view.source.inode())?.clone();
         let source_number = source_inode.number();
         let initial_links = checked(context, source_inode.metadata_snapshot())?.links;
@@ -1078,6 +1101,7 @@ pub(super) mod cases {
             checked(context, source_inode.read_at(0, &mut source_bytes_before))?,
             source_bytes_before.len(),
         );
+
         let indexed = checked(
             context,
             view.vfs
@@ -1111,6 +1135,7 @@ pub(super) mod cases {
                 "bounded hardlink batch exceeds ext4 link-count capacity",
             ));
         }
+
         let mut names = Vec::new();
         names
             .try_reserve_exact(operation_limit)
@@ -1180,6 +1205,7 @@ pub(super) mod cases {
             ));
         }
         context.expect_eq(leaf_splits, split_limit);
+
         while names.len() < 3 {
             let name = name_for_root_range(
                 &view.volume,
@@ -1202,6 +1228,7 @@ pub(super) mod cases {
                 sync_namespace_batch(context, &disk, &source_file, &directory_file)?;
             }
         }
+
         let rename_target = name_for_root_range(
             &view.volume,
             &initial,
@@ -1235,6 +1262,7 @@ pub(super) mod cases {
         names.sort_unstable_by_key(|name| name.nonce);
         sync_namespace_batch(context, &disk, &source_file, &directory_file)?;
         checked(context, root_file.sync_range(0..u64::MAX, false))?;
+
         let after = checked(context, htree_shape(&view.volume, &indexed_inode, true))?;
         preserve_indexed_layout(context, &view.volume, &indexed_inode, &initial, &after)?;
         let final_links = checked(context, source_inode.metadata_snapshot())?.links;
@@ -1265,6 +1293,7 @@ pub(super) mod cases {
             Some(FsError::NotFound),
         );
         verify_indexed_new_names(context, &view.vfs, &indexed, &names, source_number)?;
+
         let mut cold_path = Vec::new();
         cold_path
             .try_reserve_exact(9 + rename_target.bytes.len())
@@ -1318,6 +1347,7 @@ pub(super) mod cases {
         )?;
         check_collision_cursors(context, &view, &collision_signed)?;
         check_collision_cursors(context, &view, &collision_unsigned)?;
+
         sync_namespace_batch(context, &disk, &source_file, &directory_file)?;
         checked(context, root_file.sync_range(0..u64::MAX, false))?;
         for inode in &fixture.inodes {
@@ -1325,6 +1355,7 @@ pub(super) mod cases {
         }
         checked(context, crate::fs::writeback::sync_metadata(&view.volume))?;
         disk.test_flush_completions();
+
         let depth_before = initial.depth;
         let roots_before = initial.root_count;
         let leaves_before = initial.leaves;
@@ -1343,6 +1374,7 @@ pub(super) mod cases {
             after,
         ));
         fixture.inodes.clear();
+
         cold_reopen_namespace(
             context,
             fixture,
@@ -1521,6 +1553,7 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::NotEmpty),
         );
+
         checked(
             context,
             view.vfs.mkdir_from(
@@ -1636,6 +1669,7 @@ pub(super) mod cases {
                 .err(),
             Some(FsError::CrossDevice),
         );
+
         context.expect_eq(
             view.vfs
                 .rmdir_from(&view.context, &view.root, b"/", (0, 0))

@@ -9,6 +9,7 @@ const SPLICE_F_MOVE: u32 = 1;
 const SPLICE_F_MORE: u32 = 4;
 const SPLICE_F_GIFT: u32 = 8;
 const SPLICE_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+
 const TRANSFER_CHUNK: usize = 4096;
 
 /// 核明确位置和完整请求可表示为非负 loff_t，不用截断掩盖溢出。
@@ -80,6 +81,7 @@ pub(crate) fn copy_file_range(
         return Err(FsError::CrossDevice);
     }
     output.transfer_check_write()?;
+
     let flags = output.flags();
     let shared = core::ptr::eq(input, output);
     let lock_input = source_offset.is_none();
@@ -119,6 +121,7 @@ pub(crate) fn copy_file_range(
     {
         return Err(FsError::InvalidOperation);
     }
+
     let result = copy_bytes(input, start_in, output, start_out, length, caller);
     if let Ok(accepted) = result {
         if let Some(offset) = source_offset {
@@ -136,6 +139,7 @@ pub(crate) fn copy_file_range(
     }
     drop(output_cursor);
     drop(input_cursor);
+
     finish_write(output, flags, start_out, result)
 }
 
@@ -162,6 +166,7 @@ fn copy_bytes(
         if interruption_pending(caller) {
             return progress(copied, FsError::Interrupted);
         }
+
         let accepted = match output.transfer_write_at(
             start_out + copied as u64,
             &scratch[..read],
@@ -207,6 +212,7 @@ fn positioned_splice(
         .copied()
         .unwrap_or_else(|| **cursor.as_ref().unwrap());
     check_range(start, length)?;
+
     let result = operation(start);
     if let Ok(accepted) = result {
         if let Some(offset) = offset {
@@ -217,6 +223,7 @@ fn positioned_splice(
         }
     }
     drop(cursor);
+
     if writing {
         finish_write(file, flags, start, result)
     } else {
@@ -247,6 +254,7 @@ pub(crate) fn splice(
     if source.flags() & O_ACCMODE == O_WRONLY || target.flags() & O_ACCMODE == O_RDONLY {
         return Err(FsError::BadFd);
     }
+
     let nonblocking = flags & SPLICE_NONBLOCK != 0;
     match (input_pipe, output_pipe) {
         (Some(input), Some(output)) => input.splice_to_pipe(output, length, nonblocking, caller),

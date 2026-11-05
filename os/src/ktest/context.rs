@@ -1,4 +1,5 @@
 //! 捕获定位随真实 Task 迁核；子任务登记和报告空间在 OOM 主体之前预备。
+
 use super::{
     panic::{self, Boundary},
     report,
@@ -20,7 +21,9 @@ const CHILDREN: usize = if MIN_CHILDREN < crate::boot::MAX_CPUS + 1 {
 } else {
     MIN_CHILDREN
 };
+
 const NO_CASE: u32 = u32::MAX;
+
 static BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
 static BOOT_BOUNDARY: AtomicPtr<Boundary> = AtomicPtr::new(ptr::null_mut());
 static BOOT_CASE: AtomicU32 = AtomicU32::new(NO_CASE);
@@ -30,6 +33,7 @@ static BOOT_ARMED: AtomicBool = AtomicBool::new(false);
 pub(crate) struct BootGuard {
     _local: PhantomData<*mut ()>,
 }
+
 impl BootGuard {
     /// 拒绝第二执行者共享 BSP 的固定捕获槽。
     pub(crate) fn enter() -> Self {
@@ -41,6 +45,7 @@ impl BootGuard {
         }
     }
 }
+
 impl Drop for BootGuard {
     fn drop(&mut self) {
         if !BOOT_BOUNDARY.load(Ordering::Relaxed).is_null() {
@@ -59,6 +64,7 @@ fn with_task<T>(body: impl FnOnce(Option<&crate::task::Task>) -> T) -> T {
     // SAFETY: 非空对象由活登记拥有直到离开 Running，借用不逃逸 IRQ-off 回调。
     body(unsafe { pointer.as_ref() })
 }
+
 /// 硬 IRQ、BH/IPI/CSD 和无登记 worker 不得捕获被打断的 Task 边界。
 fn boundary_allowed() -> bool {
     let local = crate::cpu::current();
@@ -66,6 +72,7 @@ fn boundary_allowed() -> bool {
         && local.bh_depth.load(Ordering::Relaxed) == 0
         && !local.ktest_callback_active.load(Ordering::Relaxed)
 }
+
 /// 低层 panic 仅读取原槽，不取调度锁、不分配、不遍历。
 pub(crate) fn current_boundary() -> *mut Boundary {
     let _irq = IrqSaveGuard::new();
@@ -83,6 +90,7 @@ pub(crate) fn current_boundary() -> *mut Boundary {
         None => ptr::null_mut(),
     })
 }
+
 /// 替换当前执行者唯一边界；返回外层原槽。
 /// # Safety
 /// new 非空时必须指向当前栈中固定且存活的 Boundary；调用者逆序恢复，不跨执行者移交。
@@ -102,6 +110,7 @@ pub(crate) unsafe fn replace_boundary(new: *mut Boundary) -> *mut Boundary {
         _ => fatal("boundary installation outside test owner"),
     })
 }
+
 /// 应急故障定位允许 IRQ 控制者读取被打断测试身份，但绝不允许从 IRQ 展开。
 pub(crate) fn active_case() -> Option<u32> {
     let id = with_task(|task| {
@@ -121,6 +130,7 @@ pub(crate) fn active_case() -> Option<u32> {
     });
     (id != NO_CASE).then_some(id)
 }
+
 /// 展开内部不变量故障按实际原因归类，不读取 armed 期望。
 pub(crate) fn fatal(reason: &'static str) -> ! {
     let kind = if reason.contains("double panic") || reason.contains("nested catch") {
@@ -137,6 +147,7 @@ struct Children {
     closed: bool,
     slots: [Option<crate::task::JoinHandle>; CHILDREN],
 }
+
 /// 固定容量、实际拥有的子任务作用域；关闭后不再发表任务。
 pub(crate) struct ArcScope {
     case: AtomicU32,
@@ -146,6 +157,7 @@ pub(crate) struct ArcScope {
     children: SpinLock<Children>,
     failure: SpinLock<Option<Failure>>,
 }
+
 impl ArcScope {
     /// 所有报告/停止/登记空间预先一次分配，之后收敛不申请存储。
     pub(crate) fn new(id: u32) -> Result<Arc<Self>, TestError> {
@@ -162,16 +174,19 @@ impl ArcScope {
         })
         .map_err(|_| TestError("NoMemory: test scope"))
     }
+
     /// 合作停止同时关闭新子任务发表；既有任务保留真实 join 责任。
     fn stop(&self) {
         self.children.lock().closed = true;
         self.stop.store(true, Ordering::Release);
     }
+
     /// 锁外逐个等待真实离栈；丢观察 handle 不影响这个拥有关系。
     fn join(&self) -> Result<JoinOutcome, TestError> {
         if !self.children.lock().closed {
             return Err(TestError("join without cooperative stop"));
         }
+
         for index in 0..CHILDREN {
             let handle = self.children.lock().slots[index].take();
             if let Some(handle) = handle {
@@ -183,6 +198,7 @@ impl ArcScope {
             failure: *self.failure.lock(),
         })
     }
+
     /// 第一个子失败独立保留，不能满足父 body 的 should_panic。
     fn record(&self, failure: Failure) {
         let mut slot = self.failure.lock();
@@ -191,6 +207,7 @@ impl ArcScope {
         }
     }
 }
+
 impl Drop for ArcScope {
     /// 丢失 join 责任是框架不变量故障，不能隐式释放仍被执行者使用的对象。
     fn drop(&mut self) {
@@ -207,6 +224,7 @@ pub(crate) struct ScopeGuard<'a> {
     boundary: *mut (),
     _local: PhantomData<*mut ()>,
 }
+
 impl<'a> ScopeGuard<'a> {
     /// Arc 的稳定分配和本地 borrow 保活到恢复原槽以后。
     pub(crate) fn install(scope: &'a Arc<ArcScope>) -> Self {
@@ -226,6 +244,7 @@ impl<'a> ScopeGuard<'a> {
         }
     }
 }
+
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
         let pointer = Arc::as_ptr(self.scope).cast_mut().cast();
@@ -246,25 +265,30 @@ impl Drop for ScopeGuard<'_> {
 pub(crate) struct ChildToken {
     scope: Arc<ArcScope>,
 }
+
 impl ChildToken {
     /// 主体必须在真实工作边界检查停止请求。
     pub(crate) fn stop_requested(&self) -> bool {
         self.scope.stop.load(Ordering::Acquire)
     }
 }
+
 /// 观察 handle 只保留原完成状态；丢弃不影响父 scope 的唯一 join 责任。
 pub(crate) struct ChildHandle {
     observer: crate::task::JoinObserver,
 }
+
 impl ChildHandle {
     /// Some 表示原任务已经离栈，值始终来自原 JoinState。
     pub(crate) fn try_join(&self) -> Option<i32> {
         self.observer.try_join()
     }
+
     /// 返回原任务的稳定身份，不保活任务或执行栈。
     pub(crate) fn task_id(&self) -> crate::task::TaskId {
         self.observer.task_id()
     }
+
     /// 普通测试任务锁外等待真实离栈；子失败仍独立保留在父账本。
     pub(crate) fn join(&self) -> Result<i32, TestError> {
         if !boundary_allowed() {
@@ -273,6 +297,7 @@ impl ChildHandle {
         Ok(self.observer.join())
     }
 }
+
 /// 从当前 Thread 测试作用域发表无返回值的真实固定 CPU Task。
 pub(crate) fn spawn_on(
     cpu: usize,
@@ -340,6 +365,7 @@ fn prepare_child(
     if !boundary_allowed() {
         return Err(TestError("spawn outside ordinary test Task"));
     }
+
     let scope = with_task(|task| {
         let pointer = task
             .map_or(ptr::null_mut(), |task| {
@@ -367,6 +393,7 @@ fn prepare_child(
             return Err(TestError("child scope capacity exhausted"));
         }
     }
+
     // 已登记的原调用 Task 保住预备尾部；未发表入口不能开始执行，失败析构允许睡眠。
     let owned = Arc::clone(&scope);
     let entry = move || {
@@ -408,6 +435,7 @@ pub(crate) struct PreparedChild {
     scope: Arc<ArcScope>,
     prepared: crate::task::PreparedTask,
 }
+
 impl PreparedChild {
     /// 在 scope 发表之前关联真实用户拥有，仍由原子任务捕获和 join 协议负责退出。
     pub(crate) fn bind_user(&self, user: Arc<crate::task::UserThread>) {
@@ -428,6 +456,7 @@ impl PreparedChild {
                 return Err(TestError("child scope capacity exhausted"));
             }
         };
+
         let handle = self.prepared.publish();
         let observer = handle.observer();
         slots.slots[slot] = Some(handle);
@@ -446,6 +475,7 @@ pub(crate) struct RuntimeServices<'a> {
     suite_cleanup: core::cell::Cell<bool>,
     suite: &'static str,
 }
+
 impl<'a> RuntimeServices<'a> {
     /// 每个作用域保留 suite 名；只有 NO_CASE 哨兵属于 suite 自身。
     pub(crate) fn new(
@@ -464,6 +494,7 @@ impl<'a> RuntimeServices<'a> {
             suite,
         }
     }
+
     /// Boot 固定 case 身份在进入实例时更新，Thread 身份已在各自 ArcScope 中。
     pub(crate) fn activate(&self) {
         if self.scope.is_none() {
@@ -471,10 +502,12 @@ impl<'a> RuntimeServices<'a> {
             BOOT_ARMED.store(false, Ordering::Release);
         }
     }
+
     /// runner 已输出 setup 时同步服务本地阶段，避免重复控制行。
     pub(crate) fn mark_setup(&self) {
         self.phase.set(Some(Phase::Setup));
     }
+
     /// typed dispatch 返回且真实 join 完成后才发布普通终态；abort 永不返回到这里。
     pub(crate) fn finish(&self, ordinal: usize, outcome: &CaseOutcome) {
         if self.id == NO_CASE || self.finished.get() {
@@ -496,6 +529,7 @@ impl<'a> RuntimeServices<'a> {
         report::result(ordinal, self.case, outcome, None);
     }
 }
+
 impl Services for RuntimeServices<'_> {
     fn catch(&self, callback: &mut dyn FnMut() -> TestResult) -> Caught {
         if cfg!(panic = "abort") {
@@ -512,9 +546,11 @@ impl Services for RuntimeServices<'_> {
             }
         }
     }
+
     fn diagnostic(&self, message: core::fmt::Arguments<'_>) {
         report::diagnostic(message);
     }
+
     /// 在原阶段顺序中发布当前阶段，并只在主体期间保留既有 fatal 武装状态。
     fn phase(&self, phase: Phase) {
         if self.finished.get() {
@@ -548,15 +584,18 @@ impl Services for RuntimeServices<'_> {
             BOOT_ARMED.store(false, Ordering::Release);
         }
     }
+
     fn stop_children(&self) {
         if let Some(scope) = self.scope {
             scope.stop();
         }
     }
+
     fn join_children(&self) -> Result<JoinOutcome, TestError> {
         self.scope
             .map_or(Ok(JoinOutcome { failure: None }), |scope| scope.join())
     }
+
     fn terminate(&self, outcome: &CaseOutcome) -> ! {
         if self.finished.replace(true) {
             fatal("duplicate case termination");

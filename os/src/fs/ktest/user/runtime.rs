@@ -73,6 +73,7 @@ impl UserOwner {
             &[ENTRY, selector],
         )?;
         drop(main);
+
         let mm = image.mm.clone();
         self.start_program(context, image, fs_context, false, false, Credentials::ROOT)?;
         let event = self.wait(context)?;
@@ -118,6 +119,7 @@ impl UserOwner {
             let phdr = read_phdr(context, &loader, &header, index)?;
             assert_ne!(phdr_kind(&phdr), 3, "direct loader has PT_INTERP");
         }
+
         let argv = [interpreter, ENTRY, b"argv" as &[u8]];
         let arguments = runtime_arguments(context, interpreter, &argv)?;
         let image = prepare_image(self, context, &fs_context, arguments)?;
@@ -164,6 +166,7 @@ impl UserOwner {
             &[ENTRY, b"argv"],
         )?;
         assert_denied(&main, &loader);
+
         let child = Arc::try_new(image.mm.fork().map_err(|error| {
             context.diagnostic(format_args!("runtime-fork error={:?}", error));
             TestError("runtime two-image Mm fork failed")
@@ -190,6 +193,7 @@ impl UserOwner {
         self.run_runtime(context, image, fs_context)?;
         assert_eq!(child.user_count(), 0, "runtime fork still has users");
         assert_denied(&main, &loader);
+
         let weak = Arc::downgrade(&child);
         drop(child);
         assert!(weak.upgrade().is_none(), "runtime fork last Mm still owned");
@@ -233,6 +237,7 @@ impl UserOwner {
         )?;
         let original_pc = image.context.pc;
         let original_break = image.mm.brk(0);
+
         for (pathname, expected) in [
             (b"/elf-missing-interpreter" as &[u8], FsError::NotFound),
             (b"/elf-directory-interpreter" as &[u8], FsError::Permission),
@@ -252,6 +257,7 @@ impl UserOwner {
             )?);
             assert_denied(&main, &loader);
         }
+
         let arguments = runtime_arguments(context, ENTRY, &[ENTRY, b"argv"])?;
         let vfs = self.path.vfs().clone();
         let candidate = main.clone();
@@ -288,6 +294,7 @@ impl UserOwner {
             })
             .map_err(|_| TestError("runtime OOM controller allocation failed"))?,
         );
+
         let child = self.observer.take().expect("runtime OOM controller absent");
         context.expect_eq(child.join(), 0);
         let (evidence, result) = observed
@@ -529,6 +536,7 @@ fn read_auxv(
         "runtime envp terminator"
     );
     cursor += 8;
+
     let kinds = [3, 4, 5, 7, 9, 31];
     let mut values = [None; 6];
     for slot in 0..32 {
@@ -659,6 +667,7 @@ fn verify_image(
         .phdr
         .checked_sub(phdr_address.ok_or(TestError("main PHDR has no readable file LOAD"))?)
         .ok_or(TestError("runtime main PHDR bias underflow"))?;
+
     if header.kind == 2 {
         assert_eq!(bias, 0, "runtime ET_EXEC main bias");
     } else {
@@ -698,6 +707,7 @@ fn verify_image(
         ));
         return Ok(());
     }
+
     let interpreter = interpreter.unwrap();
     assert!(0 < auxv.base, "runtime AT_BASE is zero");
     let loader = open(context, owner, fs_context, interpreter)?;
@@ -786,6 +796,7 @@ fn verify_permissions(mm: &Mm, address: usize, flags: u32) {
             "runtime LOAD permission {address:#x} {access:?}"
         );
     }
+
     let permissions = mm
         .mapping(address)
         .expect("runtime LOAD leaf absent")
@@ -830,6 +841,7 @@ fn verify_loads(
                 "runtime biased LOAD alignment"
             );
         }
+
         let first_page = start & !(PAGE_SIZE - 1);
         let last_page = (memory_end - 1) & !(PAGE_SIZE - 1);
         for address in [
@@ -843,6 +855,7 @@ fn verify_loads(
                 page_flags(context, file, header, bias, address)?,
             );
         }
+
         let mut cursor = file_end;
         while cursor < memory_end {
             let length = bytes.len().min(memory_end - cursor);

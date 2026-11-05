@@ -12,6 +12,7 @@ pub(crate) fn fill_insecure(bytes: &mut [u8]) {
     if bytes.is_empty() {
         return;
     }
+
     // ponytail: 此来源没有安全熵承诺；密钥和安全随机必须使用真实熵源。
     let mut seed = arch::read_counter() ^ NONCE.fetch_add(1, Ordering::Relaxed);
     for chunk in bytes.chunks_mut(core::mem::size_of::<u64>()) {

@@ -24,6 +24,7 @@ unsafe fn prepare_and_release(context: &mut TestContext<'_>, slots: &[StackSlot;
     let allocations = [slots[0].allocation(), slots[1].allocation()];
     let tops = [slots[0].top(), slots[1].top()];
     let allocated = mm::stats();
+
     for slot in slots {
         // SAFETY: 两槽只在本函数准备，从未交给CPU或用于栈访问；
         // 当前Task独占归还权，准备已结束且不存在并发准备或重复归还。
@@ -34,6 +35,7 @@ unsafe fn prepare_and_release(context: &mut TestContext<'_>, slots: &[StackSlot;
         .all(|slot| slot.top() == 0 && slot.allocation().is_none());
     let after = mm::stats();
     drop(preempt);
+
     context.diagnostic(format_args!(
         "ap-stacks prepared={:?} tops={:?} before={:?} allocated={:?} released={:?}",
         allocations, tops, before.0, allocated, after
@@ -110,6 +112,7 @@ pub(crate) mod cases {
         let mut pressure = HeapPressure::prepare()?;
         let reserved = mm::alloc_pages((cpu::STACK_SIZE / mm::PAGE_SIZE).ilog2() as usize, false)
             .ok_or(TestError("AP stack OOM reserve unavailable"))?;
+
         let preempt = PreemptGuard::new();
         let evidence = pressure.exhaust();
         drop(reserved);
@@ -130,6 +133,7 @@ pub(crate) mod cases {
             .all(|slot| slot.top() == 0 && slot.allocation().is_none());
         drop(pressure);
         drop(preempt);
+
         context.diagnostic(format_args!(
             "ap-stacks OOM exhausted={:?} partial={:?} failed={} empty={} before={:?} after={:?}",
             evidence,
@@ -150,6 +154,7 @@ pub(crate) mod cases {
         assert!(empty);
         context.expect_eq(rollback_after, rollback_before);
         reclaimed(before)?;
+
         // SAFETY: 上述真实失败已清空两个局部槽；从创建至今从未交给CPU，
         // 无并发准备、归还或栈访问，同一当前Task继续独占该有限集合。
         unsafe { prepare_and_release(context, &slots) }

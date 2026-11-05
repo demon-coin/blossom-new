@@ -38,6 +38,7 @@ pub(crate) const VIRTIO_PCI_BLOCK_MODERN: u16 =
 pub(crate) const VIRTIO_PCI_NET_LEGACY: u16 = 0x1000;
 pub(crate) const VIRTIO_PCI_NET_MODERN: u16 =
     VIRTIO_PCI_MODERN_DEVICE_BASE + DeviceType::Network as u16;
+
 // 内核所选 split-ring 深度和块控制布局，须与所绑定后端的实际协议保持一致。
 pub(crate) const VIRTIO_MIN_QUEUE_DEPTH: u16 = 4;
 pub(crate) const VIRTIO_MAX_QUEUE_DEPTH: u16 = 128;
@@ -46,6 +47,7 @@ pub(crate) const VIRTIO_STATUS_BYTES: usize = core::mem::size_of::<u8>();
 #[cfg(feature = "ktest")]
 pub(crate) const SPLIT_RING_DESCRIPTOR_BYTES: usize = 16;
 const VIRTIO_PCI_MODERN_DEVICE_BASE: u16 = 0x1040;
+
 const PCI_CONFIG_SPACE_BYTES: usize = 256;
 const PCI_IDENTITY: u8 = 0;
 const VIRTIO_PCI_CAP_BAR: u8 = 4;
@@ -117,18 +119,21 @@ impl From<ProbeError> for VirtioInitError {
         Self::Resource(error)
     }
 }
+
 impl From<MmioError> for VirtioInitError {
     /// 保留 MMIO 身份和版本错误。
     fn from(error: MmioError) -> Self {
         Self::Mmio(error)
     }
 }
+
 impl From<VirtioPciError> for VirtioInitError {
     /// 保留选定 PCI capability 的实际错误。
     fn from(error: VirtioPciError) -> Self {
         Self::Pci(error)
     }
 }
+
 impl VirtioInitError {
     /// 页分配失败在 transport 仍存活时保留真实状态，不以重新 reset 后的值代替。
     pub(crate) fn dma_prepare(error: DmaError, status: DeviceStatus) -> Self {
@@ -138,6 +143,7 @@ impl VirtioInitError {
             Self::Dma { error, status }
         }
     }
+
     /// shadow 分配失败同样保留未发表时的设备状态。
     pub(crate) fn queue_prepare(error: Error, status: DeviceStatus) -> Self {
         if error == Error::NoMemory {
@@ -147,6 +153,7 @@ impl VirtioInitError {
         }
     }
 }
+
 impl From<Error> for VirtioInitError {
     /// 无设备状态上下文的协议错误保持原值，不伪造状态快照。
     fn from(error: Error) -> Self {
@@ -323,11 +330,13 @@ impl VirtioDevice {
         if transport.device_type() != DeviceType::Block {
             return Err(ProbeError::Resource("selected VirtIO device is not block").into());
         }
+
         transport.request_reset();
         if !transport.reset_complete() {
             return Err(Error::ResetPending.into());
         }
         KernelHal::dma_barrier();
+
         let info = VirtIOBlk::<KernelHal, SomeTransport<'static>>::negotiate(&mut transport)?;
         let layout = RingLayout::new(info.queue_depth, transport.requires_legacy_layout())?;
         let ring = CoherentDma::allocate(domain, layout.byte_len())
@@ -340,6 +349,7 @@ impl VirtioDevice {
         // SAFETY: 原 ring owner 存活，真实 coherent CPU/DMA 同一页，尚未交设备访问。
         let queue = unsafe { VirtQueue::<KernelHal>::new(layout, ring.region()) }
             .map_err(|error| VirtioInitError::queue_prepare(error, transport.get_status()))?;
+
         // SAFETY: ring/PDU 原页与 driver 同寿命，绑定不发表；拥有者在发表后强制真实 reset。
         let driver = unsafe { VirtIOBlk::new(transport, info, queue, pdu.region()) }?;
         Ok(Self {
@@ -356,6 +366,7 @@ impl VirtioDevice {
     pub fn driver(&self) -> &VirtIOBlk<KernelHal, SomeTransport<'static>> {
         &self.driver
     }
+
     /// 在实际 owner 保活期间借用后端并保留停止责任，调用者负责队列和通知的串行化。
     ///
     /// # Safety
@@ -365,22 +376,27 @@ impl VirtioDevice {
         self.must_reset = true;
         &mut self.driver
     }
+
     /// 返回真实协商所得块设备事实。
     pub fn info(&self) -> BlkInfo {
         self.driver.info()
     }
+
     /// 返回第一批 IRQ domain 的真实身份。
     pub fn interrupt(&self) -> IrqNumber {
         self.interrupt
     }
+
     /// 返回不可变完整硬件身份。
     pub fn identity(&self) -> VirtioIdentity {
         self.identity
     }
+
     /// 返回原 ring/PDU 分配的裸视图；不提供安全 CPU 解引用或另一份页拥有权。
     pub fn control_regions(&self) -> (DmaRegion, DmaRegion) {
         (self.ring.region(), self.pdu.region())
     }
+
     /// 返回真实硬件状态，供初始化诊断和停止流程使用。
     pub fn status(&self) -> DeviceStatus {
         self.driver.status()
@@ -410,22 +426,26 @@ impl VirtioDevice {
             irq_actions: crate::irq::test_action_count(self.interrupt),
         }
     }
+
     /// 确认本设备 ISR，不重新引入 DMA 停止责任；退休期仍须清本设备共享 IRQ 原因。
     pub fn ack_interrupt(&mut self) -> InterruptStatus {
         self.driver.ack_interrupt()
     }
+
     /// 在任何 queue_set 写入前标记停止责任；失败返回时仍保完整原页和 driver。
     pub fn publish(&mut self) -> Result<(), VirtioInitError> {
         self.must_reset = true;
         KernelHal::dma_barrier();
         self.driver.publish().map_err(Into::into)
     }
+
     /// 请求设备停止，写零不清除停止责任。
     pub fn request_reset(&mut self) {
         self.must_reset = true;
         KernelHal::dma_barrier();
         self.driver.request_reset();
     }
+
     /// 一次真实状态读回为零后执行完整屏障并清停止责任；未完成时保持全部 owner。
     pub fn reset_complete(&mut self) -> bool {
         if !self.driver.reset_complete() {
@@ -435,6 +455,7 @@ impl VirtioDevice {
         self.must_reset = false;
         true
     }
+
     /// 查询当前是否必须先确认设备停止；不代替真实状态读回。
     pub fn requires_reset(&self) -> bool {
         self.must_reset
@@ -530,6 +551,7 @@ fn selected_construct(
     {
         return Err(ProbeError::Resource("PCI inventory identity changed").into());
     }
+
     let caps = device
         .capabilities
         .get(..device.capability_count)
@@ -566,6 +588,7 @@ fn selected_construct(
                 cap_word(inventory, device, cap.offset, VIRTIO_PCI_NOTIFY_CAP_MULT)?;
         }
     }
+
     Ok(SelectedConstruct {
         device_function: DeviceFunction {
             bus: device.bus,

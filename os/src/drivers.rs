@@ -108,6 +108,7 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
     mmio_networks
         .try_reserve_exact(info.virtio_mmio_count)
         .map_err(|_| ProbeError::NoMemory)?;
+
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
         let base = mmio_region_address(resource.registers)?;
         if resource.registers.end - resource.registers.start < VIRTIO_MMIO_IDENTITY_SIZE
@@ -132,6 +133,7 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
                 "VirtIO MMIO identity or version is invalid",
             ));
         }
+
         if device_id == DeviceType::Block as u32 {
             mmio_blocks.push(MmioBlockCandidate {
                 registers: resource.registers,
@@ -148,9 +150,11 @@ pub fn discover() -> Result<DeviceInventory, ProbeError> {
             });
         }
     }
+
     mmio_blocks.sort_unstable_by_key(|candidate| candidate.registers.start);
     mmio_networks.sort_unstable_by_key(|candidate| candidate.registers.start);
     let pci = PciInventory::discover(info)?;
+
     Ok(DeviceInventory {
         mmio_blocks,
         mmio_networks,

@@ -31,7 +31,9 @@ const PROGRAM_MS: u64 = 10_000;
 const RESET_MS: u64 = 500;
 const RESET_HOLD: Duration = Duration::from_micros(10);
 const POWER_UP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 const MAX_PAYLOAD_SEGMENTS: usize = 32;
+
 const RESET_RUNNING: u32 = 0;
 const RESET_INTERFACE: u32 = 1;
 const RESET_FIFO: u32 = 2;
@@ -98,6 +100,7 @@ impl Sdmmc {
         {
             return Err(BlockError::Unsupported);
         }
+
         let irq =
             irq::map_source(resources.interrupt_source).map_err(|_| BlockError::InvalidRange)?;
         let domain = DmaDomain::new(
@@ -130,6 +133,7 @@ impl Sdmmc {
             dma_live: AtomicBool::new(false),
         })
         .map_err(|_| BlockError::NoMemory)?;
+
         // SAFETY: 调用者保证规范化 provider 的独占映射，全部可失败分配已完成。
         unsafe { board_setup::apply_setup(&resources.setup, RESET_HOLD) }
             .map_err(|_| BlockError::Unsupported)?;
@@ -139,6 +143,7 @@ impl Sdmmc {
         controller
             .input_frequency
             .store(frequency, Ordering::Release);
+
         // 初始化只执行命令与八字节 SCR PIO，尚未向硬件发表任何本对象的页地址。
         match controller.initialize() {
             Ok(true) => Ok(Some(controller)),
@@ -259,6 +264,7 @@ impl Sdmmc {
         } else {
             self.transfer(card, operation, sector, bytes, transfer)
         };
+
         match result {
             Ok(completed) => IoResult {
                 completed,
@@ -401,6 +407,7 @@ impl Sdmmc {
         if u64::from(CLOCK_DIVIDER_MASK) < divisor {
             return Err(BlockError::Unsupported);
         }
+
         self.regs.write(CLKENA, 0);
         self.update_clock()?;
         self.regs.write(CLKSRC, 0);
@@ -438,6 +445,7 @@ impl Sdmmc {
         self.poll(deadline(RESET_MS), || {
             self.regs.read(CTRL) & RESET == 0 && self.regs.read(BMOD) & BMOD_RESET == 0
         })?;
+
         let hcon = self.regs.read(HCON);
         let version = self.regs.read(VERID);
         let (fifo_offset, fifo_width) = protocol::fifo_geometry(
@@ -452,6 +460,7 @@ impl Sdmmc {
         {
             return Err(BlockError::Unsupported);
         }
+
         let present = if let Some(input) = self.resources.card_detect.as_ref() {
             // SAFETY: 本对象仅由 prepare 构造；独立 GPIO/SYS CRG 永久映射和 CD pin
             // 独占由其调用者保证，输入配置与其它板设置通过同一可睡锁串行。
@@ -483,6 +492,7 @@ impl Sdmmc {
         if !present {
             return Ok(false);
         }
+
         self.regs.write(INTMASK, 0);
         self.regs.write(IDINTEN, 0);
         self.regs.write(PWREN, CARD_POWER_ENABLE);
@@ -501,6 +511,7 @@ impl Sdmmc {
             FIFOTH,
             ((depth / 2 - 1) << FIFO_RX_WATERMARK_SHIFT) | (depth / 2),
         );
+
         let identification_frequency = self.clock(IDENTIFICATION_HZ)?;
         timer::sleep(power_delay);
         self.command_polled(GO_IDLE_STATE, 0, INITIALIZE)?;
@@ -509,6 +520,7 @@ impl Sdmmc {
             Err(BlockError::NotReady) => false,
             _ => return Err(BlockError::Unsupported),
         };
+
         let until = deadline(COMMAND_MS);
         let ocr = loop {
             let app = self.command_polled(APP_CMD, 0, RESPONSE | CRC)?[0];
@@ -532,6 +544,7 @@ impl Sdmmc {
             }
             timer::sleep(POWER_UP_POLL_INTERVAL);
         };
+
         self.command_polled(ALL_SEND_CID, 0, RESPONSE | LONG | CRC)?;
         let r6 = self.command_polled(SEND_RELATIVE_ADDR, 0, RESPONSE | CRC)?[0];
         if r6 & R6_ERRORS != 0 || r6 >> RCA_SHIFT == 0 {
@@ -555,6 +568,7 @@ impl Sdmmc {
                 )?[0],
             )?;
         }
+
         self.app_polled(card)?;
         let scr = self.scr(fifo_offset, fifo_width)?;
         if scr >> SCR_STRUCTURE_SHIFT != 0 || scr & SCR_BUS_WIDTH_1 == 0 {
@@ -573,6 +587,7 @@ impl Sdmmc {
             self.regs.write(CTYPE, CTYPE_4BIT);
             bus_width = 4;
         }
+
         let card_frequency =
             self.clock(protocol::transfer_frequency(csd)?.min(self.resources.max_frequency))?;
         self.wait_card(card, deadline(PROGRAM_MS), false)?;
@@ -580,6 +595,7 @@ impl Sdmmc {
         let readonly =
             (!self.resources.disable_wp && write_protect) || csd & CSD_WRITE_PROTECT != 0;
         self.readonly.store(readonly, Ordering::Release);
+
         crate::klog!(
             crate::klog::Level::Info,
             "SDMMC OCR={:#010x} RCA={:#06x} CSD={:#034x} SCR={:#018x}",
@@ -609,6 +625,7 @@ impl Sdmmc {
             fifo_width,
             depth
         );
+
         self.capacity.store(sectors, Ordering::Release);
         *self.command.lock() = Some(card);
         self.regs.write(RINTSTS, u32::MAX);
@@ -742,6 +759,7 @@ impl Sdmmc {
                 self.regs.write(PLDMND, 1);
             }
         }
+
         let mut observed = 0;
         loop {
             observed |= self.events.swap(0, Ordering::AcqRel);
@@ -779,6 +797,7 @@ impl Sdmmc {
         let registration = unsafe { self.waiters.register(node.as_mut()) };
         // SAFETY: timer/Waker 均固定，结束 active wait 后 cancel_sync 确认回调尾部才退栈。
         unsafe { timer.as_ref().arm_borrowed(until) }.expect("SDMMC deadline timer rejected");
+
         // mailbox 复查覆盖 ISR 先于登记、及登记后先于 park 的两种到达。
         if self.events.load(Ordering::Acquire) == 0
             && time::now() < until
@@ -786,6 +805,7 @@ impl Sdmmc {
         {
             waiter.park();
         }
+
         drop(registration);
         drop(waiter);
         timer.as_ref().cancel_sync();
@@ -814,6 +834,7 @@ impl Sdmmc {
         if write && self.readonly.load(Ordering::Acquire) {
             return Err(BlockError::ReadOnly);
         }
+
         let argument = protocol::address(sector, card.block_addressed)?;
         self.wait_card(card, deadline(PROGRAM_MS), true)?;
         let bounce = self.memory.bounce.region();
@@ -825,6 +846,7 @@ impl Sdmmc {
                 return Err(BlockError::ShortIo);
             }
         }
+
         // SAFETY: SleepMutex 独占唯一硬件通道，上一请求已真实停止 DMA 并收权；本次尚未发表地址。
         let table = unsafe { &mut *descriptors.cpu.as_ptr().cast::<[Descriptor; DESCRIPTORS]>() };
         let used = protocol::descriptors(
@@ -833,6 +855,7 @@ impl Sdmmc {
             bounce.device.value(),
             bytes,
         )?;
+
         // SAFETY: CPU 描述符写入和 Write 回调已结束；两 owner 独占完整页/cacheline，设备尚未获权。
         unsafe {
             self.memory.bounce.sync_for_device(
@@ -848,6 +871,7 @@ impl Sdmmc {
                 .descriptors
                 .sync_for_device(0, DESC_BYTES, DmaDirection::Bidirectional)?;
         }
+
         {
             let _guard = self.registers.lock();
             if self.stopping.load(Ordering::Acquire) {
@@ -856,6 +880,7 @@ impl Sdmmc {
             self.regs.write(BLKSIZ, SECTOR_BYTES as u32);
             self.regs.write(BYTCNT, bytes as u32);
         }
+
         let multiple = (SECTOR_BYTES as usize) < bytes;
         let index = match (write, multiple) {
             (false, false) => READ_SINGLE_BLOCK,
@@ -873,6 +898,7 @@ impl Sdmmc {
             )
             .and_then(|response| protocol::check_r1(response[0]).map(|_| ()));
         let transferred = (self.regs.read(TBBCNT), self.regs.read(TCBCNT));
+
         // 无论数据成功与否，多块都尝试 CMD12；错误不触发未知写重放。
         let card_stop = if multiple {
             self.command_irq(
@@ -894,6 +920,7 @@ impl Sdmmc {
         if transferred != (bytes as u32, bytes as u32) {
             return Err(BlockError::ShortIo);
         }
+
         // SAFETY: stop_dma 确认接口和 IDMAC 静止，无设备别名；控制页整体收权后才能读取 OWN。
         unsafe {
             self.memory
@@ -908,6 +935,7 @@ impl Sdmmc {
         {
             return Err(BlockError::DeviceFault);
         }
+
         // SAFETY: stop_dma 已证明设备结束访问，bounce 全区独占，Read 在同步完成前不交给回调。
         unsafe {
             self.memory.bounce.sync_for_cpu(

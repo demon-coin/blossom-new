@@ -105,6 +105,7 @@ impl UnpublishedInode {
     pub(crate) fn belongs_to(&self, volume: &Ext4Volume) -> bool {
         self.reservation.active && self.reservation.volume == volume.device
     }
+
     /// 借用本次分配预留的 inode-table 窗口，不能转移其 bitmap 责任。
     pub(crate) fn record(&self) -> (&BufferRef, usize) {
         (&self.record, self.offset)
@@ -154,6 +155,7 @@ impl Ext4Volume {
         if !matches!(mode & S_IFMT, S_IFDIR | S_IFREG | S_IFLNK) {
             return Err(FsError::InvalidOperation);
         }
+
         let mut reservation = self.reserve(hint, true, directory)?;
         let number =
             reservation.group * self.geometry.inodes_per_group + reservation.bit as u64 + 1;
@@ -162,6 +164,7 @@ impl Ext4Volume {
             self.release_reservation(&mut reservation);
             return Err(error);
         }
+
         let result = self.inode_record(number, None);
         let (buffer, offset) = match result {
             Ok(record) => record,
@@ -170,6 +173,7 @@ impl Ext4Volume {
                 return Err(error);
             }
         };
+
         let g = &self.geometry;
         buffer
             .update(&self.claim, |bytes| {
@@ -339,6 +343,7 @@ impl Ext4Volume {
         if inode.number < g.first_inode || g.inodes_count < inode.number || inode.links != 0 {
             return Err(FsError::InvalidOperation);
         }
+
         let (record, offset) = self.inode_record(inode.number, context)?;
         let mut numbers = [0u64; codec::MAX_EA_INODES];
         let count = record.with_read(|bytes| {
@@ -364,6 +369,7 @@ impl Ext4Volume {
             inode.kind == InodeKind::Directory,
             context,
         )?;
+
         let acl = if inode.file_acl == 0 {
             None
         } else {
@@ -465,6 +471,7 @@ impl Ext4Volume {
                 )
             })
             .expect("prepared freed inode record");
+
         if let Some((physical, mut block)) = prepared.acl.take() {
             let shared = {
                 let _allocation = self.allocation.lock();
@@ -492,6 +499,7 @@ impl Ext4Volume {
                 unsafe { self.release_detached_block(block) };
             }
         }
+
         for put in &prepared.ea {
             put.inode
                 .release_ea_references(&self.claim, &put.record, put.offset, put.count);
@@ -557,6 +565,7 @@ impl Ext4Volume {
         if available == 0 {
             return Err(FsError::NoSpace);
         }
+
         for step in 0..g.groups_count {
             let group = (hint % g.groups_count + step) % g.groups_count;
             let (descriptor, offset) = self.group_buffer(group, None)?;
@@ -595,6 +604,7 @@ impl Ext4Volume {
                     return Err(FsError::Checksum);
                 }
             }
+
             let valid = valid_bits(g, group, inode);
             let first = if inode && group == 0 {
                 g.first_inode.saturating_sub(1) as usize
@@ -606,6 +616,7 @@ impl Ext4Volume {
             let Some(bit) = bit else {
                 return Err(FsError::Corrupt);
             };
+
             let checksum = bitmap
                 .update(&self.claim, |bits| {
                     assert!(!bit_is_set(bits, bit), "ext4 double allocation");
@@ -683,6 +694,7 @@ impl Ext4Volume {
         {
             return Err(FsError::Corrupt);
         }
+
         let valid = valid_bits(g, group, inode);
         let mut initialized = [0u8; codec::MAX_BLOCK_BYTES];
         let bits = &mut initialized[..g.block_size];
@@ -702,6 +714,7 @@ impl Ext4Volume {
         {
             return Err(FsError::Corrupt);
         }
+
         let checksum = codec::bitmap_checksum(g, bits, inode);
         bitmap
             .update(&self.claim, |current| current.copy_from_slice(bits))

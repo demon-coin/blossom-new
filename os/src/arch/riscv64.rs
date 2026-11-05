@@ -58,6 +58,7 @@ const PMD_SIZE: usize = 1 << PMD_SHIFT;
 const PGDIR_SHIFT: usize = PMD_SHIFT + PT_INDEX_BITS;
 pub(crate) const PTE_PPN_SHIFT: usize = 10;
 const PHYSICAL_TO_PTE_SHIFT: usize = PAGE_SHIFT - PTE_PPN_SHIFT;
+
 pub(crate) const PTE_VALID: usize = 1 << 0;
 pub(crate) const PTE_READ: usize = 1 << 1;
 pub(crate) const PTE_WRITE: usize = 1 << 2;
@@ -67,6 +68,7 @@ const PTE_ACCESSED: usize = 1 << 6;
 const PTE_DIRTY: usize = 1 << 7;
 const PTE_LEAF: usize = PTE_READ | PTE_WRITE | PTE_EXEC;
 const KERNEL_DATA_FLAGS: usize = PTE_READ | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY;
+
 pub(crate) const SATP_MODE_SHIFT: usize = 60;
 pub(crate) const SATP_MODE_SV39: usize = 8 << SATP_MODE_SHIFT;
 pub(crate) const SATP_PPN_MASK: usize = (1usize << 44) - 1;
@@ -77,12 +79,14 @@ pub(crate) const SR_SPP: usize = 1 << 8;
 pub(crate) const SR_FS: usize = 3 << 13;
 pub(crate) const SR_FS_DIRTY: usize = SR_FS;
 pub(crate) const SR_UXL_64: usize = 2 << 32;
+
 const CAUSE_IRQ_FLAG: usize = 1 << (usize::BITS - 1);
 const IRQ_S_SOFT: usize = 1;
 const IRQ_S_TIMER: usize = 5;
 pub(crate) const IRQ_S_EXT: usize = 9;
 const SIE_KERNEL: usize = (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER) | (1 << IRQ_S_EXT);
 const SIP_SSIP: usize = 1 << IRQ_S_SOFT;
+
 pub(crate) const EXC_INST_MISALIGNED: usize = 0;
 pub(crate) const EXC_INST_ACCESS: usize = 1;
 pub(crate) const EXC_BREAKPOINT: usize = 3;
@@ -123,12 +127,15 @@ const SBI_SRST_SHUTDOWN: usize = 0;
 #[cfg(not(feature = "ktest"))]
 const SBI_SRST_COLD_REBOOT: usize = 1;
 const SBI_SRST_REASON_NONE: usize = 0;
+
 /// 当前唯一编译目标的架构名称。
 pub const NAME: &str = "riscv64";
+
 extern "C" {
     static __kernel_phys_end: u8;
     static __secondary_entry_phys: u8;
 }
+
 // medany 的 PC 相对取址不能直接到达物理/直映绝对符号；从本地 literal 读取地址值。
 macro_rules! address {
     ($name:ident) => {{
@@ -143,6 +150,7 @@ macro_rules! address {
         value
     }};
 }
+
 #[repr(C, align(4096))]
 struct PageTable([usize; PT_ENTRIES]);
 #[no_mangle]
@@ -240,6 +248,7 @@ pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static st
     {
         return Err("ccache DMA range is outside RAM");
     }
+
     dma_barrier();
     for line in (physical..end).step_by(SIFIVE_CCACHE_LINE_SIZE) {
         // SAFETY: 已验证完整 FLUSH64 窗口和八字节对齐，最终页表永久映射 ccache；
@@ -257,11 +266,13 @@ pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static st
 pub fn boot_hardware_id(args: [usize; 4]) -> usize {
     args[0]
 }
+
 /// 将实际 RAM 物理地址转换成直映地址；只计算地址，不证明该地址已经映射。
 pub fn phys_to_virt(pa: usize) -> usize {
     (LINK_LAYOUT.direct_map_virt_base as usize)
         .wrapping_add(pa.wrapping_sub(LINK_LAYOUT.ram_phys_base as usize))
 }
+
 /// 转换内核镜像或 RAM 直映地址为物理地址。
 pub fn virt_to_phys(va: usize) -> usize {
     if LINK_LAYOUT.kernel_link_virt as usize <= va {
@@ -271,6 +282,7 @@ pub fn virt_to_phys(va: usize) -> usize {
             .wrapping_add(LINK_LAYOUT.ram_phys_base as usize)
     }
 }
+
 /// 计算物理设备地址在 MMIO 窗口中的位置；解引用者必须保证设备范围已映射。
 pub fn mmio_address(pa: usize) -> usize {
     (LINK_LAYOUT.mmio_virt_base as usize).wrapping_add(pa)
@@ -289,6 +301,7 @@ unsafe fn table(index: usize) -> *mut usize {
             .cast()
     }
 }
+
 /// 将页对齐物理区间映射到连续 Sv39 虚拟地址，按需消耗最终表池。
 ///
 /// # Safety
@@ -329,6 +342,7 @@ unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next
         }
     }
 }
+
 /// 判断当前真实映射前缀能否采用 2MiB 叶项，预算与 PTE 写入共用此规则。
 fn huge_leaf(va: usize, pa: usize, end: usize) -> bool {
     (va | pa) & (PMD_SIZE - 1) == 0 && PMD_SIZE <= end - pa
@@ -468,6 +482,7 @@ fn add_mapping(
             "Sv39 kernel mapping is not canonical high-half"
         );
     }
+
     for old in &mappings[..*count] {
         let old_end = old.virtual_start + (old.physical.end - old.physical.start);
         assert!(
@@ -475,6 +490,7 @@ fn add_mapping(
             "Sv39 mappings overlap"
         );
     }
+
     assert!(*count < mappings.len(), "Sv39 mapping capacity exceeded");
     mappings[*count] = BootMapping {
         virtual_start,
@@ -618,6 +634,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             & !(PAGE_SIZE - 1),
     };
     validate_boot_no_map(info, kernel).expect("Sv39 boot no-map conflict");
+
     let empty = BootMapping {
         virtual_start: 0,
         physical: Region { start: 0, end: 0 },
@@ -633,6 +650,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         KERNEL_DATA_FLAGS | PTE_EXEC,
     );
     add_ram_mappings(info, &mut mappings, &mut count);
+
     for region in [
         info.interrupts.uart,
         info.interrupts.controller,
@@ -657,6 +675,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             add_device_mapping(&mut mappings, &mut count, reference.provider);
         }
     }
+
     add_setup_mappings(&mut mappings, &mut count, &info.board.rtc_setup);
     if let Some(mmc) = info.board.mmc {
         add_device_mapping(&mut mappings, &mut count, mmc.registers);
@@ -674,6 +693,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     if let Some(ahci) = info.board.ahci {
         add_device_mapping(&mut mappings, &mut count, ahci.registers);
     }
+
     for resource in &info.virtio_mmio[..info.virtio_mmio_count] {
         add_device_mapping(&mut mappings, &mut count, resource.registers);
     }
@@ -688,6 +708,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
             add_device_mapping(&mut mappings, &mut count, range.cpu);
         }
     }
+
     let required = mapping_table_count(&mappings[..count]);
     // SAFETY: BSP 独占未激活表池，全部 VA/PA 范围及准确表数已经核对；
     // 内核与 RAM 直映保证切表后取指、栈和表遍历有效，AP 只消费完成发布的 SATP。
@@ -711,8 +732,10 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         RV_FINAL_SATP = SATP_MODE_SV39 | (virt_to_phys(table(0) as usize) >> PAGE_SHIFT);
         asm!("fence rw, rw", "csrw satp, {0}", "sfence.vma", in(reg) RV_FINAL_SATP, options(nostack));
     }
+
     crate::console::configure_resources(info);
 }
+
 /// 安装本核唯一 CpuLocal 基址，随后 trap 与普通代码共享该对象。
 ///
 /// # Safety
@@ -724,6 +747,7 @@ pub unsafe fn install_cpu_local(local: *const CpuLocal) {
         asm!("mv tp, {0}", in(reg) local, options(nostack));
     }
 }
+
 /// 读取本核 CpuLocal 基址。
 pub fn cpu_local() -> *const CpuLocal {
     let value;
@@ -733,6 +757,7 @@ pub fn cpu_local() -> *const CpuLocal {
     }
     value
 }
+
 /// 关闭本核旧事件并安装可恢复 kernel trap。
 pub fn init_current_cpu() {
     // SAFETY: Rust 引导入口保证 S-mode、内核代码映射及专用栈；stvec 指向
@@ -747,6 +772,7 @@ pub fn init_current_cpu() {
     }
     disable_timer();
 }
+
 /// 保存并关闭本地中断；memory clobber 阻止临界区内存访问越过关 IRQ 边界。
 pub fn irq_save() -> usize {
     let saved;
@@ -756,6 +782,7 @@ pub fn irq_save() -> usize {
     }
     saved
 }
+
 /// 仅恢复保存的 SIE 位；memory clobber 阻止受保护访问越过恢复边界。
 ///
 /// # Safety
@@ -771,6 +798,7 @@ pub unsafe fn irq_restore(saved: usize) {
         }
     }
 }
+
 /// 查询本地中断是否使能。
 pub fn irq_enabled() -> bool {
     let s: usize;
@@ -780,6 +808,7 @@ pub fn irq_enabled() -> bool {
     }
     s & SR_SIE != 0
 }
+
 /// 开启本地中断；memory clobber 保持初始化写入和后续 online 发布位于正确边界。
 pub fn enable_interrupts() {
     // SAFETY: 两种 Rust 引导入口在允许调用此接口前安装本核现场、trap 与 IRQ 处理资源。
@@ -787,6 +816,7 @@ pub fn enable_interrupts() {
         asm!("csrsi sstatus, {sie}", sie = const SR_SIE, options(nostack));
     }
 }
+
 /// 等待本地硬件事件。
 pub fn wait_for_interrupt() {
     // SAFETY: S-mode 的 wfi 仅等待事件，trap 使用已经安装的本核栈与入口。
@@ -815,6 +845,7 @@ pub(crate) unsafe fn idle_once(
         #[cfg(feature = "ktest")]
         wait_completions.fetch_add(1, Ordering::Release);
     }
+
     // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
     // 再关闭 SIE 返回本核等待边界，不恢复任何旧 CPU 的 IRQ 状态。
     unsafe {
@@ -827,6 +858,7 @@ pub(crate) unsafe fn idle_once(
         )
     };
 }
+
 /// 读取真实硬件时间计数器。
 /// RISC-V 的 `time` 是系统级共享计数器，不存在每核补偿寄存器。
 pub fn establish_counter_epoch() {}
@@ -845,11 +877,13 @@ pub fn read_counter() -> u64 {
     }
     value
 }
+
 /// 返回启动时解析的 timebase-frequency。
 #[cfg(feature = "ktest")]
 pub fn counter_frequency() -> u64 {
     crate::boot::info().counter_frequency
 }
+
 /// 按 SBI ABI 发起固件调用；仅本模块选择无借用指针的 TIME/IPI/HSM/SRST 参数。
 fn sbi(
     extension: usize,
@@ -869,6 +903,7 @@ fn sbi(
         Err(a0 as isize)
     }
 }
+
 /// 用 SBI TIME 编程一次绝对期限；固件错误直接报告。
 pub fn program_timer(deadline: u64) {
     sbi(
@@ -880,10 +915,12 @@ pub fn program_timer(deadline: u64) {
     )
     .expect("SBI TIME failed");
 }
+
 /// 关闭本核 timer pending 和下一次事件。
 pub fn disable_timer() {
     program_timer(u64::MAX);
 }
+
 /// 通过 HSM 启动真实物理 AP 入口并传递静态启动记录。
 ///
 /// # Safety
@@ -904,6 +941,7 @@ pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Resu
     )
     .map(|_| ())
 }
+
 /// 发布软件队列后通知指定 hart；错误不丢弃。
 pub fn send_ipi(hardware_id: usize) {
     // SAFETY: fence 只发布本核先前队列写入，目标 hart 由公共 CPU 表选择。
@@ -912,6 +950,7 @@ pub fn send_ipi(hardware_id: usize) {
     }
     sbi(SBI_EXT_IPI, SBI_EXT_IPI_SEND_IPI, 1, hardware_id, 0).expect("SBI IPI failed");
 }
+
 /// 读取已发布 PLIC 窗口中的一个 32 位寄存器。
 ///
 /// # Safety
@@ -922,6 +961,7 @@ unsafe fn mmio_read(offset: usize) -> u32 {
     // SAFETY: 调用者保证实际设备映射、窗口内完整的对齐 32 位访问和寄存器读语义。
     unsafe { ptr::read_volatile((mmio_address(region.start) + offset) as *const u32) }
 }
+
 /// 写入已发布 PLIC 窗口中的一个 32 位寄存器并同步设备访问。
 ///
 /// # Safety
@@ -937,6 +977,7 @@ unsafe fn mmio_write(offset: usize, value: u32) {
         asm!("fence iorw, iorw", options(nostack));
     }
 }
+
 /// 从已安装的本核对象选择 FDT 对应的 S-mode claim/complete 寄存器。
 fn claim_offset() -> usize {
     PLIC_CONTEXT_BASE
@@ -944,6 +985,7 @@ fn claim_offset() -> usize {
             * PLIC_CONTEXT_STRIDE
         + PLIC_CLAIM_OFFSET
 }
+
 /// 初始化所有合法源的 priority，并将固定路由只保留在实际 BSP 的 S context。
 ///
 /// # Safety
@@ -965,9 +1007,11 @@ pub unsafe fn external_init(info: &BootInfo) {
             }
             mmio_write(PLIC_CONTEXT_BASE + context * PLIC_CONTEXT_STRIDE, 0);
         }
+
         for source in 1..info.interrupts.source_count {
             mmio_write(source as usize * PLIC_REGISTER_BYTES, 0);
         }
+
         for word in 0..words {
             let remaining = info.interrupts.source_count as usize - word * PLIC_ENABLE_BITS;
             let mut bits = if PLIC_ENABLE_BITS <= remaining {
@@ -1024,6 +1068,7 @@ pub unsafe fn external_complete(source: u32) {
     // SAFETY: 本核真实 claim 与已验证 S context 对应，固定 enable 保留其完成资格。
     unsafe { mmio_write(claim_offset(), source) };
 }
+
 /// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST poweroff。
 /// 仅限能服务 IRQ/IPI、无业务锁及待完成 CSD 责任的普通执行上下文。
 #[cfg(not(feature = "ktest"))]
@@ -1112,6 +1157,7 @@ fn system_reset(reset_type: usize) -> ! {
     .expect("SBI SRST failed");
     panic!("SBI SRST unexpectedly returned");
 }
+
 #[cfg(feature = "ktest")]
 /// 触发真实非法指令异常供现场诊断。
 pub fn trigger_fault() -> ! {
@@ -1120,6 +1166,7 @@ pub fn trigger_fault() -> ! {
         asm!(".word 0", options(noreturn));
     }
 }
+
 /// 处理汇编构造的本核独占 trap frame；FS 为 Off 时不访问未保存的浮点字段。
 #[no_mangle]
 extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {

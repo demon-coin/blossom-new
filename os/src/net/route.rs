@@ -7,8 +7,10 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use crate::fs::FsError;
 
 pub(crate) const IPV4_ADDRESS_BITS: u8 = u32::BITS as u8;
+
 pub(crate) const RTF_UP: u16 = 0x1;
 pub(crate) const RTF_GATEWAY: u16 = 0x2;
+
 const IPV4_LOOPBACK_NETWORK: u8 = 127;
 const IPV4_MULTICAST_FIRST_OCTET: u8 = 224;
 

@@ -12,6 +12,7 @@ impl UserOwner {
         } else {
             self.prepare(context)?;
         }
+
         let event = if matches!(mode, b"b" | b"e" | b"r") {
             self.pipe_blocked(context, mode)?
         } else if mode == b"p" {
@@ -31,6 +32,7 @@ impl UserOwner {
         } else {
             self.run_named(context, PROGRAM, mode, false, 0)?
         };
+
         context.expect_eq(event.status, 0);
         if event.status != 0 {
             return Err(TestError("ordinary pipe ABI program failed"));
@@ -50,6 +52,7 @@ impl UserOwner {
             false,
             Credentials::ROOT,
         )?;
+
         let event = self.wait(context)?;
         let result = mm
             .load_user_u32(FUTEX_CONTROL + 12)
@@ -59,6 +62,7 @@ impl UserOwner {
             "user-pipe positioned-result={} status={}",
             result, event.status
         ));
+
         self.reap_children(context, event.status != 0)?;
         Ok(event)
     }
@@ -79,6 +83,7 @@ impl UserOwner {
             false,
             Credentials::ROOT,
         )?;
+
         let pid = self
             .running
             .as_ref()
@@ -92,6 +97,7 @@ impl UserOwner {
             .executor()
             .ok_or(TestError("pipe root executor disappeared"))?;
         let phases = if mode == b"b" { 2 } else { 1 };
+
         for phase in 1..=phases {
             until("pipe root did not block in the requested I/O", || {
                 mm.load_user_u32(FUTEX_CONTROL) == Ok(phase)
@@ -105,9 +111,11 @@ impl UserOwner {
                 mode, phase
             ));
         }
+
         drop(executor);
         drop(user);
         drop(mm);
+
         let event = self.wait(context)?;
         let cancelling = event.status != 0;
         if cancelling {

@@ -136,6 +136,7 @@ impl PreparedTables {
         if arch::USER_LEVELS - 1 < count {
             return Err(PageTableError::InvalidRange);
         }
+
         let mut prepared = Self::default();
         for level in 0..count {
             prepared.tables[level] = Some(TableNode::try_new(level)?);
@@ -151,6 +152,7 @@ impl PreparedTables {
         if arch::USER_LEVELS - 1 < count {
             return Err(PageTableError::InvalidRange);
         }
+
         let mut prepared = Self::default();
         for level in 0..count {
             prepared.tables[level] = Some(TableNode::try_new_reclaim(level, attempt)?);
@@ -358,6 +360,7 @@ impl UserPageTable {
         if prepared.tables[..needed].iter().any(Option::is_none) {
             return Err(PageTableError::MissingTables);
         }
+
         let mut table = self.root_phys();
         for level in (1..arch::USER_LEVELS).rev() {
             let index = slot_index(va, level);
@@ -377,6 +380,7 @@ impl UserPageTable {
             }
             table = arch::user_entry_physical(entry, level);
         }
+
         // SAFETY: 叶表已由本对象拥有并完整初始化；调用者保活新旧数据页且负责
         // 后续同步失效。原子交换保留硬件可能更新过的旧槽实际值。
         let old = unsafe { replace_slot(table, slot_index(va, 0), leaf) };
@@ -406,10 +410,12 @@ impl UserPageTable {
             }
             path[level - 1] = arch::user_entry_physical(entry, level);
         }
+
         // SAFETY: path[0] 是仍由本表拥有的叶表，用户叶和空槽均由后端解释；
         // 调用者保活旧数据页到后续同步失效完成。
         let old = unsafe { replace_slot(path[0], slot_index(va, 0), arch::user_empty_entry(0)) };
         let old = mapping(old);
+
         for level in 0..arch::USER_LEVELS - 1 {
             // SAFETY: 此子页尚未摘离且由本表保活，短锁阻止软件新增叶或目录。
             if !unsafe { table_is_empty(path[level], level) } {

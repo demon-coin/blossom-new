@@ -15,6 +15,7 @@ use super::{Arguments, ExecError, RWX};
 const STARTUP_HEADROOM: usize = 128 * 1024;
 const AUXV_PAIRS: usize = 17;
 const AT_RANDOM_BYTES: usize = 16;
+
 const AT_NULL: usize = 0;
 const AT_PHDR: usize = 3;
 const AT_PHENT: usize = 4;
@@ -62,6 +63,7 @@ impl Layout {
             .checked_sub(words)
             .ok_or(ExecError::ArgumentsTooBig)?
             & !(arch::STACK_ALIGNMENT - 1);
+
         let actual_bottom = sp & !(PAGE_SIZE - 1);
         let actual = arch::USER_STACK_TOP - actual_bottom;
         let headroom = args
@@ -72,6 +74,7 @@ impl Layout {
         let bottom = actual_bottom
             .checked_sub(headroom)
             .ok_or(ExecError::Vm(VmError::InvalidRange))?;
+
         Ok(Self {
             bottom,
             sp,
@@ -102,15 +105,18 @@ pub(super) fn make_stack(
     {
         return Err(ExecError::Vm(VmError::Occupied));
     }
+
     mm.map_stack(
         layout.bottom,
         arch::USER_STACK_TOP - layout.bottom,
         permissions,
         RWX,
     )?;
+
     let mut strings = arch::USER_STACK_TOP;
     let execfn = stack_string(mm, &mut strings, &args.filename)?;
     debug_assert_eq!(execfn, layout.execfn);
+
     let mut pointers = layout.sp;
     stack_word(mm, &mut pointers, args.argv.len())?;
     for string in &args.argv {
@@ -118,15 +124,18 @@ pub(super) fn make_stack(
         stack_word(mm, &mut pointers, address)?;
     }
     stack_word(mm, &mut pointers, 0)?;
+
     for string in &args.envp {
         let address = stack_string(mm, &mut strings, string)?;
         stack_word(mm, &mut pointers, address)?;
     }
     stack_word(mm, &mut pointers, 0)?;
+
     debug_assert_eq!(strings - AT_RANDOM_BYTES, layout.random);
     let mut random_bytes = [0; AT_RANDOM_BYTES];
     random::fill_insecure(&mut random_bytes);
     copyout_exact(mm, layout.random, &random_bytes)?;
+
     let auxv = [
         (AT_PHDR, elf.phdr.unwrap_or(0)),
         (AT_PHENT, elf.phent),
@@ -151,6 +160,7 @@ pub(super) fn make_stack(
         stack_word(mm, &mut pointers, kind)?;
         stack_word(mm, &mut pointers, value)?;
     }
+
     debug_assert!(pointers <= layout.random);
     Ok(layout.sp)
 }

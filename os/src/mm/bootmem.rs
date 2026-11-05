@@ -4,6 +4,7 @@ use crate::boot::{Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS};
 
 pub(crate) const PAGE_SHIFT: usize = 12;
 pub(crate) const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+
 // root 索引一次，每段 RAM 至多一次描述符 backing。
 const MAX_METADATA_ALLOCATIONS: usize = 1 + MAX_MEMORY_REGIONS;
 pub(crate) const RANGE_CAPACITY: usize =
@@ -47,6 +48,7 @@ impl Ranges {
         if range.end <= range.start {
             return Ok(());
         }
+
         let first = self
             .as_slice()
             .partition_point(|entry| entry.end < range.start);
@@ -56,6 +58,7 @@ impl Ranges {
             range.end = range.end.max(self.entries[last].end);
             last += 1;
         }
+
         if first == last {
             if self.count == RANGE_CAPACITY {
                 return Err("boot range capacity exceeded");
@@ -81,6 +84,7 @@ impl Ranges {
                 end: region.end,
             })?;
         }
+
         let mut output = 0;
         for index in 0..self.count {
             let region = self.entries[index];
@@ -162,9 +166,11 @@ impl BootMemory {
         if MAX_MEMORY_REGIONS < ram.len() || MAX_RESERVED_REGIONS < reserved.len() {
             return Err("boot region count exceeds capacity");
         }
+
         self.ram.initialize_regions(ram, true)?;
         let mut reservations = const { Ranges::new() };
         reservations.initialize_regions(reserved, false)?;
+
         let mut reservation_index = 0;
         for ram in self.ram.as_slice() {
             let mut cursor = ram.start;
@@ -246,6 +252,7 @@ impl BootMemory {
         if self.allocation_count == MAX_METADATA_ALLOCATIONS {
             return Err("boot metadata allocation capacity exceeded");
         }
+
         for index in 0..self.free.count {
             let free = self.free.entries[index];
             let start = free
@@ -264,6 +271,7 @@ impl BootMemory {
             if prefix && suffix && self.free.count == RANGE_CAPACITY {
                 return Err("boot free range capacity exceeded");
             }
+
             let allocated = PageRange { start, end };
             self.metadata.insert(allocated)?;
             match (prefix, suffix) {

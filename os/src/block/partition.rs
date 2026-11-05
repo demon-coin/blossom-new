@@ -9,11 +9,13 @@ use gpt_disk_types::{BlockSize, GptHeader, GptHeaderRevision, Lba, MasterBootRec
 use crate::block::{BlockError, BlockView, SECTOR_BYTES};
 
 pub(crate) const LETTERED_DISK_COUNT: u8 = b'z' - b'a' + 1;
+
 const MBR_SIGNATURE: [u8; 2] = [0x55, 0xaa];
 const MBR_GPT_PROTECTIVE: u8 = 0xee;
 const DOS_EXTENDED_PARTITION: u8 = 0x05;
 const WIN98_EXTENDED_PARTITION: u8 = 0x0f;
 const LINUX_EXTENDED_PARTITION: u8 = 0x85;
+
 const GPT_PRIMARY_HEADER_LBA: u64 = 1;
 const GPT_FIRST_ENTRY_LBA: u64 = GPT_PRIMARY_HEADER_LBA + 1;
 
@@ -72,6 +74,7 @@ impl DeviceSelector {
         } else {
             return Err(BlockError::InvalidRange);
         };
+
         let partition = if suffix.is_empty() {
             None
         } else {
@@ -150,6 +153,7 @@ impl Partition {
         if number == 0 || start_sector == 0 || sectors == 0 || capacity < end {
             return Err(BlockError::InvalidRange);
         }
+
         let start_sector = start_sector
             .checked_mul(sector_ratio)
             .ok_or(BlockError::InvalidRange)?;
@@ -265,6 +269,7 @@ where
         storage.resize(block_bytes, 0);
         storage.as_mut_slice()
     };
+
     io.read_blocks(Lba(0), block).map_err(BlockError::from)?;
     // SAFETY: MasterBootRecord 是库声明的 512B POD，所有位模式有效且没有引用或析构；
     // block 包含已初始化的完整对象字节，read_unaligned 不要求其起始地址对齐。
@@ -343,6 +348,7 @@ where
     {
         return Err(BlockError::InvalidRange);
     }
+
     let bytes = layout
         .num_bytes_rounded_to_block_as_usize(block_size)
         .ok_or(BlockError::InvalidRange)?;
@@ -357,6 +363,7 @@ where
     if array.calculate_crc32() != header.partition_entry_array_crc32 {
         return Err(BlockError::Checksum);
     }
+
     let mut partitions = Vec::new();
     for index in 0..layout.num_entries {
         let entry = array
@@ -409,6 +416,7 @@ fn validate_header(header: &GptHeader, capacity: u64, block: &[u8]) -> Result<()
     if actual_crc != header.header_crc32.0.to_u32() {
         return Err(BlockError::Checksum);
     }
+
     let first = header.first_usable_lba.to_u64();
     let last = header.last_usable_lba.to_u64();
     let alternate = header.alternate_lba.to_u64();
@@ -574,6 +582,7 @@ mod tests {
                     sectors: 61
                 }]),
             );
+
             image[512 + 24] ^= 1;
             context.expect_eq(
                 discover_io(BlockIoAdapter::new(image.as_slice(), BlockSize::BS_512)),
@@ -592,6 +601,7 @@ mod tests {
                     Err(BlockError::InvalidRange),
                 );
             }
+
             let mut image = gpt_image(BlockSize::BS_512, 34, 94)?;
             image[512 + 12..512 + 16].copy_from_slice(&96_u32.to_le_bytes());
             image[512 + 92..512 + 96].copy_from_slice(&[1, 2, 3, 4]);

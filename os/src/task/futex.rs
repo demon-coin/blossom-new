@@ -370,6 +370,7 @@ pub fn wait(
             mm.fault(address, UserAccess::Read)?;
             continue;
         }
+
         let waiter = Waiter::new_interruptible();
         let waker = core::pin::pin!(waiter.waker());
         let timer = core::pin::pin!(Timer::new(
@@ -385,6 +386,7 @@ pub fn wait(
             waiter.id(),
             deadline
         ));
+
         let index = key.hash() & (BUCKETS - 1);
         let registration = mapping
             .with_word(address, |direct| {
@@ -402,12 +404,14 @@ pub fn wait(
         drop(mapping);
         drop(key);
         registration?;
+
         if let Some(deadline) = deadline {
             // SAFETY: timer、Waker 与节点地址固定；唯一取消先撤桶登记，结束 Waiter 后
             // 同步停止确认正在执行的真实回调尾部，之前不允许任一存储退栈。
             unsafe { timer.as_ref().arm_borrowed(deadline) }
                 .expect("fresh precise futex timer rejected");
         }
+
         waiter.park_signal();
         let outcome = cancel(node.as_ref());
         // 停 timer 必要时使用原等待系统，故先结束本轮唯一 active wait。
@@ -431,6 +435,7 @@ fn cancel(node: Pin<&Node>) -> WaitOutcome {
             // 只在真正重排竞争时重读当前位置；不扫描其他桶、不建立新等待身份。
             continue;
         }
+
         let outcome = if node
             .deadline
             .is_some_and(|deadline| deadline <= time::now())
@@ -492,6 +497,7 @@ pub fn wake(
             notifications.reserve(needed)?;
             continue;
         }
+
         let selected = notifications.count;
         notifications.notify();
         return Ok(selected);
@@ -550,6 +556,7 @@ pub fn requeue(
             mm.fault(address, UserAccess::Read)?;
             continue;
         }
+
         let source = source_key.hash() & (BUCKETS - 1);
         let destination_bucket = destination_key.hash() & (BUCKETS - 1);
         let mut operation = |direct: Option<usize>| {
@@ -570,6 +577,7 @@ pub fn requeue(
                         return Ok(RequeueAttempt::Reserve(needed));
                     }
                 }
+
                 let mut selected = 0;
                 let mut pointer = source.head;
                 for _ in 0..source.members {
@@ -598,6 +606,7 @@ pub fn requeue(
                 Ok(RequeueAttempt::Complete(selected))
             })
         };
+
         let result = if compare.is_some() {
             mapping
                 .with_word(address, |direct| operation(Some(direct)))
@@ -608,6 +617,7 @@ pub fn requeue(
         drop(mapping);
         drop(source_key);
         drop(destination_key);
+
         match result? {
             RequeueAttempt::Reserve(needed) => {
                 // spill 只含拥有值，锁外 fallible 准备后重查 key、源字和实际登记。

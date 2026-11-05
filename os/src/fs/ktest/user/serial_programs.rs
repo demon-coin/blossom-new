@@ -26,6 +26,7 @@ impl Fixture for SerialSuite {
         <UserSuite as Fixture>::tear_down(self.resources, context)
     }
 }
+
 impl Fixture<SerialSuite> for UserOwner {
     /// 串口整组持有接收附着，每例仍只建立自己的路径与用户图。
     fn set_up(context: &mut TestContext<'_>, suite: &SerialSuite) -> Result<Self, TestError> {
@@ -42,9 +43,11 @@ impl Fixture<SerialSuite> for UserOwner {
         <Self as Fixture<UserSuite>>::tear_down(self, context)
     }
 }
+
 #[ktest::suite(fixture = UserOwner, suite_resources = SerialSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod serial_programs {
     use super::*;
+
     /// 普通用户raw模式逐字节交付UART输入输出，跨write保留UTF-8与二进制值。
     #[test]
     #[ktest(tags("T19", "user-tty"), resources("uart"), timeout_ms = 90000)]

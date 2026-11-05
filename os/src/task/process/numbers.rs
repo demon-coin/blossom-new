@@ -30,6 +30,7 @@ impl Numbers {
         if max_pid == 0 || MAX_PID < max_pid {
             return Err(ProcessError::InvalidCapacity);
         }
+
         let mut numbers = Self {
             pages: Vec::new(),
             max_pid,
@@ -50,6 +51,7 @@ impl Numbers {
                 .try_reserve_exact((pages + 1).next_power_of_two())
                 .map_err(|_| ProcessError::NoMemory)?;
         }
+
         let page = Box::try_new(SlotPage {
             slots: core::array::from_fn(|_| Slot::vacant()),
             free: u32::MAX,
@@ -73,6 +75,7 @@ impl Numbers {
             growth.pages.append(&mut self.pages);
             core::mem::swap(&mut self.pages, &mut growth.pages);
         }
+
         self.pages
             .push(growth.page.take().expect("missing PID page"));
         true
@@ -144,6 +147,7 @@ impl Numbers {
 
 impl Index<usize> for Numbers {
     type Output = Slot;
+
     /// 图内已验证的身份可直接按原号码访问。
     fn index(&self, index: usize) -> &Slot {
         self.get(index).expect("PID slot outside allocated range")

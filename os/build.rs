@@ -16,6 +16,7 @@ fn main() {
         !testing || platform == "qemu-virt",
         "kernel tests require BLOSSOM_PLATFORM=qemu-virt"
     );
+
     let layout = match (arch.as_str(), platform.as_str()) {
         ("riscv64", "qemu-virt") => layout::RISCV64_QEMU_VIRT,
         ("riscv64", "visionfive2") => layout::RISCV64_VISIONFIVE2,
@@ -23,6 +24,7 @@ fn main() {
         ("loongarch64", "ls2k1000la") => layout::LOONGARCH64_LS2K1000LA,
         _ => panic!("unsupported kernel target/platform: {}/{}", arch, platform),
     };
+
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
     println!("cargo:rerun-if-env-changed=BLOSSOM_PLATFORM");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTEST");
@@ -30,11 +32,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/platform/layout.rs");
     println!("cargo:rustc-check-cfg=cfg(blossom_platform, values(\"qemu-virt\", \"visionfive2\", \"ls2k1000la\"))");
     println!("cargo:rustc-cfg=blossom_platform=\"{platform}\"");
+
     let script = match arch.as_str() {
         "riscv64" => "src/arch/riscv64/linker.ld",
         "loongarch64" => "src/arch/loongarch64/linker.ld",
         _ => panic!("unsupported kernel target: {}", arch),
     };
+
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory is missing"));
     let max_cpus = match env::var("BLOSSOM_MAX_CPUS") {
         Ok(value) => {
@@ -53,11 +57,13 @@ fn main() {
     max_cpus
         .checked_add(usize::BITS as usize - 1)
         .expect("BLOSSOM_MAX_CPUS bitmap size overflows");
+
     fs::write(
         output.join("cpu-capacity.rs"),
         format!("pub const MAX_CPUS: usize = {max_cpus};\n"),
     )
     .expect("CPU capacity cannot be written");
+
     let linker_layout = format!(
         "__blossom_platform = {identity};\n\
          __kernel_phys_start = {physical:#x};\n\
@@ -74,6 +80,7 @@ fn main() {
     );
     fs::write(output.join("platform-layout.ld"), linker_layout)
         .expect("platform linker layout cannot be written");
+
     let sections = if testing {
         r#"
   . = ALIGN(8);
@@ -103,6 +110,7 @@ fn main() {
     };
     fs::write(output.join("ktest-sections.ld"), sections)
         .expect("linker sections cannot be written");
+
     println!("cargo:rustc-link-arg=-L{}", output.display());
     if testing {
         println!("cargo:rustc-link-arg=--undefined-glob=__ktest_register__*");

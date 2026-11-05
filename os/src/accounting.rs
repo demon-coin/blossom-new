@@ -141,6 +141,7 @@ fn with_current<T>(action: impl FnOnce(&CpuAccount, &mut Segment) -> T) -> T {
         !crate::arch::irq_enabled(),
         "CPU accounting requires IRQ off"
     );
+
     let account = &cpu::current().accounting;
     // SAFETY: IRQ 已关闭；所有本核调用只在这里短借用，闭包不会恢复 IRQ 或切换，
     // 远端 snapshot 不访问此 UnsafeCell，因此没有并行或重入可变访问。
@@ -176,12 +177,14 @@ pub(crate) fn task_enter() {
         !crate::arch::irq_enabled(),
         "task accounting entry requires IRQ off"
     );
+
     // SAFETY: 调度器已发表本核 current，IRQ 关闭，活登记保护唯一执行者。
     let task = unsafe { *cpu::current().current_task.get() };
     assert!(!task.is_null(), "task accounting entry has no task");
     // SAFETY: current 活登记保活 Task；绑定只在离栈后解除，快照退还后仍由 Task 保活。
     let user = unsafe { (*task).user_thread() };
     let user = user.filter(|user| user.user_time().is_none_or(|time| time.is_active()));
+
     with_current(|_, segment| {
         assert!(segment.user.is_null());
         assert!(!segment.in_user);
@@ -199,6 +202,7 @@ pub(crate) fn task_leave() {
     // SAFETY: 当前 Task 尚未离栈，IRQ 关闭，唯一执行权与活登记保持到 finish。
     let task = unsafe { *cpu::current().current_task.get() };
     assert!(!task.is_null(), "task accounting exit has no task");
+
     transition(Mode::Task(task), Mode::Scheduler);
     with_current(|_, segment| {
         assert!(!segment.in_user, "task switched out in user accounting");
@@ -258,6 +262,7 @@ pub(crate) fn detach_user() {
         segment.user = core::ptr::null();
     });
 }
+
 /// 最终无工作检查通过以后开始 idle 片段；次数表示协议入口，架构仍会检查新提示。
 pub(crate) fn idle_enter() {
     transition(Mode::Scheduler, Mode::Idle);
@@ -275,6 +280,7 @@ pub(crate) fn irq_enter() {
         if segment.mode == Mode::Dormant {
             return;
         }
+
         assert!(
             segment.mode != Mode::Irq,
             "nested IRQ entered outer accounting"
@@ -292,6 +298,7 @@ pub(crate) fn irq_exit() {
         if segment.mode == Mode::Dormant {
             return;
         }
+
         assert!(segment.mode == Mode::Irq, "IRQ accounting exit outside IRQ");
         account.settle(segment, time::now().as_nanos());
         segment.mode = segment

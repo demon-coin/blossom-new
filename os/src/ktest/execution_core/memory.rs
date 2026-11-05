@@ -164,6 +164,7 @@ fn check_and_release(
         drop(pages);
         counts.page_frees += 1;
     }
+
     for slot in objects.iter_mut() {
         let Some(object) = slot.take() else {
             continue;
@@ -199,6 +200,7 @@ fn pressure(
         counts.heap_allocs += 1;
         counts.pressure_objects += 1;
     }
+
     flush(counts);
     check_and_release(pages, objects, 0xd4, counts);
     flush(counts);
@@ -209,15 +211,18 @@ struct Payload {
     objects: [Option<HeapObject>; PRESSURE_OBJECTS],
     counts: Counts,
 }
+
 struct Control {
     payload: SleepMutex<Payload>,
     stop: AtomicBool,
 }
+
 struct Memory {
     initial: Baseline,
     state: Arc<Control>,
     handle: Option<ChildHandle>,
 }
+
 impl Fixture<SuiteBaseline> for Memory {
     /// 记录槽先于主体捕获存在，任何页或原布局对象的归还权不会随主体panic消失。
     fn set_up(_: &mut TestContext<'_>, _: &SuiteBaseline) -> Result<Self, TestError> {
@@ -237,6 +242,7 @@ impl Fixture<SuiteBaseline> for Memory {
             handle: None,
         })
     }
+
     /// 迁核入口只有有限轮次；保住所有原页堆拥有直到其真实离栈，不超时收栈。
     fn quiesce(&mut self, _: &mut TestContext<'_>) -> TestResult {
         self.state.stop.store(true, Ordering::Release);
@@ -249,6 +255,7 @@ impl Fixture<SuiteBaseline> for Memory {
             "memory consumer did not reach original off-stack completion",
         )
     }
+
     /// 原scope已经join；最后控制owner释放页和原布局对象后逐字段比较六域。
     fn tear_down(self, _: &mut TestContext<'_>) -> TestResult {
         let Self {
@@ -288,6 +295,7 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
         check_execution(0, &local, &witness, counts);
         counts.local_rounds += 1;
     }
+
     if migrate {
         for hop in 1..=2 * cpu::count() {
             if stop.load(Ordering::Acquire) {
@@ -305,6 +313,7 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
             flush(counts);
         }
     }
+
     assert!(pages.iter().all(Option::is_none));
     assert!(objects.iter().all(Option::is_none));
     assert_eq!(counts.task, task::current_task().id().as_usize());
@@ -354,6 +363,7 @@ pub(crate) mod memory {
             consume(&mut state.payload.lock(), true, &state.stop);
             Ok(24)
         })?);
+
         let handle = fixture.handle.as_ref().unwrap();
         crate::ktest::execution_core::until(
             || handle.try_join().is_some(),

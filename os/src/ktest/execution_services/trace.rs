@@ -12,6 +12,7 @@ use ::ktest::{Fixture, TestContext, TestError, TestResult};
 
 const START: u32 = 0x4201;
 const STOP: u32 = 0x4202;
+
 const ROUNDS: usize = 72;
 
 struct Control {
@@ -103,6 +104,7 @@ impl Fixture<super::SuiteBaseline> for TraceFixture {
         drop(self.control.worker.lock().take());
         let initial = self.initial;
         drop(self);
+
         let actual = super::baseline();
         context.diagnostic(format_args!(
             "TRACE resources initial={:?} final={:?}",
@@ -157,6 +159,7 @@ fn assert_capture(bytes: &[u8], worker_id: u64, covered: bool) {
     )
     .unwrap();
     assert_eq!(lines.next().unwrap().as_bytes(), header.as_bytes());
+
     let mut worker_dispatches = 0;
     let mut worker_resumes = 0;
     for id in 0..cpu::count() {
@@ -188,6 +191,7 @@ fn assert_capture(bytes: &[u8], worker_id: u64, covered: bool) {
                 u8::from(covered)
             ));
         }
+
         let mut previous_ns = 0;
         for sequence in next - retained..next {
             let mut words = lines
@@ -265,6 +269,7 @@ fn exercise(control: Arc<Control>) -> TestResult {
     assert_eq!(old.seek(SeekFrom::Start(0)), Ok(0));
     assert_eq!(read_all(&old), original);
     assert_eq!(control.rounds.load(Ordering::Acquire), 2 + ROUNDS + 8 + 4);
+
     control.release();
     assert_eq!(child.join()?, 0);
     drop((child, old, fresh, original, current, frozen));

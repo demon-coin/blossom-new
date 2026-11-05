@@ -85,6 +85,7 @@ pub(crate) mod cases {
         let mut memory = Memory::new(0x2000);
         let mut context = UserContext::new(0x1000, 0);
         context.gpr[12] = 0x8877_6655_4433_2211;
+
         assert_eq!(
             emulate(&mut context, &mut memory, 0x200c, immediate(0xa7, 12)),
             EmulationResult::Emulated
@@ -119,6 +120,7 @@ pub(crate) mod cases {
             let mut memory = Memory::new(0x2000);
             memory.bytes[1..1 + width].fill(0xff);
             let mut context = UserContext::new(0x1000, 0);
+
             assert_eq!(
                 emulate(&mut context, &mut memory, 0x2001, word),
                 EmulationResult::Emulated
@@ -146,6 +148,7 @@ pub(crate) mod cases {
             let mut memory = Memory::new(0x2000);
             let mut context = UserContext::new(0x1000, 0);
             context.gpr[7] = u64::from_le_bytes(bytes) as usize;
+
             assert_eq!(
                 emulate(&mut context, &mut memory, 0x2001, word),
                 EmulationResult::Emulated
@@ -170,6 +173,7 @@ pub(crate) mod cases {
             let mut memory = Memory::new(0x2000);
             let mut context = UserContext::new(0x1000, 0);
             context.fpr[0].lanes = [0xfedc_ba98_8765_4321, 1, 2, 3];
+
             assert_eq!(
                 emulate(&mut context, &mut memory, 0x2001, store),
                 EmulationResult::Emulated
@@ -180,6 +184,7 @@ pub(crate) mod cases {
             );
             assert_eq!(memory.bytes[0], 0);
             assert_eq!(memory.bytes[1 + width], 0);
+
             context.fpr[0].lanes[0] = 0x1122_3344_5566_7788;
             assert_eq!(
                 emulate(&mut context, &mut memory, 0x2001, load),
@@ -210,6 +215,7 @@ pub(crate) mod cases {
             memory.bytes[1..5].copy_from_slice(&0x1234_5678u32.to_le_bytes());
             let mut context = UserContext::new(0x1000, 0);
             context.fpr[5].lanes = [u64::MAX, 1, 2, 3];
+
             assert_eq!(
                 emulate(&mut context, &mut memory, 0x2001, word),
                 EmulationResult::Emulated
@@ -225,6 +231,7 @@ pub(crate) mod cases {
         let mut memory = Memory::new(4090);
         let mut context = UserContext::new(0x1000, 0);
         context.gpr[5] = 0x8070_6050_4030_2010;
+
         assert_eq!(
             emulate(&mut context, &mut memory, 4093, pointer(0x27, 5)),
             EmulationResult::Emulated
@@ -233,6 +240,7 @@ pub(crate) mod cases {
             &memory.bytes[3..11],
             &0x8070_6050_4030_2010u64.to_le_bytes()
         );
+
         assert_eq!(
             emulate(&mut context, &mut memory, 4093, pointer(0x26, 6)),
             EmulationResult::Emulated
@@ -248,11 +256,13 @@ pub(crate) mod cases {
         memory.bytes.fill(0xff);
         let mut context = UserContext::new(0x1000, 0);
         context.gpr[0] = 0x1234;
+
         assert_eq!(
             emulate(&mut context, &mut memory, 0x2001, immediate(0xa3, 0)),
             EmulationResult::Emulated
         );
         assert_eq!(context.gpr[0], 0x1234);
+
         assert_eq!(
             emulate(&mut context, &mut memory, 0x2001, immediate(0xa7, 0)),
             EmulationResult::Emulated
@@ -295,17 +305,20 @@ pub(crate) mod cases {
         memory.fail_at = Some(4096);
         let mut context = UserContext::new(0x1000, 0);
         context.gpr[7] = usize::MAX;
+
         assert_eq!(
             emulate(&mut context, &mut memory, 4093, immediate(0xa3, 7)),
             EmulationResult::Fault
         );
         assert_eq!(context.gpr[7], usize::MAX);
+
         assert_eq!(
             emulate(&mut context, &mut memory, 4093, immediate(0xa7, 7)),
             EmulationResult::Fault
         );
         assert_eq!(&memory.bytes[3..11], &[0xff, 0xff, 0xff, 0, 0, 0, 0, 0]);
         assert_eq!(context.pc, 0x1000);
+
         assert_eq!(
             emulate(
                 &mut context,

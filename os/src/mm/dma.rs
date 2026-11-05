@@ -74,6 +74,7 @@ impl CoherentDma {
         if MAX_ORDER < order {
             return Err(DmaError::NoMemory);
         }
+
         let pages = if domain == DmaDomain::qemu_coherent() {
             alloc_pages(order, true)
         } else {
@@ -81,6 +82,7 @@ impl CoherentDma {
             alloc_pages_in(order, true, start, end)
         }
         .ok_or(DmaError::NoMemory)?;
+
         validate_backing(pages.phys_addr(), pages.len(), 0, pages.len())?;
         let device = domain.map(pages.phys_addr(), pages.len())?;
         Ok(Self {
@@ -309,6 +311,7 @@ impl MappedPages {
         if let Err(error) = validate_backing(read.phys_addr(), PAGE_SIZE, offset, len) {
             return Err((error, read));
         }
+
         Ok(Self {
             backing: ManuallyDrop::new(PayloadBacking::Folio {
                 read,
@@ -335,6 +338,7 @@ impl MappedPages {
         if let Err(error) = validate_backing(writeback.phys_addr(), PAGE_SIZE, offset, len) {
             return Err((error, writeback));
         }
+
         Ok(Self {
             backing: ManuallyDrop::new(PayloadBacking::Writeback(writeback)),
             offset,
@@ -706,6 +710,7 @@ fn validate_backing(
     {
         return Err(DmaError::AddressLimit);
     }
+
     let cpu = arch::phys_to_virt(physical);
     if cpu == 0 || cpu.checked_add(allocation_len).is_none() {
         return Err(DmaError::AddressLimit);

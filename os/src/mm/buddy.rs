@@ -143,6 +143,7 @@ impl<'a> Zone<'a> {
         if MAX_ORDER < order {
             return None;
         }
+
         let mut found = order;
         while found <= MAX_ORDER && self.heads[found] == NONE {
             found += 1;
@@ -150,6 +151,7 @@ impl<'a> Zone<'a> {
         if MAX_ORDER < found {
             return None;
         }
+
         let head = self.heads[found];
         self.remove(head, found);
         while order < found {
@@ -164,6 +166,7 @@ impl<'a> Zone<'a> {
         if MAX_ORDER < order || end <= start {
             return None;
         }
+
         let count = 1usize << order;
         for found in order..=MAX_ORDER {
             let mut head = self.heads[found];
@@ -267,6 +270,7 @@ pub(crate) fn allocate_batch(output: &mut [Option<Block>; BATCH_CAPACITY], count
         output.iter().all(Option::is_none),
         "buddy batch output is occupied"
     );
+
     let mut zone = ZONE.get().expect("buddy is not initialized").lock();
     let mut allocated = 0;
     for slot in &mut output[..count] {
@@ -289,6 +293,7 @@ pub(crate) unsafe fn release_batch(blocks: &mut [Option<Block>; BATCH_CAPACITY])
         blocks.iter().flatten().all(|block| block.order == 0),
         "buddy batch contains a nonzero order"
     );
+
     let mut zone = ZONE.get().expect("buddy is not initialized").lock();
     for slot in blocks {
         if let Some(block) = slot.take() {
@@ -334,6 +339,7 @@ impl TestZone<'_, '_> {
         self.blocks[index] = self.zone.allocate(order);
         self.blocks[index].is_some()
     }
+
     /// 登记生产受限选择算法返回的唯一块，用于边界与归还断言。
     pub(crate) fn allocate_in(
         &mut self,
@@ -346,17 +352,20 @@ impl TestZone<'_, '_> {
         self.blocks[index] = self.zone.allocate_in(order, start, end);
         self.blocks[index].is_some()
     }
+
     /// 返回仍 live 块的身份和原阶，不复制其归还权。
     pub(crate) fn block(&self, index: usize) -> (usize, usize) {
         let block = self.blocks[index].as_ref().unwrap();
         (block.head, block.order)
     }
+
     /// 消费原凭证，按原阶执行生产合并算法。
     pub(crate) fn release(&mut self, index: usize) {
         let block = self.blocks[index].take().unwrap();
         // SAFETY: block 是此 zone 分配后仍 live 的唯一凭证，测试从不访问物理页。
         unsafe { self.zone.release(block.head, block.order) };
     }
+
     /// 读取当前 guard 下的真实自由页计数。
     pub(crate) fn free(&self) -> usize {
         self.zone.free
@@ -392,6 +401,7 @@ pub(crate) fn with_test_zone(fragmented: bool, body: impl FnOnce(&mut TestZone<'
             PageKind::Available
         }));
     }
+
     // SAFETY: storage guard 独占已初始化数组，所有 map/zone 借用先于该 guard 销毁。
     let descriptors =
         unsafe { core::slice::from_raw_parts(storage.as_ptr().cast::<PageDesc>(), storage.len()) };

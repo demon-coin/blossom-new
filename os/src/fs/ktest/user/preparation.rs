@@ -27,6 +27,7 @@ const ENVP: usize = SCRATCH + 2 * PAGE_SIZE - 4;
 const STRING: usize = SCRATCH + 3 * PAGE_SIZE - 3;
 const RAW: usize = SCRATCH + 4 * PAGE_SIZE - 2;
 const ENVIRONMENT: usize = SCRATCH + 5 * PAGE_SIZE - 4;
+
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
@@ -142,6 +143,7 @@ fn snapshot_arguments(
     write_bytes(context, mm, ENVIRONMENT, b"USER_SMOKE=1\0")?;
     write_vector(context, mm, ARGV, &[STRING, RAW])?;
     write_vector(context, mm, ENVP, &[ENVIRONMENT])?;
+
     let arguments = checked_exec(
         context,
         Arguments::from_user(
@@ -152,11 +154,13 @@ fn snapshot_arguments(
             exec::DEFAULT_STACK_BYTES,
         ),
     )?;
+
     write_vector(context, mm, ARGV, &[])?;
     write_vector(context, mm, ENVP, &[])?;
     write_bytes(context, mm, STRING, b"changed\0")?;
     write_bytes(context, mm, RAW, b"bad\0")?;
     write_bytes(context, mm, ENVIRONMENT, b"broken\0")?;
+
     let image = checked_exec(
         context,
         exec::load(
@@ -192,6 +196,7 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         ));
         context.expect_eq(error, Some(ExecError::Vm(cause)));
     }
+
     for (pointer, cause) in [
         (unmapped, VmError::Unmapped),
         (arch::USER_ADDRESS_END, VmError::InvalidRange),
@@ -212,6 +217,7 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         ));
         context.expect_eq(error, Some(ExecError::Vm(cause)));
     }
+
     // 三个可读非 NUL 字节之后确实没有 VMA，跨页失败不能替换为预算耗尽。
     write_bytes(context, mm, unmapped - 3, b"abc")?;
     write_vector(context, mm, ARGV, &[unmapped - 3])?;
@@ -226,6 +232,7 @@ fn invalid_arguments(context: &mut TestContext<'_>, mm: &Mm, source: &[u8]) -> T
         .err(),
         Some(ExecError::Vm(VmError::Unmapped)),
     );
+
     write_bytes(context, mm, STRING, source)?;
     write_vector(context, mm, ARGV, &[STRING])?;
     let error = Arguments::from_user(
@@ -313,6 +320,7 @@ fn argument_bytes(
     check_stack(context, &image, &[&source[..length]], &[])?;
     drop(image);
     drop(arguments);
+
     write_bytes(context, mm, STRING + length, b"x\0")?;
     let error = Arguments::from_user(
         mm,
@@ -377,6 +385,7 @@ fn abandon_program(
         Err(ProcessError::NoChild),
     );
     drop(reserved);
+
     let image = fixture.load(context)?;
     let program = prepare_program(
         graph,
@@ -401,6 +410,7 @@ fn abandon_program(
     );
     // PreparedProgram 已持有完整用户现场、运行资源和真实执行栈，但未移交 Ready 队列。
     drop(program);
+
     let reused = graph
         .prepare_process(
             None,
@@ -441,6 +451,7 @@ fn allocation_failure(
     let placement = Placement::Cpu(crate::cpu::current().id);
     let old_pid = old_identity.tid_object();
     let number = old_identity.tid();
+
     // 所有源字节、真实文件缓存、候选映像及运行资源已准备；此段无睡眠访问。
     // 保持同一 CPU 的堆类别耗尽状态，仍允许 IRQ 与同步 SLUB 排空所需的 IPI。
     let (evidence, arguments, program) = {
@@ -456,6 +467,7 @@ fn allocation_failure(
         fixture.release_pressure();
         (evidence, arguments, program)
     };
+
     let argument_error = arguments.err();
     let program_error = program.err();
     context.diagnostic(format_args!(
@@ -474,6 +486,7 @@ fn allocation_failure(
         graph.try_wait(None, number, true),
         Err(ProcessError::NoChild),
     );
+
     let reused = graph
         .prepare_process(
             None,
@@ -508,6 +521,7 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
         .try_reserve_exact(ARGUMENT_STRING_BYTES)
         .map_err(|_| TestError("user preparation source bytes OOM"))?;
     source.resize(ARGUMENT_STRING_BYTES, b'x');
+
     snapshot_arguments(context, fixture, &old_image.mm, &file)?;
     invalid_arguments(context, &old_image.mm, &source)?;
     argument_count(context, fixture, &old_image.mm, &file)?;
@@ -516,6 +530,7 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
     allocation_failure(context, fixture, &source, &old_identity)?;
     drop(source);
     drop(file);
+
     let number = old_identity.tid();
     let old_pid = old_identity.tid_object();
     fixture.start(context, old_image)?;

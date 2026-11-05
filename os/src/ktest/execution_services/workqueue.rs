@@ -20,6 +20,7 @@ use crate::{arch, cpu, mm, sched};
 
 const SLOTS: usize = 8;
 const DEPTH: usize = 3;
+
 const PRESSURE_CAPACITY: usize = 65536;
 
 struct Entry {
@@ -267,6 +268,7 @@ fn ordered_case() -> (usize, usize) {
     queue.flush();
     assert_eq!(probe.consumed.load(Ordering::Acquire), 4);
     assert_eq!(probe.maximum.load(Ordering::Acquire), 1);
+
     for work in &works {
         work.as_ref().close_sync();
     }
@@ -355,6 +357,7 @@ fn ordered_association_case() {
     assert!(a_state.running && !a_state.queued);
     assert!(b_state.running && !b_state.queued);
     assert_ne!(a_state.worker, b_state.worker);
+
     probe.source.store(false, Ordering::Release);
     probe.gates[0].complete();
     until(
@@ -365,6 +368,7 @@ fn ordered_association_case() {
     unrelated.flush();
     assert_eq!(probe.consumed.load(Ordering::Acquire), 3);
     assert_eq!(probe.active.load(Ordering::Acquire), 0);
+
     a.as_ref().close_sync();
     b.as_ref().close_sync();
     ordered.close_sync();
@@ -424,6 +428,7 @@ fn test_duplicates() {
     } else {
         None
     };
+
     probe.submitted.store(8, Ordering::Release);
     assert!(work.as_ref().queue().unwrap());
     let mut before_duplicates = 0;
@@ -446,6 +451,7 @@ fn test_duplicates() {
         running_duplicates += usize::from(!work.as_ref().queue().unwrap());
     }
     assert_eq!(running_duplicates, 3);
+
     probe.gates[0].complete();
     work.as_ref().flush();
     queue.flush();
@@ -454,6 +460,7 @@ fn test_duplicates() {
     let callbacks = probe.callbacks.load(Ordering::Acquire);
     let maximum = probe.maximum.load(Ordering::Acquire);
     assert_eq!((submitted, consumed, callbacks, maximum), (16, 16, 2, 1));
+
     if let Some(started) = &started {
         testing::arm_pause(1, testing::PausePoint::Started);
         assert!(started.as_ref().queue().unwrap());
@@ -574,6 +581,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
             association_callback,
         )
     });
+
     let controller_probe = probe.clone();
     let controller = crate::ktest::spawn_result_on(1, move |_| {
         Ok({
@@ -602,6 +610,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
             let base = probe.tasks[0].lock().as_ref().unwrap().id();
             assert_ne!(original.id(), base);
             assert!(original.worker.is_some());
+
             let paused = testing::pool_stats(0);
             assert_eq!(paused.workers, before.workers + 1);
             assert_eq!(paused.created, before.created + 1);
@@ -634,6 +643,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
             assert_eq!(testing::pool_stats(0).retired, before.retired);
             assert!(testing::snapshot(work.as_ref()).queued);
             assert!(!testing::snapshot(work.as_ref()).running);
+
             if cancel {
                 assert!(work.as_ref().cancel_sync());
                 let state = testing::snapshot(work.as_ref());
@@ -671,6 +681,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
                 assert_ne!(flusher, original.id());
                 assert!(probe.blocked(0) && probe.blocked(2));
             }
+
             probe.gates[2].complete();
             if !cancel {
                 until(
@@ -685,6 +696,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
         })
     })
     .unwrap();
+
     assert!(works[0].as_ref().queue().unwrap());
     until(
         || probe.blocked(0),
@@ -695,6 +707,7 @@ fn association_case(action: AssociationAction) -> ::ktest::TestResult {
     if crate::ktest::child_failed() {
         return Err(::ktest::TestError("association controller child failed"));
     }
+
     for work in &works {
         work.as_ref().close_sync();
     }
@@ -757,10 +770,12 @@ fn test_deep_blocking() {
     let creators = testing::pool_stats(0).created - before.created;
     assert_eq!(blocked, DEPTH);
     assert!(DEPTH - 1 <= creators);
+
     probe.release.store(true, Ordering::Release);
     queue.flush();
     let released = probe.consumed.load(Ordering::Acquire);
     assert_eq!(released, DEPTH);
+
     for work in &works {
         work.as_ref().close_sync();
     }
@@ -770,6 +785,7 @@ fn test_deep_blocking() {
         unique_work(work);
     }
     drop((works, queue, probe));
+
     wait_services_blocked();
     let after = testing::pool_stats(0);
     let sleeping = after.sleeping - before.sleeping;
@@ -864,6 +880,7 @@ fn release_owned_pressure(page_count: usize, object_count: usize) {
         // SAFETY: 刚取得原分配的唯一归还权，pointer/layout 完全匹配，压力对象没有其他访问者。
         unsafe { dealloc(pointer, layout) };
     }
+
     for index in (0..page_count).rev() {
         // SAFETY: 已初始化原前缀的唯一页拥有者只在此移动消费，回收者外没有并发压力表访问。
         let pages = unsafe {
@@ -930,6 +947,7 @@ fn test_reclaim() {
         before.idle, 0,
         "ordinary idle worker could bypass OOM rescue"
     );
+
     mm::shrink_all();
     let page_count = exhaust_pages();
     let (objects, _heap_null) = exhaust_objects();
@@ -949,6 +967,7 @@ fn test_reclaim() {
     let worker_callbacks = probe.ordinary.load(Ordering::Acquire);
     assert!(1 <= create_failures && 1 <= after.rescued - before.rescued);
     assert_eq!((rescuer_callbacks, worker_callbacks), (1, 0));
+
     let recovered_page = mm::alloc_pages(0, false).expect("page allocation did not recover");
     drop(recovered_page);
     let mut heap_recovered = 0;
@@ -963,6 +982,7 @@ fn test_reclaim() {
     }
     let recovered = usize::from(heap_recovered == mm::SLUB_SIZES.len());
     assert_eq!(recovered, 1);
+
     probe.gates[0].complete();
     queue.flush();
     blocker.as_ref().close_sync();
@@ -1101,6 +1121,7 @@ fn ordinary_recovery_case(cancel: bool) -> (usize, usize) {
     );
     let before = testing::pool_stats(0);
     assert_eq!((before.workers, before.idle, before.nr_running), (1, 0, 0));
+
     mm::shrink_all();
     let pages = exhaust_pages();
     let (objects, nulls) = exhaust_objects();
@@ -1127,6 +1148,7 @@ fn ordinary_recovery_case(cancel: bool) -> (usize, usize) {
     }
     let failures = testing::pool_stats(0).create_failures - before.create_failures;
     assert!(1 <= failures);
+
     probe.gates[2].complete();
     ordinary_until(
         end,
@@ -1148,6 +1170,7 @@ fn ordinary_recovery_case(cancel: bool) -> (usize, usize) {
         assert_eq!(probe.ordinary.load(Ordering::Acquire), 1);
         assert!(before.created < testing::pool_stats(0).created);
     }
+
     pending.as_ref().flush();
     queue.flush();
     probe.gates[3].complete();
@@ -1209,6 +1232,7 @@ fn test_flush_boundary() {
             boundary_callback,
         )
     });
+
     assert!(works[0].as_ref().queue().unwrap());
     until(|| probe.blocked(0), "earlier work sleeping on bound CPU");
     let _earlier_blocked = usize::from(probe.blocked(0));
@@ -1220,6 +1244,7 @@ fn test_flush_boundary() {
         "later work completed",
     );
     let _later_done = probe.counts[1].load(Ordering::Acquire);
+
     let flush_probe = probe.clone();
     let queue_address = Arc::as_ptr(&queue) as usize;
     let flusher = crate::ktest::spawn_result_on(0, move |_| {
@@ -1241,6 +1266,7 @@ fn test_flush_boundary() {
     );
     assert!(!probe.done.load(Ordering::Acquire));
     assert_eq!(probe.counts[0].load(Ordering::Acquire), 0);
+
     let mut future_submitted = 0;
     for work in &works[2..] {
         future_submitted += usize::from(work.as_ref().queue().unwrap());
@@ -1261,6 +1287,7 @@ fn test_flush_boundary() {
         },
         "future accepted work retained",
     );
+
     probe.gates[0].complete();
     until(
         || probe.done.load(Ordering::Acquire),
@@ -1279,6 +1306,7 @@ fn test_flush_boundary() {
     );
     assert_eq!(boundary_done, 1);
     assert!(1 <= future_running);
+
     for index in 2..6 {
         probe.gates[index].complete();
     }
@@ -1341,6 +1369,7 @@ fn paused_delayed_stop(
     })
     .unwrap();
     until(|| probe.blocked(7), "delayed stopper prepared");
+
     delayed_testing::configure(work.as_ref(), point);
     assert!(work.as_ref().queue(Duration::from_millis(10)).unwrap());
     spin_until(
@@ -1356,6 +1385,7 @@ fn paused_delayed_stop(
     let sync_wait = usize::from(probe.blocked(7));
     assert!(!probe.done.load(Ordering::Acquire));
     assert!(delayed_testing::arrived());
+
     delayed_testing::release();
     until(
         || handle.try_join().is_some(),
@@ -1429,6 +1459,7 @@ fn test_delayed() {
         delayed_callback,
         &probe.entries[0] as *const Entry as usize,
     );
+
     let mut delayed = usize::from(work.as_ref().queue(Duration::from_secs(1)).unwrap());
     assert!(delayed_testing::snapshot(work.as_ref()).timer_pending);
     let modified = usize::from(work.as_ref().modify(Duration::from_millis(10)).unwrap());
@@ -1443,11 +1474,13 @@ fn test_delayed() {
     work.as_ref().flush();
     let transfers = probe.callbacks.load(Ordering::Acquire);
     assert_eq!((delayed, transfers), (2, 2));
+
     assert!(work.as_ref().queue(Duration::from_secs(1)).unwrap());
     let cancelled = usize::from(work.as_ref().cancel_sync());
     assert_eq!(cancelled, 1);
     let idle = delayed_testing::snapshot(work.as_ref());
     assert!(!idle.timer_pending && !idle.work_pending && !idle.running);
+
     scenario().nodes.close_delayed(work.as_ref());
     scenario()
         .delay_source_closed
@@ -1537,6 +1570,7 @@ fn test_owner() {
     owner.work.as_ref().cancel_sync();
     let idle = testing::snapshot(owner.work.as_ref());
     assert!(!idle.running && !idle.queued && !idle.closed);
+
     let reused = usize::from(owner.work.as_ref().queue().unwrap());
     assert_eq!(reused, 1);
     owner.work.as_ref().flush();
@@ -1544,11 +1578,13 @@ fn test_owner() {
     let self_requeue = owner.probe.submitted.load(Ordering::Acquire);
     let max_active = owner.probe.maximum.load(Ordering::Acquire);
     assert_eq!((self_requeue, callbacks, max_active), (2, 4, 1));
+
     owner.close();
     let closed = usize::from(testing::snapshot(owner.work.as_ref()).closed);
     let rejected = usize::from(owner.work.as_ref().queue() == Err(QueueError::Closed));
     let stops = owner.probe.stops.load(Ordering::Acquire);
     assert_eq!((closed, rejected, stops), (1, 1, 1));
+
     queue.close_sync();
     owner.probe.clear();
     unique_work(&owner.work);
@@ -1641,6 +1677,7 @@ fn test_callback_handoff() {
     let probe = Probe::new();
     let first = probe.work(&queue, 0, 0, handoff_callback);
     let next = probe.work(&queue, 1, 0, handoff_callback);
+
     wait_services_blocked();
     let created = testing::pool_stats(0).created;
     assert!(first.as_ref().queue().unwrap());
@@ -1693,6 +1730,7 @@ struct Scenario {
     objects: core::cell::UnsafeCell<alloc::vec::Vec<MaybeUninit<(*mut u8, Layout)>>>,
     pressure_counts: SpinLock<(usize, usize)>,
 }
+
 static CURRENT: core::sync::atomic::AtomicPtr<Scenario> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -1706,11 +1744,13 @@ fn scenario() -> Arc<Scenario> {
         Arc::from_raw(pointer)
     }
 }
+
 /// 每个工作或fatal场景独立拥有原节点、操作上下文和真实压力页对象。
 pub(super) struct ServiceFixture {
     state: Arc<Scenario>,
     initial: super::Baseline,
 }
+
 impl ::ktest::Fixture for ServiceFixture {
     /// 每个case从真实常驻基线重新准备独立计数、等待源及原节点owner表。
     fn set_up(context: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
@@ -1724,6 +1764,7 @@ impl ::ktest::Fixture for ServiceFixture {
         owners
             .try_reserve_exact(4)
             .map_err(|_| ::ktest::TestError("NoMemory: source owners"))?;
+
         let pressure_capacity = if context.case.name.contains("real_oom_rescuer")
             || context.case.name.contains("ordinary_worker_oom")
             || context.case.name.contains("printer_real_oom")
@@ -1742,6 +1783,7 @@ impl ::ktest::Fixture for ServiceFixture {
             .try_reserve_exact(pressure_capacity)
             .map_err(|_| ::ktest::TestError("NoMemory: pressure objects"))?;
         objects.resize_with(pressure_capacity, MaybeUninit::uninit);
+
         let state = Arc::try_new(Scenario {
             nodes: super::Nodes::new(0, 8, 2, 2)?,
             stop: AtomicBool::new(false),
@@ -1767,6 +1809,7 @@ impl ::ktest::Fixture for ServiceFixture {
             .is_ok());
         Ok(Self { state, initial })
     }
+
     /// 先合作停止真实生产者并释放停点/gate，再同步停止原节点；不在失败时收栈。
     fn quiesce(&mut self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         self.state.stop_sources();
@@ -1782,6 +1825,7 @@ impl ::ktest::Fixture for ServiceFixture {
         self.state.nodes.stop()?;
         Ok(())
     }
+
     /// runner已join每个原Task；尾票归还以后才释放context/owner并比较完整两账。
     fn tear_down(self, _: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         let mut owner = core::mem::ManuallyDrop::new(self);
@@ -1793,6 +1837,7 @@ impl ::ktest::Fixture for ServiceFixture {
                 return Err(::ktest::TestError("work callback remains active"));
             }
         }
+
         let source_count = owner.state.owners.lock().len();
         let sources = core::mem::take(&mut *owner.state.owners.lock());
         drop(sources);
@@ -1802,12 +1847,14 @@ impl ::ktest::Fixture for ServiceFixture {
         if *owner.state.pressure_counts.lock() != (0, 0) {
             return Err(::ktest::TestError("pressure ownership did not return"));
         }
+
         owner.state.nodes.tails()?;
         let probes = core::mem::take(&mut *owner.state.probes.lock());
         drop(probes);
         if owner.state.operation_drops.load(Ordering::Acquire) != count {
             return Err(::ktest::TestError("operation drop count mismatch"));
         }
+
         let initial = owner.initial;
         let pointer = CURRENT.swap(core::ptr::null_mut(), Ordering::AcqRel);
         assert_eq!(pointer, Arc::as_ptr(&owner.state).cast_mut());
@@ -1828,10 +1875,12 @@ impl ::ktest::Fixture<super::SuiteBaseline> for ServiceFixture {
     ) -> Result<Self, ::ktest::TestError> {
         <Self as ::ktest::Fixture<()>>::set_up(context, &())
     }
+
     /// suite基线不产生工作票，原压力、gate和节点责任只停止一次。
     fn quiesce(&mut self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         <Self as ::ktest::Fixture<()>>::quiesce(self, context)
     }
+
     /// case原join及强票清理不变，最后由suite资源检查跨例账务。
     fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> ::ktest::TestResult {
         <Self as ::ktest::Fixture<()>>::tear_down(self, context)
@@ -1868,6 +1917,7 @@ impl Scenario {
         }
     }
 }
+
 impl ServiceFixture {
     /// 工作/故障动作只捕获独立Scenario拥有；fixed协调者失败先解除gate，Any父才可执行真正关闭。
     pub(super) fn fixed(
@@ -1880,6 +1930,7 @@ impl ServiceFixture {
 
 // SAFETY: pressure/objects固定Vec不再扩容，body在发表回收前独占写入；counts短锁把每个已初始化前缀只移给一个回收者。其他可变字段均为原子或SpinLock。
 unsafe impl Send for Scenario {}
+
 // SAFETY: 同一原子发表和counts唯一消费协议排除压力槽并发访问；quiesce保活State直到原scope join和真实节点尾部。
 unsafe impl Sync for Scenario {}
 
@@ -1889,16 +1940,19 @@ fn pressure_pages() -> *mut MaybeUninit<mm::OwnedPages> {
     // SAFETY: Vec长度/容量setup后不变，返回存储仍由catch外fixture保活，不产生元素借用。
     unsafe { (*owner.pressure.get()).as_mut_ptr() }
 }
+
 /// 原对象指针和Layout只写入未初始化槽，唯一回收者按原前缀移动消费。
 fn pressure_objects() -> *mut MaybeUninit<(*mut u8, Layout)> {
     let owner = scenario();
     // SAFETY: 固定Vec不再移动/扩容；counts短锁和生产前发表约束由读写者遵守。
     unsafe { (*owner.objects.get()).as_mut_ptr() }
 }
+
 /// 域owner在正文捕获之外保存，真实rescuer仍由原close_sync负责join。
 fn new_queue(config: WorkQueueConfig) -> Arc<super::QueueOwner> {
     scenario().nodes.queue(config)
 }
+
 /// 原Work在任何queue之前存入typed fixture owner表。
 fn new_work(
     queue: &WorkQueue,
@@ -1908,6 +1962,7 @@ fn new_work(
 ) -> Pin<Arc<Work>> {
     scenario().nodes.work(queue, cpu, callback, context)
 }
+
 /// 原DelayedWork的稳定拥有先于真实timer移交发表。
 fn new_delayed(
     queue: &WorkQueue,
@@ -1928,6 +1983,7 @@ pub(super) fn exhaust_fault() -> (usize, usize, usize) {
 #[::ktest::suite(fixture = ServiceFixture, suite_resources = crate::ktest::execution_services::SuiteBaseline, context = "Thread", tags("execution", "work"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
+
     /// pending前后重复提交、真实业务16次合并与同Work下一轮保持唯一Worker。
     #[test]
     fn duplicates_and_business(
@@ -1939,6 +1995,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 跨CPU提交仍规范到CPU0，严格FIFO并保持全域额度一。
     #[test]
     fn ordered_fifo(
@@ -1950,6 +2007,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// ordered自关联后续必须保留原执行者，别域合法flush由另一Worker真正阻塞。
     #[test]
     fn ordered_original_worker(
@@ -1961,6 +2019,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 三层真Blocked依赖迫使动态Worker创建，早唤醒反馈配对且原manager真实join退休。
     #[test]
     fn blocked_dependency_depth(
@@ -1972,6 +2031,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 原Worker在不同域flush与登记前/后取消窗口均不可被借走，撤末票不需新work才能退休。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -1985,6 +2045,7 @@ pub(crate) mod cases {
     ) -> ::ktest::TestResult {
         fixture.fixed(move || association_case(action))
     }
+
     /// 控制者在真实worker停点内失败须正常quiesce/join并保child Fail，不能退化成worker fatal。
     #[test]
     #[ktest(
@@ -1997,6 +2058,7 @@ pub(crate) mod cases {
     ) -> ::ktest::TestResult {
         fixture.fixed(|| association_case(AssociationAction::ControllerFailure))
     }
+
     /// 真页和十二heap类耗尽、Worker创建失败后只有预建rescuer能放压，并恢复所有类。
     #[test]
     fn real_oom_rescuer(
@@ -2008,6 +2070,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 普通域真实OOM冷却保持原B需求；独立Task放压继续Blocked且无新增queue事件，或撤票后停止重试。
     #[test]
     #[case("recover_without_queue", false)]
@@ -2024,6 +2087,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 更早票未完时较晚票可完成，固定旧颜色flush不等待边界之后仍running/queued的未来票。
     #[test]
     fn finite_flush_prefix(
@@ -2035,6 +2099,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 同一个DelayedWork真实修改、timer移交及前后取消尾部，没有孤票或存储结束后访问。
     #[test]
     fn delayed_transfer_lifetime(
@@ -2046,6 +2111,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// 每个移交前/后窗口重新准备原域、D和context，同步停止必须在真实timer尾部之前Blocked。
     #[test]
     #[ktest(min_cpus = 2)]
@@ -2080,6 +2146,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// close域以后到期拒绝在任何D停止调用之前自行归票，覆盖旧孤pending/强引用根因。
     #[test]
     fn closed_domain_due_transfer(
@@ -2091,6 +2158,7 @@ pub(crate) mod cases {
             Ok(())
         })
     }
+
     /// selfqueue真实两轮、cancel后复用、owner一次stop/drop及close永久拒绝。
     #[test]
     fn explicit_owner_close(

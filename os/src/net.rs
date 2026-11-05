@@ -67,11 +67,14 @@ pub const LOOPBACK_CAPACITY: usize = 32;
 pub const LOOPBACK_MTU: usize = MAX_IP_PACKET_LEN;
 pub(crate) const SOMAXCONN: usize = 4096;
 pub(crate) const PROTOCOL_BUDGET: usize = 16;
+
 const ETHERNET_IP_MTU: usize = 1500;
 pub(crate) const ETHERNET_FRAME_CAPACITY: usize = ETHERNET_IP_MTU + ETHERNET_HEADER_LEN;
 const INTERFACE_WORKSPACE_CAPACITY: usize = 64 * 1024;
+
 const LOOPBACK_IPV4_PREFIX_LEN: u8 = 8;
 const IPV4_POINT_TO_POINT_PREFIX_LEN: u8 = IPV4_ADDRESS_BITS - 1;
+
 const ROOT_WORK_ITEMS: usize = 2;
 pub(crate) const INTERFACE_COUNT: usize = 2;
 const ROUTE_SNAPSHOT_CAPACITY: usize = INTERFACE_COUNT + 1;
@@ -219,6 +222,7 @@ impl InterfaceState {
         };
         let capture = Arc::try_new(SpinLock::new(prepare_ingress_storage()?))
             .map_err(|_| FsError::NoMemory)?;
+
         let mut config = Config::new(hardware);
         config.random_seed = seed;
         let mut device = FrameDevice {
@@ -243,6 +247,7 @@ impl InterfaceState {
                     .expect("loopback IPv6 capacity exhausted");
             });
         }
+
         Ok(Self {
             iface,
             frame,
@@ -385,6 +390,7 @@ impl<'s> TransportIngress<'s> for IngressCollector<'_> {
             .tables
             .lookup_tcp(TcpTuple { local, peer })
             .or_else(|| self.tables.lookup_listener(local));
+
         match endpoint {
             Some(endpoint) => {
                 assert!(
@@ -431,6 +437,7 @@ impl<'s> TransportIngress<'s> for IngressCollector<'_> {
         let Some(endpoint) = self.tables.lookup_udp(local, peer) else {
             return false;
         };
+
         assert!(
             self.event.is_none(),
             "multiple transports in one ingress frame"
@@ -653,6 +660,7 @@ impl NetStack {
             seed: time::now().as_nanos(),
         })
         .map_err(|_| FsError::NoMemory)?;
+
         let queue = WorkQueue::try_new(WorkQueueConfig {
             max_active: cpu::count() + ROOT_WORK_ITEMS,
             ordered: false,
@@ -664,6 +672,7 @@ impl NetStack {
             net.work_queue().close_sync();
             return Err(error);
         }
+
         net.stopped.store(false, Ordering::Release);
         Ok(NetStackOwner {
             net: ManuallyDrop::new(net),
@@ -745,6 +754,7 @@ impl NetStack {
         if !bound_source.is_unspecified() && !self.is_local(bound_source) {
             return Err(FsError::AddressNotAvailable);
         }
+
         let bound_source = if bound_source.is_unspecified() {
             match destination {
                 IpAddress::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
@@ -753,6 +763,7 @@ impl NetStack {
         } else {
             bound_source
         };
+
         let loopback = self.loopback.lock();
         let state = loopback.as_ref().ok_or(FsError::NotConnected)?;
         let loopback_up = state.up;
@@ -771,6 +782,7 @@ impl NetStack {
             });
         }
         drop(loopback);
+
         let ethernet = self
             .ethernet
             .get()
@@ -834,6 +846,7 @@ impl NetStack {
             state.set_ipv4(config.address, config.prefix_len);
             state.up = true;
         }
+
         self.configuration_changed();
         Ok(())
     }
@@ -877,6 +890,7 @@ impl NetStack {
                     up: state.up,
                 });
             }
+
             if id == InterfaceId::Ethernet {
                 snapshots[INTERFACE_COUNT] = state.default_gateway().map(|gateway| RouteSnapshot {
                     interface: id,
@@ -914,6 +928,7 @@ impl NetStack {
             };
             state.set_ipv4(address, prefix_len);
         }
+
         self.kick_egress();
         Ok(())
     }
@@ -932,6 +947,7 @@ impl NetStack {
             let cidr = state.ipv4().ok_or(FsError::AddressNotAvailable)?;
             state.set_ipv4(cidr.address().octets(), prefix_len);
         }
+
         self.kick_egress();
         Ok(())
     }
@@ -944,6 +960,7 @@ impl NetStack {
             let state = interface.as_mut().ok_or(FsError::NotConnected)?;
             state.up = up;
         }
+
         if up {
             self.configuration_changed();
         } else {
@@ -991,6 +1008,7 @@ impl NetStack {
                 if existing.is_some() {
                     return Err(FsError::Exists);
                 }
+
                 state
                     .iface
                     .routes_mut()
@@ -1003,6 +1021,7 @@ impl NetStack {
                 state.iface.routes_mut().remove_default_ipv4_route();
             }
         }
+
         self.kick_egress();
         Ok(())
     }
@@ -1129,6 +1148,7 @@ impl NetStack {
                 return Err((error, packet));
             }
         };
+
         {
             let mut egress = self.egress.lock();
             if !egress.open {
@@ -1142,6 +1162,7 @@ impl NetStack {
                 route,
             });
         }
+
         self.kick_egress();
         Ok(())
     }
@@ -1158,6 +1179,7 @@ impl NetStack {
         let Some(endpoint) = self.tables.lookup_tcp(TcpTuple { local, peer }) else {
             return result;
         };
+
         // 管理状态重查和登记与 up 提交串行，唤醒不能先于暂停登记而丢失。
         let _admission = self.admission()?;
         let result = self.resolve_route(packet.destination(), packet.source());
@@ -1185,6 +1207,7 @@ impl NetStack {
             return !loopback_up && state.iface.resolve_route(destination, source).is_ok();
         }
         drop(loopback);
+
         let Some(ethernet) = self.ethernet.get() else {
             return false;
         };
@@ -1277,6 +1300,7 @@ impl NetStack {
             retired.push(RetiredEndpoint::Tcp(endpoint));
         }
         drop(retired);
+
         self.schedule_reaper(id);
     }
 
@@ -1290,6 +1314,7 @@ impl NetStack {
             retired.push(RetiredEndpoint::Udp(endpoint));
         }
         drop(retired);
+
         self.schedule_reaper(id);
     }
 
@@ -1372,6 +1397,7 @@ impl NetStack {
                 route,
             });
         }
+
         let _ = self.ingress.get().unwrap().as_ref().queue();
         Ok(())
     }
@@ -1451,6 +1477,7 @@ impl NetStack {
             }
             egress.packet_control.take()
         };
+
         drop(control);
         Ok(())
     }
@@ -1552,6 +1579,7 @@ impl NetStack {
             let count = egress.waiting.len();
             (entry, count)
         };
+
         drop(entry);
         self.wake_egress_waiters(count);
     }
@@ -1593,6 +1621,7 @@ impl NetStack {
             }
             state.capture.clone()
         };
+
         let storage = ::core::mem::take(&mut *capture.lock());
         let storage = if storage.capacity() == 0 {
             prepare_ingress_storage()?
@@ -1627,6 +1656,7 @@ impl NetStack {
                         .is_some_and(InterfaceState::dispatch_ready)
                 }),
         ];
+
         let egress = self.egress.lock();
         if !egress.open {
             return None;
@@ -1674,6 +1704,7 @@ impl NetStack {
             self.finish_interface_egress(InterfaceId::Loopback);
             return Ok(true);
         }
+
         let (capture, storage) = self.take_ingress_storage(InterfaceId::Loopback)?;
         let mut collector = IngressCollector::new(&self.tables, capture, storage);
         collector.local_destination = self.is_local(destination).then_some(destination);
@@ -1706,12 +1737,14 @@ impl NetStack {
                 _ => (false, None),
             }
         };
+
         collector.return_storage();
         if !received {
             return Ok(false);
         }
         drop(binding);
         self.finish_interface_egress(InterfaceId::Loopback);
+
         let udp = matches!(collector.event.as_ref(), Some(IngressEvent::Udp(_, _)));
         if let Err(error) = collector.deliver() {
             let mut stats = self.loopback_stats.lock();
@@ -1754,11 +1787,13 @@ impl NetStack {
             frame.in_flight = true;
             (::core::mem::take(&mut frame.bytes), frame.len, source)
         };
+
         let accepted = self
             .nic
             .get()
             .expect("Ethernet interface without NIC")
             .try_transmit(len, |frame| frame.copy_from_slice(&bytes[..len]));
+
         let (binding, finished) = {
             let mut ethernet = ethernet.lock();
             let state = ethernet
@@ -1782,6 +1817,7 @@ impl NetStack {
                 (None, false)
             }
         };
+
         drop(binding);
         if finished {
             self.finish_interface_egress(InterfaceId::Ethernet);
@@ -1805,6 +1841,7 @@ impl NetStack {
         {
             return false;
         }
+
         let mut device = FrameDevice {
             frame: &mut state.frame,
             input: None,
@@ -1843,6 +1880,7 @@ impl NetStack {
                     blocked[0] = true;
                 }
             }
+
             if !tx_full {
                 match self
                     .transmit_ethernet_frame()
@@ -1863,6 +1901,7 @@ impl NetStack {
                 consumed += 1;
                 continue;
             }
+
             let Some((index, id)) = self.select_egress(blocked, &stalled) else {
                 break;
             };
@@ -1883,6 +1922,7 @@ impl NetStack {
             } else {
                 packet
             };
+
             let result = {
                 let mut interface = self
                     .interface(id)
@@ -1911,6 +1951,7 @@ impl NetStack {
                     _ => Err(DispatchError::Exhausted),
                 }
             };
+
             match result {
                 Ok(()) => {
                     drop(packet);
@@ -1938,6 +1979,7 @@ impl NetStack {
             }
             consumed += 1;
         }
+
         self.arm_interface_timer();
         if consumed == PROTOCOL_BUDGET && self.actionable_egress(blocked, tx_full, &stalled) {
             self.kick_egress();
@@ -2003,6 +2045,7 @@ impl NetStack {
                     .map(|packet| (entry.route.interface, packet.destination()));
             }
         }
+
         let now = interface_now();
         let mut deadline = None;
         for id in [InterfaceId::Loopback, InterfaceId::Ethernet] {
@@ -2024,6 +2067,7 @@ impl NetStack {
                 }
             }
         }
+
         let _control = self.timer_control.lock();
         if self.is_stopping() {
             return;
@@ -2055,6 +2099,7 @@ impl NetStack {
         if self.is_stopping() {
             return Err(FsError::NotConnected);
         }
+
         let (capture, storage) = self.take_ingress_storage(InterfaceId::Ethernet)?;
         let mut collector = IngressCollector::new(&self.tables, capture, storage);
         let result = {
@@ -2093,6 +2138,7 @@ impl NetStack {
                 _ => Err(FsError::NotConnected),
             }
         };
+
         collector.return_storage();
         result?;
         self.kick_egress();
@@ -2128,6 +2174,7 @@ impl NetStack {
             );
             egress.open = false;
         }
+
         // Timer 的重提边界与关门串行；等待 callback 全尾时不持这把短锁。
         {
             let _control = self.timer_control.lock();
@@ -2137,6 +2184,7 @@ impl NetStack {
         }
         self.ingress.get().unwrap().as_ref().close_sync();
         self.reaper.get().unwrap().as_ref().close_sync();
+
         let (tcp, udp, unix) = self.tables.take_all();
         for endpoint in tcp {
             endpoint.stop_sync();
@@ -2154,9 +2202,11 @@ impl NetStack {
         for pair in unix {
             pair.stop_sync();
         }
+
         if let Some(nic) = self.nic.get() {
             nic.stop_sync().map_err(NetDeviceError::into_fs_error)?;
         }
+
         let loopback = self.loopback.lock().take();
         let ethernet = self
             .ethernet
@@ -2168,6 +2218,7 @@ impl NetStack {
             let control = self.egress.lock().packet_control.take();
             drop(control);
         }
+
         loop {
             let node = self.egress.lock().waiting.pop();
             let Some(node) = node else {
@@ -2180,6 +2231,7 @@ impl NetStack {
             ::core::mem::take(&mut egress.packets)
         };
         drop(packets);
+
         self.work_queue().close_sync();
         self.stopped.store(true, Ordering::Release);
         Ok(())
@@ -2248,6 +2300,7 @@ fn classful_prefix(address: [u8; 4]) -> u8 {
     const CLASS_A_PREFIX_LEN: u8 = 0xff00_0000u32.leading_ones() as u8;
     const CLASS_B_PREFIX_LEN: u8 = 0xffff_0000u32.leading_ones() as u8;
     const CLASS_C_PREFIX_LEN: u8 = 0xffff_ff00u32.leading_ones() as u8;
+
     if address[0] < CLASS_B_FIRST_OCTET {
         CLASS_A_PREFIX_LEN
     } else if address[0] < CLASS_C_FIRST_OCTET {

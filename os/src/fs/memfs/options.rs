@@ -117,6 +117,7 @@ fn number(mut bytes: &[u8], mut base: u64) -> Result<(u64, &[u8]), FsError> {
             10
         };
     }
+
     let mut value = 0u64;
     let mut digits = 0;
     for &byte in bytes {
@@ -135,6 +136,7 @@ fn number(mut bytes: &[u8], mut base: u64) -> Result<(u64, &[u8]), FsError> {
             .ok_or(FsError::InvalidOperation)?;
         digits += 1;
     }
+
     if digits == 0 {
         return Err(FsError::InvalidOperation);
     }
