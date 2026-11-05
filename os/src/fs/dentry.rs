@@ -216,6 +216,10 @@ impl DentryCache {
     }
 
     /// 观察缓存域当前是否没有已发表名字。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "ktest 在静止名字回收后核对缓存已空并重新加载")
+    )]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

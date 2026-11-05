@@ -13,6 +13,10 @@ pub fn after(delay: Duration) -> Option<MonotonicInstant> {
 }
 
 /// 按前一次相位加非零周期，跳过过期相位并返回严格晚于 now 的下一次期限。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "定时器测试核对周期相位跳过、零周期和纳秒上溢边界")
+)]
 pub fn periodic_deadline(
     previous: MonotonicInstant,
     period: Duration,

@@ -803,6 +803,10 @@ impl Mm {
     }
 
     /// 映射持完整打开实例，属性检查与取页均不占 mmap/PTE 锁，关闭 fd 不撤销映射。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "文件映射分别携带地址范围、当前和最大权限、打开实例及共享属性，保留 mmap 的原接口和拥有边界"
+    )]
     pub fn map_file(
         &self,
         address: usize,

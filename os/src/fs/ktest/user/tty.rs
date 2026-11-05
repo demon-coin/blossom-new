@@ -263,6 +263,10 @@ impl UserOwner {
     }
 
     /// 声明线路前等待配置已发表；放行后独立观察实际阻塞，不把 yield 门控当等待。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "每段线路用例显式列出客体阶段、完整双向字节、延迟与真实生产等待预期"
+    )]
     fn tty_stage(
         &mut self,
         context: &mut TestContext<'_>,

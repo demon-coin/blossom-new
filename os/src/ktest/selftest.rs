@@ -390,6 +390,10 @@ mod failures {
     }
 
     /// 普通 assert 失败必须归属本例，不能污染后续独立 Pass 实例。
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "自测必须触发真实 assert 失败并核对归属，不能替换为另一种 panic 来源"
+    )]
     #[test]
     fn assertion_failure() {
         assert!(false, "vertical intentional assertion");

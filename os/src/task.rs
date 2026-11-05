@@ -297,6 +297,13 @@ pub struct JoinHandle {
 
 impl JoinHandle {
     /// 非阻塞地观察正常返回结果；Some 保证任务已经离栈并归还执行栈。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "执行测试非阻塞观察离栈完成，确认结果发布时执行栈已经归还"
+        )
+    )]
     pub fn try_join(&self) -> Option<i32> {
         self.join.try_join()
     }
@@ -372,6 +379,13 @@ impl PreparedTask {
 }
 
 /// 在任意在线 CPU 执行拥有数据的入口；所有分配成功以后才发表任务。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "具名测试 runner 在生产调度器上发表不固定 CPU 的 suite Task"
+    )
+)]
 pub fn spawn_kernel(
     entry: impl FnOnce() -> i32 + Send + 'static,
 ) -> Result<JoinHandle, AllocError> {

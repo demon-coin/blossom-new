@@ -142,8 +142,16 @@ impl PollMask {
     /// 表示带优先级写入不会阻塞。
     pub const POLLWRBAND: Self = Self(0x200);
     /// 表示消息事件。
+    #[expect(
+        dead_code,
+        reason = "保留 poll UAPI 的 0x400 消息位定义，当前 provider 不产生该事件"
+    )]
     pub const POLLMSG: Self = Self(0x400);
     /// 表示删除事件。
+    #[expect(
+        dead_code,
+        reason = "保留 poll UAPI 的 0x1000 删除位定义，当前 provider 不产生该事件"
+    )]
     pub const POLLREMOVE: Self = Self(0x1000);
     /// 表示对端已半关闭写侧。
     pub const POLLRDHUP: Self = Self(0x2000);
@@ -391,6 +399,10 @@ impl PollTable {
 
     /// 返回本表是否尚未登记任何源头。
     #[cfg(feature = "ktest")]
+    #[expect(
+        dead_code,
+        reason = "与已有 len 共同提供同一 poll 登记集合的长度和空集合观察接口"
+    )]
     pub fn is_empty(&self) -> bool {
         self.registrations.is_empty()
     }

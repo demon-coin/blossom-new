@@ -235,6 +235,10 @@ impl UserOwner {
     }
 
     /// 有线路先 begin 再放 gate，done 后 finish；无线路完全不取得 raw UART 所有权。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "单段作业测试显式列出客体阶段、线路字节、真实等待状态、停止事件与退出预期"
+    )]
     fn jobs_stage(
         &mut self,
         context: &mut TestContext<'_>,

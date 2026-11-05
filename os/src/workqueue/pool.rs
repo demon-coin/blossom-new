@@ -229,6 +229,13 @@ impl Worker {
     }
 
     /// 调用者持 STATE_LOCK，返回准备期保存的真实 TaskId。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "工作票测试在原状态锁内核对实际执行 worker 的 TaskId"
+        )
+    )]
     pub(super) unsafe fn task_id_locked(&self) -> usize {
         // SAFETY: 调用者持统一元数据锁。
         unsafe { (*self.state.get()).task_id }

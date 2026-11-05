@@ -42,12 +42,38 @@ unsafe impl Sync for CpuAccount {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CpuSnapshot {
+    #[expect(
+        dead_code,
+        reason = "四账快照保留各 CPU 已结算的 Task 时间；当前无直接字段读取，远端观察仍不得重读私有片段"
+    )]
     pub task_ns: u64,
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "执行时间测试比较各 CPU 的硬 IRQ 总账，普通镜像不读取此快照字段"
+        )
+    )]
     pub irq_ns: u64,
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "执行时间测试比较调度片段总账，普通镜像不读取此快照字段"
+        )
+    )]
     pub scheduler_ns: u64,
     pub idle_ns: u64,
+    #[expect(
+        dead_code,
+        reason = "快照记录 idle 协议入口次数；当前无直接字段读取，此值不等同于硬件等待驻留次数"
+    )]
     pub idle_entries: u64,
     #[cfg(feature = "ktest")]
+    #[expect(
+        dead_code,
+        reason = "ktest 快照保留 IRQ-off 最终检查次数；当前无直接字段读取，不改变调度等待窗口的原子观察"
+    )]
     pub idle_checks: u64,
 }
 
@@ -276,6 +302,13 @@ pub(crate) fn irq_exit() {
 }
 
 /// 普通 Task 短暂关闭本核 IRQ，结算当前片段后读取迁核累计总账，不取调度锁。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "执行时间测试读取并比较阻塞与迁核前后的真实 Task 总账"
+    )
+)]
 pub fn current_execution_time() -> Duration {
     let _irq = IrqSaveGuard::new();
     let local = cpu::current();

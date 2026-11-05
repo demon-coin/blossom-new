@@ -131,6 +131,10 @@ impl DelayedWork {
     }
 
     /// 返回 Work 与粗 Timer 共同绑定的实际 CPU，ordered 域已经规范到 CPU0。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "延后工作测试核对 Timer 与 Work 的共同绑定 CPU")
+    )]
     pub fn cpu(&self) -> usize {
         self.work().cpu()
     }
@@ -141,6 +145,13 @@ impl DelayedWork {
     }
 
     /// 原子替换 Delay 或 Pool 下一轮；true 表示原先有 pending，失败完整保留旧登记。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "延后工作测试原子替换 Delay 和 Pool 阶段的下一轮票"
+        )
+    )]
     pub fn modify(self: Pin<&Self>, delay: Duration) -> Result<bool, DelayedError> {
         self.schedule(delay, true)
     }
@@ -152,12 +163,26 @@ impl DelayedWork {
     }
 
     /// 只由内层 Work 永久闭门，随后依次同步 timer 与业务尾部；Drop 不另做停止。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "延后工作 owner 测试永久闭门并等待 timer 与业务回调的真实尾部"
+        )
+    )]
     pub fn close_sync(self: Pin<&Self>) -> bool {
         self.stop(true)
     }
 
     /// 将调用边界内的 Delay 立即移交同一 Work，并只等待同锁捕获的固定工作票边界。
     /// 边界后的生产不延长本次等待，不能从自身业务函数同步调用。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "延后工作测试将未到期 Delay 移交 Work 并等待捕获的固定票边界"
+        )
+    )]
     pub fn flush(self: Pin<&Self>) -> bool {
         crate::sched::assert_switchable();
         let mut releases = Releases::new();

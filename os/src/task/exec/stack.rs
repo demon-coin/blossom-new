@@ -82,6 +82,10 @@ impl Layout {
 }
 
 /// 离线候选先登记全部写入页，再按已知长度推进两个游标，不另存参数指针数组。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "离线栈构造分别消费主映像、解释器、参数、凭据与权限，保持 auxv 和映射输入的原 ABI 关系"
+)]
 pub(super) fn make_stack(
     mm: &Mm,
     elf: &Elf,

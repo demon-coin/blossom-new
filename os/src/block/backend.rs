@@ -112,6 +112,10 @@ pub(super) struct VirtioBackend {
 }
 
 /// 封闭集合只列出已经实际实现的设备；RAM 没有 DMA 控制页或 token。
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Disk 内嵌后端直接拥有已准备的传输和队列，避免单独装箱增加准备期分配与失败回收分支"
+)]
 pub(super) enum Backend {
     Virtio(VirtioBackend),
     Ram {

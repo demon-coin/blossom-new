@@ -43,6 +43,13 @@ impl Storage {
     /// AHCI 的 DMA 恒等窗口与各设备 coherency/mask 必须反映真实平台。
     /// 固件 initrd 须由 BootInfo 保留到内核结束且永久直映；固件、用户映射、其他设备和
     /// 另一 RAM disk owner 均不得访问该范围，直到本表 Disk 的 stop 全尾结束。
+    #[cfg_attr(
+        feature = "ktest",
+        expect(
+            dead_code,
+            reason = "普通 init 准备唯一永久 Storage；ktest 自行拥有磁盘 fixture，仍编译同一真实准备和停止调用链"
+        )
+    )]
     pub(crate) unsafe fn initialize(
         inventory: &DeviceInventory,
         root: DeviceName,

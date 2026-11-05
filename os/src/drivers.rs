@@ -34,7 +34,13 @@ use crate::drivers::pci::PciInventory;
 pub enum ProbeError {
     NoMemory,
     AlreadyDiscovered,
-    Resource(&'static str),
+    Resource(
+        #[expect(
+            dead_code,
+            reason = "资源发现失败通过 Debug 日志保留原始固件错误，errno 映射只选择错误类别"
+        )]
+        &'static str,
+    ),
     Pci(PciError),
     Irq(IrqError),
 }
@@ -66,8 +72,20 @@ pub struct MmioBlockCandidate {
 #[derive(Debug)]
 pub struct MmioNetCandidate {
     pub registers: Region,
+    #[allow(
+        dead_code,
+        reason = "RISC-V MMIO NIC 准备核对发现时的版本，LoongArch 网络使用 PCI 库存"
+    )]
     pub version: u32,
+    #[allow(
+        dead_code,
+        reason = "RISC-V MMIO NIC 准备核对发现时的 vendor 身份，LoongArch 网络使用 PCI 库存"
+    )]
     pub vendor_id: u32,
+    #[allow(
+        dead_code,
+        reason = "RISC-V MMIO NIC 以发现的 IRQ source 注册，LoongArch 网络使用 PCI INTx"
+    )]
     pub interrupt: IrqNumber,
 }
 

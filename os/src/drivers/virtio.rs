@@ -60,17 +60,53 @@ const VIRTIO_PCI_CAP_REGION_COUNT: usize = VIRTIO_PCI_CAP_DEVICE_CFG as usize;
 #[derive(Debug)]
 pub enum VirtioInitError {
     NoMemory {
+        #[cfg_attr(
+            not(feature = "ktest"),
+            expect(
+                dead_code,
+                reason = "准备失败日志保留设备状态；ktest 另核 OOM 时的真实协商状态"
+            )
+        )]
         status: DeviceStatus,
     },
-    Resource(ProbeError),
-    Mmio(MmioError),
-    Pci(VirtioPciError),
+    Resource(
+        #[expect(
+            dead_code,
+            reason = "STORAGE INIT 的 Debug 日志保留原库存或映射失败原因"
+        )]
+        ProbeError,
+    ),
+    Mmio(
+        #[expect(
+            dead_code,
+            reason = "STORAGE INIT 的 Debug 日志保留 MMIO 身份和版本错误"
+        )]
+        MmioError,
+    ),
+    Pci(
+        #[expect(
+            dead_code,
+            reason = "STORAGE INIT 的 Debug 日志保留所选 PCI capability 错误"
+        )]
+        VirtioPciError,
+    ),
     Dma {
         error: DmaError,
+        #[cfg_attr(
+            not(feature = "ktest"),
+            expect(
+                dead_code,
+                reason = "DMA 准备失败日志保留设备状态；ktest 另核真实 OOM 状态"
+            )
+        )]
         status: DeviceStatus,
     },
     Protocol(Error),
     StopUnconfirmed {
+        #[expect(
+            dead_code,
+            reason = "停止失败的 Debug 日志须保留超时瞬间设备状态，不能以复位后状态替代"
+        )]
         status: DeviceStatus,
     },
 }

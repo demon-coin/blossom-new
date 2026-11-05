@@ -175,7 +175,12 @@ struct Snapshot {
     rechecks: usize,
     entered: usize,
     exited: usize,
+    #[expect(
+        dead_code,
+        reason = "NIC 快照的 Debug 诊断记录收发及停止窗口中的累计 IRQ 数"
+    )]
     interrupts: usize,
+    #[expect(dead_code, reason = "NIC 停止窗口的 Debug 诊断区分停止期间到达的 IRQ")]
     stopping_interrupts: usize,
     barrier: bool,
     unregistered: bool,

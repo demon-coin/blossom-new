@@ -58,7 +58,6 @@ pub struct Geometry {
     pub uuid: [u8; 16],
     pub reserved_gdt_blocks: u64,
     pub backup_groups: [u32; 2],
-    pub log_groups_per_flex: u8,
     pub first_inode: u64,
 }
 
@@ -156,6 +155,13 @@ pub(crate) struct PreparedInodeMapping {
 
 pub struct Ext4Volume {
     device: u32,
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "ktest 通过卷的原磁盘核对系统盘身份并控制真实 I/O 完成"
+        )
+    )]
     disk: DiskRef,
     metadata: Arc<MetadataCache>,
     geometry: Geometry,
@@ -938,6 +944,10 @@ impl Ext4Volume {
     }
 
     /// 预备同目录中的原生 rename，可在同一份树编辑里覆盖目标项。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "同目录移动须将旧根、两名字、源身份和可覆盖目标交给同一次目录编辑"
+    )]
     pub(crate) fn prepare_directory_move(
         &self,
         inode: &InodeMetadata,

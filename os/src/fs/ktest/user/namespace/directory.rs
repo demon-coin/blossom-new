@@ -448,6 +448,10 @@ fn sync_namespace_batch(
 }
 
 /// 普通目录在首块满时转为 HTree，并用转换前打开且复制的 OFD 验证 cookie 续读。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "目录提升用例直接给出原视图、源 OFD、名字前缀、哈希版本与独立碰撞样本"
+)]
 fn promote_legacy_directory(
     context: &mut TestContext<'_>,
     fixture: &mut WriteOwner,

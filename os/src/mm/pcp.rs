@@ -168,6 +168,13 @@ pub(crate) unsafe fn release(head_pfn: usize) {
 /// 从调用核逐一锁住各 CPU 缓存，按有限 batch 直接归还，不发 IPI。
 /// 每核只处理首次快照数量，批次间放锁；并发新增缓存不延长本次排空。
 /// 参与者静止时全部缓存回到 buddy，并发继续运行时只保证此次有界移动。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "内存及 I/O 测试在参与者停稳后排空 PCP，比较原页归还账"
+    )
+)]
 pub fn drain_all_pages() {
     for owner in cpu::actual_set().iter() {
         let pageset = pageset(owner);

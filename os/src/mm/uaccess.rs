@@ -93,6 +93,10 @@ impl Mm {
     }
 
     /// 完整读取小端 32 位 ABI 字段；允许跨页和非自然对齐，不提供原子语义。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "用户访问测试核对跨页小端 u32 读取及真实缺页错误")
+    )]
     pub fn read_u32(&self, address: usize) -> Result<u32, VmError> {
         let mut bytes = [0u8; size_of::<u32>()];
         self.read_bytes_exact(&mut bytes, address)?;
@@ -100,6 +104,13 @@ impl Mm {
     }
 
     /// 完整读取小端 64 位 ABI 字段；任何部分读取错误都不产生字段值。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "用户映射测试读取原 Mm 内容，核对跨页、COW 与截断后的页数据"
+        )
+    )]
     pub fn read_u64(&self, address: usize) -> Result<u64, VmError> {
         let mut bytes = [0u8; size_of::<u64>()];
         self.read_bytes_exact(&mut bytes, address)?;
@@ -147,6 +158,13 @@ impl Mm {
 
     /// 对四字节自然对齐且位于同一页的用户字执行一次独立 Acquire 读取。
     /// 缺页可睡眠，原子读取仅在当前映射读侧保护内执行。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "futex 和事件测试读取用户共享控制字的真实 Acquire 状态"
+        )
+    )]
     pub fn load_user_u32(&self, address: usize) -> Result<u32, VmError> {
         check_atomic_u32(address)?;
         self.access_page(address, UserAccess::Read, |source| {

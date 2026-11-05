@@ -196,6 +196,13 @@ impl IrqRegistration {
 
     /// 关闭本 action 的准入并等待其执行引用归零，其他共享处理者继续有效。
     /// 不得从同线 handler 调用，也不得持有 handler 退出所需的资源。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "UART 共享中断测试单独关闭 action 并等待真实执行引用结束"
+        )
+    )]
     pub fn disable_sync(&self) {
         self.stop(false);
     }
@@ -207,6 +214,10 @@ impl IrqRegistration {
     }
 
     /// 读取本 action 的实际准入状态，关闭的旧 token 不访问复用槽。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "UART 共享中断测试观察新旧 action 的独立准入状态")
+    )]
     pub fn is_enabled(&self) -> bool {
         let state = self.state.lock();
         *state == RegistrationState::Live

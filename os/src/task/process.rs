@@ -66,6 +66,13 @@ pub(crate) enum ProcessError {
 /// 根回收职责属于构造图时选定的角色，不由首个号码推断。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RootRole {
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "用户执行 fixture 由内核回收根进程，普通 PID1 使用 System 角色"
+        )
+    )]
     Kernel,
     System,
 }
@@ -619,6 +626,13 @@ impl TaskGraph {
     }
 
     /// 同数值仍必须核对原 Pid 对象，旧诊断对象永远不会指向新同号线程。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "PID 复用和候选回滚测试核对原身份对象不会命中新同号线程"
+        )
+    )]
     pub(crate) fn lookup_pid(&self, pid: &Arc<Pid>) -> Option<Arc<UserThread>> {
         let user = {
             let slots = self.slots.lock();
@@ -666,6 +680,13 @@ impl TaskGraph {
     }
 
     /// kernel明确取消关闭派生准入，保留已接受的机器动作与各组首次退出原因。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "用户 fixture 清理时取消图内真实成员，随后仍等待退出与离栈"
+        )
+    )]
     pub(crate) fn request_root_exit(&self, status: i32) {
         let capacity = {
             let slots = self.slots.lock();
@@ -1410,6 +1431,13 @@ impl TaskGraph {
     }
 
     /// 内核控制者通过真实组身份发送普通信号，所有kick与uaccess仍在图和siglock之外。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "用户信号、futex 重启与停止测试由内核控制者递送真实组信号"
+        )
+    )]
     pub(crate) fn send_kernel(&self, pid: usize, signum: u8) -> Result<(), SignalError> {
         if signum == 0 || SIGNAL_COUNT < signum as usize {
             return Err(SignalError::InvalidSignal);

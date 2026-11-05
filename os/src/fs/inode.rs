@@ -1343,6 +1343,10 @@ impl InodeCache {
         Ok(self.domain.publish_root(&inode, candidate))
     }
     /// 准备真正链接前的普通文件记录和 canonical 对象。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "父属性、创建模式、umask、身份和时间是同一次普通文件创建的独立快照"
+    )]
     pub(crate) fn prepare_regular_inode(
         &self,
         owner: &InodeRef,
@@ -1378,6 +1382,10 @@ impl InodeCache {
     }
 
     /// 先构造真实点目录与父链接记录，再准备尚未连接的目录 inode。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "目录创建直接消费父属性、模式、umask、身份和时间并准备点目录与父链接"
+    )]
     pub(crate) fn prepare_directory_inode(
         &self,
         owner: &InodeRef,
@@ -1447,6 +1455,10 @@ impl InodeCache {
     }
 
     /// 分配 inode 后完成块映射或内嵌链接格式及 canonical 加载；返回对象仍为 links=0。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "三类新 inode 共用一次分配和可失败准备，原始创建快照直接参与记录构造"
+    )]
     fn prepare_new_inode(
         &self,
         volume: &Arc<Ext4Volume>,
@@ -3189,6 +3201,10 @@ impl DirectoryWriteGuard<'_> {
     }
 
     /// 单次准备覆盖目标并移走源项，避免同一旧根上的两份互相覆盖编辑。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "同父移动将源目标身份、父链接差量与时间纳入同一目录写 guard 的准备"
+    )]
     pub(crate) fn prepare_move(
         &self,
         old_name: &[u8],
@@ -3973,6 +3989,10 @@ impl InodeRef {
     }
 
     /// 父属性按 setgid/umask 规则形成候选，目标字节在链接发表前独占准备。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "内存后端使用同一创建快照应用父 setgid、umask、身份、时间及具体内容"
+    )]
     fn prepare_memory_inode(
         &self,
         parent: &InodeMetadata,

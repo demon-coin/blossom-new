@@ -123,6 +123,13 @@ pub struct VirtioNet {
     progress: Once<Pin<Arc<Work>>>,
     net: Weak<NetStack>,
     info: NetInfo,
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "ktest 校验 NIC 与库存的 MMIO 或 PCI 身份，生产路径不再读取该快照"
+        )
+    )]
     identity: VirtioIdentity,
     interrupt: IrqNumber,
     #[cfg(feature = "ktest")]

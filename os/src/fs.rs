@@ -100,6 +100,10 @@ pub enum FsError {
     AlreadyInProgress,
     InProgress,
     MessageTooLarge,
+    #[expect(
+        dead_code,
+        reason = "文件错误字典保留套接字类型错误并准确映射 ENOTSOCK；当前 fd 类型校验直接在 syscall 边界返回 errno"
+    )]
     NotSocket,
     /// UDP 发送既无本次目的地址，也无默认对端。
     DestinationRequired,

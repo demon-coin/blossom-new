@@ -76,6 +76,10 @@ pub struct InterruptResources {
     pub controller: Region,
     pub parent_controller: Region,
     pub root_interrupt: u32,
+    #[allow(
+        dead_code,
+        reason = "RISC-V PLIC 按每核 context 访问 claim 和 enable，LoongArch 使用独立中断控制器"
+    )]
     pub plic_contexts: [usize; MAX_CPUS],
 }
 
@@ -100,6 +104,10 @@ pub struct UartResources {
     pub reg_io_width: u32,
     pub reg_shift: u32,
     pub clock_frequency: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "RISC-V 映射和板 UART 准备消费时钟 provider，其他平台保留同一固件资源快照"
+    )]
     pub clocks: DeviceClocks,
     pub baud: u32,
     pub dw_apb: bool,
@@ -145,8 +153,20 @@ pub struct PinResource {
 /// GPIO 输入的实际控制器、引脚及电平有效方向，不承载外设总线复用。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpioInputResource {
+    #[allow(
+        dead_code,
+        reason = "VF2 的卡检测 GPIO 准备及映射消费 provider，其他平台没有同一 GPIO 控制器"
+    )]
     pub provider: Region,
+    #[allow(
+        dead_code,
+        reason = "VF2 卡检测按实际 GPIO pin 读取电平，其他平台使用控制器原生卡检测"
+    )]
     pub pin: u32,
+    #[allow(
+        dead_code,
+        reason = "SD 卡检测按固件 GPIO 极性解释实际电平，具体平台可没有外部 CD GPIO"
+    )]
     pub active_low: bool,
 }
 
@@ -164,17 +184,48 @@ pub struct DeviceSetup {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LioIntcResources {
     pub registers: Region,
+    #[allow(
+        dead_code,
+        reason = "LoongArch LIOINTC 用本核 ISR 窗口分发，RISC-V 使用 PLIC"
+    )]
     pub isr: [Region; 2],
+    #[allow(
+        dead_code,
+        reason = "LoongArch LIOINTC 按固件父 cause 路由硬中断，RISC-V 使用 PLIC"
+    )]
     pub parent_interrupt: u32,
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "固件测试逐字段比较 LIOINTC 父路由表，生产解析时已经核定支持的路由"
+        )
+    )]
     pub parent_map: [u32; 4],
 }
 
 /// 固件树声明的 syscon 电源动作。
 #[derive(Clone, Copy, Debug)]
 pub struct SysconAction {
+    #[allow(
+        dead_code,
+        reason = "LoongArch 最终关机或重启访问固件 syscon 窗口，RISC-V 使用 SBI 动作"
+    )]
     pub registers: Region,
+    #[allow(
+        dead_code,
+        reason = "LoongArch 最终电源动作使用固件指定 syscon 偏移，RISC-V 使用 SBI 动作"
+    )]
     pub offset: u32,
+    #[allow(
+        dead_code,
+        reason = "LoongArch syscon 电源动作只改固件 mask 指定的位，RISC-V 使用 SBI 动作"
+    )]
     pub mask: u32,
+    #[allow(
+        dead_code,
+        reason = "LoongArch syscon 电源动作写入固件指定值，RISC-V 使用 SBI 动作"
+    )]
     pub value: u32,
 }
 
@@ -184,7 +235,15 @@ pub struct MmcResources {
     pub registers: Region,
     pub interrupt_source: u32,
     pub setup: DeviceSetup,
+    #[allow(
+        dead_code,
+        reason = "RISC-V 映射 VF2 MMC 的 syscon 资源，其他架构不访问该板窗口"
+    )]
     pub syscon: Region,
+    #[expect(
+        dead_code,
+        reason = "资源快照保存 DT 的 MMC syscon 选择字段；当前 SD 驱动不写该选择，不能把它解释为已执行的硬件设置"
+    )]
     pub sysreg: [u32; 3],
     pub bus_width: u32,
     pub max_frequency: u32,
@@ -268,6 +327,10 @@ pub struct BoardResources {
     pub cache_line_size: usize,
     pub liointc: [LioIntcResources; 2],
     pub pmc: Region,
+    #[allow(
+        dead_code,
+        reason = "RISC-V RTC 准备消费真实时钟和复位资源，LoongArch RTC 不使用此板设置"
+    )]
     pub rtc_setup: DeviceSetup,
     pub reboot: Option<SysconAction>,
     pub poweroff: Option<SysconAction>,

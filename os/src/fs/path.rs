@@ -560,6 +560,10 @@ impl Vfs {
 
     /// 解析并打开现有名字，或在最终目录写 guard 下准备文件、OFD 后再发表新名字。
     /// `create_mode` 为 `(requested_mode, umask_snapshot)`；只有实际新建时才交给inode层应用。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "open 的解析起点、创建与链接选项及 OFD 准备回调共同约束最终目录锁内的单次发表"
+    )]
     pub fn open_with<T>(
         &self,
         context: &FsContext,
@@ -1056,6 +1060,10 @@ impl Vfs {
     }
 
     /// 按同一挂载的原生目录操作移动名字；NOREPLACE与普通rename共享一次父锁协议。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "rename 独立解析两端起点与名字，并将 NOREPLACE 和身份快照交给同一父锁协议"
+    )]
     pub fn rename_from(
         &self,
         context: &FsContext,
@@ -1137,6 +1145,10 @@ impl Vfs {
     }
 
     /// 父锁已按目录祖先关系取得；此处完成真实重查、所有可失败准备与无失败提交。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "两端名字与已持父目录 guard 共同完成重查、可失败准备和无失败提交"
+    )]
     fn rename_locked(
         &self,
         old: &LookupParent,

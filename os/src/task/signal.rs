@@ -20,10 +20,21 @@ pub(crate) const SIGINT: u8 = 2;
 pub(crate) const SIGQUIT: u8 = 3;
 pub(crate) const SIGILL: u8 = 4;
 pub(crate) const SIGTRAP: u8 = 5;
+#[expect(
+    dead_code,
+    reason = "Linux 通用 signal ABI 将 SIGABRT 固定为 6，保留命名以区分用户传入的终止信号编号"
+)]
 pub(crate) const SIGABRT: u8 = 6;
 pub(crate) const SIGBUS: u8 = 7;
 pub(crate) const SIGFPE: u8 = 8;
 pub(crate) const SIGKILL: u8 = 9;
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "futex 中断与重启测试以 Linux SIGUSR1 递送用户处理器信号"
+    )
+)]
 pub(crate) const SIGUSR1: u8 = 10;
 pub(crate) const SIGSEGV: u8 = 11;
 pub(crate) const SIGPIPE: u8 = 13;
@@ -450,6 +461,10 @@ impl SignalGroup {
     }
 
     /// 持canonical动作锁递送；系统根忽略普通默认处置及KILL/STOP，强制故障另行领取。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "同一动作锁下分别传递信号、目标、预备队列和成员迭代器，保持递送事务及锁归属可见"
+    )]
     fn deliver_locked<'a>(
         &self,
         info: SignalInfo,

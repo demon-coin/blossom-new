@@ -243,6 +243,10 @@ unsafe impl Exception for ExceptionToken {
 /// 捕获当前 Boot/Task 栈内同步 Rust panic，并完整执行到该边界之间的局部 Drop。
 /// 主体可在正常阶段迁核；捕获必须位于 C/trap/Task 入口之内，展开期间禁止调度。
 /// 父定位器负责排除 IRQ/IPI、未知服务任务和 Boot 非 BSP 调用。
+#[expect(
+    clippy::result_large_err,
+    reason = "Boot 捕获及真实 OOM 的 panic 路径必须无堆保存固定诊断，装箱会引入分配失败并破坏展开回收"
+)]
 pub fn catch<T>(body: impl FnOnce() -> T) -> Result<T, PanicRecord> {
     if is_unwinding() {
         crate::ktest::fatal("nested catch during panic unwind");

@@ -639,6 +639,10 @@ fn test_idle_kicks() -> (usize, usize) {
 }
 
 /// 用真实 CPU 四账和同 Task 的受控 offCPU 区间验证执行时间排除阻塞和迁核间隙。
+#[expect(
+    clippy::needless_range_loop,
+    reason = "逐个真实 CPU 核对固定快照，核数超出快照时保持原索引失败，不用迭代截断掩盖覆盖不足"
+)]
 fn test_accounting() {
     let before: [accounting::CpuSnapshot; 4] =
         core::array::from_fn(|id| accounting::snapshot(if id < cpu::count() { id } else { 0 }));

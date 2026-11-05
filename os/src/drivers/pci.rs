@@ -62,6 +62,13 @@ const MEMORY_DOMAIN: u8 = 2;
 pub struct PciBar {
     pub bus_address: u64,
     pub physical: Region,
+    #[cfg_attr(
+        feature = "ktest",
+        expect(
+            dead_code,
+            reason = "普通 init 的 PCI BAR 资源日志读取预取属性，ktest 不运行该初始化入口"
+        )
+    )]
     pub prefetchable: bool,
 }
 
@@ -81,6 +88,13 @@ pub struct PciDevice {
     pub function: u8,
     pub vendor_id: u16,
     pub device_id: u16,
+    #[cfg_attr(
+        feature = "ktest",
+        expect(
+            dead_code,
+            reason = "普通 init 的 PCI 功能资源日志读取原始头类型，ktest 不运行该初始化入口"
+        )
+    )]
     pub header_type: u8,
     /// 首次枚举读取的 class/subclass/progif，不保存未使用的 revision。
     class_code: u32,

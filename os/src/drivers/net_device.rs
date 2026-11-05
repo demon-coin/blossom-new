@@ -29,6 +29,13 @@ pub(crate) enum NetDeviceError {
 
 impl NetDevice {
     /// 只查询同次库存或启动快照中的真实候选，不探测硬件或按接口名字创建设备。
+    #[cfg_attr(
+        feature = "ktest",
+        expect(
+            dead_code,
+            reason = "普通 init 按实际库存选择 NIC 或 lo，ktest 自行建立具名网络 fixture"
+        )
+    )]
     pub(crate) fn has_candidate(inventory: &DeviceInventory) -> bool {
         match boot::info().platform {
             Platform::QemuVirt => {

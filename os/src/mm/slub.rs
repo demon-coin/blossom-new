@@ -681,6 +681,13 @@ pub fn flush_all() {
 
 /// 普通执行流先 flush，再按各 node 的初始有限预算逐项摘离；live partial 尾插保留。
 /// 停止参与者后完整归还 empty；并发新增 slab 不延长本次预算。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "内存及 I/O 测试回收空 slab 并比较原页账，内部 flush 和摘离票据随此入口保留"
+    )
+)]
 pub fn shrink_all() {
     flush_all();
     for class in 0..SIZES.len() {

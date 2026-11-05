@@ -562,7 +562,6 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         uuid,
         reserved_gdt_blocks: u64::from(le16(data, 206)?),
         backup_groups: [le32(data, 588)?, le32(data, 592)?],
-        log_groups_per_flex,
         first_inode,
     })
 }

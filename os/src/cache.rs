@@ -919,6 +919,10 @@ impl MetadataCache {
 
     /// 检查物理页索引是否为空。
     #[cfg(feature = "ktest")]
+    #[expect(
+        dead_code,
+        reason = "元数据物理页索引与 len 共同提供集合空态查询，当前测试只直接读取长度"
+    )]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1266,6 +1270,10 @@ impl BufferRef {
 
     /// 元数据块视图不接受零长度请求。
     #[cfg(feature = "ktest")]
+    #[expect(
+        dead_code,
+        reason = "元数据 Buffer 与 len 共同提供字节视图空态查询，当前合法构造长度非零且测试只读取长度"
+    )]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

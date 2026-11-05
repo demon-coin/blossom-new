@@ -526,6 +526,10 @@ impl NetTables {
     }
 
     /// 唯一整域停止关闭发表并移动三类拥有；绑定只随最后 Lease 结束。
+    #[expect(
+        clippy::type_complexity,
+        reason = "唯一停止调用者立即解构三类原拥有，在表锁外分别同步停止 TCP、UDP 与 UNIX"
+    )]
     pub fn take_all(
         &self,
     ) -> (

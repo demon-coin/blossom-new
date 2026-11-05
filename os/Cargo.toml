@@ -18,6 +18,9 @@ unwinding = { path = "../dependency/unwinding", optional = true, default-feature
 [features]
 ktest = ["dep:ktest", "dep:unwinding", "virtio-drivers/ktest"]
 
+[lints.rust]
+warnings = "deny"
+
 [profile.dev]
 opt-level = 1
 debug = 2

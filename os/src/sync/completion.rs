@@ -41,6 +41,13 @@ impl Completion {
     }
 
     /// 普通任务在可切换环境中阻塞，只有消费到一个 token 才返回。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "执行与工作队列测试用真实阻塞 token 协调回调和清理尾部"
+        )
+    )]
     pub fn wait(&self) {
         sched::assert_switchable();
         if self.try_wait() {

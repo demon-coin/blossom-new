@@ -115,6 +115,10 @@ impl Completion {
 /// 本轮只有选中的原节点和已完成 IO 的标量事实，不保存第二个 inode 或页名单。
 #[derive(Clone, Copy, Default)]
 struct Round {
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "ktest 的有限回写轮观察核对扫描上限与实际扫描数")
+    )]
     limit: usize,
     scanned: usize,
     selected_data: usize,
@@ -265,9 +269,16 @@ pub(crate) struct WritebackSnapshot {
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirtySnapshot {
+    #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出存活文件页账")]
     pub file_pages: usize,
+    #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出当前脏页账")]
     pub dirty_pages: usize,
+    #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出当前回写页账")]
     pub writeback_pages: usize,
+    #[expect(
+        dead_code,
+        reason = "全局回写压力诊断通过 Debug 输出计算脏页阈值的 dirtyable 页数"
+    )]
     pub dirtyable_pages: usize,
     pub dirty_limit: usize,
     pub background_limit: usize,

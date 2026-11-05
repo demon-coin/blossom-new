@@ -187,6 +187,13 @@ fn script_interpreter(
 }
 
 /// 首读前取得主 inode 写排斥，消费参数持有的限额与同一文件系统快照，失败归还候选拥有。
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "用户准备、真实 OOM 和写排斥测试直接装载候选映像并核对失败回收"
+    )
+)]
 pub(crate) fn load(
     vfs: &Vfs,
     context: &FsContext,

@@ -328,6 +328,10 @@ fn consume(fixture: &mut Payload, migrate: bool, stop: &AtomicBool) {
     assert!(counts.hops + 3 <= counts.cpu_checks);
 }
 
+#[expect(
+    clippy::module_inception,
+    reason = "具名 suite 的 memory 层级属于现有测试目录，外层文件模块承载同组原页 fixture"
+)]
 #[::ktest::suite(fixture = Memory, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "mm"), timeout_ms = 20000)]
 pub(crate) mod memory {
     use super::*;

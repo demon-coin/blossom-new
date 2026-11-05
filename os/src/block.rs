@@ -114,7 +114,18 @@ pub struct IoResult {
 /// 完成回调只借已经收权的原 memory；重型回调使用预建 slot Work。
 #[derive(Clone, Copy)]
 pub enum EndIo {
+    #[expect(
+        dead_code,
+        reason = "完成协议允许不睡眠轻回调在原页收权后 Inline 执行；当前生产者使用无回调或 Task 回调"
+    )]
     Inline(fn(&IoResult, &[MappedPages])),
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "块请求测试用可阻塞回调验证 slot Work 完成尾部和停止责任"
+        )
+    )]
     Task(fn(&IoResult, &[MappedPages])),
 }
 

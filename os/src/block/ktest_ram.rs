@@ -298,6 +298,10 @@ impl Ram {
     }
 
     /// 同步请求返回完整真实结果以后再比较，避免嵌套借用测试上下文。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "RAM 请求测试显式列出视图、操作、扇区、长度、字节图样和独立预期，不合并实际值与断言来源"
+    )]
     fn expect_io(
         &self,
         context: &mut TestContext<'_>,

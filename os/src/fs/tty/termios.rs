@@ -28,6 +28,10 @@ pub const VTIME: usize = 5;
 /// VMIN 控制字符下标。
 pub const VMIN: usize = 6;
 /// VSWTC 控制字符下标。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 的第 7 控制字符槽，codec 原样往返但行规程不解释切换字符"
+)]
 pub const VSWTC: usize = 7;
 /// VSTART 控制字符下标。
 pub const VSTART: usize = 8;
@@ -71,17 +75,29 @@ pub const IXON: u32 = 0x400;
 /// IXANY 输入位。
 pub const IXANY: u32 = 0x800;
 /// IXOFF 输入位。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 输入流控位，当前支持掩码拒绝 IXOFF"
+)]
 pub const IXOFF: u32 = 0x1000;
 /// IMAXBEL 输入位。
 pub const IMAXBEL: u32 = 0x2000;
 /// IUTF8 输入位。
 pub const IUTF8: u32 = 0x4000;
 /// IUCLC 输入位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 输入大小写转换位，当前支持掩码拒绝 IUCLC"
+)]
 pub const IUCLC: u32 = 0x200;
 
 /// OPOST 输出位。
 pub const OPOST: u32 = 0x01;
 /// OLCUC 输出位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 输出大小写转换位，当前支持掩码拒绝 OLCUC"
+)]
 pub const OLCUC: u32 = 0x02;
 /// ONLCR 输出位。
 pub const ONLCR: u32 = 0x04;
@@ -92,29 +108,65 @@ pub const ONOCR: u32 = 0x10;
 /// ONLRET 输出位。
 pub const ONLRET: u32 = 0x20;
 /// OFILL 输出位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 延迟填充位，当前支持掩码拒绝 OFILL"
+)]
 pub const OFILL: u32 = 0x40;
 /// OFDEL 输出位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 填充字符选择位，当前支持掩码拒绝 OFDEL"
+)]
 pub const OFDEL: u32 = 0x80;
 /// NLDLY 延迟掩码，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 换行延迟掩码，当前支持掩码拒绝该延迟"
+)]
 pub const NLDLY: u32 = 0x100;
 /// CRDLY 延迟掩码，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 回车延迟掩码，当前支持掩码拒绝该延迟"
+)]
 pub const CRDLY: u32 = 0x600;
 /// TABDLY 延迟掩码。
 pub const TABDLY: u32 = 0x1800;
 /// TAB0 制表位。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 无制表延迟的零值，validate 直接接受该零位模式"
+)]
 pub const TAB0: u32 = 0x0000;
 /// TAB3 制表位。
 pub const TAB3: u32 = 0x1800;
 /// BSDLY 延迟掩码，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 退格延迟掩码，当前支持掩码拒绝该延迟"
+)]
 pub const BSDLY: u32 = 0x2000;
 /// VTDLY 延迟掩码，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 垂直制表延迟掩码，当前支持掩码拒绝该延迟"
+)]
 pub const VTDLY: u32 = 0x4000;
 /// FFDLY 延迟掩码，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 换页延迟掩码，当前支持掩码拒绝该延迟"
+)]
 pub const FFDLY: u32 = 0x8000;
 
 /// CBAUD 波特率掩码。
 pub const CBAUD: u32 = 0x0000_100f;
 /// BOTHER 自定义波特率标记。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 自定义波特率编码，当前标准速率表不接受 BOTHER"
+)]
 pub const BOTHER: u32 = 0x0000_1000;
 /// CSIZE 字长掩码。
 pub const CSIZE: u32 = 0x0000_0030;
@@ -152,6 +204,10 @@ pub const ISIG: u32 = 0x0001;
 /// ICANON 本地位。
 pub const ICANON: u32 = 0x0002;
 /// XCASE 本地位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 规范模式大小写位，当前支持掩码拒绝 XCASE"
+)]
 pub const XCASE: u32 = 0x0004;
 /// ECHO 本地位。
 pub const ECHO: u32 = 0x0008;
@@ -168,16 +224,28 @@ pub const TOSTOP: u32 = 0x0100;
 /// ECHOCTL 本地位。
 pub const ECHOCTL: u32 = 0x0200;
 /// ECHOPRT 本地位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 打印擦除位，当前支持掩码拒绝 ECHOPRT"
+)]
 pub const ECHOPRT: u32 = 0x0400;
 /// ECHOKE 本地位。
 pub const ECHOKE: u32 = 0x0800;
 /// FLUSHO 本地位。
 pub const FLUSHO: u32 = 0x1000;
 /// PENDIN 本地位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 重处理输入位，当前支持掩码拒绝 PENDIN"
+)]
 pub const PENDIN: u32 = 0x4000;
 /// IEXTEN 本地位。
 pub const IEXTEN: u32 = 0x8000;
 /// EXTPROC 本地位，未选择。
+#[expect(
+    dead_code,
+    reason = "保留 termios UAPI 外部行规程位，当前支持掩码拒绝 EXTPROC"
+)]
 pub const EXTPROC: u32 = 0x1_0000;
 
 /// 立即提交 termios。

@@ -213,7 +213,7 @@ Plain/LTP 保原输出端点；需要正文的 Basic、固定 Pre2025、Tap 使�
 
 这种修改仍须保持类型、符号、溢出、机器现场、错误返回和同步顺序。汇编操作数及链接脚本有各自的求值约束；改后核最终ELF的指令、真实目标、对齐和装载权限，并运行受影响的内核与普通用户路径，不能只靠fmt或Clippy。[Linux coding-style §12](https://docs.kernel.org/process/coding-style.html#macros-enums-and-rtl)针对C宏和枚举；Rust的`const`、类型与模块归属按本项目职责选择，不把这些选择冒称为Linux原文要求。
 
-## 8. Clippy 诊断与等价清理
+## 8. Clippy 诊断、局部例外与严格检查
 
 按所选 target 检查普通内核与 `ktest-dev/ktest-release`；改动涉及 panic 配置边界时也检查 `ktest-abort-*`。同一源码在不同 ISA、平台和 feature 下的消费者不同：某一配置的 `unused_imports` 或 `dead_code` 不能证明定义可删。共享布局还会被宿主构建脚本读取，不能按宿主 ISA 裁掉目标定义。
 
@@ -222,3 +222,20 @@ Plain/LTP 保原输出端点；需要正文的 Basic、固定 Pre2025、Tap 使�
 不为消除诊断改变硬件或用户 ABI、有外部约束的布局、原子观察、错误返回、测试名字与断言。内部冗余字段若无消费者、裸指针或布局依赖，可以连同无效写入删除；记录内部布局可能变化，保留真实生产状态和拥有协议。删除手写测试 anchor 时，必须分别核对宏生成槽、链接保留、最终 ELF、完整目录元数据及实际选择行为。
 
 `Vec<Box<T>>`、大枚举、大错误值或多参数建议若会改变稳定地址、分配失败点、无堆环境或同步责任，应保留并说明理由，不靠批量抑制、空调用或无业务意义的包装取绿。错误诊断的修复单独记录为有意改变输出，保留触发条件和失败点，用真实输入核对修前、修后内容，不为格式化新增临时堆字符串。固定同配置统计与原日志分开保存，修后仍须构建实际产物、运行受影响内核路径和普通用户程序，并观察停止与资源回收；Clippy 通过不等于零警告或功能等价。
+
+### 合理例外与失败策略
+
+`os/Cargo.toml` 的 `[lints.rust] warnings = "deny"` 自动约束本包主目标和 `build.rs`，适用于现有 Cargo/Make 入口；依赖保留各自原有策略，不把全局 `RUSTFLAGS=-Dwarnings` 传给它们。本包新增的已启用 Rust/Clippy lint 和 `unfulfilled_lint_expectations` 都使检查失败。编译器非 lint 诊断不受该级别表控制：当前 LA 主包的 `-Ctarget-feature: ual` 不稳定特性警告须与本包 lint、依赖警告分开记录，不能称本包所有 warning 为零，也不为消音改变 ABI 参数。
+
+稳定且有技术依据的例外，在具体字段、变体、方法或函数上用 `#[expect(单个lint, reason = "具体约束")]`。仅测试有消费者时可用简单 `cfg_attr`；宏、host/target 或架构组合使预期不稳定时，用同样带理由的局部 `allow`，不堆条件树。不对整个模块统一 `allow(dead_code)`，不用 `clippy::all`、`unused` 或虚假消费者掩盖新增问题。
+
+`dead_code` 会把获例外的函数作为可达根，连带其真实调用链；不要同时给上游入口和下游方法堆 `expect`。有实际 Debug 输出的诊断字段可以保留，只有 `derive(Debug)` 不足以证明用途。标准 ABI 字典应明确哪些值当前未实现，内部无用缓存不以“未来可能用”保留。
+
+普通 RV 检查示例（LA 替换为 `loongarch64-unknown-none`，板构建使用相应正式平台）：
+
+```sh
+cd os
+BLOSSOM_PLATFORM=qemu-virt cargo clippy --locked --target riscv64gc-unknown-none-elf --profile dev
+```
+
+测试检查选择 `--profile ktest-dev/ktest-release/ktest-abort-dev/ktest-abort-release --features ktest`，只支持 `qemu-virt`；对应真实 ELF 仍由 `build-kernel-test-elf` 构建，不能把 Clippy 当链接或运行。每次修改按受影响 ISA、平台、profile、feature 验证预期满足性，不升级固定工具链、不新建质量管理框架。规范依据为 [Linux Lints](https://www.kernel.org/doc/html/latest/rust/coding-guidelines.html#lints)、[Rust 诊断属性](https://doc.rust-lang.org/reference/attributes/diagnostics.html)、[Clippy 分类](https://doc.rust-lang.org/clippy/lints.html)和 [Asterinas 属性规范](https://asterinas.github.io/book/to-contribute/coding-guidelines/for-maintainability/rust-specific/attributes-and-macros.html)。

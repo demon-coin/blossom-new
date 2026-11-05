@@ -371,6 +371,13 @@ pub struct FileStat {
 /// 普通可睡眠任务使用的文件操作；调用者须在描述符表锁外持有实例引用。
 pub trait FileLike: Send + Sync {
     /// 内核顺序读取使用与用户读取相同的页交付和位置提交协议。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "ktest 文件表和事件消费者使用内核缓冲核对共享位置与读取内容"
+        )
+    )]
     fn read(&self, dst: &mut [u8]) -> Result<usize, FsError> {
         self.read_into(&mut ReadBuffer::kernel(dst), FileIoContext::Kernel)
     }
@@ -475,6 +482,10 @@ pub trait FileLike: Send + Sync {
     fn stat(&self) -> Result<FileStat, FsError>;
 
     /// 返回下一项及其原始名字，成功取得项后才推进目录位置。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "ktest 文件表逐项核对目录名字、类型与共享 cookie")
+    )]
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError>;
 
     /// 回调完整交付一项并返回 true 后提交其 cookie；false 或错误保留该项位置。
@@ -484,11 +495,22 @@ pub trait FileLike: Send + Sync {
     ) -> Result<(), FsError>;
 
     /// 内核顺序写与用户写共用同一输入准备及文件提交协议。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "ktest 普通内核写者验证顺序位置提交与回写背压")
+    )]
     fn write(&self, src: &[u8]) -> Result<usize, FsError> {
         self.write_from(&mut WriteBuffer::kernel(src), FileIoContext::Kernel)
     }
 
     /// 内核按位置写不取得共享位置锁，追加状态仍由 inode 仲裁。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "ktest 按位置写者验证共享页、截断和原生名字修改后的内容"
+        )
+    )]
     fn write_at(&self, offset: u64, src: &[u8]) -> Result<usize, FsError> {
         self.write_at_from(offset, &mut WriteBuffer::kernel(src), FileIoContext::Kernel)
     }

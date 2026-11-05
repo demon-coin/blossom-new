@@ -341,6 +341,13 @@ impl BioInner {
     }
 
     /// 返回真实原映射数量，不把拆分后的 SG 数当作原页数量。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "批量读取测试按原页数观察每个父 Bio 的准备和完成责任"
+        )
+    )]
     pub(super) fn segment_count(&self) -> usize {
         self.segment_count
     }

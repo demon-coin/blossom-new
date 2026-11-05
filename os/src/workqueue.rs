@@ -149,6 +149,13 @@ impl WorkQueue {
     }
 
     /// 串行切换颜色，只等待入口颜色中的每一份真实票，不追随未来提交。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "工作队列测试核对域颜色边界只等待入口前的真实工作票"
+        )
+    )]
     pub fn flush(&self) {
         pool::assert_wait_allowed(&self.domain, ptr::null());
         self.domain.flush();
@@ -671,6 +678,13 @@ impl Work {
     }
 
     /// 取消当前 pending、等待真实 running 尾部，返回后允许同一 Work 重新使用。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "工作队列测试验证同步取消只撤本轮 pending 并保留对象复用能力"
+        )
+    )]
     pub fn cancel_sync(self: Pin<&Self>) -> bool {
         self.begin_stop(false).finish()
     }

@@ -1462,6 +1462,10 @@ fn remove_record(
 }
 
 /// 替换已定位记录的 inode/type 字段，目录哈希和名字保持原样。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "记录窗口、旧 inode 身份和新 inode/type 在同一校验与校验和更新中直接使用"
+)]
 fn replace_record_inode(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -2026,6 +2030,10 @@ pub(crate) fn prepare_replace(
 }
 
 /// 同父原生 rename 同时准备 source 删除和 destination 安装或替换。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "同父 rename 在同一旧根上核对源与覆盖目标并准备一份目录编辑"
+)]
 pub(crate) fn prepare_move(
     volume: &Ext4Volume,
     inode: &InodeMetadata,

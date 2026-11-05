@@ -48,6 +48,10 @@ struct SlotPage {
 }
 
 struct Slots {
+    #[expect(
+        clippy::vec_box,
+        reason = "槽页在短锁外独立准备，目录扩容只移动页拥有，避免搬动每页全部槽和 OFD"
+    )]
     pages: Vec<Box<SlotPage>>,
 }
 

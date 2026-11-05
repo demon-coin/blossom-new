@@ -70,6 +70,13 @@ impl MonotonicInstant {
     }
 
     /// 返回两个单调时刻的间隔，逆序时刻不产生负 Duration。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "执行计账测试以单调墙钟核对阻塞和迁核间隔，逆序仍须返回 None"
+        )
+    )]
     pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
         self.0.checked_sub(earlier.0).map(Duration::from_nanos)
     }

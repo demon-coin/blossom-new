@@ -304,6 +304,10 @@ fn notification_yielder(
 /// 空 CSD 回调只建立目标 CPU 的处理顺序，不读写通知位或任务状态。
 unsafe fn notification_barrier(_: *mut ()) {}
 
+#[expect(
+    clippy::module_inception,
+    reason = "具名 suite 的 context 层级属于现有测试目录，外层文件模块承载同组 fixture"
+)]
 #[::ktest::suite(fixture = Tasks, suite_resources = crate::ktest::execution_services::SuiteBaseline, tags("execution", "context"), timeout_ms = 15000)]
 pub(crate) mod context {
     use super::*;

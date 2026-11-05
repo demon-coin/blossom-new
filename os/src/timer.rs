@@ -202,6 +202,13 @@ impl Timer {
     }
 
     /// 只在不运行时摘掉下一轮，正在运行则返回 Busy 且不等待。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "定时器测试逐一验证 Idle、Cancelled 和 Busy 的非等待取消合同"
+        )
+    )]
     pub fn try_cancel(self: Pin<&Self>) -> CancelResult {
         let pointer = self.node_pointer();
         let mut state = base(self.cpu).state.lock();

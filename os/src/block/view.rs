@@ -1,7 +1,6 @@
 //! 同一物理磁盘的有界扇区视图，所有相对地址只在提交边界换算。
 
-use crate::block::{Bio, BioMemory, BlkOperation, BlockError, DiskRef, QueueLimits, SECTOR_BYTES};
-use crate::mm::FolioRead;
+use crate::block::{Bio, BlkOperation, BlockError, DiskRef, QueueLimits, SECTOR_BYTES};
 
 /// 分区只保存范围和原物理设备拥有者，不创建另一条硬件队列。
 #[derive(Clone)]
@@ -106,6 +105,10 @@ impl BlockView {
     }
 
     /// 裸请求已经保存绝对物理 LBA，提交时只检查本范围，不能再次增加分区偏移。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "RAM 范围测试验证裸 Bio 的分区边界拒绝和原父完成")
+    )]
     pub(crate) fn submit_bio(&self, bio: Bio) {
         if bio.inner.operation() != BlkOperation::Flush
             && !self.contains_bytes(bio.inner.sector() * SECTOR_BYTES, bio.inner.len())
@@ -115,28 +118,5 @@ impl BlockView {
             return;
         }
         self.disk.submit_bio(bio);
-    }
-
-    /// 原页读入保持范围检查，生产 FS 使用携带占用的同名入口。
-    pub(crate) fn load_folio(
-        &self,
-        offset: u64,
-        read: FolioRead,
-        memory: BioMemory,
-    ) -> Result<(), BlockError> {
-        let absolute = self.absolute_byte(offset, read.len())?;
-        self.disk.load_folio(absolute, read, memory)
-    }
-
-    /// 保留原分段页责任，同时限制本次读取的视图内范围。
-    pub fn fill_folio_range(
-        &self,
-        byte: u64,
-        read: FolioRead,
-        offset: usize,
-        len: usize,
-    ) -> Result<FolioRead, BlockError> {
-        self.disk
-            .fill_folio_range(self.absolute_byte(byte, len)?, read, offset, len)
     }
 }

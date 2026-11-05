@@ -451,6 +451,13 @@ impl TaskGraph {
     }
 
     /// 用户等待只消费退出信息，不等待成员离栈；nowait保留事件，具体子PID只允许一次消费。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "用户候选准备和 PID 资源测试确认未发表或已回收身份没有退出事件"
+        )
+    )]
     pub(crate) fn try_wait(
         &self,
         parent: Option<&ThreadGroup>,

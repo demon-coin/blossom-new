@@ -845,9 +845,25 @@ pub(crate) struct ReserveSnapshot {
     pub leased: usize,
     pub control_live: usize,
     pub payload_live: usize,
+    #[expect(
+        dead_code,
+        reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 Bio 控制布局"
+    )]
     pub bio_control: Option<Layout>,
+    #[expect(
+        dead_code,
+        reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 WB payload 布局"
+    )]
     pub wb_payload: Option<Layout>,
+    #[expect(
+        dead_code,
+        reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 aux payload 布局"
+    )]
     pub aux_payload: Option<Layout>,
+    #[expect(
+        dead_code,
+        reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出元数据节点控制布局"
+    )]
     pub node_control: Option<Layout>,
     pub metadata_control_live: usize,
 }

@@ -4,16 +4,32 @@
 #[derive(Clone, Copy)]
 pub struct KernelLinkLayout {
     /// ELF 的 __blossom_platform：QEMU 为 0，VisionFive2 为 1，LS2K1000LA 为 2。
+    #[allow(
+        dead_code,
+        reason = "build.rs 将平台编号写入链接符号，内核直接读取构建平台配置"
+    )]
     pub platform: u8,
     /// 内核镜像最低装载物理地址，RISC-V 的物理启动段也从此处开始。
+    #[allow(
+        dead_code,
+        reason = "build.rs 生成装载地址，RISC-V 地址换算也读取；LoongArch 使用 DMW"
+    )]
     pub kernel_load_phys: u64,
     /// 内核高地址镜像的链接基址，RISC-V 正文位于物理启动段之后。
+    #[allow(
+        dead_code,
+        reason = "build.rs 生成链接地址，RISC-V 地址换算也读取；LoongArch 使用 DMW"
+    )]
     pub kernel_link_virt: u64,
     /// RISC-V 对应 ram_phys_base；LoongArch 对应物理地址零的缓存 DMW。
     pub direct_map_virt_base: u64,
     /// 物理设备地址零对应的非缓存设备窗口。
     pub mmio_virt_base: u64,
     /// RISC-V 直映窗口的物理起点；实际可分配 RAM 范围仍由固件资源决定。
+    #[allow(
+        dead_code,
+        reason = "build.rs 生成 RAM 基址，RISC-V 直映换算读取；LoongArch 从物理零开始映射"
+    )]
     pub ram_phys_base: u64,
 }
 
@@ -56,8 +72,20 @@ pub const LOONGARCH64_LS2K1000LA: KernelLinkLayout = KernelLinkLayout {
 // DMW 顶部段号与低60位地址部分分开解释，不能套用页表物理地址宽度。
 pub(crate) const DMW_VSEG_SHIFT: u32 = 60;
 pub(crate) const DMW_ADDRESS_END: u64 = 1 << DMW_VSEG_SHIFT;
+#[allow(
+    dead_code,
+    reason = "LS2K 固件地址归一化读取，宿主 build.rs 只生成链接布局"
+)]
 pub(crate) const DMW_ADDRESS_MASK: u64 = DMW_ADDRESS_END - 1;
+#[allow(
+    dead_code,
+    reason = "LS2K 固件地址校验读取，宿主 build.rs 不解析固件地址"
+)]
 pub(crate) const DMW_CACHED_VSEG: usize =
     (LOONGARCH64_QEMU_VIRT.direct_map_virt_base >> DMW_VSEG_SHIFT) as usize;
+#[allow(
+    dead_code,
+    reason = "LS2K 固件地址校验读取，宿主 build.rs 不解析固件地址"
+)]
 pub(crate) const DMW_UNCACHED_VSEG: usize =
     (LOONGARCH64_QEMU_VIRT.mmio_virt_base >> DMW_VSEG_SHIFT) as usize;

@@ -624,6 +624,10 @@ fn read_interpreter<'a>(
 }
 
 /// AT_PHDR 的主文件位置关系推导实际主 bias；解释器 PC 与 AT_BASE 独立核对真实 loader LOAD。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "直接比较装载结果、真实主文件与解释器及原 argv，不把被测结果和独立预期装成同一对象"
+)]
 fn verify_image(
     context: &TestContext<'_>,
     image: &LoadedImage,

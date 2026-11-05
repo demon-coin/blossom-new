@@ -84,6 +84,13 @@ impl<T> SpinLock<T> {
     }
 
     /// 关闭 IRQ 后仅尝试一次取锁；竞争失败立即恢复原状态，成功仍先解锁再恢复 IRQ。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "启动、MM 和 panic 展开测试验证竞争失败及 guard 归还后的 IRQ 状态"
+        )
+    )]
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         self.try_lock_with_irq(IrqSaveGuard::new())
     }

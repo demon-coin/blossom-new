@@ -176,6 +176,10 @@ impl FsClaim {
     }
 
     /// 同步字节读取保实际范围占用到 slot 真尾，返回前只复制完整成功的数据。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "文件写入和截断测试通过原 FS 占用读取实际设备字节")
+    )]
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         let absolute = self.view().absolute_byte(offset, dst.len())?;
         drop(task::current_task());
@@ -565,6 +569,13 @@ impl Disk {
     }
 
     /// raw 批次没有 FS 授权，每组最多八个生成者，组内相邻普通范围才允许合并。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "块队列测试验证无 FS 授权的显式批次合并及连续完成前缀"
+        )
+    )]
     pub(crate) fn submit_batch(self: &DiskRef, bios: impl IntoIterator<Item = Bio>) {
         self.submit_batch_from(bios, None);
     }
@@ -729,6 +740,13 @@ impl Disk {
     }
 
     /// 将原 folio 的完整读入范围交给 Bio，等待真实 DMA 全尾及内容结果发布。
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(
+            dead_code,
+            reason = "原页缓存测试用无 FS 占用的真实 Disk 验证读入、OOM 和完成收权"
+        )
+    )]
     pub(crate) fn load_folio(
         self: &DiskRef,
         byte_offset: u64,
@@ -747,25 +765,6 @@ impl Disk {
             return Err(BlockError::ShortIo);
         }
         Ok(())
-    }
-
-    /// 普通 Task 将一个页内子范围直接读到原页，全尾收权后返回仍锁定的整份读入者。
-    /// 磁盘位置与页内偏移独立；失败发布原错误，成功不提前授予整页读取权。
-    pub fn fill_folio_range(
-        self: &DiskRef,
-        byte_offset: u64,
-        read: FolioRead,
-        offset: usize,
-        len: usize,
-    ) -> Result<FolioRead, BlockError> {
-        let (completion, result) = self.read_folio_bio(
-            byte_offset,
-            read,
-            Some((offset, len)),
-            Vec::new_in(BioAllocator::Heap),
-            None,
-        )?;
-        finish_folio_range(completion, result, len)
     }
 
     /// 锁外准备原页 Bio 并同步等待；None 结束完整读，子范围成功后由来源继续填页。

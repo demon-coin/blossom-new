@@ -621,7 +621,12 @@ impl Drop for DeferredFiles<'_> {
 
 struct RetiredEntry {
     // 字段按声明顺序析构；先同步撤全源，具体节点拥有覆盖每个 callback 的完整尾部。
+    #[expect(dead_code, reason = "析构先同步撤销全部 poll 登记，等待回调尾部结束")]
     sources: PollTable,
+    #[expect(
+        dead_code,
+        reason = "强引用保活兴趣节点，直到前一字段撤源并等待全部回调结束"
+    )]
     entry: EntryRef,
 }
 
@@ -728,6 +733,10 @@ impl EpollFile {
     }
 
     /// 准备期可失败；全部源登记完成后无分配发表，再按已发布 mask query 当前状态。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "兴趣键、源登记与锁外退休拥有共同完成一次可失败准备和无分配发表"
+    )]
     fn add(
         &self,
         tree: &mut index::Tree,
