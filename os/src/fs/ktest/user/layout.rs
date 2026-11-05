@@ -355,8 +355,8 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
             random_found = true;
             assert!(
                 sp <= value && value <= crate::arch::USER_STACK_TOP - 16,
-                "{}",
-                "AT_RANDOM is outside the initialized user stack: {value:#x}"
+                "AT_RANDOM is outside the initialized user stack: {:#x}",
+                value
             );
             let mut bytes = [0; 16];
             read_mm(context, &image.mm, value, &mut bytes)?;
