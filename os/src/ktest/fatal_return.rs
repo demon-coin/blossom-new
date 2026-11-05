@@ -70,11 +70,6 @@ impl Drop for ReturnFixture {
     }
 }
 
-/// 导出真实 suite 注册锚点，交由父模块统一挂接。
-pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
-    expected::__ktest_anchor()
-}
-
 #[::ktest::suite(
     context = "Thread",
     isolation = "Case",

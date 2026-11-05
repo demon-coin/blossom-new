@@ -7,11 +7,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{cpu, mm, sched, task, time, timer};
 
-/// 显式锚定唯一正式 suite，不维护第二份 case 清单。
-pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
-    children::__ktest_anchor()
-}
-
 struct Observation {
     drops: AtomicUsize,
     body_runs: AtomicUsize,

@@ -396,8 +396,7 @@ impl Sdmmc {
         let divisor = if input <= target as u64 {
             0
         } else {
-            (input + CLOCK_DIVIDER_FACTOR * target as u64 - 1)
-                / (CLOCK_DIVIDER_FACTOR * target as u64)
+            input.div_ceil(CLOCK_DIVIDER_FACTOR * u64::from(target))
         };
         if u64::from(CLOCK_DIVIDER_MASK) < divisor {
             return Err(BlockError::Unsupported);

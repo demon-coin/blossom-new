@@ -28,6 +28,8 @@ const RW: PagePermissions = PagePermissions {
 };
 type Metadata = crate::workqueue::testing::MetadataStats;
 type WatchWeak = Weak<dyn Send + Sync>;
+/// 保存子任务自己发表的弱身份，观察拥有不延长 Task 生命周期。
+type TaskObserver = Arc<SpinLock<Option<Weak<Task>>>>;
 
 struct EpollSuite {
     memory: mm::MemoryStats,
@@ -74,7 +76,7 @@ struct EpollOwner {
     reader: Option<FileRef>,
     writer: Option<FileRef>,
     joins: Vec<JoinHandle>,
-    observers: [Option<Arc<SpinLock<Option<Weak<Task>>>>>; 4],
+    observers: [Option<TaskObserver>; 4],
     gates: Vec<Arc<Completion>>,
     stop: Arc<AtomicBool>,
 }

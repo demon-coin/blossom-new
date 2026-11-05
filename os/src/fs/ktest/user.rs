@@ -39,6 +39,9 @@ mod write;
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
 const FUTEX_CONTROL: usize = 0x4400_0000;
 
+/// 用户控制例修改前的接口与路由快照，由原 quiesce 恢复。
+type NetworkControlSnapshot = ([Option<InterfaceSnapshot>; 2], [Option<RouteSnapshot>; 3]);
+
 struct RunningProgram {
     pid: usize,
     target: Option<usize>,
@@ -79,7 +82,7 @@ struct UserOwner {
     path: PathOwner,
     net: Option<NetStackRef>,
     /// 控制例保存修改前的小值，用户异常退出后仍由原 fixture 恢复共享域。
-    network_control: Option<([Option<InterfaceSnapshot>; 2], [Option<RouteSnapshot>; 3])>,
+    network_control: Option<NetworkControlSnapshot>,
     metadata_before: MetadataStats,
     graph: Option<Arc<TaskGraph>>,
     running: Option<RunningProgram>,

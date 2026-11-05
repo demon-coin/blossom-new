@@ -35,7 +35,6 @@ pub struct BindLease {
     local: InetEndpoint,
     owner_id: u64,
     lease_id: u64,
-    dual_stack: bool,
     net: Weak<NetStack>,
     /// 准备中的 Arc 尚未发表，失败析构不能撤其它真实记录。
     published: bool,
@@ -161,7 +160,6 @@ impl NetTables {
             local: requested,
             owner_id,
             lease_id: net.allocate_identity(),
-            dual_stack,
             net: Arc::downgrade(net),
             published: false,
         })

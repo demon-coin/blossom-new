@@ -4,11 +4,6 @@ use core::fmt;
 
 use ::ktest::TestContext;
 
-/// 显式根只引用宏注册槽，不维护第二份用例清单。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 2] {
-    [boot::__ktest_anchor(), fatal::__ktest_anchor()]
-}
-
 struct FragmentedMessage;
 
 impl fmt::Display for FragmentedMessage {

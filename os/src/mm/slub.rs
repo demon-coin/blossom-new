@@ -730,7 +730,6 @@ pub(crate) struct SlabSnapshot {
 #[derive(Clone, Copy)]
 pub(crate) struct CpuSnapshot {
     pub(crate) active: usize,
-    pub(crate) local: usize,
     pub(crate) local_count: usize,
     pub(crate) partial: usize,
     pub(crate) partial_count: usize,
@@ -781,7 +780,6 @@ pub(crate) fn cpu_snapshot(class: usize, owner: usize) -> CpuSnapshot {
     let local = cache(class).cpu(owner).lock();
     CpuSnapshot {
         active: local.active,
-        local: local.local,
         local_count: local.local_count,
         partial: local.partial,
         partial_count: local.partial_count,

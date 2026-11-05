@@ -8,20 +8,6 @@ use ::ktest::{Fixture, TestContext, TestError, TestResult};
 use crate::ktest::panic::{catch, is_unwinding};
 use crate::sync::{IrqSaveGuard, PreemptGuard, SpinLock};
 
-/// 显式根只引用真实 suite 注册槽，不维护第二份 case 清单。
-pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 8] {
-    [
-        boot::__ktest_anchor(),
-        thread::__ktest_anchor(),
-        children::__ktest_anchor(),
-        child_failures::__ktest_anchor(),
-        failures::__ktest_anchor(),
-        setup_failure::__ktest_anchor(),
-        cleanup_failure::__ktest_anchor(),
-        fatal::__ktest_anchor(),
-    ]
-}
-
 /// 每例重新创建的局部锁和析构账本，不依赖上一个实例的状态。
 struct LocalFixture {
     lock: SpinLock<usize>,
