@@ -1,4 +1,62 @@
-//! 32 位 DW-MMC 寄存器与命令位；MMIO 的映射和独占由控制器拥有者证明。
+//! Synopsys DesignWare Mobile Storage Host Controller (DW-MMC) 32 位寄存器定义与 MMIO 访问封装。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于 `drivers::sdmmc` 驱动内部，负责定义 DW-MMC 控制器及内置 32 位链式 IDMAC 的全部
+//! MMIO 寄存器字节偏移、控制位、状态位与命令标志位，并提供轻量级的寄存器读写封装 [`Registers`]。
+//! 上游仅由 `drivers::sdmmc` 和 `drivers::sdmmc::protocol` 调用，不对外暴露硬件细节。
+//!
+//! # 核心寄存器与位域布局
+//!
+//! ## 1. 寄存器空间布局（32 位 IDMAC 变体）
+//! ```text
+//! Offset  Name      Description
+//! ------  --------  ------------------------------------------------------
+//! 0x00    CTRL      全局控制（软复位 CONTROLLER/FIFO/DMA、总中断与 IDMAC 使能）
+//! 0x04    PWREN     卡电源开关
+//! 0x08    CLKDIV    时钟分频器（Divider0 位于 bit[7:0]，实际分频 = 2 * div）
+//! 0x0c    CLKSRC    时钟源选择
+//! 0x10    CLKENA    卡时钟输出使能
+//! 0x14    TMOUT     响应与数据超时计数器
+//! 0x18    CTYPE     卡总线宽度（0 = 1-bit，1 = 4-bit）
+//! 0x1c    BLKSIZ    块大小（通常为 512 字节，读取 SCR 时为 8 字节）
+//! 0x20    BYTCNT    本次传输总字节数
+//! 0x24    INTMASK   主机中断屏蔽（1 = 允许产生中断）
+//! 0x28    CMDARG    32 位命令参数
+//! 0x2c    CMD       命令下发与传输模式控制（写 START 位触发硬件执行）
+//! 0x30..  RESP0..3  136 位长响应或 48 位短响应寄存器组（4 x 32-bit）
+//! 0x40    MINTSTS   屏蔽后中断状态
+//! 0x44    RINTSTS   原始中断状态（写 1 清零 W1C）
+//! 0x48    STATUS    控制器实时状态（DATA_BUSY、FIFO 计数 FCNT、DMA_REQ 等）
+//! 0x4c    FIFOTH    FIFO 收发水线阈值
+//! 0x50    CDETECT   原生卡检测引脚状态（0 = 在位，1 = 缺卡）
+//! 0x54    WRTPRT    原生写保护引脚状态（1 = 写保护）
+//! 0x5c    TCBCNT    卡侧已传输字节数
+//! 0x60    TBBCNT    主机侧 FIFO/总线已传输字节数
+//! 0x6c    VERID     Synopsys IP 版本号（0x240a 起 FIFO 数据窗口迁至 0x200）
+//! 0x70    HCON      硬件综合配置参数（总线位宽、DMA 接口类型、地址位宽）
+//! 0x74    UHS       UHS-I 电压与 DDR 控制
+//! 0x80    BMOD      IDMAC 总线模式（软复位 SWR、突发模式 FB、使能 DE）
+//! 0x84    PLDMND    IDMAC 轮询需求触发（写入任意值唤醒挂起的描述符读取）
+//! 0x88    DBADDR    IDMAC 描述符表首地址（32 位物理/设备地址）
+//! 0x8c    IDSTS     IDMAC 状态寄存器（写 1 清零 W1C）
+//! 0x90    IDINTEN   IDMAC 中断使能
+//! 0x100 / 0x200     FIFO 数据读写窗口（旧版 < 2.40a 为 0x100，>= 2.40a 为 0x200）
+//! ```
+//!
+//! ## 2. `CMD` 命令寄存器关键位域（Offset `0x2c`）
+//! ```text
+//!  31    29         21        15    14     13        10     9     8     7      6    5..0
+//! +-----+----+-----+---------+-----+----+------+----+-----+----+-----+------+-----+------+
+//! |START|HOLD| ... |UPD_CLOCK|INIT |STOP|WAIT_D| .. |WRITE|DATA| CRC | LONG |RESP |INDEX |
+//! +-----+----+-----+---------+-----+----+------+----+-----+----+-----+------+-----+------+
+//! ```
+//!
+//! # 并发与锁契约
+//! [`Registers`] 仅封装對已映射 MMIO 虚拟基址的 `read_volatile` / `write_volatile` 操作，自身不持锁：
+//! - 设备初始化（`Sdmmc::initialize`）期间，控制器尚未发布到块设备层也未开放中断，由初始化任务独占访问。
+//! - 运行期（`publish` 之后），对 `CTRL`、`INTMASK`、`RINTSTS`、`BMOD`、`IDSTS`、`IDINTEN` 等共享控制与
+//!   状态寄存器的并发读写（如工作线程下发命令与中断处理函数清中断）必须在外层持有 `Sdmmc::registers`
+//!   自旋锁临界区后执行。
 
 pub(super) const CTRL: usize = 0x00;
 pub(super) const PWREN: usize = 0x04;
@@ -125,28 +183,43 @@ pub(crate) const FIFO_MAX_DEPTH: u32 = FIFO_WATERMARK_MASK + 1;
 pub(super) const FIFO_COUNT_SHIFT: u32 = 17;
 pub(super) const FIFO_COUNT_MASK: u32 = 0x1fff;
 
-/// 验证后的永久 MMIO 窗口；方法只接受本模块公开的对齐偏移。
+/// 已通过边界与对齐校验的 DW-MMC 永久 MMIO 寄存器窗口封装。
+///
+/// 内部元组字段 `0` 保存控制器寄存器窗口的内核虚拟基地址（字节对齐的 `usize`）。
 pub(super) struct Registers(pub usize);
 
 impl Registers {
-    /// 读取独占映射内的寄存器；并发 W1C 和控制更新由外层短锁协调。
+    /// 读取指定字节偏移处的 32 位寄存器值。
+    ///
+    /// 调用方需传入本模块定义的 4 字节对齐寄存器偏移常量；运行期涉及中断与控制并发访问时由外层自旋锁保护。
     pub fn read(&self, offset: usize) -> u32 {
-        // SAFETY: prepare 验证整个寄存器窗口，拥有者保活映射；偏移只来自本模块常量。
+        // SAFETY:
+        // 1. `Sdmmc::prepare` 在构造 `Registers` 前已校验 `self.0` 满足 8 字节对齐，且映射区间长度
+        //    至少覆盖到 `IDINTEN + REGISTER_BYTES`（0x94 字节）。
+        // 2. 本方法仅由 `sdmmc` 模块以本文件定义的 4 字节对齐寄存器偏移常量调用，目标地址不越界且对齐合法。
+        // 3. 启动期创建的内核永久 MMIO 映射在系统运行期间始终有效。
         unsafe { ((self.0 + offset) as *const u32).read_volatile() }
     }
 
-    /// 写入独占映射内的寄存器，不把普通原子操作当设备访问。
+    /// 向指定字节偏移处的 32 位寄存器写入值。
+    ///
+    /// 使用 `write_volatile` 确保每次写入都产生实际的设备总线事务，不被编译器优化合并或重排。
     pub fn write(&self, offset: usize, value: u32) {
-        // SAFETY: prepare 验证整个寄存器窗口，拥有者保活映射；偏移只来自本模块常量。
+        // SAFETY:
+        // 1. `Sdmmc::prepare` 已验证 `self.0` 的对齐与 MMIO 窗口覆盖范围。
+        // 2. `offset` 仅来自本模块的 4 字节对齐寄存器偏移常量，不会越界。
+        // 3. 读-改-写或 W1C 清除操作在并发场景下由外层 `Sdmmc::registers` 自旋锁串行化。
         unsafe { ((self.0 + offset) as *mut u32).write_volatile(value) }
     }
 
-    /// 在调用方持有寄存器短锁或尚未发表时更新控制位。
+    /// 对指定寄存器执行“先清除 `clear` 掩码位、再置位 `set` 掩码位”的读-改-写更新。
+    ///
+    /// 在控制器已发布运行期调用时，调用方必须持有 `Sdmmc::registers` 自旋锁以防并发修改丢失。
     pub fn update(&self, offset: usize, clear: u32, set: u32) {
         self.write(offset, (self.read(offset) & !clear) | set);
     }
 
-    /// 读取 R2 的低字在前原始排列。
+    /// 依次读取 `RESP0..RESP3` 四个 32 位响应寄存器，按低字在前（`RESP0` 在下标 0）返回原始数组。
     pub fn response(&self) -> [u32; 4] {
         core::array::from_fn(|index| self.read(RESP0 + index * REGISTER_BYTES))
     }

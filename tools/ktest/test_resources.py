@@ -1,4 +1,11 @@
-"""宿主 resources 回归；运行 python3 -m unittest discover -s tools/ktest。"""
+"""ktest 宿主测试磁盘资源管理与 QEMU 测试会话生命周期的单元测试模块。
+
+本模块验证内核测试框架在准备与回收磁盘资源时的安全性与隔离性保证：
+1. CLI 入口在准备磁盘资源前对非法 `--root-mode` 挂载模式的拦截，确保不破坏既有文件；
+2. 声明磁盘角色但缺失源镜像时的错误报告，以及工作盘独立拷贝与拒绝硬链接/软链接别名的保护；
+3. `QemuTestSession` 多实例并发工作盘隔离、等待子进程完全退出后再清理工作盘的生命周期控制，
+   以及在复制中途失败（如 `ENOSPC`）或进程启动失败时对半成品工作盘的清理和对已有日志证据的保留。
+"""
 
 import errno
 import hashlib
@@ -18,11 +25,12 @@ from ktest.qemu_session import QemuTestSession
 
 
 class RootModeInputTests(unittest.TestCase):
-    """真实宿主入口在资源准备前拒绝非法根挂载模式。"""
+    """验证 CLI 入口在接触磁盘资源前对 `--root-mode` 参数合法性的校验。"""
 
     def test_invalid_mode_is_rejected_without_replacing_work_disks(self):
-        """ktest CLI 拒绝未知或多 token 值，已有工作盘与源文件保持不变。"""
+        """验证传入非法的根文件系统挂载模式时 CLI 立即报错退出，且不修改已有工作盘、源镜像或创建报告目录。"""
         with tempfile.TemporaryDirectory() as temporary:
+            # 准备测试用的源镜像与已有工作盘文件，用于验证失败时文件不会被触碰
             base = Path(temporary)
             source = base / "source.img"
             source.write_bytes(b"original source")
@@ -36,6 +44,7 @@ class RootModeInputTests(unittest.TestCase):
                 [sys.executable, str(TOOLS / "run_kernel_tests.py"), "run", "--arch", "riscv64",
                  "--report-dir", str(base / "report")],
             ]
+            # 遍历空字符串、大写、多余权限字符及包含空白或等号的非法挂载模式
             for mode in ("", "RO", "rwx", "ro rw", "ro=foo", "rw=foo", "%"):
                 for command in commands:
                     with self.subTest(command=command, mode=mode):
@@ -48,25 +57,27 @@ class RootModeInputTests(unittest.TestCase):
 
 
 class ResourceTests(unittest.TestCase):
-    """工作盘独占副本、真实进程拥有和失败清理。"""
+    """验证 ktest 工作盘副本隔离、链接别名拦截、QEMU 会话生命周期及异常清理行为。"""
 
     def test_missing_declared_root_is_error(self):
-        """声明根盘资源后必须提供真实输入镜像。"""
+        """验证测试声明需要 `root` 磁盘资源但未提供源镜像路径时抛出 `HostError`。"""
         with self.assertRaises(HostError):
             validate_resources({"root"}, options())
 
     def test_work_copy_does_not_modify_source_and_rejects_alias(self):
-        """硬链接和符号链接不能成为可写工作盘。"""
+        """验证准备的工作盘为独立文件副本（修改不影响源镜像），且拒绝覆盖指向源镜像的软硬链接。"""
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             source = base / "source.raw"
             source.write_bytes(b"original disk")
             work = base / "work"
             work.mkdir()
+            # 正常工作盘准备：修改生成的工作盘不应改变源镜像内容
             args = options(disks={"root": source})
             disks = prepare_disks({"root"}, args, work)
             disks[0][1].write_bytes(b"changed work disk")
             self.assertEqual(source.read_bytes(), b"original disk")
+            # 若目标工作盘路径已是指向源镜像的硬链接或软链接，准备过程必须报错拒绝以保护源镜像
             for symbolic in (False, True):
                 alias_dir = base / ("symbolic" if symbolic else "hard")
                 alias_dir.mkdir()
@@ -81,12 +92,13 @@ class ResourceTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), b"original disk")
 
     def test_vm_disks_live_until_process_wait_and_cleanup_partial_construction(self):
-        """真实进程退出前保盘，隔离并行实例并清掉半复制，保留输入及原文日志。"""
+        """验证工作盘在 QEMU 及其子进程完全退出前保持存在，多会话互不干扰，且复制或启动失败时自动清理半成品工作盘并保留已有日志。"""
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             source = base / "source.raw"
             source.write_bytes(b"original disk")
             source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            # 构造模拟 QEMU 的测试脚本：打开所有工作盘并派生子进程共同持有，收到 SIGTERM 时记录磁盘是否仍存在
             executable = base / "disk-user"
             executable.write_text(
                 f"#!{sys.executable}\n"
@@ -118,6 +130,7 @@ class ResourceTests(unittest.TestCase):
             vms = []
             working_disks = []
             try:
+                # 启动两个并行的 QemuTestSession 实例，并在报告目录预置日志证据文件
                 for index in range(2):
                     directory = base / str(index)
                     directory.mkdir()
@@ -136,8 +149,10 @@ class ResourceTests(unittest.TestCase):
                     for path in paths:
                         self.assertTrue(path.is_file())
                     vm.uart.raw.write(b"UART original log\n")
+                # 验证两个并发会话分配了各自独立的工作盘路径
                 self.assertTrue(set(working_disks[0]).isdisjoint(working_disks[1]))
                 working_disks[0][0].write_bytes(b"guest mutation")
+                # 逐个关闭会话：验证进程终止时磁盘仍存在，关闭完成后临时工作盘被清理且报告目录中的日志证据完好保留
                 for index, vm in enumerate(vms):
                     vm.close()
                     self.assertEqual(vm.process.returncode, 0)
@@ -150,6 +165,7 @@ class ResourceTests(unittest.TestCase):
                     self.assertTrue((vm.directory / "command.json").is_file())
                     self.assertEqual((vm.directory / "uart-segment.raw").read_bytes(), b"raw UART evidence")
                     self.assertEqual((vm.directory / "root.raw").read_bytes(), b"unowned report evidence")
+                    # 关闭第一个会话不应影响第二个仍在运行的会话及其工作盘
                     if index == 0:
                         for path in working_disks[1]:
                             self.assertTrue(path.is_file())
@@ -161,11 +177,12 @@ class ResourceTests(unittest.TestCase):
             no_space = OSError(errno.ENOSPC, "No space left on device")
 
             def fail_copy(source_file, target_file, length):
-                """已实际写出半盘时注入原始宿主 ENOSPC。"""
+                """模拟复制工作盘中途发生磁盘空间不足（`ENOSPC`），先写入部分字节再抛出异常。"""
                 target_file.write(source_file.read(3))
                 partial.append(Path(target_file.name))
                 raise no_space
 
+            # 验证复制工作盘中途失败时，半成品工作盘目录被清理，同时保留已有的串口证据文件
             directory = base / "partial"
             directory.mkdir()
             (directory / "uart-segment.raw").write_bytes(b"keep")
@@ -177,6 +194,7 @@ class ResourceTests(unittest.TestCase):
             self.assertTrue((directory / "uart.log").is_file())
             self.assertTrue((directory / "qemu.log").is_file())
             self.assertEqual((directory / "uart-segment.raw").read_bytes(), b"keep")
+            # 验证 QEMU 可执行文件不存在导致启动失败时，已准备的临时工作盘目录同样被清理且源镜像完好无损
             directory = base / "launch-failure"
             directory.mkdir()
             args.qemu = str(base / "missing-executable")

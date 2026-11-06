@@ -1,4 +1,56 @@
-//! 固定请求槽与真实 ring head 共同维持块 I/O 的唯一拥有关系。
+//! 块设备实例（[`Disk`]）、请求队列状态机与固定请求槽（[`SlotStorage`]）管理。
+//!
+//! ## 模块职责与架构定位
+//! 本模块是块设备层（`crate::block`）的核心调度与资源管理枢纽：
+//! - **上游调用者**：由 `crate::block::submit`（请求拆分与合并）、`crate::block::bio`（`Bio` 生命周期）、
+//!   `crate::block::stop`（停机与 `FsClaim` 仲裁）以及系统启动/驱动初始化代码调用。
+//! - **下游依赖**：通过 `crate::block::backend::Backend` 统一对接 VirtIO-Blk、RAM 盘、SD/MMC 与 AHCI
+//!   控制器；利用 `crate::irq` 处理设备完成中断，并通过 `crate::workqueue` 异步执行后端命令或可睡眠完成回调。
+//!
+//! ## 核心设计与关键状态机
+//!
+//! ### 1. 预分配固定请求槽与零热路径内存分配
+//! 在 `Disk::prepare*` 阶段，根据设备队列深度（`limits.tag_count`）一次性预分配全部 [`SlotStorage`]、
+//! 散聚表（SG `Vec<PayloadRange>`）容量、进度 `Work` 与每槽位完成 `Work`。进入 I/O 提交与中断完成热路径后，
+//! 不再进行任何堆内存分配，从而彻底消除写回（Writeback）与中断上下文中的内存分配死锁风险。
+//!
+//! ### 2. 请求槽状态机（[`SlotState`]）与独占访问权转移
+//! 每个请求槽的 `SlotResources` 存放在 `UnsafeCell` 中，其独占访问权由 `QueueState::slot_states[tag]`
+//! 的状态转换严格隔离，无需为每个槽位单独加锁：
+//! ```text
+//!   ┌──────┐  reserve_slot()   ┌───────────┐  try_publish()   ┌───────────┐
+//!   │ Free │ ────────────────► │ Preparing │ ───────────────► │ Submitted │
+//!   └──────┘                   └───────────┘                  └─────┬─────┘
+//!      ▲                             │                              │
+//!      │       (未发布即 Drop)        │         ┌────────────────────┼────────────────────┐
+//!      ├─────────────────────────────┘         │ (VirtIO IRQ 消费   │ (Work 后端认领)    │ (复位后强制失败)
+//!      │                                       │  used ring 认领)   ▼                    │
+//!      │                                       │             ┌───────────┐               │
+//!      │                                       │             │ Executing │               │
+//!      │                                       │             └─────┬─────┘               │
+//!      │      finish_slot() 清理资源后归还     ▼                   ▼                     ▼
+//!      └──────────────────────────────────── ┌─────────────────────────────────────────────┐
+//!                                            │                  Finishing                  │
+//!                                            └─────────────────────────────────────────────┘
+//! ```
+//!
+//! ### 3. 队列生命周期状态机（[`QueuePhase`]）
+//! ```text
+//!   Prepared ──(start)──► Live ──(stop)──► Draining ──(排空后)──► Resetting ──(确认复位)──► DmaStopped ──► Stopped
+//!      │                   │                  │                       │
+//!      └──(start 失败)─────┴──(硬件故障)──────┴──► Faulting ──────────┴──(2s 超时)──► Quarantined
+//! ```
+//! - `Live`：正常接纳新的根 `Bio` 请求（`admit_from`）及子请求切片。
+//! - `Draining`：拒绝新的根 `Bio` 准入，但允许已准入的请求生成者（`generators > 0`）继续分配槽位并发起子请求，直至排空。
+//! - `Faulting` / `Resetting` / `DmaStopped` / `Stopped` / `Quarantined`：拒绝一切新请求或子请求提交。
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! 1. `Disk::control`（`SleepMutex<()>`）：最外层睡眠锁，仅在普通任务调用 `start()` 和 `stop()` 时获取。
+//! 2. `Disk::queue`（`SpinLock<QueueState>`）：保护队列阶段、槽位状态数组、活跃计数与侵入式链表。
+//!    - 持锁期间严禁睡眠、严禁执行大块内存拷贝（如 RAM/SDMMC 数据复制）或耗时的 `Bio` 完成回调。
+//!    - 若需同时操作 `BioInner` 内部状态锁，顺序为：`Disk::queue` ➔ `BioInner` 状态锁（如 `register_child` / `accept_child`）。
+//! 3. `Disk::irq`（`SpinLock<Option<IrqRegistration>>`）与 `Disk::metadata_cache`（`SpinLock<Weak<MetadataPages>>`）：
+//!    均为叶子自旋锁，不在持有它们时再去获取 `Disk::queue` 锁。
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -23,176 +75,267 @@ use crate::sync::{SleepMutex, SpinLock};
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::{Work, WorkQueue};
 
+/// 单次中断或单轮进度 `Work` 连续处理的请求槽上限（8 个），超过后让出并调度下一轮 `progress_work`，防止长时间关中断或饿死其他任务。
 pub(super) const IRQ_BUDGET: usize = 8;
 
+/// 固定在堆上（Pin）且引用计数的块设备句柄类型。
 pub type DiskRef = Pin<Arc<Disk>>;
 
+/// 块设备请求队列的生命周期阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QueuePhase {
+    /// 固定槽位、后端数据结构与 `Work` 已在内存中准备就绪，但尚未向硬件发布队列地址或使能中断。
     Prepared,
+    /// 设备已启动并正常工作，允许准入新的根 `Bio` 请求并提交子请求。
     Live,
+    /// 正在停机排空：拒绝新的根 `Bio` 准入，但允许已准入的请求生成者继续拆分并提交子请求直至完成。
     Draining,
+    /// 检测到设备故障或启动失败：已停止接收任何新子请求，等待认领并执行硬件复位。
     Faulting,
+    /// 唯一执行流已认领复位流程：正在等待门铃通知和 `Executing` 槽位退出，并向硬件发出复位命令轮询确认。
     Resetting,
+    /// 硬件已确认复位完成且已执行完 DMA 屏障：设备不再访问任何内存，可安全回收在途 `Submitted` 槽位与物理页。
     DmaStopped,
+    /// 中断已同步注销、所有 `Work` 已关闭、后端控制器已释放，设备彻底停机。
     Stopped,
+    /// 硬件复位在超时时间内未能确认完成：队列进入永久隔离状态，保留设备与在途 DMA 页面所有权以防 DMA 踩内存。
     Quarantined,
 }
 
+/// 单个固定请求槽（Tag）的状态机阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SlotState {
+    /// 槽位空闲，可被 `try_reserve_slot` 分配给请求准备者。
     Free,
+    /// 已被某个任务通过 `PreparingSlot` 守卫独占认领，正在锁外填充散聚表（SG）与子请求片段（`RequestPart`）。
     Preparing,
+    /// 已通过 `try_publish` 提交给后端（写入 VirtIO avail ring 或排入 `Work` 后端队列），硬件或后端工作队列拥有访问权。
     Submitted,
+    /// 仅用于 `Work` 驱动的后端（RAM / SDMMC / AHCI）：`progress_work` 已从后端队列取出该槽位，正在锁外执行数据传输。
     Executing,
+    /// 硬件或后端已完成传输并交回软件认领者，正在执行或等待 `completion_work` 执行上层 `Bio` 完成回调与资源清理。
     Finishing,
 }
 
+/// 由 `Disk::queue` 自旋锁保护的队列运行期状态与统计信息。
 pub(super) struct QueueState {
+    /// 底层块设备后端实例（VirtIO / RAM / SDMMC / AHCI）；在 `Stopped` 阶段被 `take()` 释放。
     pub(super) device: Option<Backend>,
+    /// 当前队列所处的生命周期阶段。
     pub(super) phase: QueuePhase,
+    /// 记录导致队列进入故障或隔离状态的首个错误原因。
     pub(super) failure: Option<BlockError>,
+    /// 当前已准入但尚未彻底结束父 `Bio` 完成回调的请求生成者总数。
     pub(super) generators: usize,
+    /// 当前已准入的写操作请求生成者数量。
     pub(super) writer_generators: usize,
+    /// 当前非 `Free` 状态的请求槽总数（涵盖 `Preparing`、`Submitted`、`Executing`、`Finishing`）。
     pub(super) active_slots: usize,
+    /// 当前处于 `Submitted` 或 `Finishing` 状态的写操作请求槽数量。
     pub(super) writing_slots: usize,
+    /// 当前正在锁外执行硬件门铃通知（Doorbell MMIO 写入）的并发执行流计数；复位前必须等待其归零。
     pub(super) notify_active: usize,
+    /// 标记是否有已提交至队列但尚未敲响硬件门铃（或尚未唤醒 `progress_work`）的请求。
     pub(super) pending_notify: bool,
+    /// 当前活跃的文件系统扇区占用（`FsClaim`）计数；非零时禁止 `stop()` 停机。
     pub(super) mounts: usize,
+    /// 每个请求槽（按 `tag` 索引）的当前状态。
     pub(super) slot_states: Vec<SlotState>,
+    /// 指向活跃文件系统占用（`FsClaimInner`）侵入式单向链表头部的指针。
     pub(super) claim_head: *const crate::block::stop::FsClaimInner,
+    /// 指向已准入的裸设备写请求（无 `FsClaim` 的 `BioInner`）侵入式单向链表头部的指针。
     pub(super) raw_writers: *const BioInner,
+    /// 每个请求槽对应的裸设备写入扇区区间 `Some((start_sector, end_sector))`，用于与 `claim_fs` 进行范围冲突检测。
     pub(super) slot_writes: Vec<Option<(u64, u64)>>,
+    /// 内核测试（`ktest`）统计计数器快照。
     #[cfg(feature = "ktest")]
     counters: TestSnapshot,
+    /// 内核测试开关：是否暂停消费完成队列（used ring）。
     #[cfg(feature = "ktest")]
     test_paused: bool,
+    /// 内核测试中用于观测和控制停机/复位流程的状态。
     #[cfg(feature = "ktest")]
     pub(super) ktest_stop: StopTestState,
+    /// 内核测试记录的最近一次单 Folio 请求的首个散聚段 DMA 映射信息：`(物理页基址, 设备 DMA 地址, 页内偏移, 字节长度)`。
     #[cfg(feature = "ktest")]
     ktest_folio_dma: Option<(usize, u64, usize, usize)>,
+    /// 内核测试注册的一次性完成错误注入配置：`(匹配请求类型, 注入错误码, 可选的成功读取字节前缀)`。
     #[cfg(feature = "ktest")]
     ktest_completion_error: Option<(TestCompletionKind, BlockError, Option<usize>)>,
+    /// 内核测试中指定要拦截并暂缓软件完成回调的目标文件页物理地址（不影响硬件 used ring 的正常消费）。
     #[cfg(feature = "ktest")]
-    // 只匹配目标文件原页的 Data-WB，不改变真实 used ring 消费。
     ktest_hold_file_writeback_page: Option<usize>,
+    /// 内核测试中已从硬件完成队列取出、但因匹配 `ktest_hold_file_writeback_page` 而暂缓调用 `finish_slot` 的槽位号列表。
     #[cfg(feature = "ktest")]
-    // 已收真实 used 但仍须走原 finish_slot 的软件完成责任。
     ktest_held_file_writeback_slots: [Option<u16>; MAX_BATCH],
 }
 
 impl QueueState {
-    /// 已接受生成者在排空阶段仍能继续发表，故障之后不能新增设备引用。
+    /// 判断当前队列阶段是否允许已准入的请求生成者继续分配槽位、提交子请求及处理完成事件（仅 `Live` 与 `Draining` 阶段返回 `true`）。
     fn accepts_children(&self) -> bool {
         matches!(self.phase, QueuePhase::Live | QueuePhase::Draining)
     }
 
-    /// 停机或故障返回队列事实，不让消费者把额度暂满误作设备错误。
+    /// 返回队列在非活动或故障阶段拒绝请求时应报告的错误码（若存在故障则返回故障错误，否则返回 `QueueStopped`）。
     fn stopped_error(&self) -> BlockError {
         self.failure.unwrap_or(BlockError::QueueStopped)
     }
 }
 
+/// 单个硬件请求槽中所承载的一个上层 `Bio` 子片段（支持将最多 `MAX_BATCH` 个相邻 `Bio` 片段合并到同一请求槽）。
 pub(super) struct RequestPart {
+    /// 所属上层 `Bio` 的内部强引用。
     pub(super) bio: BioArc,
+    /// 该片段在所属 `Bio` 字节范围中的起始偏移量（单位：字节）。
     pub(super) offset: usize,
+    /// 该片段的字节长度（单位：字节）。
     pub(super) length: usize,
-    // 独立保占用到 slot 资源和队列计数归还；父 ready 不终止此责任。
+    /// 独立持有的文件系统占用凭证副本，确保在槽位资源清理与队列计数归还前，文件系统占用不会被提前释放（即使父 `Bio` 已提前唤醒等待者）。
     _fs_claim: Option<FsClaim>,
 }
 
+/// 单个请求槽在一次 I/O 周期内独占使用的可变资源集合。
 struct SlotResources {
+    /// 预分配容量的散聚表（Scatter-Gather List），记录本次请求的物理/DMA 地址段。
     sg: Vec<PayloadRange>,
+    /// 本次请求合并承载的 `Bio` 子片段数组（最多 `MAX_BATCH` 个）。
     parts: [Option<RequestPart>; MAX_BATCH],
+    /// `parts` 数组中当前有效的子片段数量。
     part_count: usize,
+    /// 本次请求的块操作类型（`Read`、`Write` 或 `Flush`）。
     operation: BlkOperation,
+    /// 本次请求在磁盘上的起始扇区号（以 512 字节 `SECTOR_BYTES` 为单位；`Flush` 请求为 0）。
     sector: u64,
+    /// 本次请求传输的总字节数。
     bytes: usize,
+    /// 由复位清理（`fail_submitted_after_reset`）或测试错误注入强制覆盖的错误码。
     forced_error: Option<BlockError>,
+    /// 后端返回的归一化 I/O 完成结果（已完成字节数与可选错误）。
     completion: Option<crate::block::IoResult>,
+    /// 内核测试注入的读操作部分成功前缀：`Some((已成功读取字节数, 后续部分注入的错误码))`。
     #[cfg(feature = "ktest")]
     ktest_read_prefix: Option<(usize, BlockError)>,
+    /// 标记当前槽位是否已通过 `PreparingSlot::configure` 完成参数校验与协议头写入。
     configured: bool,
 }
 
+/// 固定在 `Disk::slots` 数组中的单个请求槽存储单元。
 pub(super) struct SlotStorage {
+    /// 槽位的可变请求资源，其独占访问权由 `QueueState::slot_states` 状态机在 `Preparing`、`Executing` 与 `Finishing` 阶段之间安全流转。
     resources: UnsafeCell<SlotResources>,
+    /// 预分配的槽位专属完成工作任务（当槽位包含需要任务上下文的 `Bio` 完成回调时调度）。
     pub(super) completion_work: Option<Pin<Arc<Work>>>,
+    /// 槽位在硬件与队列中的唯一编号（`0..limits.tag_count`）。
     pub(super) tag: u16,
+    /// 指回所属 `Disk` 实例的裸指针（在 `Disk::prepare_backend` 固定 `Disk` 地址后写入，供 `completion_work` 回调使用）。
     pub(super) disk: *const Disk,
+    /// 后端与槽位绑定的控制块句柄（如 VirtIO 请求头与状态字节的访问入口）。
     control: SlotControl,
 }
 
-// SAFETY: resources 只由 Preparing guard、唯一 Executing Work 或真实完成的 Finishing 认领者访问；
-// 固定 Vec 不再增长，context 在登记前写定，Work 与 IRQ 尾部结束前 Disk owner 保活。
+// SAFETY:
+// 1. `resources` 仅在持有独占 `PreparingSlot` 守卫、处于唯一 `Executing` 工作任务、或赢得 `Submitted -> Finishing` 转换的唯一完成执行流中被访问；
+// 2. `disk` 裸指针在 `Disk` 固定（Pin）后一次性写入且不再改变，在 `Disk::stop` 同步关闭所有 `Work` 与注销 IRQ 前 `Disk` 始终存活。
 unsafe impl Send for SlotStorage {}
-// SAFETY: 同一槽的两个独占访问期由 queue 状态转换隔开；不向外提供共享资源引用。
+// SAFETY:
+// 同一槽位在不同执行流之间的可变访问期由 `Disk::queue` 自旋锁内的 `SlotState` 状态转换及释放-获取内存序严格隔开，不会产生并发数据竞争。
 unsafe impl Sync for SlotStorage {}
 
-/// 一个固定设备 owner 保存全部槽、控制页与回调上下文，不能从 Arc 中移出后移动。
+/// 块设备核心对象，统一管理请求队列、固定请求槽数组、中断注册、工作队列任务及 DMA 域。
+///
+/// 该结构体包含自引用裸指针（如 `SlotStorage::disk` 及注册给 IRQ/`Work` 的上下文指针），因此通过 [`DiskRef`]（`Pin<Arc<Disk>>`）固定在堆内存中，不可移动。
 pub struct Disk {
+    /// 保护队列状态机、槽位分配、在途计数及占用链表的自旋锁。
     pub(super) queue: SpinLock<QueueState>,
+    /// 串行化外部任务调用 `start()` 与 `stop()` 的睡眠互斥锁。
     pub(super) control: SleepMutex<()>,
+    /// 保存设备中断注册句柄的自旋锁（在 `start()` 时注册，在 `stop()` 时取出并同步注销）。
     pub(super) irq: SpinLock<Option<IrqRegistration>>,
+    /// 预分配的设备级进度工作任务（用于处理 `Work` 驱动后端的 I/O 执行、超出中断预算后的接续消费以及异步故障复位）。
     pub(super) progress_work: Option<Pin<Arc<Work>>>,
+    /// 在准备阶段一次性分配且容量固定的请求槽数组（按下标 `tag` 索引）。
     pub(super) slots: Vec<SlotStorage>,
+    /// 当请求槽耗尽或硬件描述符环（avail ring）暂满时，供提交者等待空闲资源的等待队列。
     pub(super) available: WaitQueue,
+    /// 供停机/复位流程等待在途请求生成者、槽位与门铃通知全部归零（Quiescent）的等待队列。
     pub(super) quiescent: WaitQueue,
+    /// 设备在准备阶段协商确定的队列与 DMA 硬件限制参数。
     pub(super) limits: QueueLimits,
+    /// 设备的全局唯一身份标识。
     pub(super) identity: DiskIdentity,
+    /// 设备所属的硬件 DMA 映射域（RAM 盘等纯 CPU 拷贝后端为 `None`）。
     pub(super) domain: Option<DmaDomain>,
+    /// 指向本设备共享元数据页缓存（`MetadataPages`）的弱引用，允许多个相同范围的挂载视图复用同一份元数据缓存。
     metadata_cache: SpinLock<Weak<MetadataPages>>,
+    /// 标记 `Disk` 为 `!Unpin`，防止从 `Pin<Arc<Disk>>` 中被移动导致自引用裸指针失效。
     pub(super) _pinned: PhantomPinned,
 }
 
-// SAFETY: 协议元数据由 queue 锁串行，原生命令由唯一 progress Work 和控制器内部锁串行；
-// 固定 context 的寿命由显式 stop、执行尾、IRQ 注销及 Work close_sync 共同终止。
+// SAFETY:
+// 1. 队列状态与链表指针由 `queue` 自旋锁保护，后端硬件命令由唯一的 `progress_work` 或后端内部锁串行化；
+// 2. 注册给中断与 `Work` 的 `Disk` 裸指针在 `Disk::stop` 同步注销 IRQ 并关闭所有 `Work` 之前始终保持有效。
 unsafe impl Send for Disk {}
-// SAFETY: 安全接口不暴露 DMA 引用；跨 Task 的准备和完成只访问分别认领的槽。
+// SAFETY:
+// 公开接口不直接暴露内部 `UnsafeCell` 或裸指针；跨 CPU 任务的请求准备与完成回调仅访问各自通过 `queue` 锁独占认领的 `SlotStorage`。
 unsafe impl Sync for Disk {}
-
-/// 仅验收镜像保存真实队列事件计数，不参与正常请求协议。
+/// 内核测试（`ktest`）用于观测队列运行行为的事件统计快照。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TestSnapshot {
+    /// 已成功提交到后端设备的请求槽总次数。
     pub submitted: usize,
+    /// 已完成并释放归还的请求槽总次数。
     pub completed: usize,
+    /// 已提交的文件数据页回写（Data Writeback）请求数。
     pub data_submitted: usize,
+    /// 已提交的共享元数据页回写（Metadata Writeback）请求数。
     pub metadata_submitted: usize,
+    /// 已提交的缓存刷出（`Flush`）请求数。
     pub flush_submitted: usize,
-    /// 实际接受且承载文件原页读入的设备请求数。
+    /// 已提交的文件数据页读入（File Read）请求数。
     pub file_read_submitted: usize,
+    /// 运行期间同时处于在途（Inflight）状态的请求槽峰值数量。
     pub peak_inflight: usize,
+    /// 实际敲响硬件门铃（Doorbell Notify）的总次数。
     pub notifications: usize,
+    /// 提交者因槽位或硬件描述符不足而在 `available` 等待队列上睡眠（Park）的次数。
     pub resource_parks: usize,
+    /// 上层 `Bio` 因硬件限额而被拆分为多个子请求片段的额外拆分次数。
     pub splits: usize,
+    /// 相邻 `Bio` 子片段被合并到同一个硬件请求槽的合并次数。
     pub merges: usize,
+    /// 因单次消费达到 `IRQ_BUDGET` 上限而交由 `progress_work` 接续处理的次数。
     pub budget_continuations: usize,
+    /// 当前正处于在途状态的请求槽数量。
     pub inflight: usize,
-    /// 原 IRQ action 实际读取并确认本设备 ISR 的次数。
+    /// 中断处理函数读取并确认本设备中断状态寄存器（ISR）的总次数。
     #[cfg(feature = "ktest")]
     pub irq_calls: usize,
-    /// 实际 ISR 含 QUEUE 位的次数，与完成请求数分开。
+    /// 中断状态寄存器包含队列完成位（QUEUE interrupt）的次数。
     #[cfg(feature = "ktest")]
     pub irq_queue: usize,
-    /// 实际 ISR 完全为空的次数，不包含仅配置变更的中断。
+    /// 中断状态寄存器为空（共享中断线上非本设备触发）的次数。
     #[cfg(feature = "ktest")]
     pub irq_empty: usize,
 }
 
-/// 一次性错误仅在匹配请求的真实 used 被认领后替换上层完成结果。
+/// 内核测试中用于匹配单次完成错误注入目标的请求类别。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TestCompletionKind {
+    /// 普通文件数据页的回写请求。
     Data,
+    /// 文件系统元数据页的回写请求。
     Metadata,
+    /// 块设备 `Flush` 同步请求。
     Flush,
+    /// 普通文件数据页的读入请求。
     FileRead,
 }
 
 #[cfg(feature = "ktest")]
 impl TestCompletionKind {
-    /// 按原 folio 来源区分读入与 WB，raw 请求不参与文件内容分类。
+    /// 检查已完成传输的请求槽资源 `resources` 是否匹配当前错误注入目标类别（裸设备直接请求不参与文件数据/元数据匹配）。
     fn matches(self, resources: &SlotResources) -> bool {
         match self {
             Self::Flush => resources.operation == BlkOperation::Flush,
@@ -215,20 +358,28 @@ impl TestCompletionKind {
     }
 }
 
-/// 停机用例只观察本盘生产转换；拒读确认开关不伪造硬件状态。
+/// 内核测试中用于控制和观测停机与硬件复位流程的辅助状态。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct StopTestState {
+    /// 是否暂停消费硬件完成队列（用于构造复位前存在未消费完成项的并发场景）。
     pub(super) pause_used: bool,
+    /// 是否拦截硬件复位完成确认（用于模拟硬件复位超时并验证 `Quarantined` 隔离行为）。
     pub(super) withhold_confirmation: bool,
+    /// 已成功发布到后端的请求槽累计数量。
     pub(super) published: usize,
+    /// 已执行完 `finish_slot` 的请求槽累计数量。
     pub(super) finished: usize,
+    /// 已向后端硬件发起 `request_reset()` 的次数。
     pub(super) reset_requests: usize,
+    /// 已确认硬件 `reset_complete()` 并完成 DMA 屏障的次数。
     pub(super) reset_confirmations: usize,
 }
 
 impl Disk {
-    /// 在普通 Task 中完整准备固定表与全部 Work；此时硬件尚不知道任何队列地址。
+    /// 在普通任务上下文中根据 VirtIO 设备硬件特性预分配所有固定请求槽与 `Work`，构造处于 `Prepared` 阶段的 [`DiskRef`]。
+    ///
+    /// 此阶段仅完成内存结构准备，尚未向硬件写入队列物理地址或注册中断，需随后调用 [`Disk::start`] 启动。
     pub fn prepare(device: VirtioDevice, workqueue: &WorkQueue) -> Result<DiskRef, BlockError> {
         let limits = virtio_limits(device.info())?;
         Self::prepare_with_limits(
@@ -240,7 +391,7 @@ impl Disk {
         )
     }
 
-    /// 只有构造期能降低测试限额，固定 Disk 发表后不再修改共享能力。
+    /// 内核测试辅助构造函数：在不超出硬件真实能力的前提下，使用收紧的队列限额参数构造 [`DiskRef`]，用于测试请求拆分与边界对齐。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_prepare_with_limits(
         device: VirtioDevice,
@@ -277,7 +428,7 @@ impl Disk {
         )
     }
 
-    /// 串行验收通过本次调用的栈输出保存实际 SG reserve 失败，不武装全局分配器。
+    /// 内核测试辅助构造函数：构造 VirtIO 磁盘并通过输出参数 `observation` 记录散聚表预分配快照。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_prepare_observed(
         device: VirtioDevice,
@@ -289,7 +440,7 @@ impl Disk {
         Self::prepare_with_limits(device, workqueue, limits, Some(observation))
     }
 
-    /// 锁外构造唯一固定表，生产和受控限额镜像共用全部实际资源路径。
+    /// 使用指定的队列限额 `limits` 初始化 VirtIO 后端并构造固定请求槽表。
     fn prepare_with_limits(
         device: VirtioDevice,
         workqueue: &WorkQueue,
@@ -311,13 +462,12 @@ impl Disk {
         Self::prepare_backend(backend, workqueue, limits)
     }
 
-    /// 让唯一 RAM 磁盘访问专用范围，不转移原范围的归还权或创建 DMA 控制区。
+    /// 基于一段独占的连续物理内存区域 `region` 构造内存盘（RAM Disk）实例。
     ///
     /// # Safety
-    /// region 须覆盖完整、独占且直接映射有效的 RAM。来源可以是 MM 接管前保留的 initrd，
-    /// 或调用者持有的独占原页；原页拥有者必须保活到本 Disk 真实 stop、Work/IRQ 及全部
-    /// CPU 复制尾部结束。发表期间调用者和固件不得访问该范围，也不得将其映射给用户或
-    /// 其他设备；只持有原页而保留冲突的 CPU 裸别名不能满足此契约。
+    /// 1. `region` 必须指向完整、有效且在内核恒等/线性映射区可访问的物理 RAM（例如启动期保留的 initrd 或调用方独占持有的物理页）；
+    /// 2. 该物理内存区域的所有者必须保证其存活至本 `Disk` 完成 `stop()` 且所有关联的 `Work`/CPU 拷贝任务彻底退出；
+    /// 3. 在本 `Disk` 处于活跃状态期间，调用方、用户态进程或其他外设均不得并发修改或映射该内存区域，避免数据竞争。
     pub unsafe fn prepare_ram(
         region: crate::boot::Region,
         workqueue: &WorkQueue,
@@ -326,39 +476,41 @@ impl Disk {
         Self::prepare_backend(Backend::ram(region)?, workqueue, limits)
     }
 
-    /// 用同一固定请求核心准备真实 SD，原 payload 只交 CPU 复制访问期；无卡不建立 Disk。
+    /// 使用平台解析出的 SD/MMC 控制器资源初始化 SD 卡块设备实例；若卡槽未检测到介质则返回 `Ok(None)`。
     ///
     /// # Safety
-    /// 资源来自唯一快照，控制器及其 clock/reset/pin/GPIO/syscon 完整永久映射且由调用者独占；
-    /// 外部 owner 必须保本 Disk 到 IRQ、命令、Work 和真实停止全部结束。
+    /// 1. `resources` 必须来自唯一的平台硬件资源描述，且控制器 MMIO 及其关联的时钟/复位/引脚复用寄存器已完成永久有效的内核映射并由本驱动独占；
+    /// 2. 调用方必须保持返回的 [`DiskRef`] 存活至所有中断、后端命令、`Work` 任务及 `stop()` 流程彻底执行完毕。
     pub(crate) unsafe fn prepare_sdmmc(
         resources: &crate::boot::MmcResources,
         workqueue: &WorkQueue,
     ) -> Result<Option<DiskRef>, BlockError> {
-        // SAFETY: 调用者传递真实资源独占、映射和 IRQ/停止的完整寿命义务。
+        // SAFETY: 调用方已满足 `prepare_sdmmc` 的 `# Safety` 前置条件（寄存器映射有效且独占、生命周期受控）。
         let Some((backend, limits)) = unsafe { Backend::sdmmc(resources) }? else {
             return Ok(None);
         };
         Self::prepare_backend(backend, workqueue, limits).map(Some)
     }
 
-    /// 用真实 AHCI 地址域准备直接原页请求；真实无介质不建立 Disk，身份仍取同一库存。
+    /// 使用平台解析出的 AHCI 控制器与端口资源初始化 SATA 块设备实例；若端口未连接存储介质则返回 `Ok(None)`。
     ///
     /// # Safety
-    /// ABAR、IRQ、DMA 范围须来自唯一资源解析，固件已退出且完整强序映射永久有效；
-    /// 调用者独占本端口，保本 Disk 到全部 DMA、IRQ、Work 和真实停止尾部结束。
+    /// 1. `resources` 中的 ABAR 寄存器、中断号与 DMA 窗口必须来自唯一的平台硬件资源描述，固件已退出接管且 MMIO 强序映射永久有效；
+    /// 2. 调用方独占该 AHCI 端口，并保证返回的 [`DiskRef`] 存活至所有 DMA 传输、中断、`Work` 任务及 `stop()` 流程彻底执行完毕。
     pub(crate) unsafe fn prepare_ahci(
         resources: &crate::boot::AhciResources,
         workqueue: &WorkQueue,
     ) -> Result<Option<DiskRef>, BlockError> {
-        // SAFETY: 调用者证明解析后的真实功能资源和完整拥有寿命。
+        // SAFETY: 调用方已满足 `prepare_ahci` 的 `# Safety` 前置条件（ABAR/IRQ/DMA 资源有效且独占、生命周期受控）。
         let Some((backend, limits)) = unsafe { Backend::ahci(resources) }? else {
             return Ok(None);
         };
         Self::prepare_backend(backend, workqueue, limits).map(Some)
     }
 
-    /// 构造协议无关的固定软件槽和预留完成任务，所有 fallible 准备先于硬件发表。
+    /// 为给定的块设备后端 `backend` 预分配全部固定请求槽、散聚表容量与工作队列任务（`Work`），返回固定在堆上的 [`DiskRef`]。
+    ///
+    /// 所有可能因内存不足而失败的堆分配均在此阶段完成，I/O 运行期不再进行动态扩容。
     fn prepare_backend(
         backend: Backend,
         workqueue: &WorkQueue,
@@ -369,6 +521,7 @@ impl Disk {
         let mut slots = Vec::new();
         let mut slot_states = Vec::new();
         let mut slot_writes = Vec::new();
+        // Step 1: 按照队列深度 `limits.tag_count` 与单请求最大段数 `limits.max_segments` 预分配槽位数组与散聚表容量。
         slots
             .try_reserve_exact(usize::from(limits.tag_count))
             .map_err(|_| BlockError::NoMemory)?;
@@ -405,6 +558,7 @@ impl Disk {
             slot_writes.push(None);
         }
 
+        // Step 2: 分配 `Arc<Disk>` 并将队列初始阶段设为 `QueuePhase::Prepared`。
         let disk = Arc::try_new(Self {
             queue: SpinLock::new(QueueState {
                 device: Some(backend),
@@ -450,16 +604,22 @@ impl Disk {
         })
         .map_err(|_| BlockError::NoMemory)?;
 
+        // Step 3: 将 `Arc<Disk>` 转换为 `Pin<Arc<Disk>>`，并在对象地址固定后初始化自引用指针与预留的 `Work` 实例。
         let raw = Arc::into_raw(disk);
-        // SAFETY: into_raw 的唯一强引用尚未发表；构造过程中不队列化 Work，不注册 IRQ。
-        // 原 Arc 立刻恢复，失败仍以 Prepared 正常析构；固定 Vec 不再重新分配。
+        // SAFETY:
+        // 1. `raw` 来自上一行刚创建的唯一 `Arc<Disk>`，此时尚未向外部发布任何克隆引用，也未注册 IRQ 或入队 `Work`；
+        // 2. 立即通过 `Arc::from_raw(raw)` 恢复所有权并封装为 `Pin`，若后续步骤失败，`disk` 仍会按 `Prepared` 状态正常析构。
         let disk = unsafe { Pin::new_unchecked(Arc::from_raw(raw)) };
         let progress = Work::try_new_reserved(workqueue, 0, progress_callback, raw as usize)
             .map_err(|_| BlockError::NoMemory)?;
-        // SAFETY: 还没有第二份 Disk 引用或异步票；写入不移动 Disk 或槽 Vec。
+        // SAFETY:
+        // 1. `disk` 尚未对外发布，当前函数拥有唯一访问权；
+        // 2. 修改 `progress_work` 字段不会移动 `Disk` 本身或其内部的 `slots` 数组。
         unsafe { (*raw.cast_mut()).progress_work = Some(progress) };
         for index in 0..usize::from(limits.tag_count) {
-            // SAFETY: 固定 Vec 已完整构造且从不增长；仅未发表构造者访问此槽。
+            // SAFETY:
+            // 1. `slots` 数组已在 Step 1 中完成固定容量填充且绝不再重新分配；
+            // 2. `disk` 尚未对外发布，当前构造函数独占访问每个 `SlotStorage` 元素。
             let slot = unsafe { &mut (&mut (*raw.cast_mut()).slots)[index] };
             slot.disk = raw;
             slot.completion_work = Some(
@@ -476,8 +636,11 @@ impl Disk {
         Ok(disk)
     }
 
-    /// 串行注册真实 disabled action，再发表硬件；失败仍保留 owner 供显式停止。
+    /// 启动处于 `Prepared` 阶段的块设备：注册中断处理函数、向硬件发布队列地址并使能设备中断，将队列切换至 `Live` 阶段。
+    ///
+    /// 若硬件发布失败，队列将转入 `Faulting` 阶段，调用方仍需调用 [`Disk::stop`] 清理已注册的中断与工作任务。
     pub fn start(&self) -> Result<(), BlockError> {
+        // Step 1: 获取 `control` 睡眠锁并检查队列是否处于 `Prepared` 阶段，读取后端中断号。
         let _control = self.control.lock();
         let number = {
             let q = self.queue.lock();
@@ -490,14 +653,18 @@ impl Disk {
                 .interrupt()
         };
 
+        // Step 2: 若设备使用硬件中断，先以禁用（disabled）状态注册中断回调，防止队列未就绪前触发中断。
         if let Some(number) = number {
-            // SAFETY: 私有构造器返回 pinned Arc，外部 owner 显式 stop 并同步注销后才释放。
+            // SAFETY:
+            // 1. `self` 通过 `DiskRef`（`Pin<Arc<Disk>>`）固定在堆上，地址恒定；
+            // 2. 外部所有者在释放 `Disk` 前必须调用 `Disk::stop()`，其中会调用 `registration.unregister_sync()` 等待中断回调彻底退出。
             let registration =
                 unsafe { irq::register(number, irq_callback, self as *const Self as *mut ()) }
                     .map_err(|_| BlockError::Busy)?;
             *self.irq.lock() = Some(registration);
         }
 
+        // Step 3: 在 `queue` 自旋锁下向后端硬件发布队列并切换至 `QueuePhase::Live`（失败则转入 `Faulting`）。
         let result = {
             let mut q = self.queue.lock();
             let result = q
@@ -522,6 +689,7 @@ impl Disk {
             }
         };
 
+        // Step 4: 队列发布成功后，正式使能中断控制器上的该中断线。
         if result.is_ok() {
             if let Some(registration) = self.irq.lock().as_ref() {
                 registration.enable();
@@ -530,23 +698,25 @@ impl Disk {
         result
     }
 
-    /// 返回 Bio 构造时绑定的真实设备身份。
+    /// 返回本块设备的全局唯一身份标识（[`DiskIdentity`]）。
     pub fn identity(&self) -> DiskIdentity {
         self.identity
     }
 
-    /// 返回本次协商的限额，不在请求路径重新读取配置。
+    /// 返回本块设备在准备阶段协商确定的队列与 DMA 硬件限制参数（[`QueueLimits`]）。
     pub fn limits(&self) -> QueueLimits {
         self.limits
     }
 
-    /// 取得本磁盘尚存活的共同元数据缓存；不在块层构造或解析文件系统。
+    /// 尝试升级并返回绑定在本磁盘上的共享元数据页缓存（[`MetadataPages`]）；若尚未绑定或已被释放则返回 `None`。
     pub(crate) fn metadata_cache(&self) -> Option<Arc<MetadataPages>> {
         self.metadata_cache.lock().upgrade()
     }
 
-    /// 候选由缓存层锁外构造，调用方须保证属于本磁盘并检查预算相容；短锁双查只发布弱引用。
-    /// 未采用的候选仍归调用方，旧弱引用在锁外释放。
+    /// 注册或复用本磁盘的共享元数据页缓存。
+    ///
+    /// 若当前已有存活的 `MetadataPages` 实例，则直接返回已有实例（忽略调用方传入的 `candidate`）；
+    /// 否则将 `candidate` 的弱引用存入 `metadata_cache` 并返回其强引用克隆。旧的失效弱引用在锁外释放。
     pub(crate) fn intern_metadata_cache(
         &self,
         candidate: &Arc<MetadataPages>,
@@ -562,7 +732,7 @@ impl Disk {
         Arc::clone(candidate)
     }
 
-    /// 析构者只摘自身 payload 身份的弱槽，复用后的新登记保持不变；返回的 Weak 须锁外释放。
+    /// 当 `MetadataPages` 析构时调用：仅当槽位中的弱引用仍指向 `identity` 时将其清空并返回，供调用方在锁外释放。
     pub(crate) fn unregister_metadata_cache(
         &self,
         identity: *const MetadataPages,
@@ -575,7 +745,7 @@ impl Disk {
         }
     }
 
-    /// 非 slot 的 Task 最后义务复用原域，并在 Bio 构造期预留独占执行栈及一次性尾部。
+    /// 在与 `progress_work` 相同的工作队列上预分配一个一次性收尾 `Work`，供需要在任务上下文执行完成回调的根 `Bio` 使用。
     pub(super) fn prepare_finalizer(
         &self,
         callback: fn(Pin<&Work>),
@@ -588,7 +758,7 @@ impl Disk {
             .map_err(|_| BlockError::NoMemory)
     }
 
-    /// 普通生成者或其独立完成 Work 在真实回调尾部归还同一 accepted 责任。
+    /// 在根 `Bio` 的拆分生成与父完成回调全部结束后，递减队列的 `generators` 计数（若为裸写请求则同时从 `raw_writers` 链表摘除），并唤醒 `quiescent` 等待队列。
     pub(super) fn finish_generation_tail(&self, bio: &BioInner) {
         {
             let mut q = self.queue.lock();
@@ -597,7 +767,9 @@ impl Disk {
             if bio.operation() == BlkOperation::Write {
                 q.writer_generators -= 1;
                 let mut link = &mut q.raw_writers as *mut *const BioInner;
-                // SAFETY: accepted 生成者保活整条链，所有链接只在此 queue 锁下修改。
+                // SAFETY:
+                // 1. 当前持有 `queue` 自旋锁，串行化对 `raw_writers` 链表的所有修改；
+                // 2. 链表中每个已准入的 `BioInner` 节点在调用本函数将其摘除前，始终由对应的请求生成者（`ActiveBio` 或收尾 `Work`）保活。
                 unsafe {
                     while !(*link).is_null() {
                         if ptr::eq(*link, bio) {
@@ -613,7 +785,7 @@ impl Disk {
         self.quiescent.wake_all();
     }
 
-    /// raw 准入没有文件系统授权，与 FS 提交共用原生成者和 slot 核心。
+    /// 准入一个不带文件系统占用凭证（裸设备访问）的根 `Bio` 请求（仅用于内核测试）。
     #[cfg(feature = "ktest")]
     pub(super) fn admit<'a>(
         self: &'a DiskRef,
@@ -622,13 +794,19 @@ impl Disk {
         self.admit_from(bio, None)
     }
 
-    /// Live 下核对实际磁盘和写来源，再在同一队列短锁中接受 root。
-    /// claim 由借用来源保活到锁外移交，复杂最后 put 不发生在准入锁中。
+    /// 校验并准入一个上层根 `Bio` 请求，成功时返回代表活跃请求生成者的 [`ActiveBio`] 守卫。
+    ///
+    /// # 准入检查（在 `queue` 自旋锁下原子执行）
+    /// 1. 队列必须处于 `QueuePhase::Live` 阶段；
+    /// 2. `bio` 的目标设备身份必须与本磁盘一致，且若提供了 `claim`（`FsClaim`），其所属磁盘及扇区范围必须完整包含本次请求；
+    /// 3. 若为写请求，磁盘与 `claim` 必须具备可写权限；若为无 `claim` 的裸设备写请求，其扇区范围不得与任何已挂载的 `FsClaim` 重叠；
+    /// 4. 通过检查后递增 `generators`（及 `writer_generators`），将裸写请求挂入 `raw_writers` 链表，并在锁外完成 DMA 映射同步（`bio.inner.begin()`）。
     pub(super) fn admit_from<'a>(
         self: &'a DiskRef,
         bio: Bio,
         claim: Option<&FsClaim>,
     ) -> Result<ActiveBio<'a>, (Bio, BlockError)> {
+        // Step 1: 在 `queue` 自旋锁下校验队列状态、目标范围与写权限，并登记请求生成者计数。
         {
             let mut q = self.queue.lock();
             let error = if !matches!(q.phase, QueuePhase::Live) {
@@ -669,7 +847,9 @@ impl Disk {
             if bio.inner.operation() == BlkOperation::Write {
                 q.writer_generators += 1;
                 if claim.is_none() {
-                    // SAFETY: 本 Bio 尚未发表，accepted 生成者保活到同锁摘链；不在锁内增加 Arc。
+                    // SAFETY:
+                    // 1. 当前 `bio` 尚未发布，且当前持有 `queue` 自旋锁；
+                    // 2. `bio.inner` 将由后续构造的 `ActiveBio`（或失败回滚时的 `finish_generation_tail`）保活至持同一把锁从 `raw_writers` 摘除。
                     unsafe {
                         *bio.inner.raw_writer_next.get() = q.raw_writers;
                     }
@@ -678,6 +858,7 @@ impl Disk {
             }
         }
 
+        // Step 2: 在锁外执行缓冲区状态切换与 DMA 缓存同步；若失败则回滚生成者计数与链表节点。
         if let Err(error) = bio.inner.begin() {
             self.finish_generation_tail(&bio.inner);
             return Err((bio, error));
@@ -694,7 +875,9 @@ impl Disk {
         })
     }
 
-    /// 先 kick 已接受前缀，再栈登记、复查、真实 park；排空只拒新 root。
+    /// 为已准入的请求生成者分配一个空闲请求槽（返回 [`PreparingSlot`] 守卫）。
+    ///
+    /// 若当前无空闲槽位，会先调用 [`Disk::unplug`] 刷出待发送通知以加速在途请求完成，随后在 `available` 等待队列上睡眠等待。
     pub(super) fn reserve_slot(&self) -> Result<PreparingSlot<'_>, BlockError> {
         loop {
             if let Some(slot) = self.try_reserve_slot()? {
@@ -703,7 +886,9 @@ impl Disk {
             self.unplug();
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 与栈 pin 节点一直保活，registration 在本轮任何退出前先撤链。
+            // SAFETY:
+            // 1. `self.available` 在本次方法调用期间始终有效；
+            // 2. `node` 固定（Pin）在当前栈帧上，且 `registration` 守卫在本轮循环退出前必定执行析构并从等待队列摘除该节点。
             let registration = unsafe { self.available.register(node.as_mut()) };
             if let Some(slot) = self.try_reserve_slot()? {
                 return Ok(slot);
@@ -714,7 +899,7 @@ impl Disk {
         }
     }
 
-    /// 在唯一 queue 锁中把空闲 tag 交给一个准备者，不触碰任何槽资源。
+    /// 尝试在 `queue` 自旋锁下查找一个处于 `Free` 状态的槽位并将其切换为 `Preparing` 状态。
     fn try_reserve_slot(&self) -> Result<Option<PreparingSlot<'_>>, BlockError> {
         let mut q = self.queue.lock();
         if !q.accepts_children() {
@@ -736,7 +921,9 @@ impl Disk {
         }))
     }
 
-    /// 在锁内认领唯一通知责任，锁外 doorbell 的真实尾部阻止并发 reset。
+    /// 刷出待发送的队列通知：若后端使用 `Work` 驱动则调度 `progress_work`；若使用硬件门铃则在 `queue` 锁内递增 `notify_active` 后在锁外执行 MMIO 通知。
+    ///
+    /// `notify_active` 计数确保在门铃写入及紧随其后的 `dma_barrier()` 彻底完成前，并发的停机/故障复位流程不会提前释放或复位设备。
     pub(super) fn unplug(&self) {
         let notification = {
             let mut q = self.queue.lock();
@@ -756,8 +943,9 @@ impl Disk {
             q.notify_active += 1;
             notification
         };
-        // SAFETY: notify_active 保持设备与映射有效，reset 先关闭认领并等此计数归零。
-        // 门铃前屏障发布描述符；门铃后屏障还必须先完成设备输出，再向另一CPU归还尾部计数。
+        // SAFETY:
+        // 1. 在 `queue` 锁内已递增 `notify_active`，硬件复位流程（`reset_claimed`）必须等待 `notify_active == 0` 后才能复位设备，因此当前设备寄存器映射必定有效；
+        // 2. 门铃写入前后均配合 `dma_barrier()`，确保描述符写入对硬件可见且门铃写入在递减 `notify_active` 前完成。
         unsafe { notification.notify::<KernelHal>() };
         KernelHal::dma_barrier();
         {
@@ -771,7 +959,9 @@ impl Disk {
         self.quiescent.wake_all();
     }
 
-    /// 关闭发表和通知认领；原生命令仍执行时保留 IRQ，由执行尾或真实 reset 关闭。
+    /// 将队列标记为故障状态（`QueuePhase::Faulting`），记录首个故障错误码并唤醒等待队列与 `progress_work` 异步执行硬件复位。
+    ///
+    /// 若后端并非正在执行同步命令（`Executing`），则立即屏蔽设备中断；否则保留中断使能直至正在执行的后端命令返回或硬件复位完成。
     pub(super) fn mark_fault(&self, error: BlockError) {
         let claimed = {
             let mut q = self.queue.lock();
@@ -803,14 +993,16 @@ impl Disk {
         }
     }
 
-    /// 续处理使用预建 Work 的现存票协议，不在 IRQ 分配。
+    /// 将预分配的设备进度工作任务（`progress_work`）排入工作队列（可在中断或持锁/无锁上下文中安全调用，不进行内存分配）。
     pub(super) fn queue_progress(&self) {
         if let Some(work) = &self.progress_work {
             let _ = work.as_ref().queue();
         }
     }
 
-    /// 本设备真实 ISR 决定共享线处理归属，配置变更与 NEEDS_RESET 都进入故障停机。
+    /// 设备中断处理核心逻辑：读取并确认硬件中断状态寄存器（ISR），根据中断原因触发故障退役或消费完成队列（`drain_used`）。
+    ///
+    /// 返回 `true` 表示本次中断确由本设备触发并已处理，返回 `false` 表示共享中断线上非本设备中断。
     fn interrupt(&self) -> bool {
         let (cause, live) = {
             let mut q = self.queue.lock();
@@ -838,11 +1030,11 @@ impl Disk {
         }
         cause.claimed || cause.fault
     }
-
-    /// 唯一 progress Work 在锁外执行 RAM 复制或一个真实原生命令，ISR 保持稳态 IRQ。
+    /// 在 `progress_work` 工作任务上下文中，按批次（最多 `IRQ_BUDGET` 个）从 `Work` 驱动后端取出已提交槽位并在锁外执行实际 I/O。
     fn progress_requests(&self) {
         crate::sched::assert_switchable();
         for _ in 0..IRQ_BUDGET {
+            // Step 1: 在 `queue` 自旋锁下从后端待处理队列取出一个 `Submitted` 槽位并将其状态切换为 `Executing`。
             let (tag, target) = {
                 let mut q = self.queue.lock();
                 if !q.accepts_children() {
@@ -859,22 +1051,27 @@ impl Disk {
                 q.slot_states[usize::from(tag)] = SlotState::Executing;
                 (tag, target)
             };
-            // SAFETY: Submitted→Executing 唯一认领固定槽；stop 等执行尾部，IRQ 只操作 mailbox，
-            // 不读取或修改本槽；原 parts 保 accepted payload 及实际 FS 占用。
+            // Step 2: 在 `queue` 锁外独占访问 `SlotResources`，根据后端类型执行内存拷贝、SD/MMC 弹跳缓冲传输或 AHCI DMA 命令。
+            // SAFETY:
+            // 1. 上一步在 `queue` 锁下将槽位状态从 `Submitted` 切换为 `Executing`，确保当前唯一的 `progress_work` 独占拥有该槽位；
+            // 2. 停机复位流程（`reset_claimed`）会等待所有 `Executing` 槽位退出，中断处理函数仅更新控制器邮箱而不触碰 `SlotResources`；
+            // 3. 槽位中的 `parts` 持有上层 `Bio` 引用与 `FsClaim`，保证目标缓冲区与扇区占用在传输期间始终有效。
             let resources = unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
             let native = !matches!(&target, WorkTarget::Ram(_));
             let result = match target {
                 WorkTarget::Ram(region) => {
                     let start = region.start + (resources.sector * SECTOR_BYTES) as usize;
-                    // SAFETY: RAM 范围独占且不与 payload 重叠，正式限额已核完整物理范围；
-                    // child 保来源到复制结束，此唯一 Work 不并行复制同一 RAM 通道。
+                    // SAFETY:
+                    // 1. `prepare_ram` 契约保证 `region` 独占且线性映射有效，请求提交前已校验扇区范围不越界且不与 `Bio` 缓冲区重叠；
+                    // 2. 单一的 `progress_work` 串行执行所有 RAM 盘拷贝，无并发写冲突。
                     unsafe {
                         copy_cpu_parts(resources, crate::arch::phys_to_virt(start) as *mut u8)
                     }
                 }
                 WorkTarget::Sdmmc(controller) => {
-                    // SAFETY: 原 payload 在 CPU 复制期，child 保所有来源；bounce 由控制器独占，
-                    // 回调只复制有界 parts，不分配、睡眠或反调设备，全部 IRQ 保持启用。
+                    // SAFETY:
+                    // 1. `resources.parts` 中的上层 `Bio` 处于 CPU 拷贝访问期且在子请求完成前保持有效；
+                    // 2. `bounce` 弹跳缓冲区由 `controller` 内部锁独占保护，闭包仅执行有界内存拷贝，不睡眠、不分配内存也不重入控制器。
                     unsafe {
                         controller.execute(
                             resources.operation,
@@ -891,8 +1088,9 @@ impl Disk {
                     }
                 }
                 WorkTarget::Ahci(controller) => {
-                    // SAFETY: Bio 已按该控制器唯一 domain 交权，SG 只引用 accepted 原范围；
-                    // Executing 和 controller Arc 保全部 owning 到硬件停止确认，CPU 不访问内容。
+                    // SAFETY:
+                    // 1. 上层 `Bio` 已按该 AHCI 控制器的 DMA 域完成缓存同步与访问权移交，`resources.sg` 仅包含有效的物理/DMA 地址段；
+                    // 2. `Executing` 状态与 `controller` 引用保证在硬件确认命令结束或复位停止前，所有物理页保持存活且 CPU 不并发访问其内容。
                     unsafe {
                         controller.execute(
                             resources.operation,
@@ -903,6 +1101,7 @@ impl Disk {
                     }
                 }
             };
+            // Step 3: 若后端控制器因硬件复位超时返回 `StopUnconfirmed`，立即将队列转入 `Quarantined` 隔离阶段并保留槽位与物理页不释放。
             if result.error == Some(BlockError::StopUnconfirmed) {
                 let mut q = self.queue.lock();
                 assert_eq!(q.slot_states[usize::from(tag)], SlotState::Executing);
@@ -910,11 +1109,12 @@ impl Disk {
                 q.phase = QueuePhase::Quarantined;
                 q.pending_notify = false;
                 drop(q);
-                // 停止未确认时不移出 parts、不完成 Bio、不收 payload；原后端仍在永久拥有槽。
+                // 硬件未能确认停止 DMA，严禁回收 `parts`、严禁完成上层 `Bio` 或释放物理页。
                 self.available.wake_all();
                 self.quiescent.wake_all();
                 return;
             }
+            // Step 4: 记录完成结果，将槽位状态切换为 `Finishing`，并在锁外派发上层完成回调。
             resources.completion = Some(result);
             {
                 let mut q = self.queue.lock();
@@ -928,18 +1128,21 @@ impl Disk {
                     self.request_retire(error);
                 }
             }
-            // execute 已归还硬件通道，再分派可能等待同盘 Read 的可睡完成者。
+            // 此时后端硬件通道已释放，可以安全派发槽位完成处理（即使完成回调中再次发起同盘读请求也不会死锁）。
             self.dispatch_slot(tag);
         }
         self.queue_progress();
     }
 
-    /// 最多消费八个真实 used；重装并复查后由预建 Work 接续，不依赖下一次 IRQ。
+    /// 从中断驱动后端（如 VirtIO）的完成环（used ring）中最多消费 `IRQ_BUDGET`（8）个已完成槽位并派发完成回调。
+    ///
+    /// 消费完毕后重新开启队列中断通知并复查完成环；若仍有未消费项，则调度预分配的 `progress_work` 继续消费。
     fn drain_used(&self) {
         let mut tags = [None; IRQ_BUDGET];
         let mut count = 0;
         let mut fault = None;
         let mut continuation = false;
+        // Step 1: 在 `queue` 自旋锁下暂时抑制设备中断，循环弹出最多 `IRQ_BUDGET` 个完成项并将对应槽位切换至 `Finishing` 状态。
         {
             let mut q = self.queue.lock();
             if !q.accepts_children() {
@@ -977,8 +1180,9 @@ impl Disk {
                             break;
                         }
                         q.slot_states[usize::from(tag)] = SlotState::Finishing;
-                        // SAFETY: Submitted→Finishing 唯一认领，真实 used 已结束本槽设备访问；
-                        // queue 锁保持槽不可复用，仅写本轮完成元数据，不访问 payload 内容。
+                        // SAFETY:
+                        // 1. 硬件已将该请求写入 used ring，`pop_completion` 内部已完成 DMA 屏障并回收硬件描述符；
+                        // 2. 当前在 `queue` 自旋锁下将状态从 `Submitted` 唯一切换为 `Finishing`，阻止其他执行流复用或并发访问该槽位的 `SlotResources`。
                         let resources =
                             unsafe { &mut *self.slots[usize::from(tag)].resources.get() };
                         resources.completion = Some(result);
@@ -1008,7 +1212,7 @@ impl Disk {
                                     })
                             });
                             if hold {
-                                // used 已推进 ring；仅保留目标 folio 的软件 WB 责任，其他 slot 继续派发。
+                                // 硬件 used ring 已正常消费，仅将该槽位号暂存在 `ktest_held_file_writeback_slots` 中延后调用 `finish_slot`。
                                 let slot = q
                                     .ktest_held_file_writeback_slots
                                     .iter_mut()
@@ -1045,10 +1249,11 @@ impl Disk {
             }
         }
 
+        // Step 2: 在 `queue` 锁外处理设备异常、唤醒等待硬件描述符的提交者，并逐个派发已完成槽位。
         if let Some(error) = fault {
             self.mark_fault(error);
         }
-        // descriptor 已经归还；准备者可以继续使用自己的 SG，无需等待回调释放 tag。
+        // 硬件描述符已在 `pop_completion` 中归还，等待描述符空间的 `PreparingSlot::publish` 任务可立即被唤醒。
         if 0 < count {
             self.available.wake_all();
         }
@@ -1060,10 +1265,11 @@ impl Disk {
         }
     }
 
-    /// Task parts 始终交专用槽 Work，进度和 reset 只分派；轻完成仍直接结束。
+    /// 派发处于 `Finishing` 状态的请求槽：若任一子片段需要在可睡眠的任务上下文中完成，则排入该槽位专属的 `completion_work`；否则直接在当前上下文调用 [`Disk::finish_slot`]。
     pub(super) fn dispatch_slot(&self, tag: u16) {
         let slot = &self.slots[usize::from(tag)];
-        // SAFETY: 调用者唯一拥有 Submitted→Finishing 的认领，本槽不可准备或二次派发。
+        // SAFETY:
+        // 调用方刚刚赢得该槽位向 `SlotState::Finishing` 的唯一状态转换，在 `finish_slot` 将其置回 `Free` 前无任何并发访问。
         let needs_task = unsafe {
             (*slot.resources.get())
                 .parts
@@ -1083,16 +1289,19 @@ impl Disk {
         }
     }
 
-    /// 在 Finishing 独占期锁外读取稳定 PDU，按真实前缀结束 parts，最后才归还 tag。
+    /// 执行 `Finishing` 槽位的最终完成处理：按实际完成的字节前缀逐个通知上层 `Bio` 子片段完成、清空槽位资源、在 `queue` 锁下将槽位状态归还为 `Free`，最后释放 `FsClaim`。
     pub(super) fn finish_slot(&self, tag: u16) {
+        // Step 1: 独占读取槽位的完成结果，若检测到设备故障则触发故障状态转换。
         let slot = &self.slots[usize::from(tag)];
-        // SAFETY: 本函数由唯一完成认领者或其专用 Work 调用；Finishing 阻止 prepare/reuse。
+        // SAFETY:
+        // 本函数仅由赢得 `Finishing` 状态的唯一执行流（或其调度的专属 `completion_work`）调用；在 Step 4 将状态置回 `Free` 前，本槽位不会被重新分配。
         let resources = unsafe { &mut *slot.resources.get() };
         let (completed, error) = completion_result(resources);
         if error == Some(BlockError::DeviceFault) {
             self.mark_fault(BlockError::DeviceFault);
         }
 
+        // Step 2: 取出所有 `RequestPart`，按照已完成字节数 `completed` 依次结算每个子片段的成功进度或错误。
         let writing = resources.operation == BlkOperation::Write;
         let mut remaining = completed;
         let parts = core::mem::replace(&mut resources.parts, [const { None }; MAX_BATCH]);
@@ -1107,6 +1316,7 @@ impl Disk {
             BioInner::finish_child(&part.bio, part.offset, part.length, progress, part_error);
         }
 
+        // Step 3: 重置槽位内的散聚表与元数据，为下一轮复用做准备。
         resources.sg.clear();
         resources.part_count = 0;
         resources.configured = false;
@@ -1117,7 +1327,7 @@ impl Disk {
             resources.ktest_read_prefix = None;
         }
 
-        // 从此处起不再访问本轮 slot 数据；其他 producer 在状态清空后可以马上重用。
+        // Step 4: 在 `queue` 自旋锁下将槽位状态置回 `Free` 并递减活跃槽位计数，随后在锁外唤醒等待队列并释放 `parts` 持有的 `FsClaim`。
         {
             let mut q = self.queue.lock();
             assert_eq!(q.slot_states[usize::from(tag)], SlotState::Finishing);
@@ -1139,11 +1349,11 @@ impl Disk {
         }
         self.available.wake_all();
         self.quiescent.wake_all();
-        // 完成观察者可早于 slot 尾被唤醒，所有 part 的占用仍保留到计数归还后。
+        // 必须在 `active_slots` 归还之后再 drop `parts`，确保 `RequestPart::_fs_claim` 覆盖整个槽位生命周期。
         drop(parts);
     }
 
-    /// 只有真实 reset 已确认才能撤 Submitted 的设备拥有期；已认领完成槽不会重复完成。
+    /// 在硬件复位已确认完成且进入 `DmaStopped` 阶段后，将所有仍处于 `Submitted` 状态的在途请求槽强制转入 `Finishing` 并以指定错误 `error` 结束。
     pub(super) fn fail_submitted_after_reset(&self, error: BlockError) {
         for index in 0..self.slots.len() {
             let claimed = {
@@ -1151,7 +1361,9 @@ impl Disk {
                 assert_eq!(q.phase, QueuePhase::DmaStopped);
                 if q.slot_states[index] == SlotState::Submitted {
                     q.slot_states[index] = SlotState::Finishing;
-                    // SAFETY: 真实 reset 已确认并屏障，本次转换唯一认领，设备不能再访问。
+                    // SAFETY:
+                    // 1. `q.phase == QueuePhase::DmaStopped` 证明硬件复位已完成且已执行 DMA 屏障，硬件不再访问任何槽位；
+                    // 2. 在 `queue` 自旋锁下将状态从 `Submitted` 唯一切换为 `Finishing`，当前执行流取得该槽位 `resources` 的独占访问权。
                     unsafe {
                         (*self.slots[index].resources.get()).forced_error = Some(error);
                     }
@@ -1167,45 +1379,44 @@ impl Disk {
         self.available.wake_all();
         self.quiescent.wake_all();
     }
-
-    /// 返回验收镜像的真实计数快照，不读取活动 DMA。
+    /// 返回内核测试统计计数器快照（[`TestSnapshot`]）。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_snapshot(&self) -> TestSnapshot {
         self.queue.lock().counters
     }
 
-    /// 对下一次真实文件 WB used 注入一次上层完成错误，不改变硬件或准入。
+    /// 内核测试钩子：为下一次完成的普通文件数据页回写（Data Writeback）请求注入一次软件完成错误 `error`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_data(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::Data, error, None);
     }
 
-    /// 对下一次真实文件原页读入的 used 注入一次上层完成错误。
+    /// 内核测试钩子：为下一次完成的普通文件数据页读入（File Read）请求注入一次软件完成错误 `error`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_file_read(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::FileRead, error, None);
     }
 
-    /// 真实文件读入成功 used 后仅交付指定扇区前缀，剩余部分保留一次软件完成错误。
+    /// 内核测试钩子：在下一次文件数据页读入请求完成时，模拟仅成功传输前 `completed` 字节（须为扇区整数倍），并对剩余部分注入错误 `error`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_file_read_after(&self, completed: usize, error: BlockError) {
         assert!(0 < completed && completed % SECTOR_BYTES as usize == 0);
         self.test_arm_completion_error(TestCompletionKind::FileRead, error, Some(completed));
     }
 
-    /// 对下一次真实共同元数据 used 注入一次完成错误。
+    /// 内核测试钩子：为下一次完成的共享元数据页回写（Metadata Writeback）请求注入一次软件完成错误 `error`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_metadata(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::Metadata, error, None);
     }
 
-    /// 对下一次真实 FLUSH used 注入一次完成错误，未协商能力仍走原拒绝。
+    /// 内核测试钩子：为下一次完成的 `Flush` 同步请求注入一次软件完成错误 `error`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_fail_next_flush(&self, error: BlockError) {
         self.test_arm_completion_error(TestCompletionKind::Flush, error, None);
     }
 
-    /// 测试控制只保存本 Disk 的一次性匹配，不伪造设备停止或 reset 确认。
+    /// 在 `queue` 自旋锁下配置单次完成错误注入规则 `(kind, error, prefix)`。
     #[cfg(feature = "ktest")]
     fn test_arm_completion_error(
         &self,
@@ -1229,13 +1440,13 @@ impl Disk {
         q.ktest_completion_error = Some((kind, error, prefix));
     }
 
-    /// 观察一次性匹配是否仍未被真实 used 消费。
+    /// 检查已配置的内核测试完成错误注入是否仍在等待匹配（尚未被任何完成项消费）。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_completion_error_pending(&self) -> bool {
         self.queue.lock().ktest_completion_error.is_some()
     }
 
-    /// 只在本例全部请求和回调结束后捕获实际 Work 票尾，不能用 idle 或定长sleep代替。
+    /// 同步等待本磁盘的进度 `Work` 与所有槽位的完成 `Work` 当前排队的任务全部执行完毕。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_flush_completions(&self) {
         if let Some(work) = &self.progress_work {
@@ -1248,7 +1459,7 @@ impl Disk {
         }
     }
 
-    /// 成功发表后才累计额外 child 与跨 Bio 合并的真实数量。
+    /// 在请求生成者成功提交全部子请求后，累加本次生成的子请求拆分次数 `splits` 与跨 `Bio` 合并次数 `merges`。
     #[cfg(feature = "ktest")]
     pub(super) fn record_generation(&self, splits: usize, merges: usize) {
         let mut q = self.queue.lock();
@@ -1256,7 +1467,7 @@ impl Disk {
         q.counters.merges += merges;
     }
 
-    /// 指定文件原页真实 Data-WB 的used到达后暂留其软件完成责任；其他I/O仍沿原IRQ与完成路径。
+    /// 内核测试钩子：指定当承载物理页 `folio` 的文件数据回写请求从硬件完成环取出后，暂缓执行其 `finish_slot` 软件完成回调（其他无关 I/O 仍正常完成）。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_hold_file_writeback(&self, folio: &crate::mm::FolioRef) {
         let mut q = self.queue.lock();
@@ -1278,7 +1489,7 @@ impl Disk {
         q.ktest_hold_file_writeback_page = Some(folio.phys_addr());
     }
 
-    /// 只有原页身份匹配的真实 used slot 已进入 Finishing 时才返回真。
+    /// 检查目标物理页 `folio` 的文件数据回写请求是否已被硬件完成并正处于 `Finishing` 暂缓状态。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_file_writeback_is_held(&self, folio: &crate::mm::FolioRef) -> bool {
         let q = self.queue.lock();
@@ -1288,7 +1499,7 @@ impl Disk {
                 .any(Option::is_some)
     }
 
-    /// 暂停本 queue 的完成消费，仍确认真实 ISR，不 mask 共享源也不伪造 used。
+    /// 内核测试钩子：暂停本磁盘完成环（used ring）的消费并屏蔽队列完成通知中断。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_suspend_completions(&self) {
         let mut q = self.queue.lock();
@@ -1300,7 +1511,7 @@ impl Disk {
             .set_interrupts(false);
     }
 
-    /// 恢复 queue 完成并重派已收 used 的暂留 slot，再用预建 Work 接续其他真实 used。
+    /// 内核测试钩子：恢复本磁盘的完成消费，派发所有暂缓的文件回写槽位（`ktest_held_file_writeback_slots`），并在存在待处理完成项时调度 `progress_work`。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_resume_completions(&self) {
         let (pending, held) = {
@@ -1328,14 +1539,14 @@ impl Disk {
         }
     }
 
-    /// 已有真实 used 时交预建进度 Work；保持 NO_INTERRUPT 到生产 drain 重装。
+    /// 内核测试钩子：解除 `test_paused` 并直接通过 `progress_work` 驱动完成环消费（由 `drain_used` 在消费结束后重新开启中断通知）。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_resume_via_progress(&self) {
         self.queue.lock().test_paused = false;
         self.queue_progress();
     }
 
-    /// 本例暂停真实 used 消费；仍允许设备 DMA 与 ISR，不改变共享 IRQ 线。
+    /// 停机测试钩子：暂停消费完成环（`pause_used = true`）并抑制队列中断，使已完成请求留在硬件 used ring 中以测试停机排空与复位交互。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_hold_used(&self) {
         let mut q = self.queue.lock();
@@ -1347,21 +1558,20 @@ impl Disk {
             .set_interrupts(false);
     }
 
-    /// 撤销本例暂停并交原进度 Work 消费真实 used；故障阶段仍不收未确认 DMA。
+    /// 停机测试钩子：解除 `pause_used` 并调度 `progress_work` 继续消费硬件完成环。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_release_used(&self) {
         self.queue.lock().ktest_stop.pause_used = false;
         self.queue_progress();
     }
 
-    /// 返回最近成功发表的单 folio 首 SG：原页物理地址、设备地址、页内偏移和字节数。
-    /// 观测者须串行安排该盘 producer，后续原页 I/O 会替换这一记录。
+    /// 返回最近一次成功提交的单 Folio 请求的首个散聚段 DMA 信息：`(物理页基址, 设备 DMA 地址, 页内偏移, 字节长度)`。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_last_folio_dma(&self) -> Option<(usize, u64, usize, usize)> {
         self.queue.lock().ktest_folio_dma
     }
 
-    /// 只在登记后复查仍无额度、即将调用真实 park 时计数。
+    /// 在任务注册等待节点并复查仍无可用资源、即将睡眠（`park()`）前递增 `resource_parks` 统计计数。
     fn count_park(&self) {
         #[cfg(feature = "ktest")]
         {
@@ -1371,7 +1581,7 @@ impl Disk {
 }
 
 impl Drop for Disk {
-    /// 析构不代替显式停止，IRQ 与 Work raw context 必须先完成全部真实尾部。
+    /// 析构断言检查：销毁 `Disk` 前必须处于从未启动的 `Prepared` 阶段或已完成显式停机的 `Stopped` 阶段，且中断与所有活跃计数均已清零。
     fn drop(&mut self) {
         let q = self.queue.lock();
         assert!(
@@ -1385,21 +1595,27 @@ impl Drop for Disk {
     }
 }
 
+/// 代表一个已通过 [`Disk::admit_from`] 准入、正在拆分子请求并提交到硬件槽位的活跃根 `Bio` 守卫。
 pub(super) struct ActiveBio<'a> {
+    /// 已准入的上层 `Bio` 内部强引用。
     pub(super) bio: BioArc,
+    /// 当前已成功拆分并提交的字节偏移进度（单位：字节）。
     pub(super) offset: usize,
+    /// 目标块设备引用。
     disk: &'a DiskRef,
+    /// 标记是否已调用 `finish_inner` 完成了生成阶段结算。
     finished: bool,
+    /// 本次提交携带的文件系统占用凭证副本，保活至生成阶段收尾完成。
     fs_claim: Option<FsClaim>,
 }
 
 impl ActiveBio<'_> {
-    /// 普通 Task 结束父生成者，未知 callback 返回后才减少 accepted 责任。
+    /// 正常或带错结束当前根 `Bio` 的子请求生成阶段，并在所有子请求及完成回调结束后归还队列 `generators` 计数。
     pub(super) fn finish(mut self, error: Option<(usize, BlockError)>) {
         self.finish_inner(error);
     }
 
-    /// 若生成者是最后义务，将可睡尾部交独立 Work，不阻塞其它父的生成结束。
+    /// 内部结算逻辑：调用 `BioInner::finish_generation`；若未延迟到异步收尾 `Work`，则立即调用 `finish_generation_tail` 归还生成者计数并释放 `fs_claim`。
     fn finish_inner(&mut self, error: Option<(usize, BlockError)>) {
         if self.finished {
             return;
@@ -1409,13 +1625,13 @@ impl ActiveBio<'_> {
         if !deferred {
             self.disk.finish_generation_tail(&self.bio);
         }
-        // 延后完成由 BioState 继续保活；同步完成在 accepted 队列尾后才解除本引用。
+        // 若完成回调被推迟到异步 `Work`，`BioInner` 内部已保留一份 `FsClaim`；若已同步完成，则在归还 `generators` 计数后安全释放。
         drop(self.fs_claim.take());
     }
 }
 
 impl Drop for ActiveBio<'_> {
-    /// 任意生成错误出口仍结束生成者义务，错误位置保已经完整发表的逻辑前缀。
+    /// 当 `ActiveBio` 未显式调用 `finish` 而提前析构时，刷出已提交的前缀请求并以 `(self.offset, BlockError::QueueStopped)` 结束生成阶段。
     fn drop(&mut self) {
         if !self.finished {
             self.disk.unplug();
@@ -1424,41 +1640,47 @@ impl Drop for ActiveBio<'_> {
     }
 }
 
+/// 代表一个处于 `SlotState::Preparing` 阶段的独占请求槽守卫，用于在 `queue` 锁外填充散聚表、合并 `Bio` 子片段并最终发布到硬件队列。
 pub(super) struct PreparingSlot<'a> {
+    /// 所属块设备引用。
     disk: &'a Disk,
+    /// 当前独占认领的槽位编号（`0..limits.tag_count`）。
     tag: u16,
+    /// 标记该槽位是否已通过 `try_publish` 成功切换为 `SlotState::Submitted`（若为 `false`，析构时会自动清理并将槽位归还为 `Free`）。
     published: bool,
 }
 
 impl PreparingSlot<'_> {
-    /// guard 唯一拥有 Preparing，资源引用不能长于 guard 的当前借用。
+    /// 返回当前槽位内部 `SlotResources` 的共享引用（生命周期绑定到当前守卫借用）。
     fn resources(&self) -> &SlotResources {
-        // SAFETY: guard 唯一且尚未发表，设备和其他 CPU 都不访问此槽资源。
+        // SAFETY:
+        // `PreparingSlot` 独占拥有处于 `SlotState::Preparing` 的槽位 `self.tag`，在发布前硬件与其他 CPU 均不会访问该槽位的 `resources`。
         unsafe { &*self.disk.slots[usize::from(self.tag)].resources.get() }
     }
 
-    /// Preparing 只有一个 Task 修改固定 SG 和 parts，queue 锁不携带这些引用。
+    /// 返回当前槽位内部 `SlotResources` 的独占可变引用（生命周期绑定到当前守卫可变借用）。
     fn resources_mut(&mut self) -> &mut SlotResources {
-        // SAFETY: &mut guard 排除同一准备者内别名；状态尚未 Submitted/Finishing。
+        // SAFETY:
+        // `&mut self` 保证了同一任务内无其他借用别名，且 `SlotState::Preparing` 状态排除了硬件与其他任务的并发访问。
         unsafe { &mut *self.disk.slots[usize::from(self.tag)].resources.get() }
     }
 
-    /// 借用当前准备中的小 SG 元数据，不借 DMA payload。
+    /// 返回当前槽位已填充的散聚段（[`PayloadRange`]）切片。
     pub(super) fn sg(&self) -> &[PayloadRange] {
         &self.resources().sg
     }
 
-    /// SG capacity 已在 prepare 完整预留，调用者不得 reserve 或超出 limits 增长。
+    /// 返回当前槽位预分配散聚表 `Vec<PayloadRange>` 的可变引用（容量已在 `Disk::prepare_backend` 中按 `limits.max_segments` 预留，调用方不得触发扩容）。
     pub(super) fn sg_mut(&mut self) -> &mut Vec<PayloadRange> {
         &mut self.resources_mut().sg
     }
 
-    /// 固定 parts 限额供显式 batch 判定，尚未登记任何 child。
+    /// 返回当前槽位已添加的 `Bio` 子片段（[`RequestPart`]）数量。
     pub(super) fn part_count(&self) -> usize {
         self.resources().part_count
     }
 
-    /// 保存一个原 Bio 的有界责任，child 仅在真正发表前登记。
+    /// 向当前请求槽追加一个上层 `Bio` 的子片段 `[offset, offset + length)`（此时尚未向 `BioInner` 登记在途子请求计数，仅在 `try_publish` 时登记）。
     pub(super) fn push_part(
         &mut self,
         bio: BioArc,
@@ -1482,13 +1704,14 @@ impl PreparingSlot<'_> {
         Ok(())
     }
 
-    /// 在 queue 锁外准备本轮稳定 PDU，原视图没有 driver 借用跨锁别名。
+    /// 在 `queue` 锁外校验散聚表与子片段总字节数及硬件对齐约束，并初始化槽位的硬件协议请求头（`SlotControl::prepare`）。
     pub(super) fn configure(
         &mut self,
         operation: BlkOperation,
         sector: u64,
         bytes: usize,
     ) -> Result<(), BlockError> {
+        // Step 1: 校验子片段数量、散聚段数量以及散聚段与子片段累加字节数是否严格等于 `bytes` 且符合逻辑块大小对齐。
         let limits = self.disk.limits;
         let resources = self.resources();
         if resources.part_count == 0
@@ -1520,6 +1743,7 @@ impl PreparingSlot<'_> {
             return Err(BlockError::InvalidRange);
         }
 
+        // Step 2: 写入后端协议控制头（如 VirtIO 请求头）并标记 `resources.configured = true`。
         let slot = &self.disk.slots[usize::from(self.tag)];
         slot.control.prepare(operation, sector)?;
         let resources = self.resources_mut();
@@ -1536,7 +1760,10 @@ impl PreparingSlot<'_> {
         Ok(())
     }
 
-    /// descriptor 暂满保留整份锁外准备，先 kick、栈登记复查，再真实 park。
+    /// 将已配置就绪的请求槽发布到后端硬件队列。
+    ///
+    /// 若后端硬件描述符（如 VirtIO indirect/chained descriptors）暂时不足，则保留当前槽位已准备好的全部数据，
+    /// 先调用 [`Disk::unplug`] 触发在途请求执行，再在 `available` 等待队列上睡眠等待描述符释放后重试。
     pub(super) fn publish(mut self) -> Result<(), BlockError> {
         if !self.resources().configured {
             return Err(BlockError::InvalidRange);
@@ -1550,7 +1777,9 @@ impl PreparingSlot<'_> {
             self.disk.unplug();
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: 栈 pin 节点和 disk 借用覆盖此轮，registration 在任何退出先撤链。
+            // SAFETY:
+            // 1. `self.disk.available` 在本次调用期间始终有效；
+            // 2. `node` 固定（Pin）在当前栈帧上，且 `registration` 守卫在本轮循环退出前必定执行析构并从等待队列摘除该节点。
             let registration = unsafe { self.disk.available.register(node.as_mut()) };
             if self.try_publish()? {
                 self.published = true;
@@ -1562,10 +1791,11 @@ impl PreparingSlot<'_> {
         }
     }
 
-    /// queue 锁中登记 child 并发表真实 avail，安装 head→tag 后才让 IRQ 观察。
+    /// 尝试在 `queue` 自旋锁下向后端提交当前槽位：若描述符不足则返回 `Ok(false)`；若成功则将槽位状态切换为 `Submitted` 并置位 `pending_notify`。
     fn try_publish(&mut self) -> Result<bool, BlockError> {
         let disk = self.disk;
         let tag = self.tag;
+        // Step 1: 在 `queue` 自旋锁下检查队列阶段与后端描述符余量，向各 `Bio` 登记子请求并提交给后端。
         let result = {
             let mut q = disk.queue.lock();
             let resources = self.resources();
@@ -1648,6 +1878,7 @@ impl PreparingSlot<'_> {
             result
         };
 
+        // Step 2: 若后端 `submit` 失败，在锁外回滚所有已登记的 `Bio` 子请求并视需要触发设备故障退役。
         match result {
             Ok(_) => Ok(true),
             Err(error) => {
@@ -1667,7 +1898,7 @@ impl PreparingSlot<'_> {
 }
 
 impl Drop for PreparingSlot<'_> {
-    /// 未发表槽只清普通准备数据，绝不读取或归还任何活动 DMA。
+    /// 若 `PreparingSlot` 在成功发布前被丢弃（例如准备阶段发生错误退出），清空已填充的散聚表与子片段并将槽位状态归还为 `Free`。
     fn drop(&mut self) {
         if self.published {
             return;
@@ -1692,7 +1923,7 @@ impl Drop for PreparingSlot<'_> {
     }
 }
 
-/// 协议后端归一真实完成，受控前缀只在成功的真实请求上生效。
+/// 从 `Finishing` 槽位的 `resources` 中提取归一化的完成结果 `(已完成字节数, 可选错误)`（优先应用 `forced_error` 与测试注入的短读前缀）。
 fn completion_result(resources: &SlotResources) -> (usize, Option<BlockError>) {
     if let Some(error) = resources.forced_error {
         return (0, Some(error));
@@ -1713,18 +1944,19 @@ fn completion_result(resources: &SlotResources) -> (usize, Option<BlockError>) {
     (result.completed, result.error)
 }
 
-/// IRQ context 来自 pinned Disk，注销同步返回前由外部控制 owner 保活。
+/// 注册给中断子系统的 C 风格回调入口，将上下文指针还原为 [`Disk`] 引用并调用 [`Disk::interrupt`]。
 ///
 /// # Safety
-/// context 必须是 register 保存的原 Disk，登记寿命内不可移动或析构。
+/// 1. `context` 必须是在 [`Disk::start`] 中通过 `irq::register` 传入的固定 [`Disk`] 实例指针；
+/// 2. [`Disk`] 实例在 [`Disk::stop`] 调用 `unregister_sync()` 同步等待本回调彻底返回之前，必须始终保持存活且地址不变。
 unsafe fn irq_callback(context: *mut ()) -> bool {
-    // SAFETY: IRQ 注册契约保活固定 Disk，执行引用直到此 handler 返回才归零。
+    // SAFETY: 调用方与 `Disk::stop` 中的 `unregister_sync` 契约保证了 `context` 指向的 `Disk` 在本函数返回前始终有效。
     unsafe { &*context.cast::<Disk>() }.interrupt()
 }
 
-/// 普通 Work 续处理预算或执行唯一故障 reset，不取得外部 control 锁也不关闭自己。
+/// 设备级进度工作任务（`progress_work`）的回调入口：根据当前队列阶段执行异步故障复位、驱动 `Work` 后端请求或接续消费完成环。
 fn progress_callback(work: Pin<&Work>) {
-    // SAFETY: 外部 stop 在关闭此 Work 的全部票尾部后才释放 pinned Disk。
+    // SAFETY: `work.context()` 在 `Disk::prepare_backend` 中固定为 `Disk` 地址，且 `Disk::stop` 在释放 `Disk` 前必定先调用 `progress_work.close_sync()` 等待本回调退出。
     let disk = unsafe { &*(work.context() as *const Disk) };
     let (phase, uses_work) = {
         let q = disk.queue.lock();
@@ -1744,29 +1976,32 @@ fn progress_callback(work: Pin<&Work>) {
     }
 }
 
-/// 专用完成 Work 只消费其本轮 Finishing 责任，槽释放后不再读任何旧数据。
+/// 槽位专属完成工作任务（`completion_work`）的回调入口：在可睡眠的任务上下文中执行 [`Disk::finish_slot`]。
 fn completion_callback(work: Pin<&Work>) {
-    // SAFETY: SlotStorage 位于固定 Vec，Disk 外部 owner 保活至此 Work close_sync 尾部。
+    // SAFETY: `work.context()` 指向固定容量 `Disk::slots` 数组中的 `SlotStorage` 元素，`Disk::stop` 在释放 `Disk` 前必定先调用每个 `completion_work.close_sync()` 等待本回调退出。
     let slot = unsafe { &*(work.context() as *const SlotStorage) };
     let tag = slot.tag;
-    // SAFETY: disk context 构造时写定，Work 关闭同步返回前 Disk 不释放。
+    // SAFETY: `slot.disk` 在 `Disk::prepare_backend` 中写定为所属 `Disk` 的固定地址，在 `completion_work` 关闭前始终有效。
     let disk = unsafe { &*slot.disk };
     disk.finish_slot(tag);
 }
 
-/// 一个已认领 child 的全部 parts 复制到连续 CPU 范围，错误保已完整复制的连续前缀。
+/// 将处于 `Executing` 状态的请求槽中所有 `RequestPart` 与连续虚拟地址缓冲区 `pointer` 之间按顺序执行 CPU 字节拷贝（用于 RAM 盘或 SD/MMC 弹跳缓冲区）。
+///
+/// 若某个子片段拷贝失败，则保留此前已成功拷贝的连续字节数 `copied` 并立即返回错误。
 ///
 /// # Safety
-/// 调用者须独占覆盖 resources.bytes 的连续范围，且它不与任何原 payload 重叠。
-/// 原 child 与 CPU 访问期保活到函数返回，唯一 progress Work 串行化通道和相交范围。
+/// 1. `pointer` 必须指向长度至少为 `resources.bytes` 的有效、可读写连续内存区域，且与所有 `resources.parts` 中的 `Bio` 缓冲区均不重叠；
+/// 2. `resources` 所属槽位必须处于唯一的 `SlotState::Executing` 阶段，所有子片段的 `Bio` 在本函数返回前保持存活且处于合法的 CPU 访问期。
 unsafe fn copy_cpu_parts(resources: &SlotResources, pointer: *mut u8) -> crate::block::IoResult {
     let mut copied = 0;
     for part in resources.parts.iter().flatten() {
         if part.length == 0 {
             continue;
         }
-        // SAFETY: 计划范围已由 parts 总长度验证，原 child 未结束且对应 CPU 访问期仍有效；
-        // 目标/源连续范围由调用者独占，固定槽资源不被 IRQ 或另一个 Work 访问。
+        // SAFETY:
+        // 1. `PreparingSlot::configure` 已验证所有 `part.length` 之和等于 `resources.bytes`，因此 `copied + part.length <= resources.bytes`，`pointer.add(copied)` 不会越界；
+        // 2. 调用方保证 `pointer` 连续区域独占有效且与 `part.bio` 缓冲区不重叠，当前槽位由唯一的 `Executing` 工作任务独占访问。
         if let Err(error) = unsafe {
             part.bio
                 .copy_cpu(part.offset, part.length, pointer.add(copied))

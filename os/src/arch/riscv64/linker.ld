@@ -1,7 +1,15 @@
 OUTPUT_ARCH(riscv)
 ENTRY(__primary_entry_phys)
 INCLUDE platform-layout.ld
-/* Sv39 使用 4KiB 基本页，每级 9 位；启动镜像以 L1 叶对齐并限制在一张 L1 表内。 */
+/*
+ * RISC-V 64 (Sv39) 内核链接脚本。
+ *
+ * 内存布局与地址空间约定：
+ * - 基础物理页大小（__page_size）为 4KiB，每级页表索引占 9 位（512 项）。
+ * - 二级大页（PMD / Mega Page，__pmd_size）为 2MiB；一级目录页（PGDIR / Giga Page，__pgdir_size）为 1GiB。
+ * - `.boot` 段保持物理地址直接执行（VMA == LMA == __kernel_phys_start），完成启动页表构建后再跳转到高半核虚拟地址（__kernel_virt_start）。
+ * - 整个内核镜像（代码、只读数据、读写数据、启动栈与页表、BSS）按 2MiB 叶项映射，总大小必须限制在单张 L1 页表（1GiB 覆盖范围，即 `RV_BOOT_IMAGE` 的 512 个 2MiB 槽位）之内。
+ */
 HIDDEN(__page_size = 4096);
 HIDDEN(__pt_index_bits = 9);
 HIDDEN(__pmd_size = __page_size << __pt_index_bits);

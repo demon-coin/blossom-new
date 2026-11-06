@@ -1,4 +1,32 @@
-//! TTY 行规程的原生队列/定时/配置消费者与宿主 duplex 阶段。
+//! TTY 行规程（`NttyState`）、终端配置编解码（`Termios` / `Winsize`）与双工串口（UART）集成测试模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于文件系统测试层（`fs::ktest::tty`），同时提供两类测试能力：
+//! 1. **行规程与 VFS 设备接口测试**：验证 `NttyState` 在规范模式（Canonical）与非规范模式（Raw）下的
+//!    输入编辑、信号生成、流控、回显、满环边界，以及 `/dev/ttyS0`、`/dev/console`、`/dev/tty` 的打开与 `ioctl` 契约；
+//! 2. **宿主双工串口（UART Stage）协同基础设施**：导出 `UartStage` 与 `SerialTtyOwner`，供本模块及
+//!    `fs::ktest::user::tty` 等用户态串口测试与宿主测试运行器进行带配额与 CRC32C 校验的串口收发握手。
+//!
+//! # 宿主双工串口握手协议（`UartStage` 状态流转）
+//! ```text
+//! [内核测试线程]                                      [宿主 ktest 运行器]
+//!       |                                                      |
+//!       +-- UartStage::begin(rx, tx, rx_delay, tx_delay)       |
+//!       |     1. 接管串口接收控制权，同步在途接收中断并冲刷工作队列 |
+//!       |     2. 输出 "# KTEST io <id> duplex <rx_len> <rx_crc> ... \n"
+//!       | ---------------------------------------------------> |
+//!       | <--------------------------------------------------- +-- 回复单字节握手 'H'
+//!       |     3. 开启 rx.len() 字节接收配额 (arm_receive_bytes)  |
+//!       | <================ 串口 RX/TX 双工收发 ================> |
+//!       +-- UartStage::finish()                                |
+//!       |     1. 等待 RX 配额耗尽、工作队列排空且 TX 发送移位器排空 |
+//!       | <--------------------------------------------------- +-- 发送 "KTEST IO OK <id>\n"
+//!       |     2. 校验用例编号匹配，按当前 Termios::CREAD 释放控制权 |
+//! ```
+//!
+//! # 锁与资源回收顺序契约
+//! - `SerialTtyOwner` 在套件级（`TtySuite`）启用串口到 TTY 子系统的接收挂钩，并在所有用例结束后的 `quiesce` 阶段关闭挂钩、排空残留工作项与发送队列；
+//! - 单条用例（`TtyOwner`）在 `quiesce` 中必须先等待所有辅助内核线程退出（`join`）并确认 `UartStage` 已正常调用 `finish()` 归还串口控制权，随后才关闭打开的 `FileRef` 与 `Vfs` 视图。
 
 use ::ktest::{TestContext, TestError, TestResult};
 use alloc::sync::{Arc, Weak};
@@ -17,7 +45,7 @@ use crate::sync::SpinLock;
 use crate::task::{JoinHandle, State, Task};
 use crate::{cpu, mm, sched, task};
 
-/// 计算 Castagnoli CRC32C，不带最终取反由边界负责。
+/// 计算给定字节切片的 Castagnoli CRC32C 校验和（包含首尾按位取反）。
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut state = u32::MAX;
     for byte in bytes {
@@ -29,7 +57,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !state
 }
 
-/// 从轮询路径读取一个控制字节。
+/// 轮询等待串口控制通道就绪并读取单个控制字节；若超时则返回 `TestError`。
 fn control_byte() -> Result<u8, TestError> {
     until("tty UART control input timed out", || {
         crate::console::receive_pending()
@@ -37,21 +65,24 @@ fn control_byte() -> Result<u8, TestError> {
     Ok(crate::ktest::control_read_byte())
 }
 
-/// 宿主 duplex 阶段的真实拥有者，负责声明、quota 与 ACK。
-/// 成功路径必须 begin→finish，finish 成功后才 inactive；body 错误或 fixture 退出时
-/// 保持 active，不在 quiesce 中伪清或补读 ACK，原 case-abort 负责终止本 VM。
+/// 宿主双工串口（UART）测试阶段的会话控制器，负责收发声明握手、接收配额管理与完成确认（ACK）校验。
+///
+/// 正常测试路径必须成对调用 `begin` 与 `finish`，仅当 `finish` 成功校验宿主 ACK 后才将状态重置为非活动。
+/// 若用例中途失败退出，`owned` 保持为 `true`，不在 `quiesce` 中跳过握手或强行重置，而是直接触发用例中止以防止污染后续串口流。
 pub struct UartStage {
-    /// 本阶段是否仍拥有 raw 通道。
+    /// 标记当前阶段是否正持有串口双工测试通道的控制权。
     owned: bool,
 }
 
 impl UartStage {
-    /// 建立未拥有任何阶段的对象。
+    /// 创建一个尚未进入双工测试阶段的 `UartStage` 控制器。
     pub fn new() -> Self {
         Self { owned: false }
     }
 
-    /// 声明本段 duplex；先同步旧 IRQ 全尾、核空环，再发送宿主声明并打开配额。
+    /// 开启一段宿主双工串口测试阶段。
+    ///
+    /// 先接管串口接收控制权、同步在途接收中断并确认软件接收环为空，随后向宿主输出双工参数声明、等待 `'H'` 握手字节，最后开放 `rx.len()` 字节的接收配额。
     pub fn begin(
         &mut self,
         _context: &TestContext<'_>,
@@ -65,6 +96,7 @@ impl UartStage {
         }
         let id = crate::ktest::active_case().ok_or(TestError("tty UART IO outside case"))?;
         self.owned = true;
+        // Step 1: 接管串口接收控制权，同步在途接收中断并冲刷 TTY 接收工作队列，确保软件接收环为空。
         crate::console::testing::claim_receive_control();
         crate::console::testing::synchronize_receive_irq()?;
         crate::fs::tty::flush_work();
@@ -72,6 +104,7 @@ impl UartStage {
             return Err(TestError("tty RX ring is not empty before stage"));
         }
 
+        // Step 2: 向宿主发送包含期望收发字节数、CRC32C 校验值与延迟参数的双工测试声明，并等待宿主返回 'H' 握手确认。
         crate::ktest::report::write(format_args!(
             "  # KTEST io {} duplex {} {:08x} {} {} {:08x} {}\n",
             id,
@@ -85,29 +118,33 @@ impl UartStage {
         if control_byte()? != b'H' {
             return Err(TestError("tty duplex handshake mismatch"));
         }
+        // Step 3: 握手成功后开放指定字节数的 TTY 串口接收配额。
         crate::console::testing::arm_receive_bytes(rx.len());
         Ok(())
     }
 
-    /// quota 耗尽后排空环、drain、读 ACK，再按 CREAD 释放控制。
+    /// 结束当前双工串口测试阶段：等待接收配额耗尽、排空接收工作队列与发送缓冲区、读取并校验宿主 `"KTEST IO OK <id>"` 确认行，最后按当前 `CREAD` 配置释放串口接收控制权。
     pub fn finish(&mut self) -> TestResult {
         if !self.owned {
             return Err(TestError("tty UART stage is not active"));
         }
+        // Step 1: 等待预设的串口接收配额被全部消费完毕。
         until("tty RX quota was not consumed", || {
             crate::console::testing::receive_quota_remaining().is_none()
         })?;
-        // 阶段边界允许重复 flush 至环空，Work 票前缀非全 RX 消完。
+        // Step 2: 循环冲刷 TTY 工作队列直至控制台软件接收环完全排空（单次工作队列执行存在批处理预算上限，因此需循环至环空）。
         loop {
             crate::fs::tty::flush_work();
             if crate::console::testing::receive_queue_empty() {
                 break;
             }
         }
+        // Step 3: 等待 TTY 输出队列与硬件发送移位器（TEMT）排空，并再次冲刷工作队列。
         crate::fs::tty::drain(FileIoContext::Kernel)
             .map_err(|_| TestError("tty drain failed before ACK"))?;
         crate::fs::tty::flush_work();
 
+        // Step 4: 从控制通道逐字节读取宿主返回的确认行（以 '\n' 结尾），校验 "KTEST IO OK <case_id>" 与当前活动用例 ID 一致。
         let mut line = [0u8; 64];
         let mut length = 0;
         loop {
@@ -141,32 +178,34 @@ impl UartStage {
             return Err(TestError("tty ACK case mismatch"));
         }
 
+        // Step 5: 根据当前 Termios 的 CREAD 标志恢复串口接收状态，并释放测试阶段独占控制权。
         let receiver = crate::fs::tty::termios().cflag & crate::fs::tty::termios::CREAD != 0;
         crate::console::testing::release_receive_control(receiver);
         self.owned = false;
         Ok(())
     }
 
-    /// 返回本阶段是否仍拥有 raw 通道。
+    /// 返回当前是否正处于尚未结束的双工串口测试阶段。
     pub fn active(&self) -> bool {
         self.owned
     }
 }
 
 impl Default for UartStage {
-    /// 建立未拥有阶段的对象。
+    /// 创建默认的非活动 `UartStage` 实例。
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// 本组测试拥有唯一串口的 TTY 接收附着，常驻端点、Work 与 IRQ 仍由生产服务保活。
+/// 串口 TTY 接收通道的套件级挂载守卫，负责在测试套件运行期间启用串口到 TTY 行规程的输入转发，并在套件结束时安全解绑。
 pub(super) struct SerialTtyOwner {
+    /// 标记当前是否已启用串口到 TTY 子系统的接收转发。
     attached: bool,
 }
 
 impl SerialTtyOwner {
-    /// 在首例基线前同步旧接收尾部，恢复合法配置后按真实 CREAD 解除临时控制。
+    /// 在套件初始化阶段接管串口接收控制权、启用 TTY 接收转发、排空残留输入并恢复默认 `Termios` 配置。
     pub(super) fn attach() -> Result<Self, TestError> {
         crate::console::testing::claim_receive_control();
         crate::console::testing::set_tty_receive(true)?;
@@ -176,7 +215,7 @@ impl SerialTtyOwner {
         Ok(Self { attached: true })
     }
 
-    /// 全部任务、文件与 raw 阶段结束后停止新 TTY RX，真实排完已接受字节才恢复 Raw。
+    /// 在套件所有测试用例结束后关闭新的 TTY 串口接收转发，排空已接收字节与待发送回显后恢复原始串口控制状态。
     pub(super) fn stop(&mut self) -> TestResult {
         if !self.attached {
             return Ok(());
@@ -190,7 +229,7 @@ impl SerialTtyOwner {
         Ok(())
     }
 
-    /// RX producer 已同步停止后，等待环、Work、echo/output 与 TEMT，再清退休输入。
+    /// 在串口接收生产端已停止的前提下，循环冲刷工作队列与接收环、等待输出排空（`drain`），并通过 `TCSAFLUSH` 重置为默认 `Termios`。
     fn finish_receive() -> TestResult {
         loop {
             crate::fs::tty::flush_work();
@@ -211,17 +250,18 @@ impl SerialTtyOwner {
     }
 }
 
+/// TTY 测试套件的共享资源夹具，管理套件级串口接收挂载状态以及内存与任务元数据基线。
 struct TtySuite {
-    /// 本组真实接收附着的结束责任。
+    /// 套件级串口 TTY 接收通道挂载守卫。
     serial: SerialTtyOwner,
-    /// 同一 VM 的整组资源基线。
+    /// 套件开始前的物理内存与堆分配六域统计基线。
     memory: mm::MemoryStats,
-    /// 同一 VM 的任务元数据基线。
+    /// 套件开始前的任务与工作队列元数据统计基线。
     metadata: crate::workqueue::testing::MetadataStats,
 }
 
 impl ::ktest::Fixture for TtySuite {
-    /// 常驻服务停稳并附着 TTY 接收后保存同一 VM 的整组资源。
+    /// 等待后台日志、定时器与工作队列服务进入阻塞稳态，挂载串口 TTY 接收通道并记录套件级资源基线。
     fn set_up(_context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         crate::klog::testing::wait_service_blocked();
         until("tty timer services did not block", || {
@@ -246,12 +286,12 @@ impl ::ktest::Fixture for TtySuite {
         })
     }
 
-    /// 全部 case 已释放自己的拥有后，真实停止本组接收并恢复 Raw。
+    /// 在套件内全部测试用例完成后关闭串口 TTY 接收转发并排空残留数据。
     fn quiesce(&mut self, _context: &mut TestContext<'_>) -> TestResult {
         self.serial.stop()
     }
 
-    /// 接收已恢复 Raw 后核第二层六域及任务元数据。
+    /// 校验串口接收已解绑，并断言套件运行前后的内存六域统计与任务元数据统计完全归零复原。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert!(
             !self.serial.attached,
@@ -271,27 +311,28 @@ impl ::ktest::Fixture for TtySuite {
     }
 }
 
+/// 单条 TTY 测试用例的资源与执行环境夹具。
 struct TtyOwner {
-    /// 本例资源基线。
+    /// 本用例开始前的内存六域统计基线。
     before: mm::MemoryStats,
-    /// 本例任务元数据基线。
+    /// 本用例开始前的任务与工作队列元数据统计基线。
     metadata: crate::workqueue::testing::MetadataStats,
-    /// 真实子任务句柄。
+    /// 本用例启动的辅助内核任务汇合句柄列表。
     joins: Vec<JoinHandle>,
-    /// 子任务弱身份观察。
+    /// 当前受观察辅助内核任务的弱引用槽位，用于检测该任务是否已进入 `State::Blocked`。
     observer: Option<Arc<SpinLock<Option<Weak<Task>>>>>,
-    /// 宿主阶段拥有者。
+    /// 本用例的宿主双工串口阶段控制器。
     stage: UartStage,
-    /// 本例 devfs 视图。
+    /// 本用例按需创建的独立 `devfs` 虚拟文件系统实例。
     vfs: Option<Arc<crate::fs::Vfs>>,
-    /// 本例文件系统上下文。
+    /// 本用例的 VFS 路径解析上下文（根目录与当前工作目录）。
     context: Option<crate::fs::FsContext>,
-    /// 本例打开的真实 TTY 文件。
+    /// 本用例已打开的 TTY 设备文件引用列表。
     files: Vec<FileRef>,
 }
 
 impl TtyOwner {
-    /// 显式 join 全部子任务并结束观察拥有。
+    /// 等待本用例启动的所有辅助内核任务执行完毕并脱离内核栈，同时清空任务观察器。
     fn join(&mut self, context: &mut TestContext<'_>) {
         while let Some(join) = self.joins.pop() {
             context.expect_eq(join.join(), 0);
@@ -299,7 +340,7 @@ impl TtyOwner {
         self.observer = None;
     }
 
-    /// 发表记录弱身份的真实内核任务。
+    /// 在当前 CPU 上创建并启动一个辅助内核任务，在执行 `action` 前先将其 `Weak<Task>` 写入 `observer` 以便主测试线程观测其阻塞状态。
     fn run(&mut self, action: impl FnOnce() -> i32 + Send + 'static) -> TestResult {
         let observer =
             Arc::try_new(SpinLock::new(None)).map_err(|_| TestError("tty task observer OOM"))?;
@@ -314,7 +355,7 @@ impl TtyOwner {
         Ok(())
     }
 
-    /// 观察子任务是否真实阻塞。
+    /// 检查最近启动的受观察辅助内核任务当前是否已处于调度器 `State::Blocked` 状态。
     fn blocked(&self) -> bool {
         self.observer
             .as_ref()
@@ -322,7 +363,7 @@ impl TtyOwner {
             .is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
 
-    /// 建立本例独立 devfs 并保存视图与上下文。
+    /// 为本用例创建独立的内存 `devfs` 实例、Inode 缓存与 `Vfs` 根视图，并保存在夹具中。
     fn prepare_view(&mut self, context: &TestContext<'_>) -> TestResult {
         let fs = checked(context, crate::fs::devfs::try_new(0o755))?;
         let cache = Arc::try_new(checked(context, crate::fs::InodeCache::try_new(16))?)
@@ -344,7 +385,7 @@ impl TtyOwner {
         Ok(())
     }
 
-    /// 用生产路径解析并打开真实 TTY，保存 FileRef 供正文调用。
+    /// 在本用例的 `devfs` 视图中解析并按指定标志位打开目标 TTY 设备节点（如 `b"/ttyS0"` 或 `b"/console"`），将返回的 `FileRef` 存入 `self.files`。
     fn open_tty(&mut self, context: &TestContext<'_>, name: &[u8], flags: u32) -> TestResult {
         if self.vfs.is_none() {
             self.prepare_view(context)?;
@@ -363,12 +404,12 @@ impl TtyOwner {
         Ok(())
     }
 
-    /// 借用本例已打开的 TTY。
+    /// 按索引借用本用例已打开的 TTY 设备文件引用。
     fn tty(&self, index: usize) -> &FileRef {
         &self.files[index]
     }
 
-    /// 释放本例视图与文件，子任务已离栈后调用。
+    /// 关闭并清空本用例打开的所有 TTY 文件引用，并释放 `FsContext` 与 `Vfs` 视图（须在所有辅助子任务退出后调用）。
     fn release(&mut self) {
         self.files.clear();
         drop(self.context.take());
@@ -377,7 +418,7 @@ impl TtyOwner {
 }
 
 impl ::ktest::Fixture<TtySuite> for TtyOwner {
-    /// 每例在任何临时对象准备前保存资源。
+    /// 在单条 TTY 用例开始前记录内存六域与任务元数据基线，并初始化空的任务、串口阶段与文件视图容器。
     fn set_up(_context: &mut TestContext<'_>, _suite: &TtySuite) -> Result<Self, TestError> {
         Ok(Self {
             before: settled()?,
@@ -391,7 +432,7 @@ impl ::ktest::Fixture<TtySuite> for TtyOwner {
         })
     }
 
-    /// 子任务离栈、阶段 inactive 后才释放本例文件与视图。
+    /// 在单条用例结束时汇合所有辅助子任务、确认串口双工阶段已正常关闭，随后释放本用例打开的 TTY 文件与 VFS 视图。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.join(context);
         if self.stage.active() {
@@ -401,7 +442,7 @@ impl ::ktest::Fixture<TtySuite> for TtyOwner {
         Ok(())
     }
 
-    /// 全部拥有结束后核本例完整六域与元数据。
+    /// 销毁用例夹具并校验内存六域统计与任务/工作队列元数据是否完全恢复至用例开始前的基线。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let before = self.before;
         let metadata = self.metadata;
@@ -420,16 +461,19 @@ impl ::ktest::Fixture<TtySuite> for TtyOwner {
     }
 }
 
-/// 父模块只保留此真实宏锚点。
+/// 导出 TTY 测试套件的注册锚点供父模块挂载。
 pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
     cases::__ktest_anchor()
 }
 
+/// TTY 行规程、终端 ABI 编解码与串口 I/O 集成测试套件。
 #[ktest::suite(fixture = TtyOwner, suite_resources = TtySuite, context = "Thread", tags("fs-tty"), timeout_ms = 45000)]
 pub(crate) mod cases {
     use super::*;
 
-    /// 四字段完整转换与 signed pid_t 边界直接消费正式 ABI codec。
+    /// 验证 `pid_t` 编解码边界、`Winsize` 窗口尺寸四字段序列化以及 `Termios`（含 `TOSTOP`）往返转换。
+    ///
+    /// - **测试目标**：确认终端控制 `ioctl` 使用的 `pid_t`、`Winsize` 和 `Termios` 二进制编解码器严格保留全部字段并拒绝负数 PID。
     #[test]
     fn control_abi_codecs_preserve_all_fields(
         _context: &mut TestContext<'_>,
@@ -466,7 +510,9 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 信号效果保持 strip、literal-next、NOFLSH、BRKINT 与同批后继合法输入。
+    /// 验证输入信号字符（`VINTR` / `VQUIT` / `VSUSP`）与 `ISTRIP`、`VLNEXT` 字面转义、`NOFLSH` 及 `BRKINT` / `IGNBRK` 的交互顺序和冲刷边界。
+    ///
+    /// - **测试目标**：确认信号触发时默认清空已缓存的输入/输出队列但保留同批后续输入；启用 `VLNEXT` 时将信号字节作为普通数据入队；启用 `NOFLSH` 时只产生信号而不清空输入队列。
     #[test]
     fn input_signals_preserve_order_and_flush_boundary(
         _context: &mut TestContext<'_>,
@@ -558,7 +604,9 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// Kernel 裸指针与无用户身份的 tty 打开只返回正式边界错误。
+    /// 验证在内核调用上下文（`FileIoContext::Kernel`）下传入裸指针执行用户态专属 `ioctl` 命令或打开 `/dev/tty` 时，返回明确的错误码。
+    ///
+    /// - **测试目标**：确认需要用户地址空间或进程控制终端上下文的操作在 `FileIoContext::Kernel` 下被安全拒绝（分别返回 `InvalidOperation` 与 `NoDeviceAddress`）。
     #[test]
     fn control_requests_reject_kernel_pointer_context(
         context: &mut TestContext<'_>,
@@ -591,7 +639,7 @@ pub(crate) mod cases {
 
     use crate::fs::SeekFrom;
 
-    /// 默认 termios 的 36 字节编解码与 Linux 默认值一致。
+    /// 验证 `Termios::default()` 的 36 字节二进制序列化与反序列化结果同标准 Linux 默认终端属性一致。
     #[test]
     fn termios_codec_matches_linux_default(
         _context: &mut TestContext<'_>,
@@ -616,7 +664,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 未选择的延迟、大小写与流控位返回真实 EINVAL。
+    /// 验证 `Termios::from_bytes` 拒绝包含未实现标志位（如特定延迟掩码、大小写转换或硬件流控位）的配置字节流。
     #[test]
     fn termios_rejects_unselected_bits(
         _context: &mut TestContext<'_>,
@@ -640,7 +688,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 规范记录的换行提交语义正确。
+    /// 验证规范模式（`ICANON`）下收到换行符 `'\n'` 后立即提交当前行记录并可供读取。
     #[test]
     fn canonical_record_newline(
         _context: &mut TestContext<'_>,
@@ -658,7 +706,9 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 空 EOF 只产生一次零 read，含内容 EOF 提交内容不交控制字节。
+    /// 验证规范模式下 `VEOF`（Ctrl-D）在空行与非空行中的不同提交语义。
+    ///
+    /// - **测试目标**：确认空行收到 `VEOF` 时产生一次零长度读取（`eof = true`），非空行收到 `VEOF` 时立即提交已输入的字符且不将 `0x04` 控制字节本身混入返回数据。
     #[test]
     fn canonical_eof_empty_and_content(
         _context: &mut TestContext<'_>,
@@ -686,7 +736,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// ERASE 擦除单字节。
+    /// 验证规范模式下 `VERASE`（`0x7f`）擦除前一个单字节 ASCII 字符。
     #[test]
     fn canonical_erase_single(
         _context: &mut TestContext<'_>,
@@ -703,7 +753,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// IUTF8 擦除只回退真实字符边界。
+    /// 验证启用 `IUTF8` 时，`VERASE` 按 UTF-8 多字节字符边界回退整字符（如 2 字节的 `'é'`），而非仅删除单个尾字节。
     #[test]
     fn canonical_erase_utf8_boundary(
         _context: &mut TestContext<'_>,
@@ -721,7 +771,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// CR/LF 映射与 ISTRIP 语义正确。
+    /// 验证输入路径上的 `ICRNL`（回车 `'\r'` 映射为换行 `'\n'`）与 `ISTRIP`（剥离最高位第 7 位）转换语义。
     #[test]
     fn input_mapping_and_strip(
         _context: &mut TestContext<'_>,
@@ -752,7 +802,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// Ctrl-S 停输出但 RX 继续，Ctrl-Q 恢复。
+    /// 验证软件流控（`IXON`）下收到 `VSTOP`（Ctrl-S，`19`）暂停输出但不阻塞后续输入入队，收到 `VSTART`（Ctrl-Q，`17`）恢复输出。
     #[test]
     fn input_flow_stop_continues_rx(
         _context: &mut TestContext<'_>,
@@ -777,7 +827,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 输出 ONLCR 扩展 LF 为两字节。
+    /// 验证输出处理开启 `OPOST | ONLCR` 时，单个换行符 `'\n'` 被扩展为 `"\r\n"` 两字节写入输出缓冲区。
     #[test]
     fn output_onlcr_expands_lf(
         _context: &mut TestContext<'_>,
@@ -790,7 +840,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 输出 TAB3 按列展开，满时不消费输入。
+    /// 验证 `TAB3` 将水平制表符 `'\t'` 按当前列位置展开为空格，且当输出缓冲区剩余空间不足以容纳展开后的全部字节时不消费该输入字节。
     #[test]
     fn output_tab3_and_full_reserve(
         _context: &mut TestContext<'_>,
@@ -812,7 +862,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 连续 VDISCARD 在停发且不泵输出时立即退休旧待发状态，恢复后保输入顺序和新输出。
+    /// 验证在输出暂停状态下连续收到 `VDISCARD`（Ctrl-O）时，第一次立即清空待发送输出、回显与重印快照并置位 `FLUSHO`，第二次清除 `FLUSHO` 标志，且恢复输出后不影响输入队列顺序与新输出写入。
     #[test]
     fn vdiscard_toggles_output_flush(
         _context: &mut TestContext<'_>,
@@ -845,7 +895,7 @@ pub(crate) mod cases {
         assert_eq!(reprint.bytes[0], b'a');
         assert_eq!(reprint.done, 0);
 
-        // 旧回显与快照由真实输入生成；关闭后继回显，单独观察丢弃边界的退休效果。
+        // 先通过前面的输入生成待发送回显与重印快照，随后关闭 ECHO 标志，以便单独观测 VDISCARD 对已有待发送状态的清理效果。
         state.termios.lflag &= !ECHO;
         let termios = state.termios;
         assert!(!state.flusho());
@@ -895,7 +945,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// poll 规范未提交不就绪，提交后就绪。
+    /// 验证规范模式下 `poll_readable()` 在行未提交前返回 `false`，收到换行符提交后返回 `true`。
     #[test]
     fn poll_canonical_committed(
         _context: &mut TestContext<'_>,
@@ -916,7 +966,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// poll 非规范 MIN 门限。
+    /// 验证非规范模式（`!ICANON`）下 `poll_readable()` 仅当输入队列字节数达到 `c_cc[VMIN]` 门限时才返回 `true`。
     #[test]
     fn poll_noncanonical_min(
         _context: &mut TestContext<'_>,
@@ -938,7 +988,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// IMAXBEL 在输入满时响铃，overrun 计数真实。
+    /// 验证输入缓冲区满（4096 字节）后再收到新字节时：丢弃新字节、递增 `overrun` 溢出计数，并在启用 `IMAXBEL` 时向输出队列压入响铃字节。
     #[test]
     fn imaxbel_and_overrun_are_real(
         _context: &mut TestContext<'_>,
@@ -965,7 +1015,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// BRKINT 本地清空输入与回显，不冒称信号递送。
+    /// 验证启用 `BRKINT`（且未启用 `ISIG`）时，收到串口 Break 状态条件会在本地清空输入队列与回显队列。
     #[test]
     fn brkint_flushes_locally(
         _context: &mut TestContext<'_>,
@@ -986,7 +1036,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 真实打开 /ttyS0 与 /console，以设备号和操作错误核对各自文件语义。
+    /// 验证打开 `/dev/ttyS0` 与 `/dev/console` 后的设备号（`rdev`）以及不支持的文件操作（`seek`、`sync_range`、`truncate`、未知或内核态 `ioctl`）返回预期错误码。
     #[test]
     fn real_open_capabilities_poll_and_stat(
         context: &mut TestContext<'_>,
@@ -1016,7 +1066,7 @@ pub(crate) mod cases {
             first.ioctl(0xffff, 0, FileIoContext::Kernel).err(),
             Some(crate::fs::FsError::NotTty)
         );
-        // Kernel 上下文对已识别命令报 InvalidOperation，不解引用裸指针。
+        // 内核上下文（FileIoContext::Kernel）对需要用户态缓冲区的已识别 ioctl 命令返回 InvalidOperation。
         assert_eq!(
             first.ioctl(0x5401, 0, FileIoContext::Kernel).err(),
             Some(crate::fs::FsError::InvalidOperation)
@@ -1024,7 +1074,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 4095 长行 VKILL 按列差生成精确退格，后继 y 有序。
+    /// 验证在 4095 字节满编辑行上触发 `VKILL`（Ctrl-U，`21`）时，按列宽精确生成 4095 组退格擦除序列 `"\x08 \x08"`，且后续输入的字符 `'y'` 严格排在擦除序列之后输出。
     #[test]
     fn kill_line_op_emits_exact_backspaces(
         _context: &mut TestContext<'_>,
@@ -1089,7 +1139,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 4090 行 REPRINT 操作留头，后继 Z 入尾，展开保序。
+    /// 验证在 4090 字节未提交行上触发 `VREPRINT`（Ctrl-R，`18`）并紧跟输入 `'Z'` 时，输出流严格按照“原 4090 字节回显 → `^R\n` → 4090 字节重印快照 → `'Z'`”的顺序分段生成。
     #[test]
     fn reprint_snapshot_order_with_control_prefix(
         _context: &mut TestContext<'_>,
@@ -1143,7 +1193,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 满队 VEOF 挂起，短读腾格即发表，新 Z 后于旧记录与 EOF。
+    /// 验证当输入环被 4096 字节已提交记录占满时，紧随其后的 `VEOF` 被挂起（阻塞后续普通字节入队），一旦读取消费腾出 1 字节空间即优先发布该 `EOF` 标记，随后才接纳新的输入字符。
     #[test]
     fn pending_eof_blocks_data_then_publishes_first(
         _context: &mut TestContext<'_>,
@@ -1173,7 +1223,7 @@ pub(crate) mod cases {
         assert_eq!(state.input.len(), 4096);
         assert!(overrun < state.overrun);
 
-        // 短读 1 腾格，EOF 即发表，后继 Z 仍满应 overrun。
+        // Step 1: 短读消费 1 个字节腾出环空间，此时挂起的 VEOF 立即占位发布；环再次填满，后续输入的 'Z' 仍触发溢出（overrun）。
         let mut out = [0u8; 4096];
         let (length, eof) = state.peek_canonical(&mut out[..1]);
         assert_eq!((length, eof), (1, false));
@@ -1186,7 +1236,7 @@ pub(crate) mod cases {
         });
         assert!(overrun < state.overrun);
 
-        // 读完旧记录余部，EOF 零记录在前，新 Z 换行后交付。
+        // Step 2: 读完旧记录剩余的 4095 字节，紧接着读出零长度的 EOF 记录；此时输入环排空，新输入的 "Z\n" 正常入队并交付。
         let (length, eof) = state.peek_canonical(&mut out);
         assert_eq!(length, 4095);
         assert!(!eof);
@@ -1208,7 +1258,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 真 raw 满队 4096 字节可读，NUL/FF/控制字节原样交付。
+    /// 验证纯原始模式（Raw Mode）下输入环可写满全部 4096 字节，且包含 `0x00`、`0xff` 及各类控制字符在内的所有字节均原样无损读出。
     #[test]
     fn raw_full_queue_reads_exact_bytes(
         _context: &mut TestContext<'_>,
@@ -1238,7 +1288,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// canonical 4095 数据+LF 满行，短读拼回含 LF 完整行。
+    /// 验证规范模式下连续输入 4096 个普通字符 `'a'` 时，第 4096 个 `'a'` 因需预留行尾定界符槽位而触发 `overrun`（仅保留 4095 个 `'a'`），随后输入的 `'\n'` 可填入第 4096 格并通过多次短读完整拼回。
     #[test]
     fn canonical_full_line_eol_and_short_read(
         _context: &mut TestContext<'_>,
@@ -1251,7 +1301,7 @@ pub(crate) mod cases {
                 status: 0x01,
             });
         }
-        // 第 4096 个 a 超 4095 数据上限计 overrun，不入环。
+        // 第 4096 个 'a' 超出规范模式单行 4095 数据字节上限，计入 overrun 而不写入接收环，为行尾换行符保留最后 1 个槽位。
         assert_eq!(state.input.len(), 4095);
         assert_eq!(state.overrun, 1);
         assert!(!state.poll_readable());
@@ -1278,7 +1328,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 两条记录短读不越界。
+    /// 验证规范模式下缓冲区内连续存放两条已提交行记录（`"hi\n"` 与 `"bye\n"`）时，单次读取严格在第一条记录末尾截断，不会越过行边界读取第二条记录。
     #[test]
     fn canonical_two_records_short_read(
         _context: &mut TestContext<'_>,
@@ -1299,7 +1349,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 数据+EOF 切 raw 后只交付数据字节，已解释 VEOF 不变 NUL。
+    /// 验证规范模式下输入 `"ab\x04"`（含 `VEOF` 提交）后切换至非规范模式（Raw Mode）时，仅交付数据字节 `"ab"`，已作为行尾定界符消费的 `VEOF` 不会变成额外的数据字节。
     #[test]
     fn data_eof_to_raw_retires_token(
         _context: &mut TestContext<'_>,
@@ -1317,7 +1367,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 空 EOF 切 raw 后无数据可读。
+    /// 验证规范模式下仅收到单个空 `VEOF`（`0x04`）后立即切换至非规范模式时，该空 `EOF` 标记被清理，非规范模式下无任何字节可读。
     #[test]
     fn empty_eof_to_raw_reads_nothing(
         _context: &mut TestContext<'_>,
@@ -1335,7 +1385,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// raw 0x04 切 canonical 后保持数据字节，不重解释为 EOF。
+    /// 验证非规范模式下作为普通数据入队的 `0x04` 字节，在切换回规范模式后仍保持为普通未提交数据字节，不会被事后重新解释为 `VEOF`。
     #[test]
     fn raw_0x04_to_canonical_stays_data(
         _context: &mut TestContext<'_>,
@@ -1355,7 +1405,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// TCOOFF 下写满阻塞，TCFLSH 输出唤醒阻塞写者，TCOON 后排空。
+    /// 验证在 `TCOOFF` 暂停串口输出并写满输出缓冲区导致写线程阻塞后，调用 `TCFLSH` 清空输出队列能够立即唤醒阻塞写者并使其写入新字节，随后 `TCOON` 恢复输出可将新字节通过 UART 通道发送至宿主。
     #[test]
     #[ktest(resources("uart"))]
     fn blocked_writer_wakes_on_output_flush(
@@ -1386,7 +1436,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 校验错误与break标记完整保序，近满环不发表半个错误序列。
+    /// 验证启用 `INPCK | PARMRK` 时奇偶校验错误与 Break 条件的三字节转义序列（`0xff 0x00 <byte>`）以及 `0xff` 双写转义（`0xff 0xff`），且当输入环剩余空间不足以容纳完整转义序列时原子拒绝整组字节并计入 `overrun`。
     #[test]
     fn parity_marking_is_atomic_at_capacity(
         _context: &mut TestContext<'_>,
@@ -1428,7 +1478,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 高位CR和STOP/START先strip，再执行映射或流控解释。
+    /// 验证启用 `ISTRIP` 时，最高位为 1 的回车符（`0x8d`）和流控字符（`0x93` / `0x91`）先剥离最高位变为 `'\r'`、Ctrl-S、Ctrl-Q，随后再正常触发 `ICRNL` 换行映射与 `IXON` 流控暂停/恢复。
     #[test]
     fn strip_precedes_mapping_and_flow_control(
         _context: &mut TestContext<'_>,
@@ -1463,7 +1513,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 已提交旧记录占用容量时，新编辑尾仍为实际LF保留总环末格。
+    /// 验证当输入环中已有未读完的已提交旧记录（如 4 字节 `"old\n"`）占用空间时，新编辑行的最大数据长度仍以整个 4096 字节环的剩余空间减 1 计算，确保最后 1 个槽位始终保留给行尾换行符 `'\n'`。
     #[test]
     fn canonical_ending_slot_includes_old_records(
         _context: &mut TestContext<'_>,
@@ -1498,7 +1548,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// ONOCR抑制重显中的CR时快照游标仍完成，后继字节不丢失。
+    /// 验证启用 `ONOCR`（在列 0 处抑制回车符 `'\r'` 输出）时，即使 `VREPRINT` 重印快照中包含大量被抑制输出的 `'\r'`，重印游标仍能正常推进直至完成，不会卡死或丢失后续字符 `'Z'` 的回显。
     #[test]
     fn reprint_suppressed_carriage_returns_advance(
         _context: &mut TestContext<'_>,
@@ -1537,7 +1587,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 没有打开OFD时仍跨64项预算退休真实RX，结束阶段核软件环为空。
+    /// 验证在没有任何进程打开 TTY 文件描述符的情况下，串口连续收到超过单次工作队列预算（64 项）的 65 字节输入时，后台工作队列仍会自动续调排空全部硬件接收字节，阶段结束时软件接收环为空。
     #[test]
     #[ktest(resources("uart"))]
     fn rx_without_open_continues_past_work_budget(
@@ -1551,7 +1601,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// 末OFD关闭后已接受的4098字节回显尾部仍通过真实UART完整发送。
+    /// 验证当最后一个打开的 TTY 文件描述符关闭时，此前已被行规程接收并生成的 4098 字节控制字符回显（2049 个 `"^A"`）在 `TCOON` 恢复输出后仍能通过 UART 通道完整发送给宿主。
     #[test]
     #[ktest(resources("uart"))]
     fn accepted_echo_finishes_after_last_close(
@@ -1591,7 +1641,7 @@ pub(crate) mod cases {
         Ok(())
     }
 
-    /// PARMRK 的 VEOL/VEOL2 扩展可用总环末两格，容量不足时整组拒存且保留旧记录。
+    /// 验证在启用 `PARMRK` 且将行结束符 `VEOL` / `VEOL2` 设为 `0xff` 时，行尾结束符所需的双字节转义（`0xff 0xff`）可使用输入环的最后两个槽位提交整行；若剩余空间不足 2 字节，则原子拒绝该结束符、递增 `overrun` 并保持已提交旧记录与当前未提交编辑行完好。
     #[test]
     fn parmrk_record_ending_uses_last_slot(
         _context: &mut TestContext<'_>,

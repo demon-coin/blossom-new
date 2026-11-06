@@ -1,4 +1,34 @@
-//! ELF64 小端解码与最终映像区间计划；文件、匿名零页和必要合成页共用现有 Mm。
+//! ELF64 小端可执行映像解析与页级映射规划器。
+//!
+//! ## 模块职责与架构定位
+//! 本模块是 `execve` 装载器的子模块（`crate::task::exec::elf`），负责解析主可执行文件与可选动态链接器（`PT_INTERP`）的 ELF64 头部及程序头表（Program Header Table），并将所有 `PT_LOAD` 段转换为无重叠的虚拟内存映射计划安装到目标 [`Mm`] 中。
+//!
+//! ## 核心机制：`PT_LOAD` 段边界离散化与三类页面映射规划
+//!
+//! 一个或多个 `PT_LOAD` 段可能出现页内未对齐、文件数据与 BSS 零尾共享同一物理页、甚至多个段在同一页内重叠覆盖的情况。本模块通过 [`mapping_plan`] 与 [`page_plan`] 将所有段的起止边界离散化，将每个虚拟页归类为三种 [`Source`] 之一：
+//!
+//! ```text
+//!   ELF PT_LOAD 段内存视图：
+//!   |<------------------- memsz ------------------->|
+//!   |<------- filesz ------->|<--- BSS 零填充尾 --->|
+//!   +-----+------------------+-----+----------------+-----+
+//!   | 页0 |        页1..页K        |      页K+1     | 页M |
+//!   +-----+------------------+-----+----------------+-----+
+//!      │               │                   │           │
+//!      ▼               ▼                   ▼           ▼
+//!   Source::Copy   Source::File       Source::Copy  Source::Anonymous
+//!   (首部未对齐页)  (整页对齐且同源，  (文件尾与BSS   (纯BSS匿名零页，
+//!    预分配物理页   直接建立私有文件   交界页，预读   按需零页映射)
+//!    读取文件片段)  VMA 按需缺页)      文件前缀+清零)
+//! ```
+//!
+//! - **`Source::File`（整页文件直接映射）**：当且仅当整个虚拟页完全由同一个底层 Inode 的连续文件字节覆盖，且文件偏移量满足 `PAGE_SIZE` 对齐时，建立私有文件映射（`mm.map_file`），支持后续按需缺页加载。
+//! - **`Source::Anonymous`（整页匿名零页映射）**：当整个虚拟页全部落在 `filesz..memsz`（BSS 段）或段内未覆盖的零填充区域时，建立匿名按需零页映射（`mm.map_anonymous`）。
+//! - **`Source::Copy`（边缘/混合合成页）**：当页内包含段起止边缘、文件与 BSS 交界、非页对齐的文件偏移或被后续 `PT_LOAD` 段部分覆盖时，由 [`map_edge`] 立即分配清零物理页，按声明顺序将各段文件字节读入页内对应偏移（后声明的段覆盖先声明的段），再通过 `mm.map_owned` 直接挂入页表。
+//!
+//! ## 并发与内存安全契约
+//! - **调用方保证写排斥**：调用 [`Elf::read`] 与 [`map_images`] 前，上游 [`super::load_elf`] 已经持有主程序与动态链接器文件的 `ExecAccess` 写排斥守卫，确保解析与映射期间底层文件大小和内容不会被并发修改。
+//! - **合成页物理内存所有权**：在 [`map_edge`] 中分配的物理页在完成内核态文件读取后，立即销毁临时可变字节切片并将物理页唯一所有权移交给尚未发布的局部 `Mm`，不存在并发访问或悬垂指针风险。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -13,58 +43,92 @@ use crate::mm::{alloc_pages, PAGE_SIZE};
 
 use super::{read_exact, ExecError, MAX_PATH_BYTES, RWX};
 
+/// ELF64 文件头（`Elf64_Ehdr`）的固定字节长度（64 字节）。
 pub(super) const ELF_HEADER_BYTES: usize = 64;
+/// ELF64 程序头表项（`Elf64_Phdr`）的最小固定解码长度（56 字节）。
 const PHDR_BYTES: usize = 56;
 
+/// `PT_LOAD`：需要装载到内存中的程序段。
 const PT_LOAD: u32 = 1;
+/// `PT_INTERP`：指定动态链接器（解释器）路径的程序段。
 const PT_INTERP: u32 = 3;
+/// `PT_GNU_STACK`：指定用户栈是否需要可执行权限的 GNU 扩展段。
 const PT_GNU_STACK: u32 = 0x6474_e551;
+/// `ET_DYN`：位置无关可执行文件（PIE）或共享对象类型。
 const ET_DYN: u16 = 3;
 
+/// `PF_R`：程序段可读标志位。
 const PF_R: u32 = 4;
+/// `PF_W`：程序段可写标志位。
 const PF_W: u32 = 2;
+/// `PF_X`：程序段可执行标志位。
 const PF_X: u32 = 1;
 
+/// 主程序为 `ET_DYN`（PIE）时使用的默认装载基地址下界（`0x2000_0000`）。
 pub(super) const MAIN_DYN_BASE: usize = 0x2000_0000;
+/// 动态链接器（`PT_INTERP`）为 `ET_DYN` 时使用的默认装载基地址下界（`0x3000_0000`）。
 pub(super) const INTERP_DYN_BASE: usize = 0x3000_0000;
 
-/// 只保存装载、入口和初始栈真正消费的映像描述。
+/// 解析后的 ELF64 可执行映像元数据与装载段列表。
 pub(super) struct Elf {
+    /// `PT_INTERP` 段指定的动态链接器路径（不含末尾 NUL 字节）。
     pub(super) interp: Option<Vec<u8>>,
+    /// 位置无关映像（`ET_DYN`）附加的虚拟地址偏移量（`ET_EXEC` 固定为 `0`）。
     pub(super) bias: usize,
+    /// 已加上 `bias` 偏移的非空 `PT_LOAD` 装载段列表（保持原程序头声明顺序）。
     segments: Vec<Segment>,
+    /// 已加上 `bias` 偏移的程序入口虚拟地址（`e_entry + bias`）。
     pub(super) entry: usize,
+    /// 映射到用户空间中的程序头表虚拟地址（用于填充 `AT_PHDR`；若程序头表未被完整原样映射则为 `None`）。
     pub(super) phdr: Option<usize>,
+    /// 单个程序头表项的字节大小（`e_phentsize`，用于填充 `AT_PHENT`）。
     pub(super) phent: usize,
+    /// 程序头表项总数（`e_phnum`，用于填充 `AT_PHNUM`）。
     pub(super) phnum: usize,
+    /// 程序头表在文件中的起始字节偏移（`e_phoff`）。
     phoff: u64,
+    /// 程序头表占用的总字节数（`phnum * phent`）。
     table_bytes: usize,
+    /// 所有 `PT_LOAD` 段中最高的结束虚拟地址（用于计算初始 `brk` 用户堆起点）。
     pub(super) end: usize,
+    /// 是否声明了可执行栈（由 `PT_GNU_STACK` 段的 `PF_X` 标志决定）。
     pub(super) executable_stack: bool,
 }
 
-/// 文件前缀和匿名零尾都按原程序头顺序参与最终字节覆盖。
+/// 单个 `PT_LOAD` 段在虚拟地址空间与文件中的区间描述。
 struct Segment {
+    /// 段在用户虚拟地址空间中的起始地址（已含 `bias`，单位：字节）。
     start: usize,
+    /// 段内由文件数据初始化的结束虚拟地址（`start + filesz`，单位：字节）。
     file_end: usize,
+    /// 段在内存中的结束虚拟地址（`start + memsz`，`file_end..end` 为 BSS 零填充区，单位：字节）。
     end: usize,
+    /// 段数据在源文件中的起始偏移量（单位：字节）。
     offset: u64,
+    /// 段的原始权限标志位（`PF_R | PF_W | PF_X`）。
     flags: u32,
 }
 
-/// 程序头只解码固定前缀，较长表项的扩展尾不参与装载。
+/// 解码后的单个 ELF64 程序头表项（`Elf64_Phdr`）。
 struct ProgramHeader {
+    /// 段类型（`p_type`，如 `PT_LOAD`、`PT_INTERP`、`PT_GNU_STACK`）。
     kind: u32,
+    /// 段权限标志（`p_flags`，如 `PF_R`、`PF_W`、`PF_X`）。
     flags: u32,
+    /// 段内容在文件中的字节偏移（`p_offset`）。
     offset: u64,
+    /// 段的期望虚拟地址（`p_vaddr`）。
     address: usize,
+    /// 段在文件中的字节长度（`p_filesz`）。
     filesz: usize,
+    /// 段在内存中的字节长度（`p_memsz`）。
     memsz: usize,
+    /// 段的地址对齐要求（`p_align`）。
     align: usize,
 }
 
 impl ProgramHeader {
-    /// 从已完整读取的 ELF64 小端程序头前缀取得各字段。
+    /// 从 56 字节的 ELF64 小端程序头原始字节数组中解码各字段。
     fn decode(bytes: &[u8; PHDR_BYTES]) -> Self {
         Self {
             kind: word32(bytes, 0),
@@ -77,7 +141,7 @@ impl ProgramHeader {
         }
     }
 
-    /// LOAD 的文件前缀必须可读取，且能容纳于同一可表示的内存区间。
+    /// 校验 `PT_LOAD` 段的文件范围与内存大小关系（要求 `memsz >= filesz` 且不发生地址溢出），转换为 [`Segment`]。
     fn segment(&self, size: u64) -> Result<Segment, ExecError> {
         if self.memsz < self.filesz {
             return Err(ExecError::Format);
@@ -102,12 +166,15 @@ impl ProgramHeader {
 }
 
 impl Elf {
-    /// 逐项读取实际程序头，保留声明顺序；未消费的元数据不施加额外格式政策。
+    /// 校验 ELF64 文件头并遍历解析所有程序头表项，提取 `PT_LOAD` 段、`PT_INTERP` 解释器路径与 `PT_GNU_STACK` 属性。
+    ///
+    /// 对于 `ET_DYN` 位置无关映像，根据所有非空 `PT_LOAD` 段的最小公倍对齐要求向上对齐 `dyn_base` 作为装载基址偏移 `bias`。
     pub(super) fn read(
         file: &FileRef,
         header: &[u8; ELF_HEADER_BYTES],
         dyn_base: usize,
     ) -> Result<Self, ExecError> {
+        // Step 1: 校验 64 位小端 ELF 魔数、头部尺寸以及程序头表在文件内的范围合法性。
         let size = file.stat()?.size;
         let phent = word16(header, 54) as usize;
         let phnum = word16(header, 56) as usize;
@@ -121,6 +188,7 @@ impl Elf {
         }
         file_range(phoff, table_bytes, size)?;
 
+        // Step 2: 顺序读取并解码每个程序头，收集非空 PT_LOAD 段、唯一 PT_INTERP 路径以及可执行栈标志。
         let dynamic = word16(header, 16) == ET_DYN;
         let mut alignment = PAGE_SIZE;
         let mut segments = Vec::new();
@@ -156,6 +224,7 @@ impl Elf {
             return Err(ExecError::Format);
         }
 
+        // Step 3: 计算 ET_DYN 映像的装载偏移 bias，将所有段地址重定位并校验是否超出用户地址空间上限。
         let bias = if dynamic {
             align_up(dyn_base, alignment)?
         } else {
@@ -192,7 +261,7 @@ impl Elf {
         })
     }
 
-    /// 按实际 LOAD 页范围检查栈及 guard 的占用，映像高地址空洞不占用栈。
+    /// 检查给定的虚拟地址范围 `[start, end)` 是否与本映像任一 `PT_LOAD` 段占用的页范围重叠。
     pub(super) fn overlaps(&self, start: usize, end: usize) -> bool {
         self.segments.iter().any(|segment| {
             page_start(segment.start) < end
@@ -201,7 +270,7 @@ impl Elf {
     }
 }
 
-/// 只验证当前读取的文件区间，不检查未消费头中的地址或对齐标签。
+/// 校验文件偏移区间 `[offset, offset + length)` 是否未发生整数溢出且完全落在文件总大小 `size` 以内。
 fn file_range(offset: u64, length: usize, size: u64) -> Result<(), ExecError> {
     let end = offset.checked_add(length as u64).ok_or(ExecError::Format)?;
     if size < end {
@@ -210,7 +279,7 @@ fn file_range(offset: u64, length: usize, size: u64) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 解释器路径使用现有路径长度 ABI，并且必须完整以唯一 NUL 终止。
+/// 根据 `PT_INTERP` 程序头从文件中读取动态链接器路径（要求以单个 NUL 结尾且内部不含额外 NUL 字节）。
 fn read_interpreter(file: &FileRef, ph: &ProgramHeader) -> Result<Vec<u8>, ExecError> {
     if ph.filesz < 2 || MAX_PATH_BYTES < ph.filesz {
         return Err(ExecError::Format);
@@ -228,7 +297,7 @@ fn read_interpreter(file: &FileRef, ph: &ProgramHeader) -> Result<Vec<u8>, ExecE
     Ok(pathname)
 }
 
-/// 公倍数允许非幂二声明，仅在真实布局对齐无法表示时失败。
+/// 使用欧几里得算法计算两个对齐值的最小公倍数（支持非 2 的幂的段对齐声明）。
 fn common_alignment(left: usize, right: usize) -> Result<usize, ExecError> {
     let (mut a, mut b) = (left, right);
     while b != 0 {
@@ -237,7 +306,7 @@ fn common_alignment(left: usize, right: usize) -> Result<usize, ExecError> {
     (left / a).checked_mul(right).ok_or(ExecError::Format)
 }
 
-/// 通用向上对齐不依赖对齐值为二的幂。
+/// 将虚拟地址 `address` 向上对齐到 `alignment` 的整数倍（支持任意正整数对齐粒度）。
 fn align_up(address: usize, alignment: usize) -> Result<usize, ExecError> {
     let remainder = address % alignment;
     if remainder == 0 {
@@ -249,28 +318,41 @@ fn align_up(address: usize, alignment: usize) -> Result<usize, ExecError> {
     }
 }
 
-/// 计划只借用候选映像，真正发表的 VMA 和 Mm 独立持有对应文件。
+/// 绑定了源文件引用的待装载 `PT_LOAD` 段视图。
 struct LoadSegment<'a> {
+    /// 该段所属的可执行文件或动态链接器文件句柄。
     file: &'a FileRef,
+    /// 该段的虚拟地址与文件偏移描述。
     segment: &'a Segment,
 }
 
+/// 规划后的虚拟内存区间的数据来源类型。
 #[derive(Clone, Copy)]
 enum Source<'a> {
+    /// 纯匿名零页映射（如 BSS 段或段内零填充页）。
     Anonymous,
+    /// 页对齐的连续文件背景映射（绑定源文件引用与页对齐的起始文件偏移）。
     File(&'a FileRef, u64),
+    /// 需要立即分配物理页并按字节拼接填充的边缘或混合来源页。
     Copy,
 }
 
+/// 合并后的连续虚拟页映射规划项。
 struct Mapping<'a> {
+    /// 映射区间的起始虚拟地址（页对齐）。
     start: usize,
+    /// 映射区间的结束虚拟地址（页对齐）。
     end: usize,
+    /// 合并后的 ELF 段权限标志（`PF_R | PF_W | PF_X`）。
     flags: u32,
+    /// 该区间的数据填充方式。
     source: Source<'a>,
 }
 
 impl Mapping<'_> {
-    /// 相邻区间仅在权限和真实来源连续时合并，不跨过空洞。
+    /// 判断当前映射区间 `self` 是否可以与紧邻的下一区间 `next` 合并为单个连续映射。
+    ///
+    /// 仅当两区间虚拟地址首尾相接、权限完全一致，且同为匿名映射、同为合成拷贝页，或指向同一底层 Inode 且文件偏移连续时才允许合并。
     fn joins(&self, next: &Self) -> bool {
         if self.end != next.start || self.flags != next.flags {
             return false;
@@ -285,7 +367,7 @@ impl Mapping<'_> {
     }
 }
 
-/// 不同 OFD 仍可指向同一 canonical inode，文件字节来源按该真实身份比较。
+/// 判断两个打开文件引用是否指向同一个底层可映射 Inode。
 fn same_file(left: &FileRef, right: &FileRef) -> bool {
     Arc::ptr_eq(left, right)
         || left
@@ -298,7 +380,10 @@ fn same_file(left: &FileRef, right: &FileRef) -> bool {
             )
 }
 
-/// 两映像先组成唯一非重叠计划，再一次安装；后声明字节及零尾覆盖此前内容。
+/// 将主程序与可选动态链接器的所有 `PT_LOAD` 段统一规划为不重叠的页面映射并安装到 `mm` 中。
+///
+/// 若多个段在同一虚拟地址范围发生重叠，后声明的段字节（含 BSS 零尾）会覆盖先声明的段内容；
+/// 同时检测主程序头表是否完整保留在映射中，以填写 `main.phdr`（供 `AT_PHDR` 使用）。
 pub(super) fn map_images(
     mm: &mut Mm,
     file: &FileRef,
@@ -354,7 +439,10 @@ pub(super) fn map_images(
     Ok(())
 }
 
-/// 只有段起止及文件尾所在页能改变来源；计划空间随段数增长，不随跨度增长。
+/// 提取所有 `PT_LOAD` 段的页对齐边界点，对每个相邻边界区间生成并合并页面映射规划 [`Mapping`]。
+///
+/// 由于只有段的起始地址、`file_end` 和结束地址所在页可能改变映射来源或权限，
+/// 离散边界点数量仅与段数成线性关系（最多 `6 * loads.len()`），不随段跨越的虚拟地址长度增长。
 fn mapping_plan<'a>(loads: &[LoadSegment<'a>]) -> Result<Vec<Mapping<'a>>, ExecError> {
     let mut boundaries = Vec::new();
     let capacity = loads.len().checked_mul(3 * 2).ok_or(ExecError::NoMemory)?;
@@ -394,7 +482,7 @@ fn mapping_plan<'a>(loads: &[LoadSegment<'a>]) -> Result<Vec<Mapping<'a>>, ExecE
     Ok(plan)
 }
 
-/// 返回当前位置的最终文件来源和下一个字节边界，BSS 与页内空洞都提供零。
+/// 查询虚拟地址 `address` 处在 `[address, end)` 范围内最终生效的字节来源（文件偏移或 `None` 表示零字节）以及下一个内容变化边界地址。
 fn contents_at<'a>(
     loads: &[LoadSegment<'a>],
     address: usize,
@@ -420,7 +508,11 @@ fn contents_at<'a>(
     (stop, source)
 }
 
-/// 页权限取所有参与声明的并集，只有最终整页同源对齐文件才能延迟文件缺页。
+/// 分析单个虚拟页 `[base, base + PAGE_SIZE)` 的合并权限与映射来源类型 [`Source`]。
+///
+/// - 若没有任何 `PT_LOAD` 段覆盖该页，返回 `None`；
+/// - 若整页具有单一连续来源：全为零则返回 [`Source::Anonymous`]，来自同一文件且文件偏移按页对齐则返回 [`Source::File`]；
+/// - 其余情况（包含段边缘、文件偏移未对齐或多段拼接）均返回 [`Source::Copy`]。
 fn page_plan<'a>(loads: &[LoadSegment<'a>], base: usize) -> Option<(u32, Source<'a>)> {
     let end = base + PAGE_SIZE;
     let mut flags = 0;
@@ -462,7 +554,9 @@ fn page_plan<'a>(loads: &[LoadSegment<'a>], base: usize) -> Option<(u32, Source<
     Some((flags, source))
 }
 
-/// 仅实际保留原文件程序头字节的映射产生 AT_PHDR，缺失保持 None，不施加 bias。
+/// 查找主程序的程序头表在用户虚拟地址空间中的映射地址（用于设置辅助向量 `AT_PHDR`）。
+///
+/// 仅当某个 `PT_LOAD` 段完整覆盖了文件的 `[phoff, phoff + table_bytes)` 区间，且该区间未被后续段覆盖改写时，才返回对应的用户虚拟地址。
 fn find_phdr(loads: &[LoadSegment<'_>], file: &FileRef, image: &Elf) -> Option<usize> {
     if image.table_bytes == 0 {
         return None;
@@ -491,7 +585,7 @@ fn find_phdr(loads: &[LoadSegment<'_>], file: &FileRef, image: &Elf) -> Option<u
     })
 }
 
-/// 合成页只分配必要的边缘或不能直映的来源，文件读取失败时仍由候选拥有归还原页。
+/// 为单个边缘或混合来源虚拟页 `[base, base + PAGE_SIZE)` 分配物理页，按最终覆盖关系读入文件片段后挂入 `mm`。
 fn map_edge(
     mm: &mut Mm,
     loads: &[LoadSegment<'_>],
@@ -500,8 +594,10 @@ fn map_edge(
 ) -> Result<(), ExecError> {
     let mut pages = alloc_pages(0, true).ok_or(ExecError::NoMemory)?;
     {
-        // SAFETY: pages 独占已完整清零且尚未映射的 order0 页；此切片只在本次填充中存在，
-        // 没有用户、设备或其他内核访问者，填充结束后才把原页转交 Mm。
+        // SAFETY:
+        // 1. `pages` 是刚刚通过 `alloc_pages(0, true)` 分配并清零的 order-0 物理页（恰为 `PAGE_SIZE` 字节），当前由本函数独占持有；
+        // 2. `bytes` 可变切片的作用域严格限制在当前代码块内，期间该物理页尚未映射到任何页表，无其他 CPU、用户线程或 DMA 访问；
+        // 3. 代码块结束时 `bytes` 切片立即销毁，之后才在下方将 `pages` 移交给 `mm.map_owned`。
         let bytes =
             unsafe { core::slice::from_raw_parts_mut(pages.as_mut_ptr().cast::<u8>(), PAGE_SIZE) };
         let mut cursor = base;
@@ -515,13 +611,17 @@ fn map_edge(
         }
     }
 
-    // SAFETY: 整页由初始清零及最终来源的精确文件读取完整初始化；所有原始切片已结束，
-    // mm 尚未发表，pages 唯一拥有只消费一次，成功后数据和页表生命周期由 Mm 管理。
+    // SAFETY:
+    // 1. `pages` 整页在分配时已清零，且上方代码块已将所有需要从文件加载的字节片段精确填入对应偏移，整页内存完全初始化；
+    // 2. 指向 `pages` 的临时可变切片 `bytes` 已离开作用域销毁，且 `mm` 是尚未发布给任何运行任务的私有候选地址空间；
+    // 3. `pages` 的唯一所有权在此处移交给 `mm` 管理；若 `read_exact` 在上方提前失败返回，`pages` 会随栈帧自动析构归还伙伴分配器。
     unsafe { mm.map_owned(base, pages, current, RWX) }?;
     Ok(())
 }
 
-/// 写权限转换时表达 RV 页表的真实 R 要求，不以 W-only 标签拒绝映像。
+/// 将 ELF 程序头权限标志（`PF_R`/`PF_W`/`PF_X`）转换为页表权限 [`PagePermissions`]。
+///
+/// 在 RISC-V 64 架构下，硬件页表规范不支持只写不可读（`W=1, R=0`）组合，因此若带有 `PF_W` 则自动开启读权限。
 fn permissions(flags: u32) -> PagePermissions {
     let write = flags & PF_W != 0;
     PagePermissions {
@@ -531,27 +631,27 @@ fn permissions(flags: u32) -> PagePermissions {
     }
 }
 
-/// 页下界用于把实际 LOAD 字节转换为硬件页范围。
+/// 将虚拟地址向下对齐所在页的起始边界。
 fn page_start(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
 }
 
-/// 页上界的加法仅在可表示时成立。
+/// 将虚拟地址向上对齐到页边界；若发生算术溢出则返回 [`ExecError::Format`]。
 pub(super) fn page_end(address: usize) -> Result<usize, ExecError> {
     align_up(address, PAGE_SIZE)
 }
 
-/// 解码完整头中固定位置的小端 16 位字段。
+/// 从字节切片指定偏移处读取小端序 `u16`。
 fn word16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
-/// 解码完整头中固定位置的小端 32 位字段。
+/// 从字节切片指定偏移处读取小端序 `u32`。
 fn word32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
-/// 解码完整头中固定位置的小端 64 位字段。
+/// 从字节切片指定偏移处读取小端序 `u64`。
 fn word64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }

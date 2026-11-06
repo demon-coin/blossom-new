@@ -1,4 +1,54 @@
-//! 有限硬件差值维护单调时间；每核事件统一选择维护、时间片和两类 timer 的最早期限。
+//! 系统单调时钟（Monotonic Clock）、墙钟时间（Realtime）与每核时钟事件（Clockevent）管理。
+//!
+//! # 模块职责与架构定位
+//! - **职责**：将底层硬件计数器周期（Cycles）精确换算为单调递增的纳秒时间（[`MonotonicInstant`]），结合平台实时时钟（RTC）提供 Unix 墙钟时间，并统一管理每个 CPU 核心的硬件定时器下一次触发期限。
+//! - **上游调用者**：启动初始化（`initialize`）、调度器（`activate_current_cpu`、`task_switch_in`、`task_switch_out`）、时钟中断处理入口（`handle_timer`）、软件定时器子系统（[`crate::timer`]）以及时间相关系统调用与内核日志时间戳。
+//! - **下游依赖**：架构层硬件计数器读取与定时器编程（[`crate::arch`]）、板级 RTC 采样（`arch::board_rtc_calendar`）、每核本地状态（[`crate::cpu`]）及软件定时器最近到期查询（`crate::timer::with_next_deadline`）。
+//!
+//! # 核心机制、算术模型与寄存器布局
+//! 1. **定点换算与小数余数保留（[`Scale`]）**：
+//!    为避免 64 位整数乘法溢出并消除多次维护采样之间的舍入累积误差，硬件周期差值 $\Delta \text{cycles}$ 通过定点参数 $(\text{mult}, \text{shift})$ 换算为纳秒：
+//!    $$\text{scaled} = \Delta \text{cycles} \times \text{mult} + \text{fraction}$$
+//!    $$\Delta \text{ns} = \text{scaled} \gg \text{shift}, \quad \text{fraction}' = \text{scaled} \ \& \ ((1 \ll \text{shift}) - 1)$$
+//!    每次维护间隔 `maintenance_delta` 取最大安全差值 `max_delta` 的一半，为中断延迟预留充足余量。
+//!
+//! 2. **顺序锁（SeqLock）无锁读取与单写者更新（[`Timekeeper`]）**：
+//!
+//! ```text
+//! 维护写者 (Timekeeper::update)                     并发读者 (Timekeeper::sample)
+//! ─────────────────────────────                     ─────────────────────────────
+//! 1. 获取 writer 自旋锁 (关中断)                    1. 读 sequence (Acquire)
+//! 2. 读取硬件 counter 并计算新基准                     └─ 若为奇数 (写者正在更新) -> spin_loop 重试
+//! 3. sequence 置为奇数 (sequence + 1)               2. 依次读取 base_ns, cycle_last, fraction
+//! 4. fence(Release) ───────────────────────────────► 3. 读取硬件 counter
+//! 5. 写入新的 base_ns, cycle_last, fraction         4. fence(Acquire)
+//! 6. sequence 置为新偶数 (Release)                  5. 再次读 sequence：若与步骤 1 不相等则重试
+//! 7. 释放 writer 自旋锁                             6. 用一致的基准与 counter 计算当前纳秒
+//! ```
+//!
+//! 3. **LoongArch LS7A TOY（Time of Year）寄存器位域布局（[`toy`]）**：
+//!
+//! ```text
+//! TOY_READ0_REG (offset 0x2c) - 32 位日历低字寄存器：
+//! ┌──────────┬──────────┬──────────┬───────────┬───────────┬──────────┐
+//! │ 31 .. 26 │ 25 .. 21 │ 20 .. 16 │ 15 .. 10  │  9 .. 4   │  3 .. 0  │
+//! │  Month   │   Day    │   Hour   │  Minute   │  Second   │ Sub-sec  │
+//! │ (6 bits) │ (5 bits) │ (5 bits) │ (6 bits)  │ (6 bits)  │ (4 bits) │
+//! └──────────┴──────────┴──────────┴───────────┴───────────┴──────────┘
+//! TOY_READ1_REG (offset 0x30)：32 位年份偏移值（实际公历年份 = 1900 + TOY_READ1_REG）
+//! RTC_CTRL_REG  (offset 0x40)：Bit 11 = TOY_ENABLE，Bit 8 = TOY_32KHZ_ENABLE
+//! ```
+//!
+//! 4. **每核时钟事件（[`LocalEvent`]）三合一期限仲裁**：
+//!    每个 CPU 在编程底层硬件比较器（`program`）时，从以下三类期限中取最早值（最小值）：
+//!    - `maintenance`：防止硬件计数器差值超出 `Scale::max_delta` 的周期性时间基准维护期限；
+//!    - `quantum`：当前运行任务的时间片轮转到期期限（`QUANTUM = 10ms`）；
+//!    - `timer_deadline`：当前 CPU 上挂载的硬定时器与睡眠定时器的最早到期时间。
+//!
+//! # 锁获取顺序与并发契约
+//! - `LocalEvent::with_current` 要求在关中断（IRQ-off）状态下仅访问当前 CPU 自身的 `LocalEvent`，且闭包内严禁触发上下文切换或递归调用 `with_current`。
+//! - `handle_timer` 先结束 `LocalEvent::with_current` 的可变借用，再调用 `crate::timer::handle_interrupt()`（允许定时器回调重新注册定时器并触发重编程），最后调用 `reprogram_current()`。
+//! - 硬件编程路径锁顺序：先按值拷贝出 `EventState`，再进入 `crate::timer::with_next_deadline` 获取本核定时器底座自旋锁，在锁内调用 `Timekeeper::sample`（无锁顺序读）与 `arch::program_timer` 完成硬件下发，确保不会把已被并发移除或更新的旧期限写入硬件。
 
 pub use core::time::Duration;
 
@@ -15,64 +65,88 @@ use crate::boot::{BootInfo, Platform, Region};
 use crate::cpu;
 use crate::sync::SpinLock;
 
+/// 每秒包含的纳秒数（$10^9\text{ ns}$）。
 pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
+/// 每毫秒包含的纳秒数（$10^6\text{ ns}$）。
 pub(crate) const NSEC_PER_MSEC: u64 = NSEC_PER_SEC / 1_000;
+/// 每微秒包含的纳秒数（$10^3\text{ ns}$）。
 pub(crate) const NSEC_PER_USEC: u64 = NSEC_PER_MSEC / 1_000;
+/// 每秒包含的微秒数（$10^6\ \mu\text{s}$）。
 pub(crate) const USEC_PER_SEC: u64 = NSEC_PER_SEC / NSEC_PER_USEC;
 
+/// 选择定点换算系数时要求无溢出覆盖的最小时间跨度（3600 秒，即 1 小时）。
 const CONVERSION_SECONDS: u64 = 3600;
 
+/// 调度器任务时间片长度（10 毫秒）。
 const QUANTUM: Duration = Duration::from_millis(10);
 
-/// TOY 只读日历字段与控制位，供共同时间层和板级 RTC 采样使用。
+/// LoongArch LS7A TOY（Time of Year）实时时钟寄存器偏移、控制位与日历位域定义。
 #[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
 pub(crate) mod toy {
+    /// TOY 日历低字只读寄存器偏移（存放月、日、时、分、秒字段）。
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_READ0_REG: usize = 0x2c;
+    /// TOY 日历高字只读寄存器偏移（存放相对于 1900 年的年份偏移）。
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_READ1_REG: usize = 0x30;
+    /// RTC 控制寄存器偏移。
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const RTC_CTRL_REG: usize = 0x40;
+    /// `RTC_CTRL_REG` 中的 TOY 计数器使能位（Bit 11）。
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_ENABLE: u32 = 1 << 11;
+    /// `RTC_CTRL_REG` 中的外部 32.768kHz 晶振使能位（Bit 8）。
     #[cfg(target_arch = "loongarch64")]
     pub(crate) const TOY_32KHZ_ENABLE: u32 = 1 << 8;
 
+    /// TOY 年份寄存器的基准年份（1900 年）。
     pub(crate) const TOY_YEAR_BASE: u32 = 1900;
+    /// `TOY_READ0_REG` 中月份字段的起始位偏移（Bit 26）。
     pub(crate) const TOY_MONTH_SHIFT: u32 = 26;
+    /// `TOY_READ0_REG` 中月份字段的位掩码（6 位）。
     pub(crate) const TOY_MONTH_MASK: u32 = (1 << 6) - 1;
+    /// `TOY_READ0_REG` 中日期（Day of Month）字段的起始位偏移（Bit 21）。
     pub(crate) const TOY_DAY_SHIFT: u32 = 21;
+    /// `TOY_READ0_REG` 中日期字段的位掩码（5 位）。
     pub(crate) const TOY_DAY_MASK: u32 = (1 << 5) - 1;
+    /// `TOY_READ0_REG` 中小时字段的起始位偏移（Bit 16）。
     pub(crate) const TOY_HOUR_SHIFT: u32 = 16;
+    /// `TOY_READ0_REG` 中小时字段的位掩码（5 位）。
     pub(crate) const TOY_HOUR_MASK: u32 = (1 << 5) - 1;
+    /// `TOY_READ0_REG` 中分钟字段的起始位偏移（Bit 10）。
     pub(crate) const TOY_MINUTE_SHIFT: u32 = 10;
+    /// `TOY_READ0_REG` 中分钟字段的位掩码（6 位）。
     pub(crate) const TOY_MINUTE_MASK: u32 = (1 << 6) - 1;
+    /// `TOY_READ0_REG` 中秒字段的起始位偏移（Bit 4）。
     pub(crate) const TOY_SECOND_SHIFT: u32 = 4;
+    /// `TOY_READ0_REG` 中秒字段的位掩码（6 位）。
     pub(crate) const TOY_SECOND_MASK: u32 = (1 << 6) - 1;
 }
 
-/// 自时间源注册起累计的单调纳秒，不表示日历时间。
+/// 自系统时间基准初始化起累计的单调递增时刻（单位：纳秒）。
+///
+/// 该时间戳仅反映系统运行经过的相对单调时间，不受墙钟（RTC）起点影响。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MonotonicInstant(u64);
 
 impl MonotonicInstant {
-    /// 构造内部绝对纳秒期限，不赋予墙钟含义。
+    /// 由自时间基准起点起算的纳秒数直接构造 [`MonotonicInstant`]。
     pub const fn from_nanos(nanos: u64) -> Self {
         Self(nanos)
     }
 
-    /// 返回统一时间域的纳秒值。
+    /// 返回自时间基准起点起算的纳秒数。
     pub const fn as_nanos(self) -> u64 {
         self.0
     }
 
-    /// 计算有限期限，拒绝 Duration 或结果超出内部纳秒空间。
+    /// 计算当前时刻加上 `duration` 后的目标时刻；若 `duration` 或加法结果超出 `u64` 纳秒表示范围则返回 `None`。
     pub fn checked_add(self, duration: Duration) -> Option<Self> {
         let nanos = u64::try_from(duration.as_nanos()).ok()?;
         self.0.checked_add(nanos).map(Self)
     }
 
-    /// 返回两个单调时刻的间隔，逆序时刻不产生负 Duration。
+    /// 计算从 `earlier` 到当前时刻 `self` 经过的时间间隔；若 `self < earlier` 则返回 `None`。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -85,18 +159,25 @@ impl MonotonicInstant {
     }
 }
 
-/// 注册后不变的定点换算与安全采样界限。
+/// 硬件计数器周期与纳秒之间的定点换算参数及安全采样界限。
+///
+/// 在 [`Timekeeper`] 初始化时根据硬件频率一次性计算生成，运行期只读不变。
 #[derive(Clone, Copy)]
 pub(crate) struct Scale {
+    /// 硬件计数器的有效位掩码（连续低位全 1，如 64 位计数器为 `u64::MAX`）。
     pub(crate) mask: u64,
+    /// 周期转纳秒的定点乘数（满足 $\text{ns} \approx (\text{cycles} \times \text{mult}) \gg \text{shift}$）。
     pub(crate) mult: u64,
+    /// 周期转纳秒的定点右移位数。
     pub(crate) shift: u32,
+    /// 单次采样允许的最大硬件计数器周期差值（同时受 64 位乘法不溢出与计数器半周期回绕边界 `mask >> 1` 限制）。
     pub(crate) max_delta: u64,
+    /// 周期性维护基准的硬件周期差值阈值（取 `max_delta / 2`，为关中断延迟预留一半安全窗口）。
     pub(crate) maintenance_delta: u64,
 }
 
 impl Scale {
-    /// 验证连续低位 mask 和频率，并选择覆盖一小时乘法的最高精度。
+    /// 校验硬件计数器频率与位宽掩码，并搜索能无溢出覆盖 1 小时跨度（`CONVERSION_SECONDS`）的最高精度定点换算参数。
     fn new(frequency: u64, mask: u64) -> Self {
         assert!(
             0 < frequency && frequency <= u32::MAX as u64,
@@ -107,6 +188,7 @@ impl Scale {
             "invalid counter mask"
         );
 
+        // Step 1: 从最大移位值向小搜索，寻找满足 1 小时周期数乘 `mult` 加余数不溢出的最高精度 `(mult, shift)`。
         let required_cycles = frequency * CONVERSION_SECONDS;
         let (mult, shift) = (0..=u32::BITS)
             .rev()
@@ -124,6 +206,7 @@ impl Scale {
             })
             .expect("counter has no valid scale");
 
+        // Step 2: 计算最大安全周期差值 `max_delta`（不超过计数器半量程）与维护间隔 `maintenance_delta`。
         let residue_mask = (1u64 << shift) - 1;
         let max_delta = ((u64::MAX - residue_mask) / mult).min(mask >> 1);
         let maintenance_delta = max_delta / 2;
@@ -141,7 +224,9 @@ impl Scale {
         scale
     }
 
-    /// 对有限差值保留小数余数；超界输入不会返回饱和的伪时间。
+    /// 将硬件周期差值 `delta` 与上一次保留的小数余数 `fraction` 换算为 `(纳秒增量, 新小数余数)`。
+    ///
+    /// 若 `delta` 超过 `max_delta` 或 `fraction` 超出移位余数范围，返回 `None`。
     pub(crate) fn convert(self, delta: u64, fraction: u64) -> Option<(u64, u64)> {
         let residue_mask = (1u64 << self.shift) - 1;
         if self.max_delta < delta || residue_mask < fraction {
@@ -151,14 +236,14 @@ impl Scale {
         Some((scaled >> self.shift, scaled & residue_mask))
     }
 
-    /// 返回提前于最大安全差值的维护间隔，留出一半差值空间供 IRQ 延迟。
+    /// 返回周期性基准维护间隔对应的纳秒数。
     fn maintenance_ns(self) -> u64 {
         self.convert(self.maintenance_delta, 0)
             .expect("invalid maintenance delta")
             .0
     }
 
-    /// 从同一读数的小数位置向上取整至硬件 tick，并校验最大转换范围。
+    /// 根据当前采样点 `sample` 将目标单调时刻 `deadline` 换算为底层硬件定时器的绝对比较周期值（向上取整至硬件 tick）。
     fn deadline_cycles(self, sample: Sample, deadline: MonotonicInstant) -> u64 {
         if deadline <= sample.instant {
             return sample.cycle;
@@ -180,27 +265,38 @@ impl Scale {
     }
 }
 
+/// 单次一致性时间采样的结果快照。
 #[derive(Clone, Copy)]
 struct Sample {
+    /// 换算得到的当前单调纳秒时刻。
     instant: MonotonicInstant,
+    /// 本次采样读取并掩码截断后的硬件计数器周期值。
     cycle: u64,
+    /// 定点换算后不足 1 纳秒的小数余数（范围 `0 .. (1 << shift)`）。
     fraction: u64,
 }
 
-/// 原子基准字段与序号共同提供合法的一代快照；写侧短锁只串行维护。
+/// 全局单调时间维护器（基于顺序锁 SeqLock 实现多核无锁读取与单写者周期推进）。
 pub(crate) struct Timekeeper {
+    /// 硬件计数器到纳秒的定点换算参数（初始化后只读）。
     scale: Scale,
+    /// 串行化多核维护更新操作的写者自旋锁（获取时自动关闭本地中断）。
     writer: SpinLock<()>,
+    /// 顺序锁代次序号：偶数值表示基准快照一致可读，奇数值表示写者正在更新基准字段。
     sequence: AtomicU64,
+    /// 当前基准点对应的单调纳秒时间（由 `writer` 锁与 `sequence` 保护）。
     base_ns: AtomicU64,
+    /// 当前基准点对应的硬件计数器周期读数（由 `writer` 锁与 `sequence` 保护）。
     cycle_last: AtomicU64,
+    /// 当前基准点保留的定点换算小数余数（由 `writer` 锁与 `sequence` 保护）。
     fraction: AtomicU64,
+    /// 测试辅助字段：记录基准成功更新的累计次数。
     #[cfg(feature = "ktest")]
     updates: AtomicU64,
 }
 
 impl Timekeeper {
-    /// 建立相对原始计数起点，完整验证配置后才可向读者发表。
+    /// 使用指定的硬件计数器频率、位掩码与初始周期读数构造 [`Timekeeper`]。
     pub(crate) fn new(frequency: u64, mask: u64, initial_cycle: u64) -> Self {
         Self {
             scale: Scale::new(frequency, mask),
@@ -214,25 +310,26 @@ impl Timekeeper {
         }
     }
 
-    /// 从匹配基准外推当前纳秒；采样必须在序号验证区间内完成。
+    /// 通过顺序锁（SeqLock）无锁读取一致的基准字段并采样硬件计数器，外推计算当前时刻快照 [`Sample`]。
     fn sample(&self, counter: impl Fn() -> u64) -> Sample {
         loop {
+            // Step 1: 读取当前序号；若为奇数说明写者正在更新基准，自旋等待下一轮。
             let sequence = self.sequence.load(Ordering::Acquire);
             if sequence & 1 != 0 {
                 spin_loop();
                 continue;
             }
+            // Step 2: 读取基准纳秒、基准周期与小数余数。
             let base = self.base_ns.load(Ordering::Relaxed);
             #[cfg(feature = "ktest")]
             let overlap = testing::pause_snapshot(self);
             let last = self.cycle_last.load(Ordering::Relaxed);
             let fraction = self.fraction.load(Ordering::Relaxed);
-            // 原始 counter 指令声明 nomem；编译器屏障将它保留在两次序号读取之间。
+            // Step 3: 使用编译器屏障约束无内存副作用的硬件计数器读取指令，确保采样严格落在两次序号检查之间。
             compiler_fence(Ordering::SeqCst);
             let cycle = counter() & self.scale.mask;
             compiler_fence(Ordering::SeqCst);
-            // 若任一字段读到新写，写侧 Release fence 与此 Acquire fence 同步，
-            // 奇序号先于最后序号读取；原子一致性禁止后者仍接受旧偶序号。
+            // Step 4: 执行 Acquire 内存屏障并与初始序号比对；若期间写者修改了任一字段，写侧 Release 屏障保证此处观测到序号变化并重试。
             fence(Ordering::Acquire);
             if self.sequence.load(Ordering::Relaxed) != sequence {
                 #[cfg(feature = "ktest")]
@@ -245,7 +342,7 @@ impl Timekeeper {
         }
     }
 
-    /// 对已经稳定的基准做算术，避免把重试期间的混合字段误报为超界。
+    /// 在确认顺序锁快照一致后，根据基准字段 `(base, last, fraction)` 与当前周期 `cycle` 计算最新 [`Sample`]。
     fn advance(&self, base: u64, last: u64, fraction: u64, cycle: u64) -> Sample {
         let delta = cycle.wrapping_sub(last) & self.scale.mask;
         let (nanos, fraction) = self
@@ -262,14 +359,16 @@ impl Timekeeper {
         }
     }
 
-    /// 读取同一算法的当前时刻；采样函数只能非阻塞读取同一计数源，不能递归维护。
+    /// 读取当前单调纳秒时刻；传入的 `counter` 闭包必须无阻塞地读取同一硬件计数源且不得重入 [`Timekeeper`]。
     pub(crate) fn read(&self, counter: impl Fn() -> u64) -> MonotonicInstant {
         self.sample(counter).instant
     }
 
-    /// 在 IRQ-safe 短锁内重新采样并推进基准，小数余数跨维护保留。
-    /// 采样函数必须非阻塞且无分配，不能重入此基准；原始采样不得在调用前缓存。
+    /// 获取写者自旋锁（关中断），采样硬件计数器并将单调时间基准向前推进。
+    ///
+    /// 传入的 `counter` 闭包必须无阻塞、无内存分配且不重入当前 [`Timekeeper`]。
     pub(crate) fn update(&self, counter: impl Fn() -> u64) -> MonotonicInstant {
+        // Step 1: 获取关中断写锁，采样当前硬件周期并在锁内基于现有基准计算出新基准值。
         let _writer = self.writer.lock();
         compiler_fence(Ordering::SeqCst);
         let cycle = counter() & self.scale.mask;
@@ -291,7 +390,7 @@ impl Timekeeper {
             .checked_add(1)
             .expect("timekeeper update count exhausted");
 
-        // 全部可能失败的算术在奇序号前结束；写侧关 IRQ，不能被本核 reader 打断。
+        // Step 2: 所有可能触发 panic 的算术检查均已在上方完成；将序号置为奇数通知并发读者进入更新临界区，写入新基准后再以 Release 发布新偶数序号。
         self.sequence.store(sequence + 1, Ordering::Relaxed);
         fence(Ordering::Release);
         #[cfg(feature = "ktest")]
@@ -307,13 +406,13 @@ impl Timekeeper {
         sample.instant
     }
 
-    /// 向专用验收公开注册后的真实换算参数。
+    /// 测试辅助接口：返回当前 [`Timekeeper`] 使用的定点换算参数 [`Scale`]。
     #[cfg(feature = "ktest")]
     pub(crate) fn scale(&self) -> Scale {
         self.scale
     }
 
-    /// 返回稳定基准中的小数余数，不把观察操作当作维护更新。
+    /// 测试辅助接口：通过顺序锁一致性读取当前基准中保存的小数余数 `fraction`。
     #[cfg(feature = "ktest")]
     pub(crate) fn fraction(&self) -> u64 {
         loop {
@@ -331,14 +430,17 @@ impl Timekeeper {
     }
 }
 
+/// 全局唯一单调时间维护器实例（由 BSP 在启动阶段初始化一次）。
 static TIMEKEEPER: Once<Timekeeper> = Once::new();
+/// 系统启动时刻对应的 Unix 墙钟基准时间（单位：纳秒；未校时状态下为 `0`）。
 static REALTIME_BASE: Once<u64> = Once::new();
 
-/// 读取已映射 RTC 内完整对齐的 32 位寄存器，设备屏障维持连续采样的先后顺序。
+/// 读取已映射 RTC 设备窗口内 4 字节对齐的 32 位寄存器，并在读取后插入设备内存屏障。
 ///
 /// # Safety
-/// region 必须来自当前平台已验证的 RTC，且其永久 MMIO 映射已经建立；
-/// offset 必须对应可读寄存器，调用者独占设备采样协议。
+/// 1. `region` 必须来自当前平台已验证的 RTC 设备资源描述，且对应的永久 MMIO 虚拟映射已建立。
+/// 2. `offset` 必须对应设备内合法的 32 位可读寄存器偏移。
+/// 3. 调用者必须独占当前 RTC 设备的采样序列，避免与其他并发访问交错破坏硬件锁存状态。
 unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     assert!(
         offset % core::mem::size_of::<u32>() == 0
@@ -350,8 +452,10 @@ unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     let address = arch::mmio_address(region.start)
         .checked_add(offset)
         .expect("RTC virtual register address overflows");
-    // SAFETY: 调用者保证实际 RTC 与永久映射；窗口校验保证完整对齐访问，
-    // volatile 不建立设备内存引用，完整屏障在后续寄存器或 counter 采样前完成该读。
+    // SAFETY:
+    // 1. 调用方契约保证 `region` 对应的 RTC MMIO 区域已永久映射且当前独占访问；
+    // 2. 上方 `assert!` 已验证 `offset` 按 4 字节对齐且不超出 `region` 边界，因此 `address as *const u32` 对齐且有效；
+    // 3. `read_volatile` 仅执行单次 MMIO 读指令，随后的 `arch::dma_barrier()` 确保该设备读操作在后续寄存器访问或计数器采样前完成。
     unsafe {
         let value = core::ptr::read_volatile(address as *const u32);
         arch::dma_barrier();
@@ -359,7 +463,7 @@ unsafe fn rtc_register(region: Region, offset: usize) -> u32 {
     }
 }
 
-/// RTC 只能以有效日历提供墙钟起点；不可用样本保留未校时零点及诊断原因。
+/// 解析板级 RTC 日历采样结果：若日历有效则转换为 Unix 纳秒起点，否则回退至 `0`（Unix 纪元零点）并返回诊断原因字符串。
 fn rtc_realtime_base(
     sample: &Result<Option<[u32; 6]>, &'static str>,
 ) -> (u64, Option<&'static str>) {
@@ -373,19 +477,21 @@ fn rtc_realtime_base(
     }
 }
 
-/// BSP 按实际平台尝试RTC授时；未取得有效起点时保持未校时状态，不阻止单调计数器注册。
+/// 在 BSP 启动阶段根据平台类型采样硬件 RTC，确定系统墙钟时间的初始 Unix 纳秒基准。
+///
+/// 若平台无持久化 RTC 或日历值无效，则打印启动诊断信息并将墙钟起点设为 `0`（不影响单调时钟初始化）。
 ///
 /// # Safety
-/// info 必须是已验证的当前机器启动资源；存在的 RTC 及其时钟、复位 provider
-/// 已永久映射，IRQ 关闭且 AP 尚未释放，没有其它 RTC 访问者。
+/// 1. `info` 必须是当前机器已验证的启动信息（[`BootInfo`]），其中描述的 RTC 及其依赖的时钟/复位控制器 MMIO 区域已完成永久映射。
+/// 2. 必须在关中断（IRQ-off）且从核（AP）尚未唤醒的 BSP 单核阶段调用，保证无其他执行流并发访问 RTC 硬件。
 unsafe fn boot_realtime(info: &BootInfo) -> u64 {
     match info.platform {
         Platform::QemuVirt => {
-            // SAFETY: 平台身份来自已验证 BootInfo；初始化独占已映射的 QEMU RTC。
+            // SAFETY: `info.platform` 已确认为 `QemuVirt`，且本函数调用方保证 BSP 关中断独占已永久映射的 QEMU RTC。
             unsafe { qemu_realtime(info) }
         }
         Platform::VisionFive2 | Platform::Ls2k1000la => {
-            // SAFETY: 继承 BSP IRQ-off、AP 未释放、真实资源与 provider 永久映射的合同。
+            // SAFETY: 本函数调用方保证 BSP 处于关中断单核启动阶段，且 `info` 中的板级 RTC 及其时钟/复位控制器已完成永久 MMIO 映射。
             let sample = unsafe { arch::board_rtc_calendar(info) };
             let (realtime, unavailable) = rtc_realtime_base(&sample);
             if let Some(reason) = unavailable {
@@ -401,19 +507,20 @@ unsafe fn boot_realtime(info: &BootInfo) -> u64 {
     }
 }
 
-/// 保留 QEMU Goldfish 的纳秒锁存与 TOY 的启用、稳定采样协议。
+/// 读取 QEMU `virt` 平台的虚拟 RTC（RISC-V Goldfish RTC 或 LoongArch LS7A TOY），返回 Unix 纳秒时间戳。
 ///
 /// # Safety
-/// info 必须属于 QEMU virt；RTC 已永久映射，IRQ 关闭且 AP 尚未释放，
-/// 调用者独占锁存和 TOY 控制寄存器。
+/// 1. `info` 必须属于 QEMU `virt` 平台，且 `info.rtc` 指向的 MMIO 区域已完成永久映射。
+/// 2. 必须在关中断（IRQ-off）且 AP 尚未释放的 BSP 初始化阶段调用，保证独占访问 Goldfish 锁存寄存器或 LS7A TOY 控制寄存器。
 unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     #[cfg(target_arch = "riscv64")]
     {
         const TIME_LOW: usize = 0;
         const TIME_HIGH: usize = TIME_LOW + core::mem::size_of::<u32>();
-        // TIME_LOW 锁存同一采样的高字；必须先读低字再读取该高字。
-        // SAFETY: 初始化调用者独占实际 Goldfish RTC；两个偏移均为可读寄存器，
-        // rtc_register 验证宽度并在两次访问间执行设备屏障。
+        // Goldfish RTC 规定读取 `TIME_LOW` 会同时锁存同一时刻的 `TIME_HIGH`；因此必须先读低 32 位再读高 32 位。
+        // SAFETY:
+        // 1. 调用方保证当前独占已永久映射的 Goldfish RTC MMIO 窗口；
+        // 2. `TIME_LOW` (0x0) 与 `TIME_HIGH` (0x4) 均为合法的 32 位只读寄存器偏移，`rtc_register` 内部会校验窗口边界并插入设备屏障。
         unsafe {
             let low = rtc_register(info.rtc, TIME_LOW);
             let high = rtc_register(info.rtc, TIME_HIGH);
@@ -424,8 +531,10 @@ unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     {
         use crate::time::toy::{RTC_CTRL_REG, TOY_READ0_REG, TOY_READ1_REG};
         const TOY_ENABLE_MASK: u32 = toy::TOY_ENABLE | toy::TOY_32KHZ_ENABLE;
-        // SAFETY: BSP 独占 LS7A TOY；控制字只增加计数和晶振使能位，
-        // 不改日历或 alarm，窗口已由平台验证，强序 DMW 与设备屏障排序读改写。
+        // SAFETY:
+        // 1. 调用方保证 BSP 在关中断状态下独占访问已永久映射的 LS7A TOY 寄存器窗口；
+        // 2. 先通过 `rtc_register` 验证 `RTC_CTRL_REG` 落在 `info.rtc` 窗口内，再按位置位 `TOY_ENABLE` 与 `TOY_32KHZ_ENABLE` 并插入设备屏障；
+        // 3. 随后循环读取 `TOY_READ1_REG`（年）与 `TOY_READ0_REG`（月日时分秒），均为合法对齐的只读寄存器。
         unsafe {
             let control = rtc_register(info.rtc, RTC_CTRL_REG);
             let address = arch::mmio_address(info.rtc.start)
@@ -439,7 +548,7 @@ unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
                 "RTC TOY could not be enabled"
             );
 
-            // 年寄存器不锁存低字；跨年时整组重新采样，避免合成两年的日历。
+            // `TOY_READ1_REG`（年份）不会硬件锁存 `TOY_READ0_REG`；若读取低字前后年份发生变化（跨年边界），则重新采样整组寄存器。
             loop {
                 let year = rtc_register(info.rtc, TOY_READ1_REG);
                 let low = rtc_register(info.rtc, TOY_READ0_REG);
@@ -452,7 +561,7 @@ unsafe fn qemu_realtime(info: &BootInfo) -> u64 {
     }
 }
 
-/// 解码以 1900 为起点的 TOY 年份及日历寄存器，复用完整公历校验。
+/// 将 LoongArch LS7A TOY 寄存器的年份偏移（基于 1900 年）与打包日历低字解码并换算为 Unix 纳秒时间戳。
 #[cfg(any(target_arch = "loongarch64", feature = "ktest"))]
 fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
     calendar_realtime([
@@ -465,15 +574,16 @@ fn rtc_calendar(toy_year: u32, low: u32) -> Option<u64> {
     ])
 }
 
-/// 将绝对公历年月日时分秒转换为 Unix 纳秒，拒绝无效日期和容量之外的样本。
+/// 将公历 `[年, 月, 日, 时, 分, 秒]` 校验并转换为自 1970-01-01 00:00:00 UTC 起的 Unix 纳秒数；日期非法或溢出时返回 `None`。
 fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     const HOURS_PER_DAY: i64 = 24;
     const MINUTES_PER_HOUR: i64 = 60;
     const SECONDS_PER_MINUTE: i64 = 60;
 
-    // 三月起算的公历天数公式在 Unix epoch 的偏移。
+    // 以 3 月 1 日为年度起点的公历天数公式相对于 1970-01-01（Unix Epoch）的天数偏移常数。
     const UNIX_EPOCH_DAY_OFFSET: i64 = 719_499;
 
+    // Step 1: 校验月、时、分、秒的基本范围，并根据格里高利历闰年规则校验当月天数。
     let [year, month, day, hour, minute, second] = calendar.map(i64::from);
     if !(1..=12).contains(&month)
         || HOURS_PER_DAY <= hour
@@ -502,7 +612,7 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
         return None;
     }
 
-    // 将一、二月移至前一年末尾，闰日统一落在最后一月。
+    // Step 2: 将 1 月和 2 月视作上一年的第 13、14 月，使闰日（2 月 29 日）固定落在每年末尾，从而统一计算自 1970-01-01 起的天数与纳秒数。
     let (year, month) = if month <= 2 {
         (year - 1, month + 10)
     } else {
@@ -515,12 +625,12 @@ fn calendar_realtime(calendar: [u32; 6]) -> Option<u64> {
     u64::try_from(seconds).ok()?.checked_mul(NSEC_PER_SEC)
 }
 
-/// BSP 一次确定持久时钟或未校时零点，并注册后续共同使用的稳定计数器。
+/// 初始化全局时间子系统：采样平台 RTC 建立墙钟基准 [`REALTIME_BASE`]，并注册全局单调时间维护器 [`TIMEKEEPER`]。
 ///
 /// # Safety
-/// 仅 BSP 在 MM 初始化后、IRQ 关闭且 AP 尚未释放时调用一次；BootInfo 必须是
-/// 当前机器已验证的资源，存在的 RTC 及其时钟、复位 provider 已永久映射且无其它
-/// 访问者；频率属于当前跨 CPU 一致的 64 位硬件 counter，之后不得切换计数源。
+/// 1. 仅允许由主核（BSP）在内存管理初始化完成后、本地中断关闭（IRQ-off）且从核（AP）尚未启动时调用一次。
+/// 2. `info` 必须是经校验的当前机器启动信息，其中 RTC 及其依赖的时钟、复位控制器 MMIO 区域已完成永久映射且无并发访问。
+/// 3. `info.counter_frequency` 必须准确反映当前全核同步的 64 位硬件计数器频率，且初始化后不得切换底层计数源。
 pub unsafe fn initialize(info: &BootInfo) {
     assert!(!arch::irq_enabled(), "time initialization requires IRQ-off");
     assert!(
@@ -528,7 +638,7 @@ pub unsafe fn initialize(info: &BootInfo) {
         "timekeeper is already initialized"
     );
     TIMEKEEPER.call_once(|| {
-        // SAFETY: 本入口继承 BSP 独占、IRQ-off、AP 未释放和实际 RTC/provider 已映射的启动合同。
+        // SAFETY: 当前处于 `initialize` 入口校验后的 BSP 关中断单核上下文，直接满足 `boot_realtime` 对 `info` 与永久 MMIO 映射的安全前提。
         let realtime = unsafe { boot_realtime(info) };
         compiler_fence(Ordering::SeqCst);
         let cycle = arch::read_counter();
@@ -538,19 +648,19 @@ pub unsafe fn initialize(info: &BootInfo) {
     });
 }
 
-/// 借用已经完整发表的唯一时间基准，注册前调用直接失败。
+/// 获取已初始化的全局 [`Timekeeper`] 引用；若在 [`initialize`] 完成前调用则直接 panic。
 fn keeper() -> &'static Timekeeper {
     TIMEKEEPER
         .get()
         .expect("timekeeper has not been initialized")
 }
 
-/// 读取生产单调时间；panic 与不可屏蔽异常不得等待可能被其打断的写者。
+/// 读取当前系统单调时间 [`MonotonicInstant`]（自 [`initialize`] 起算的纳秒数）。
 pub fn now() -> MonotonicInstant {
     keeper().read(arch::read_counter)
 }
 
-/// 将 RTC 起点或未校时零点与原单调经过纳秒相加，日历空间耗尽时直接失败。
+/// 读取当前 Unix 墙钟时间（单位：纳秒，等于启动墙钟基准 [`REALTIME_BASE`] 加上当前单调时间 [`now()`]）。
 pub fn realtime() -> u64 {
     REALTIME_BASE
         .get()
@@ -559,7 +669,7 @@ pub fn realtime() -> u64 {
         .expect("realtime nanoseconds exhausted")
 }
 
-/// 将当前日历域的绝对睡眠期限转换到原单调域；起点之前的期限对应已经过去的零时刻。
+/// 将 Unix 墙钟时间域的绝对纳秒期限转换为系统单调时间域的 [`MonotonicInstant`]（早于启动墙钟基准的时刻饱和归零）。
 pub(crate) fn realtime_deadline(nanos: u64) -> MonotonicInstant {
     let base = *REALTIME_BASE
         .get()
@@ -567,27 +677,38 @@ pub(crate) fn realtime_deadline(nanos: u64) -> MonotonicInstant {
     MonotonicInstant::from_nanos(nanos.saturating_sub(base))
 }
 
+/// 每核时钟事件（Clockevent）的内部可变状态。
 #[derive(Clone, Copy)]
 struct EventState {
+    /// 标记当前 CPU 的时钟事件是否已由调度器激活接管。
     active: bool,
+    /// 当前 CPU 下一次必须执行 [`Timekeeper::update`] 的单调时间期限。
     maintenance: MonotonicInstant,
+    /// 当前 CPU 上正在运行任务的时间片到期期限；若当前无任务时间片（如切出期间）则为 `None`。
     quantum: Option<MonotonicInstant>,
 }
 
-/// CpuLocal 中预备的本核事件状态，只由所属 CPU 在 IRQ-off 边界访问。
+/// 存放在每核本地存储（`CpuLocal`）中的本核时钟事件控制器。
+///
+/// 内部的 `state` 仅由所属 CPU 在关中断（IRQ-off）上下文中通过 [`LocalEvent::with_current`] 访问。
 pub(crate) struct LocalEvent {
+    /// 本核时钟事件状态（激活标志、维护期限与任务时间片期限），仅限本核关中断访问。
     state: UnsafeCell<EventState>,
+    /// 测试辅助字段：控制本核硬件定时器编程入口的暂停状态机（`0` / `ARMED` / `PAUSED` / `PUBLISHED`）。
     #[cfg(feature = "ktest")]
     program_pause: AtomicUsize,
+    /// 测试辅助字段：记录本核最近一次成功下发到硬件定时器的目标单调纳秒期限。
     #[cfg(feature = "ktest")]
     last_programmed: AtomicU64,
 }
 
-// SAFETY: state 只经 with_current 访问；它校验所属 CPU 和 IRQ-off，远端只发送重编程提示。
+// SAFETY:
+// 1. `LocalEvent::state` 仅通过私有方法 `with_current` 访问，该方法强制断言本地中断已关闭（`!arch::irq_enabled()`）且调用方就是所属 CPU（`ptr::eq(self, &cpu::current().time_event)`）；
+// 2. 跨核操作仅在测试模式下访问原子字段 `program_pause` 与 `last_programmed`，不会触碰 `state`，因此 `LocalEvent` 实现 `Sync` 是安全的。
 unsafe impl Sync for LocalEvent {}
 
 impl LocalEvent {
-    /// 静态准备尚未接管硬件的本核事件，早期手动 timer 保持原行为。
+    /// 创建未激活的初始每核时钟事件控制器（支持静态初始化）。
     pub(crate) const fn new() -> Self {
         Self {
             state: UnsafeCell::new(EventState {
@@ -602,19 +723,23 @@ impl LocalEvent {
         }
     }
 
-    /// 将可变事件借用限制在所属 CPU 的 IRQ-off 调用内，不跨任务切换。
+    /// 在校验本地中断已关闭且归属当前 CPU 后，对本核 [`EventState`] 执行可变借用操作。
+    ///
+    /// 传入的 `operation` 闭包不得触发任务上下文切换或重入 `with_current`。
     fn with_current<R>(&self, operation: impl FnOnce(&mut EventState) -> R) -> R {
         assert!(!arch::irq_enabled(), "local clockevent requires IRQ-off");
         assert!(
             core::ptr::eq(self, &cpu::current().time_event),
             "foreign CPU clockevent access"
         );
-        // SAFETY: 对象为当前核的内嵌事件，IRQ 已关闭，私有方法不逃逸引用或调用调度。
+        // SAFETY:
+        // 1. 上方两个 `assert!` 已确认当前处于关中断状态且 `self` 即为当前 CPU 的本地实例，不存在跨核并发访问或本地中断抢占；
+        // 2. 可变引用 `&mut EventState` 的生命周期被严格限制在非重入的同步闭包 `operation` 内，不会逃逸到外部或跨越上下文切换。
         unsafe { operation(&mut *self.state.get()) }
     }
 }
 
-/// 在本核 scheduler 开始时接管一次事件；每个已激活 CPU 独立保证维护期限。
+/// 在当前 CPU 启动调度器时激活本核时钟事件：推进一次全局时间基准、设定首次维护期限并下发硬件定时器。
 pub(crate) fn activate_current_cpu() {
     cpu::current().time_event.with_current(|event| {
         assert!(!event.active, "local clockevent already activated");
@@ -625,7 +750,7 @@ pub(crate) fn activate_current_cpu() {
     reprogram_current();
 }
 
-/// 当前任务真实切入时建立新时间片，不继承旧 CPU 或旧执行段的期限。
+/// 在任务切入当前 CPU 执行时（关中断上下文），为其分配新的调度时间片（`QUANTUM`）并重新编程本核硬件定时器。
 pub(crate) fn task_switch_in() {
     cpu::current().time_event.with_current(|event| {
         assert!(
@@ -637,7 +762,7 @@ pub(crate) fn task_switch_in() {
     reprogram_current();
 }
 
-/// 当前任务真实切出时移除时间片，保留本核计数器维护事件。
+/// 在当前任务切出 CPU 时（关中断上下文），清除任务时间片期限并按剩余维护/定时器事件重新编程本核硬件定时器。
 pub(crate) fn task_switch_out() {
     cpu::current().time_event.with_current(|event| {
         assert!(event.active, "task clockevent is not activated");
@@ -646,8 +771,9 @@ pub(crate) fn task_switch_out() {
     reprogram_current();
 }
 
-/// 先结束事件维护借用，再执行允许重新武装 timer 的硬回调，最后重查本核期限。
+/// 时钟中断处理函数：检查并推进到期的基准维护事件、清理到期的任务时间片，随后触发软件定时器回调并重编程下一次硬件中断。
 pub(crate) fn handle_timer() {
+    // Step 1: 在本核 `EventState` 短暂可变借用内检查维护期限与时间片期限，并在借用结束前释放可变引用。
     let active = cpu::current().time_event.with_current(|event| {
         if !event.active {
             return false;
@@ -662,13 +788,14 @@ pub(crate) fn handle_timer() {
         true
     });
 
+    // Step 2: 在释放 `EventState` 借用后执行软件定时器到期回调（允许回调内部重武装定时器），最后统一重新编程本核硬件定时器。
     if active {
         crate::timer::handle_interrupt();
         reprogram_current();
     }
 }
 
-/// 重查本核真实最早事件并编程；远端提示不携带可能失效的旧期限。
+/// 重新查询当前 CPU 的维护期限、任务时间片与软件定时器最早到期时间，并将最早期限写入本核硬件定时器。
 pub(crate) fn reprogram_current() {
     let event = cpu::current()
         .time_event
@@ -678,19 +805,19 @@ pub(crate) fn reprogram_current() {
     }
 }
 
-/// 从本次真实维护基准建立下一次期限，纳秒空间耗尽直接失败。
+/// 根据当前维护完成时刻 `instant` 计算下一次基准维护的单调时间期限。
 fn maintenance_deadline(instant: MonotonicInstant) -> MonotonicInstant {
     instant
         .checked_add(Duration::from_nanos(keeper().scale.maintenance_ns()))
         .expect("counter maintenance deadline overflows")
 }
 
-/// 对当前执行段重建一次真实调度期限，提交前由调用者结束可变事件借用。
+/// 为指定事件状态设置从当前时刻起算的一个完整任务时间片期限（`now() + QUANTUM`）。
 fn arm_quantum(event: &mut EventState) {
     event.quantum = Some(now().checked_add(QUANTUM).expect("task quantum overflows"));
 }
 
-/// 在同一本核 base 锁下最终重查两类 timer，并保持锁直到真实硬件编程结束。
+/// 在持有本核软件定时器底座锁的临界区内，综合比较维护期限、任务时间片与软件定时器期限，将最早到期时间换算为硬件周期并写入比较器。
 fn program(event: EventState) {
     #[cfg(feature = "ktest")]
     testing::pause_program();
@@ -710,7 +837,7 @@ fn program(event: EventState) {
     });
 }
 
-/// 专用验收只公开生产对象与同一算法，不维护第二套时间模型。
+/// 内核单元测试（`ktest`）专用的时间子系统白盒观测与并发交错控制辅助模块。
 #[cfg(feature = "ktest")]
 pub(crate) mod testing {
     pub(crate) use super::Timekeeper;
@@ -721,12 +848,12 @@ pub(crate) mod testing {
     use core::hint::spin_loop;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    /// 对独立字段调用生产日历换算，不访问或改写实际 RTC。
+    /// 测试辅助接口：调用 [`super::rtc_calendar`] 对指定的 TOY 年份偏移与打包低字进行公历换算。
     pub(crate) fn rtc_calendar(year: u32, low: u32) -> Option<u64> {
         super::rtc_calendar(year, low)
     }
 
-    /// 对独立RTC样本执行生产启动授时规则，不访问硬件或改写已发布的时间基准。
+    /// 测试辅助接口：调用 [`super::rtc_realtime_base`] 验证板级 RTC 日历样本到 Unix 纳秒起点的解析逻辑。
     pub(crate) fn rtc_realtime_base(
         sample: Result<Option<[u32; 6]>, &'static str>,
     ) -> (u64, Option<&'static str>) {
@@ -746,13 +873,13 @@ pub(crate) mod testing {
     #[cfg(feature = "ktest")]
     static FAULT_WRITER: AtomicUsize = AtomicUsize::new(0);
 
-    /// 将故障限定到已等待 printer 真阻塞的当前普通 Task，维护 IRQ 不消费停点。
+    /// 测试辅助接口：将顺序锁写者故障注入目标绑定到当前普通任务（定时器维护中断不会消费该故障注入点）。
     #[cfg(feature = "ktest")]
     pub(crate) fn arm_writer_fault() {
         FAULT_WRITER.store(task::current_task().id().as_usize(), Ordering::Release);
     }
 
-    /// 仅在生产写锁和真实奇序号内报告写者故障；终结路径不读取单调时间或普通日志。
+    /// 测试辅助钩子：当目标普通任务持有全局 [`Timekeeper`] 写锁且已将 `sequence` 置为奇数时，触发致命故障诊断事件。
     #[cfg(feature = "ktest")]
     pub(super) fn panic_writer(timekeeper: &Timekeeper, raw: u64) {
         if core::ptr::eq(timekeeper, keeper())
@@ -772,8 +899,9 @@ pub(crate) mod testing {
         }
     }
 
-    /// 为指定 CPU 的下一次真实硬件提交武装锁前停点，须由另一 CPU 释放。
-    /// 上一次停点的真实提交与 handler 已返回、相关生产子任务已 join 后才可重新武装。
+    /// 测试辅助接口：为目标 CPU `target` 的下一次硬件定时器编程武装锁前暂停点（必须由另一 CPU 调用并释放）。
+    ///
+    /// 调用前必须确保上一轮暂停点的硬件编程及中断处理函数已执行完毕，且相关测试子任务已汇合（join）。
     pub(crate) fn arm_program_pause(target: usize) {
         assert_ne!(
             target,
@@ -787,7 +915,7 @@ pub(crate) mod testing {
             .expect("clockevent program pause already armed");
     }
 
-    /// 观察目标已进入真实提交入口，但尚未持有 timer base 锁。
+    /// 测试辅助接口：查询目标 CPU `target` 是否已进入 `program` 并在获取定时器底座锁前处于暂停状态（`PAUSED`）。
     pub(crate) fn program_paused(target: usize) -> bool {
         cpu::get(target)
             .time_event
@@ -796,7 +924,7 @@ pub(crate) mod testing {
             == PAUSED
     }
 
-    /// 释放真实提交停点；目标随后在 base 锁内重新选择已发表的最早节点。
+    /// 测试辅助接口：放行处于 `PAUSED` 状态的目标 CPU `target`，使其继续获取定时器底座锁并完成硬件定时器编程。
     pub(crate) fn release_program_pause(target: usize) {
         cpu::get(target)
             .time_event
@@ -805,9 +933,9 @@ pub(crate) mod testing {
             .expect("clockevent program pause has not been reached");
     }
 
-    /// 撤销未到达的提交停点，或放行已暂停的真实提交；不撤销硬件事件且不等待 handler。
-    /// 控制者须在另一 CPU 保持目标与相关 timer 存储有效，锁外完成真实 close/join 和
-    /// handler 尾部确认后才能重新武装；状态归零本身不证明提交或中断已结束。
+    /// 测试辅助接口：撤销目标 CPU `target` 尚未触发的编程暂停点，或放行已暂停的编程流程。
+    ///
+    /// 调用者必须在其他 CPU 上保证目标 CPU 及关联定时器对象存活，并在锁外完成任务汇合（join）与中断退出确认后才能再次武装。
     pub(crate) fn cancel_program_pause(target: usize) {
         let state = &cpu::get(target).time_event.program_pause;
         loop {
@@ -827,7 +955,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// 读取真实硬件编程结束后发表的统一纳秒期限，不把候选期限冒充提交证据。
+    /// 测试辅助接口：读取目标 CPU `target` 最近一次完成硬件定时器编程时写入的单调纳秒期限。
     pub(crate) fn last_programmed_deadline(target: usize) -> MonotonicInstant {
         MonotonicInstant::from_nanos(
             cpu::get(target)
@@ -837,7 +965,7 @@ pub(crate) mod testing {
         )
     }
 
-    /// 只在真实提交取最终 base 锁之前暂停；原始计数器限制等待且不重入时间事件。
+    /// 测试辅助钩子：在 `program` 获取本核软件定时器底座锁之前检查暂停状态，若已武装则使用原始硬件计数器自旋等待放行。
     pub(super) fn pause_program() {
         let state = &cpu::current().time_event.program_pause;
         if state
@@ -865,11 +993,11 @@ pub(crate) mod testing {
         state.store(0, Ordering::Release);
     }
 
-    /// 在当前普通任务的 IRQ-off 段重建时间片，沿用生产事件和硬件提交。
+    /// 测试辅助接口：在当前普通任务的关中断临界区内重置任务时间片期限并重新编程本核硬件定时器。
     ///
     /// # Safety
-    /// 调用者必须为本核普通任务，IRQ 已关闭且不跨任务切换；本核事件已由
-    /// scheduler 激活，调用期间不得持有会重入时间事件的锁或借用。
+    /// 1. 调用者必须运行在已由调度器激活时钟事件的当前 CPU 普通任务上下文中，且本地中断已关闭（IRQ-off）、期间不发生任务切换。
+    /// 2. 调用期间不得持有任何会在重编程路径中被再次获取的自旋锁或可变借用。
     pub(crate) unsafe fn rearm_current_quantum() {
         assert_ordinary_task();
         cpu::current().time_event.with_current(|event| {
@@ -879,13 +1007,12 @@ pub(crate) mod testing {
         reprogram_current();
     }
 
-    /// 为唯一生产基准准备一次指定任务的跨核快照交错。
+    /// 测试辅助接口：为全局 [`Timekeeper`] 配置一次指定读者任务 `reader` 与写者任务 `writer` 之间的跨核顺序锁并发交错握手。
     ///
     /// # Safety
-    /// reader 必须在本核普通任务的 IRQ-off 段调用，并在同一段立即调用 now，
-    /// 期间不切换或先调用其他时间读接口；writer 必须已在另一 CPU 可运行，
-    /// 以原始 counter 有限等待 reader_paused 后调用 maintain。双方不得持有
-    /// 对方推进所需的锁；reader 的 now 返回且双方真实 join 后才可重新注册。
+    /// 1. 必须由 `reader` 任务在本地关中断（IRQ-off）的普通任务上下文中调用，且调用后须在同一关中断段内立即调用 [`super::now()`]。
+    /// 2. `writer` 任务必须已在另一 CPU 上就绪运行，通过硬件计数器轮询等待 [`reader_paused`] 为真后调用 [`maintain`] 推进时间基准。
+    /// 3. 读写双方不得持有阻碍对方前进的锁；必须在 `reader` 从 [`super::now()`] 返回且双方任务汇合后才允许开启下一轮握手。
     pub(crate) unsafe fn arm_snapshot_overlap(reader: TaskId, writer: TaskId) {
         assert_ordinary_task();
         assert_eq!(task::current_task_id(), Some(reader));
@@ -902,12 +1029,12 @@ pub(crate) mod testing {
         OVERLAP_PHASE.store(ARMED, Ordering::Release);
     }
 
-    /// 无锁观察 reader 是否已经读取旧偶序号和 base，写者不调用 now 等待。
+    /// 测试辅助接口：无锁查询 `reader` 任务是否已在读取旧偶数序号与 `base_ns` 后进入暂停状态（`PAUSED`）。
     pub(crate) fn reader_paused() -> bool {
         OVERLAP_PHASE.load(Ordering::Acquire) == PAUSED
     }
 
-    /// 返回真实重叠更新数和由末序号不匹配产生的拒绝重试数。
+    /// 测试辅助接口：返回并发交错测试期间写者完成重叠更新的次数与读者因序号变化触发重试的次数 `(overlaps, retries)`。
     pub(crate) fn snapshot_overlap_result() -> (usize, usize) {
         (
             OVERLAPS.load(Ordering::Acquire),
@@ -915,7 +1042,7 @@ pub(crate) mod testing {
         )
     }
 
-    /// 在 reader 的 now 已返回后关闭一次完成的握手，不留下生产停点。
+    /// 测试辅助接口：在 `reader` 任务验证完重试并从 [`super::now()`] 返回后，重置跨核交错握手状态机。
     pub(crate) fn finish_snapshot_overlap() {
         assert_eq!(
             OVERLAP_PHASE.load(Ordering::Acquire),
@@ -925,15 +1052,12 @@ pub(crate) mod testing {
         OVERLAP_PHASE.store(0, Ordering::Release);
     }
 
-    /// 原 reader 离开 sample 后撤销本例快照握手；重复取消空状态不改变生产基准。
-    /// 只修改停点，不跳过 writer 的真实字段写或伪造 PUBLISHED，不等待 reader/writer。
+    /// 测试辅助接口：在 `reader` 离开 `Timekeeper::sample` 后取消当前跨核交错握手状态机（幂等）。
     ///
     /// # Safety
-    /// 调用者须独占本例控制权，并证明原 reader 已退出本次 sample 或不会再进入它：
-    /// 本体 catch 退栈或 reader 子任务真实 join 可提供该证明。仍暂停的 reader 必须
-    /// 先由指定 writer 真实 maintain 发布 even 并放行，再在原同 CPU IRQ-off 段退出
-    /// sample；不得以取消替代这次生产写。取消后仍保活双方，真实 join 全部 writer
-    /// 和 reader 以前不得重新武装，避免旧 producer 的 CAS 消费下一例的同值状态。
+    /// 1. 调用者必须独占当前测试用例的控制权，并确保 `reader` 任务已退出 `Timekeeper::sample`（例如已捕获栈展开或已完成子任务 join）。
+    /// 2. 若 `reader` 仍处于 `PAUSED` 自旋状态，必须先由指定 `writer` 调用 [`maintain`] 完成更新将其放行，严禁直接取消导致 `reader` 断言失败。
+    /// 3. 取消后必须等待本轮所有 `reader` 与 `writer` 任务完全退出汇合后，才可重新调用 [`arm_snapshot_overlap`]。
     pub(crate) unsafe fn cancel_snapshot_overlap() {
         loop {
             let phase = OVERLAP_PHASE.load(Ordering::Acquire);
@@ -948,7 +1072,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// 校验停点只位于本核普通执行段，IRQ 不能在等待期间重入时间读取。
+    /// 断言当前执行流处于关中断（IRQ-off）的普通任务上下文（非硬中断或软中断下半部）。
     fn assert_ordinary_task() {
         assert!(!arch::irq_enabled(), "snapshot test requires IRQ-off");
         let local = cpu::current();
@@ -960,7 +1084,7 @@ pub(crate) mod testing {
         );
     }
 
-    /// 只识别唯一生产基准与指定普通任务，独立算术实例不访问 CPU 状态。
+    /// 检查 `timekeeper` 是否为全局唯一实例，且当前执行流为非中断上下文中匹配 `target` 任务 ID 的普通任务。
     fn matches_task(timekeeper: &Timekeeper, target: &AtomicUsize) -> bool {
         if !core::ptr::eq(timekeeper, keeper()) {
             return false;
@@ -972,7 +1096,7 @@ pub(crate) mod testing {
                 .is_some_and(|id| id.as_usize() == target.load(Ordering::Relaxed))
     }
 
-    /// 在旧代 even 和 base 之后暂停一次 reader；等待只依赖原始 counter。
+    /// 测试辅助钩子：当匹配的 `reader` 任务在 `Timekeeper::sample` 中读取 `base_ns` 后，将其暂停直到另一核上的 `writer` 完成一次基准更新。
     pub(super) fn pause_snapshot(timekeeper: &Timekeeper) -> bool {
         if OVERLAP_PHASE.load(Ordering::Acquire) != ARMED
             || !matches_task(timekeeper, &OVERLAP_READER)
@@ -1001,8 +1125,7 @@ pub(crate) mod testing {
         true
     }
 
-    /// 写者完成真实字段写和 even 发布以后才释放持旧 base 的 reader。
-    /// 原 reader 已退出时取消可先关闭握手；CAS 防止仍在真实 update 尾部的旧 writer 复活停点。
+    /// 测试辅助钩子：当匹配的 `writer` 任务在 `Timekeeper::update` 中完成字段更新并发布新偶数序号后，将握手状态推进至 `PUBLISHED` 以唤醒暂停的 `reader`。
     pub(super) fn publish_snapshot_update(timekeeper: &Timekeeper) {
         if OVERLAP_PHASE.load(Ordering::Acquire) == PAUSED
             && matches_task(timekeeper, &OVERLAP_WRITER)
@@ -1017,18 +1140,18 @@ pub(crate) mod testing {
         }
     }
 
-    /// 只在原 sample 的末序号实际不匹配时记录拒绝，不把暂停当成重试。
+    /// 测试辅助钩子：当 `reader` 在 `Timekeeper::sample` 末尾检测到序号变化并准备重试时，递增重试计数并将状态标记为 `REJECTED`。
     pub(super) fn reject_snapshot() {
         RETRIES.fetch_add(1, Ordering::Relaxed);
         OVERLAP_PHASE.store(REJECTED, Ordering::Release);
     }
 
-    /// 真实推进生产基准，写锁与序号协议和本地维护 IRQ 完全相同。
+    /// 测试辅助接口：在测试中主动调用全局 [`Timekeeper::update`] 推进一次单调时间基准。
     pub(crate) fn maintain() -> MonotonicInstant {
         keeper().update(arch::read_counter)
     }
 
-    /// 返回生产基准真实完成的维护更新次数。
+    /// 测试辅助接口：返回全局 [`Timekeeper`] 自启动以来完成的基准维护更新总次数。
     pub(crate) fn updates() -> u64 {
         keeper().updates.load(Ordering::Acquire)
     }

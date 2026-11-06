@@ -1,4 +1,38 @@
-//! 逻辑请求拥有原页；生成者与已登记 child 共同决定唯一父完成。
+//! 逻辑块请求（`Bio`）的状态机、物理页 DMA 所有权流转与父子请求完成聚合。
+//!
+//! # 模块职责与架构定位
+//! `Bio` 代表一次上层（文件系统、页缓存读入/写回或直接块读写）发起的连续扇区逻辑 I/O 请求。
+//! 它持有本次 I/O 涉及的全部物理页映射（[`BioMemory`]），在提交到 [`Disk`] 时可由拆分器按硬件队列限额
+//! 拆分为 1 至多个连续的硬件子请求（child `RequestPart`）。提交线程（生成器）与所有已登记的子请求共同承担
+//! 引用计数式的完成义务（`remaining`），仅在最后一项义务结束时一次性收回物理页 DMA 访问权、执行 `EndIo` 回调并唤醒等待者。
+//!
+//! # 核心状态机（`Phase`）与义务计数流转
+//! ```text
+//!                      ┌─── reject() (未准入即失败，物理页未移交设备) ───┐
+//!                      │                                                 ▼
+//!   try_new() ──► [ Phase::New ] ──► begin() ──► [ Phase::Beginning ]    │
+//!                                      │  移交物理页 DMA/CPU 访问权      │
+//!                                      │  remaining = 1 (生成器义务)     │
+//!                                      ▼                                 │
+//!                              [ Phase::Active ]                         │
+//!                                │  register_child(): remaining += 1     │
+//!                                │  accept_child(): 记录硬件实际接收范围 │
+//!                                │  finish_child():   remaining -= 1     │
+//!                                │  finish_generation():                 │
+//!                                │    generating = false, remaining -= 1 │
+//!                                ▼  (当 remaining == 0)                  │
+//!                           [ Phase::Finishing ] ◄───────────────────────┘
+//!                                │  1. 收回物理页 DMA/CPU 访问权
+//!                                │  2. 执行 EndIo 回调 (Inline 或 Work)
+//!                                │  3. 更新 Folio 读入/写回状态
+//!                                ▼
+//!                           [ Phase::Complete ] (ready = true, 唤醒等待队列)
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - `Disk.queue`（`SpinLock`）──► `BioInner.state`（`SpinLock`）：在 `accept_child` 等路径中允许先持物理队列锁再获取 `BioInner.state`；禁止反向获取。
+//! - `BioInner.raw_writer_next` 裸链表指针不经过 `BioInner.state`，仅在所属目标 `Disk.queue` 自旋锁保护下读写。
+//! - 持 `BioInner.state` 自旋锁期间严禁执行 DMA 缓存同步、`EndIo` 回调、页框状态更新（`complete_folio`）或释放 `FsClaim` / `DiskRef`；这些重操作必须先将数据移出锁外执行。
 
 use alloc::sync::Arc;
 use core::pin::{pin, Pin};
@@ -17,107 +51,144 @@ use crate::sync::SpinLock;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 use crate::workqueue::Work;
 
-/// 唯一可提交凭证；完成观察者只克隆同一父对象，不能重新提交。
+/// 逻辑块 I/O 请求的唯一提交句柄（不可克隆，消费后移交队列避免重复提交）。
 pub struct Bio {
+    /// 指向底层共享控制块与自定义分配器的强引用。
     pub(super) inner: BioArc,
 }
 
-/// 完成观察者不拥有 Disk，也不创建新的等待存储或内存副本。
+/// `Bio` 的只读完成观察句柄，允许多个调用方克隆并等待结果，不持有 `Disk` 强引用且无法重复提交请求。
 #[derive(Clone)]
 pub struct BioCompletion {
+    /// 与原 `Bio` 共享同一个底层控制块，用于查询结果、睡眠等待或单次取回物理页容器。
     inner: BioArc,
 }
 
+/// `Bio` 生命周期内的内部阶段状态机（受 `BioInner.state` 自旋锁保护）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
+    /// 刚构造完成、尚未进入物理队列准入，物理页访问权仍在 CPU 手中。
     New,
+    /// 正在由唯一准入任务将物理页访问权移交给 DMA 设备（或内存盘 CPU 拷贝通道）。
     Beginning,
+    /// 已完成准入，正在由生成器拆分登记子请求并由硬件异步执行。
     Active,
+    /// 生成器与全部已登记子请求均已结束（或请求在准入前被拒绝），正在锁外收回物理页访问权并执行完成回调。
     Finishing,
+    /// 物理页回收、回调与 `Folio` 结算全部完成，最终结果已发布且等待队列已唤醒。
     Complete,
 }
 
+/// `BioInner` 中受自旋锁保护的可变账本状态。
 struct BioState {
+    /// 当前所处的生命周期阶段。
     phase: Phase,
+    /// 本次请求携带的物理页映射集合；在 `Beginning`（移交访问权期间）、`Finishing`（收回与回调期间）或被调用方 `take_memory` 领走后为 `None`。
     memory: Option<BioMemory>,
+    /// 尚未完成的义务总数（包含 1 份生成器拆分义务 + 已登记但未完成的硬件子请求数）；归零时触发唯一完成流程。
     remaining: usize,
+    /// 生成器是否仍在继续拆分并登记子请求。
     generating: bool,
+    /// 已按逻辑顺序向本 `Bio` 登记拆分的连续字节末尾偏移（单位：字节）。
     registered_end: usize,
+    /// 已登记的子请求总个数（用于校验 `Flush` 单次生成与非空提交）。
     registered_children: usize,
+    /// 底层驱动 `submit` 已实际接收的连续字节末尾偏移（单位：字节）。
     accepted_end: usize,
+    /// 所有失败子请求或生成错误中偏移最小的一处 `(失败起始字节偏移, 错误码)`，用于计算连续成功前缀。
     first_error: Option<(usize, BlockError)>,
+    /// 请求进入 `Finishing` / `Complete` 后固化保存的最终完成结果。
     result: Option<IoResult>,
+    /// 当非槽位路径（如生成器最后结束）将 `EndIo::Task` 异步移交给 `finalizer_work` 时，临时持有的 `DiskRef` 以推迟归还队列生成器计数。
     completion_owner: Option<DiskRef>,
+    /// 文件系统提交路径绑定的挂载占用凭证，延续到父请求及所有子请求脱离队列后再释放。
     fs_claim: Option<FsClaim>,
+    /// 派发 `finalizer_work` 前暂存的 `BioArc` 裸强引用票据，由工作队列回调取走并恢复为 `BioArc`。
     finalizer_ticket: Option<BioRawTicket>,
+    /// 文件系统后台写回路径绑定的脏页流量统计域。
     writeback_domain: Option<Arc<WritebackDomain>>,
 }
 
-/// 不可变范围与常数完成账本分开；队列 part 只强拥有此对象。
+/// 逻辑块请求的共享核心控制块，分离构造期固定的不可变寻址参数与自旋锁保护的动态完成账本。
 pub(super) struct BioInner {
+    /// 构造时绑定的目标物理块设备唯一身份标识（不持有 `Disk` 强引用以避免循环引用）。
     target: DiskIdentity,
+    /// 目标设备的 DMA 域参数；内存盘等纯 CPU 拷贝后端为 `None`。
     domain: Option<DmaDomain>,
+    /// 直接块写请求在目标 `Disk.queue` 活跃写链表中的侵入式后继指针（仅在目标 `Disk.queue` 锁保护下访问）。
     pub(super) raw_writer_next: UnsafeCell<*const BioInner>,
+    /// 请求的块操作类型（读、写或刷盘）。
     operation: BlkOperation,
+    /// 请求在物理整盘上的起始扇区号（单位：512 字节 `SECTOR_BYTES`）。
     sector: u64,
+    /// 请求负载的总字节长度（`Flush` 操作为 0）。
     len: usize,
+    /// 构造时传入的物理页映射段（`MappedPages`）数量。
     segment_count: usize,
+    /// 可选的请求完成异步回调。
     end_io: Option<EndIo>,
+    /// 当携带 `EndIo::Task` 时在构造期预分配的独立工作项，用于处理被拒绝或由生成器最后结束时的可睡眠回调。
     finalizer_work: Option<Pin<Arc<Work>>>,
+    /// 保护动态阶段、子请求计数与物理页容器的自旋锁。
     state: SpinLock<BioState>,
+    /// 标记请求是否已彻底进入 `Phase::Complete` 的原子标志（写入用 `Release`，观察用 `Acquire`）。
     ready: AtomicBool,
+    /// 供 `BioCompletion::wait` 阻塞等待完成通知的任务等待队列。
     waiters: WaitQueue,
 }
 
-// SAFETY: raw_writer_next 只在目标 Disk.queue 锁下读写，accepted 生成者保活链节点；
-// 其余可变状态由 state 锁保护，来源外部访问期由每个 child 的原账本结束。
+// SAFETY:
+// 1. `raw_writer_next` 仅在目标 `Disk.queue` 自旋锁临界区内读写，且在途生成器持有 `BioArc` 保证链表节点存活；
+// 2. 其余可变字段全部受 `state` 自旋锁保护，物理页 DMA/CPU 访问权在最后一个子请求与生成器全部结束后才移交回 CPU。
 unsafe impl Send for BioInner {}
-// SAFETY: 共享引用不访问 payload，裸链的同步和寿命遵循同一个物理队列锁。
+// SAFETY:
+// 1. 跨线程共享 `&BioInner` 不会在无锁状态下暴露底层物理页内容；
+// 2. `raw_writer_next` 裸指针由同一个目标 `Disk.queue` 自旋锁串行化，其余内部可变状态均由 `state`、`ready` 与 `waiters` 同步原语保护。
 unsafe impl Sync for BioInner {}
 
-/// 所有父、子请求及观察者同时携带原 allocator 拥有。
+/// 携带预留池/堆分配器状态（[`BioAllocator`]）的 `BioInner` 强引用智能指针类型。
 pub(super) type BioArc = Arc<BioInner, BioAllocator>;
 
-/// 一张真实 raw strong 与其转出的原 allocator 值共同移动。
+/// 用于跨工作队列上下文无损传递一份 `BioArc` 强引用所有权及其底层分配器的裸票据。
 struct BioRawTicket {
+    /// 由 `Arc::into_raw_with_allocator` 转出的 `BioInner` 裸指针（持有一份未释放的强引用计数）。
     pointer: *const BioInner,
+    /// 与该 `Arc` 实例绑定的原始分配器句柄。
     allocator: BioAllocator,
 }
 
-// SAFETY: pointer 来自真实 into_raw_with_allocator strong；票只由一次
-// Work 移交，状态锁保护其存取，allocator 覆盖回调及真正 deallocate。
+// SAFETY:
+// 1. `pointer` 与 `allocator` 来自真实的 `BioArc` 强引用拆解，等价于跨线程移动一个 `BioArc`（`BioInner: Send + Sync` 且 `BioAllocator: Send`）；
+// 2. 票据存入与取出均受 `BioInner.state` 自旋锁保护，仅由单次排队的 `finalizer_callback` 消费并还原为 `BioArc`。
 unsafe impl Send for BioRawTicket {}
 
 impl BioRawTicket {
-    /// 消费真 Arc 并保留原 allocator，不新建计数或猜来源。
+    /// 拆解一份 `BioArc` 强引用，在不改变引用计数的前提下保存其裸指针与原始分配器。
     fn from_arc(owner: BioArc) -> Self {
         let (pointer, allocator) = Arc::into_raw_with_allocator(owner);
         Self { pointer, allocator }
     }
 
-    /// 同一票一次恢复原 strong 与 allocator owning。
+    /// 消费本票据，将其持有的强引用与分配器一次性还原为 `BioArc`。
     fn into_arc(self) -> BioArc {
-        // SAFETY: 本票的 pointer/allocator 从同一次真实 into_raw 转移；
-        // 没有其它 from_raw 消费者，allocator 值恰好移回这一份 Arc。
+        // SAFETY:
+        // 1. `self.pointer` 与 `self.allocator` 由 `Self::from_arc` 调用 `Arc::into_raw_with_allocator` 配对产生；
+        // 2. `into_arc` 按值消费 `self`，保证同一张票据只会被调用一次 `Arc::from_raw_in`，不会发生双重释放。
         unsafe { Arc::from_raw_in(self.pointer, self.allocator) }
     }
 }
 
 impl Bio {
-    /// 在普通可切换 Task、所有队列锁外校验原映射并准备全部 fallible 完成存储。
-    /// 失败不发表请求，folio 以原错误结束读入责任，原页来源按原阶归还。
+    /// 在普通可睡眠任务上下文（未持有任何队列自旋锁）中校验映射范围，并预分配 `Bio` 控制块与所需的完成工作项。
+    ///
+    /// 若校验或内存预分配失败，本函数不会向设备提交任何请求，并会以当前准备错误代为结算各 `MappedPages` 关联的 `Folio` 状态。
     ///
     /// # Safety
-    /// Write 的整个范围必须已初始化；独占来源的全部 CPU 裸别名须结束至真实收权。
-    /// 共享文件 WB 来源必须持有对应原页及映射撤权完成的凭证，之后原始写会记录新 Dirty，
-    /// 不允许导出内容切片。每个输入映射须为 CPU-owned，移交来源完整设备访问责任；
-    /// Read 的读入者尚未初始化完成，短结果不授予未写尾部的内容访问权。
-    /// 回调若调用 MappedPages::bytes，须证明独占来源整个范围初始化且无并发写。
-    /// Inline 回调不得睡眠、动态准备或递归停止本 Disk；Task 回调可以睡眠，
-    /// 但不得等待自身父完成、等待本 Disk 停止或复用仍由回调访问的 slot。
-    /// 两种回调都不得泄露 memory 借用或在返回后继续访问其裸别名。
-    /// Task 回调的现存工作域须保开放至本 Bio 被拒绝或完成，沿用域 owner 停外部生产源后关闭的规则。
-    /// Task Bio 构造期另备同域独占执行栈；拒绝或生成者最后完成也不能耗尽设备完成的准入。
+    /// 1. 对于 `Write` 请求，输入映射覆盖的全部物理页字节必须已完成初始化；对于独占物理页来源，调用方持有的全部可变/裸指针别名必须在移交期间停止访问，直到请求完成收回访问权；
+    /// 2. 对于共享文件页写回（Writeback）来源，调用方必须已完成脏页写保护清理并持有写回凭证，映射期间不允许导出可变内容切片；
+    /// 3. 每个输入 `MappedPages` 当前必须处于 CPU 拥有状态且未结算，构造成功后其设备访问周期由本 `Bio` 接管；对于 `Read` 请求，短读或错误返回时未覆盖的尾部字节仍处于未初始化状态；
+    /// 4. 若 `end_io` 回调内部调用 `MappedPages::bytes`，调用方必须自行保证对应独占映射全范围已初始化且无并发修改；两种回调均不得泄露切片引用或在返回后继续解引用底层地址；
+    /// 5. `EndIo::Inline` 回调严禁睡眠、动态分配阻塞资源或递归调用本 `Disk` 的 `stop`；`EndIo::Task` 回调允许睡眠，但严禁等待本 `Bio` 自身完成或等待所属 `Disk` 停机，且目标 `Disk` 的共享工作队列必须保持存活至本 `Bio` 完成。
     pub(crate) unsafe fn try_new(
         disk: &Disk,
         operation: BlkOperation,
@@ -128,6 +199,7 @@ impl Bio {
     ) -> Result<Self, BlockError> {
         sched::assert_switchable();
         let prepared = (|| {
+            // Step 1: 确认所有物理页映射当前归 CPU 所有且未完成结算，并校验队列范围、对齐及目标 DMA 域可达性。
             let mut len = 0_usize;
             for mapped in &memory {
                 if mapped.is_device_owned() || mapped.is_folio_complete() {
@@ -150,6 +222,7 @@ impl Bio {
                 }
             }
 
+            // Step 2: 使用输入内存容器配套的控制块分配器构造 BioInner，避免在 I/O 提交与完成热路径上再次做可失败分配。
             let allocator = memory.allocator().control();
             let mut uninit = Arc::<BioInner, BioAllocator>::try_new_uninit_in(allocator)
                 .map_err(|_| BlockError::NoMemory)?;
@@ -183,15 +256,17 @@ impl Bio {
                     ready: AtomicBool::new(false),
                     waiters: WaitQueue::new(),
                 });
-            // SAFETY: 新 uninit Arc 尚未发表且没有其它引用，全部字段已写齐，
-            // 原 allocator 值随同同一真实控制分配继续存在。
+            // SAFETY: `uninit` 是刚分配的唯一未公开 `Arc` 实例，上方 `write` 已完整初始化 `BioInner` 的全部字段。
             let inner = unsafe { uninit.assume_init() };
+            // Step 3: 若携带可睡眠的 EndIo::Task 回调，提前在目标磁盘的工作队列域中预留专用 finalizer_work 与内核执行栈。
             if inner.needs_task() {
                 let ticket = BioRawTicket::from_arc(inner);
                 let raw = ticket.pointer;
                 let owner = ticket.into_arc();
                 let work = disk.prepare_finalizer(finalizer_callback, raw as usize)?;
-                // SAFETY: Work 尚无票，原映射未移入，没有任何回调或第二份 Bio 引用。
+                // SAFETY:
+                // 1. `owner` 尚未对外返回，当前不存在任何其它线程或中断持有 `BioInner` 的引用；
+                // 2. `work` 刚构造且尚未入队运行，`raw` 指向的 `finalizer_work` 字段此时由当前栈帧独占写入。
                 unsafe { (*raw.cast_mut()).finalizer_work = Some(work) };
                 return Ok(owner);
             }
@@ -204,10 +279,12 @@ impl Bio {
                 Ok(Self { inner })
             }
             Err(error) => {
+                // Step 4 (失败清理): 请求尚未移交设备，直接在本地以准备失败错误结算所有输入映射关联的 Folio 读入/写回状态。
                 for mapped in &mut memory {
                     if !mapped.is_device_owned() {
-                        // SAFETY: 请求未发表，构造义务保证 CPU 别名结束；
-                        // 错误结果不授予初始化范围，保留真正准备错误而非析构取消错误。
+                        // SAFETY:
+                        // 1. 上方 `!mapped.is_device_owned()` 确认物理页仍归 CPU 所有，且请求从未发布到硬件队列；
+                        // 2. 调用方 `# Safety` 契约保证外部无冲突别名，传入 `completed: 0` 不会将未读入的数据页误标为已初始化。
                         unsafe {
                             mapped.complete_folio(IoResult {
                                 completed: 0,
@@ -221,7 +298,7 @@ impl Bio {
         }
     }
 
-    /// 克隆现存父引用供提交后的观察，不分配或复制 payload。
+    /// 创建一个指向同一底层请求的完成观察句柄（仅克隆 `Arc` 指针，不复制任何物理页负载）。
     pub fn completion(&self) -> BioCompletion {
         BioCompletion {
             inner: Arc::clone(&self.inner),
@@ -230,7 +307,9 @@ impl Bio {
 }
 
 impl BioCompletion {
-    /// 普通可切换 Task 登记栈节点、复查再阻塞；通知只用于重查 Release 完成事实。
+    /// 在普通可睡眠任务上下文中阻塞等待 `Bio` 完成，并返回最终 `IoResult`。
+    ///
+    /// 采用标准的“先检查完成态 -> 注册栈上等待节点 -> 二次复查完成态 -> 睡眠挂起”协议，防止错过唤醒信号。
     pub fn wait(&self) -> IoResult {
         sched::assert_switchable();
         loop {
@@ -239,8 +318,9 @@ impl BioCompletion {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 强拥有等待源，pin! 固定栈节点；registration 不被遗忘，
-            // 所有返回均先撤 registration，再析构节点与 waiter，源始终有效。
+            // SAFETY:
+            // 1. `self.inner` 持有 `BioInner` 的强引用，保证等待队列 `waiters` 在整个循环期间有效；
+            // 2. `node` 通过 `pin!` 固定在当前栈帧上，`_registration` 守卫在每次循环迭代或提前 `return` 时都会先于 `node` 和 `waiter` 析构摘链，不会被 `mem::forget` 遗忘。
             let _registration = unsafe { self.inner.waiters.register(node.as_mut()) };
             if let Some(result) = self.result() {
                 return result;
@@ -249,7 +329,7 @@ impl BioCompletion {
         }
     }
 
-    /// Acquire 观察最终 DMA 收权和回调尾部，完成结果不被其他观察者消费。
+    /// 非阻塞读取请求的最终完成结果；若请求尚未彻底完成则返回 `None`，多次调用或克隆句柄均可重复读取同一结果。
     pub fn result(&self) -> Option<IoResult> {
         if !self.is_complete() {
             return None;
@@ -257,14 +337,14 @@ impl BioCompletion {
         self.inner.state.lock().result
     }
 
-    /// 只在所有义务、收权及回调已经结束后为真。
+    /// 通过 `Acquire` 内存序检查请求是否已彻底完成（保证观察到物理页 DMA 访问权收回及 `EndIo` 回调的全部内存副作用）。
     pub fn is_complete(&self) -> bool {
         self.inner.ready.load(Ordering::Acquire)
     }
 
-    /// 完成后只允许一个观察者移出原 memory，未完成或重复领取返回 Busy。
-    /// Read 错误和短读的尾部仍可能未初始化；返回映射只提供安全 MaybeUninit 写入口，
-    /// unsafe bytes 的全范围初始化义务不因领取 memory 而解除。
+    /// 在请求完成后将原始物理页容器（[`BioMemory`]）移出给唯一调用者；若请求未完成或已被取走则返回 `Err(BlockError::Busy)`。
+    ///
+    /// 对于 `Read` 失败或短读场景，`IoResult::completed` 之后的物理页尾部字节仍可能未初始化，调用方仅能按实际完成前缀读取或通过 `MaybeUninit` 安全写入。
     pub(crate) fn take_memory(&self) -> Result<BioMemory, BlockError> {
         if !self.is_complete() {
             return Err(BlockError::Busy);
@@ -277,13 +357,13 @@ impl BioCompletion {
             .ok_or(BlockError::Busy)
     }
 
-    /// 延长原 Arc 控制及其 owning allocator 的弱尾，不复制计数或保留父强引用。
+    /// 测试辅助接口：降级获取底层控制块的弱引用（用于验证所有父子强引用及自定义分配器槽位是否已彻底释放）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_weak(&self) -> impl Send + Sync + 'static {
         Arc::downgrade(&self.inner)
     }
 
-    /// 验收等待已预备父 finalizer 的真实票尾，不以 ready 推测 worker 已返还。
+    /// 测试辅助接口：阻塞等待预分配的 `finalizer_work` 工作项彻底执行完毕并退出。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_flush_finalizer(&self) {
         if let Some(work) = &self.inner.finalizer_work {
@@ -291,7 +371,7 @@ impl BioCompletion {
         }
     }
 
-    /// 观察原父的登记与真实设备接受前缀，登记失败的 child 不会扩大接受账。
+    /// 测试辅助接口：读取当前已登记的子请求个数、已登记字节末尾与底层驱动已实际接收的字节末尾。
     #[cfg(feature = "ktest")]
     pub(crate) fn test_acceptance(&self) -> (usize, usize, usize) {
         let state = self.inner.state.lock();
@@ -302,7 +382,7 @@ impl BioCompletion {
         )
     }
 
-    /// 只观察已有父 finalizer 的原生任务；弱观察升级不申请新的执行资源。
+    /// 测试辅助接口：获取 `finalizer_work` 预留的专用工作线程 `Task` 引用（若存在）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_finalizer_task(&self) -> Option<Arc<crate::task::Task>> {
         self.inner
@@ -311,7 +391,7 @@ impl BioCompletion {
             .and_then(|work| work.ktest_reserved_task())
     }
 
-    /// 只在原 manager 完成该 finalizer 原生任务的真实 join 后为真。
+    /// 测试辅助接口：检查工作队列管理器是否已完成对 `finalizer_work` 预留线程的 `join` 回收。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_finalizer_joined(&self) -> bool {
         self.inner
@@ -322,27 +402,27 @@ impl BioCompletion {
 }
 
 impl BioInner {
-    /// 返回构造时固定的完整设备身份，不强拥有设备。
+    /// 返回构造时绑定的目标物理磁盘身份标识。
     pub(super) fn target(&self) -> DiskIdentity {
         self.target
     }
 
-    /// 返回父逻辑操作，所有 child 必须保持此操作。
+    /// 返回本请求的逻辑块操作类型（所有拆分出的子请求均沿用该操作）。
     pub(super) fn operation(&self) -> BlkOperation {
         self.operation
     }
 
-    /// 返回固定的 512 字节协议 sector 起点。
+    /// 返回本请求在物理整盘上的起始扇区号（单位：512 字节 `SECTOR_BYTES`）。
     pub(super) fn sector(&self) -> u64 {
         self.sector
     }
 
-    /// 返回原映射总字节数，Flush 的范围为空。
+    /// 返回本请求的数据负载总字节数（`Flush` 请求为 0）。
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    /// 返回真实原映射数量，不把拆分后的 SG 数当作原页数量。
+    /// 返回构造时传入的原始物理页映射段（`MappedPages`）个数。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -354,7 +434,7 @@ impl BioInner {
         self.segment_count
     }
 
-    /// 从唯一原拥有者复制一份有界 DMA 元数据，不导出页借用。
+    /// 按下标复制第 `index` 个映射段的物理地址与长度元数据（`PayloadRange`），不借出底层物理页引用。
     pub(super) fn segment(&self, index: usize) -> Option<PayloadRange> {
         self.state
             .lock()
@@ -364,11 +444,13 @@ impl BioInner {
             .map(MappedPages::range)
     }
 
-    /// 已登记 child 在锁外执行 CPU 复制，短锁只取得原页的有界裸地址计划。
+    /// 供内存盘（RAM disk）后端在已登记子请求的执行期内，通过 CPU 在物理页负载与内存盘后备区间之间拷贝数据。
+    ///
+    /// 每次仅短暂获取 `state` 自旋锁以生成当前映射段的拷贝计划，实际字节拷贝在锁外执行。
     ///
     /// # Safety
-    /// 调用者持本 child 的唯一完成责任和目标 RAM 的独占复制通道，ram
-    /// 覆盖 length 字节且不与原 payload 重叠；child 完成前不得结束 CPU 访问期。
+    /// 1. 调用方必须持有对应子请求 `[offset, offset + length)` 的唯一未完成执行权，且在该子请求调用 `finish_child` 前不得提前结束 CPU 访问期；
+    /// 2. `ram` 指针必须在 `[ram, ram + length)` 范围内有效、可读写（按读/写方向），由当前拷贝通道独占访问，且与本 `Bio` 的物理页负载内存无任何重叠。
     pub(super) unsafe fn copy_cpu(
         &self,
         offset: usize,
@@ -396,13 +478,16 @@ impl BioInner {
                 }
                 let within = offset + copied - base;
                 let part_len = (mapped.len() - within).min(length - copied);
-                // SAFETY: 已登记 child 未完成，memory 不会移出；计划只含本 child 的范围，
-                // 单一复制通道排斥重叠访问，执行时不再借用 MappedPages。
+                // SAFETY:
+                // 1. 当前子请求尚未完成（`state.phase == Phase::Active`），`memory` 底层物理页保持存活且 CPU 访问期尚未结束；
+                // 2. 切片 `[within, within + part_len)` 完全落在当前子请求独占负责的范围内，释放自旋锁后拷贝过程不再借用 `MappedPages` 元数据。
                 let plan =
                     unsafe { mapped.cpu_copy_range(within, part_len) }.map_err(BlockError::from)?;
                 (plan, part_len, end)
             };
-            // SAFETY: 完整 RAM 范围独占且长度已核实；child 保原页和 CPU 访问期到返回。
+            // SAFETY:
+            // 1. 调用方 `# Safety` 契约保证 `ram.add(copied)` 起 `part_len` 字节有效、独占且不与物理页负载重叠；
+            // 2. 当前子请求完成前 `MappedPages` 维持 CPU 访问态，保证 `plan` 目标物理页有效且无并发别名冲突。
             unsafe {
                 match self.operation {
                     BlkOperation::Read => plan.copy_from(ram.add(copied)),
@@ -418,7 +503,7 @@ impl BioInner {
         Ok(())
     }
 
-    /// 按父 payload 次序投影到实际原 folio，支持一个 Bio 内的多个原映射。
+    /// 测试辅助接口：将 `Bio` 负载内的逻辑字节偏移 `offset` 映射到对应的底层 `Folio` 物理首址与页内偏移。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_folio_origin(&self, offset: usize) -> Option<(usize, usize)> {
         let state = self.state.lock();
@@ -436,7 +521,7 @@ impl BioInner {
         None
     }
 
-    /// 只分类本 child 的实际 WB 来源，用于本盘一次性受控错误。
+    /// 测试辅助接口：查询负载字节偏移 `offset` 所在映射段是否为元数据写回（Metadata Writeback）来源，用于故障注入匹配。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_writeback_metadata(&self, offset: usize) -> Option<bool> {
         let state = self.state.lock();
@@ -451,7 +536,7 @@ impl BioInner {
         None
     }
 
-    /// 按本 child 的 payload 起点识别实际文件读入，不访问 DMA 内容。
+    /// 测试辅助接口：查询负载字节偏移 `offset` 所在映射段是否为文件页缓存读入（File Read）来源。
     #[cfg(feature = "ktest")]
     pub(super) fn ktest_file_read(&self, offset: usize) -> Option<bool> {
         let state = self.state.lock();
@@ -466,12 +551,12 @@ impl BioInner {
         None
     }
 
-    /// slot 在 IRQ 分派前检查是否必须使用预建完成 Work。
+    /// 判断本请求是否注册了必须在可睡眠工作线程中执行的 `EndIo::Task` 回调。
     pub(super) fn needs_task(&self) -> bool {
         matches!(self.end_io, Some(EndIo::Task(_)))
     }
 
-    /// 唯一 WB 准备者在准入前登记真实统计域，不分配新控制对象。
+    /// 在请求进入队列准入前（`Phase::New`），关联文件系统后台写回流量统计域。
     pub(super) fn track_writeback(&self, domain: &Arc<WritebackDomain>) {
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::New);
@@ -479,7 +564,7 @@ impl BioInner {
         state.writeback_domain = Some(domain.clone());
     }
 
-    /// 已接受 FS 来源在任何 child 发表之前保留共享占用，拒绝的 Bio 不取得该责任。
+    /// 在文件系统请求通过队列准入后（`Phase::Active`）、登记任何子请求前，保存所属挂载占用凭证（`FsClaim`）。
     pub(super) fn retain_fs_claim(&self, claim: &FsClaim) {
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::Active);
@@ -487,14 +572,17 @@ impl BioInner {
         state.fs_claim = Some(claim.clone());
     }
 
-    /// 为准备中的 part 克隆同一占用，延续至 slot 资源与队列尾部结束。
+    /// 为正在构造的硬件子请求（`RequestPart`）克隆一份挂载占用凭证，确保槽位执行期覆盖挂载生命周期。
     pub(super) fn fs_claim(&self) -> Option<FsClaim> {
         self.state.lock().fs_claim.clone()
     }
 
-    /// 唯一 admission 在普通 Task 中建立生成者义务，再锁外交整个原 memory 给设备。
+    /// 在普通可睡眠任务上下文中执行唯一准入：建立生成器初始义务，并在锁外将全部物理页的访问权移交给 DMA 设备（或内存盘 CPU 通道）。
+    ///
+    /// 若中途某个映射段的 DMA 准备或缓存维护失败，立即回滚前面已移交的映射段并将状态重置回 `Phase::New`。
     pub(super) fn begin(&self) -> Result<(), BlockError> {
         sched::assert_switchable();
+        // Step 1: 在自旋锁内将阶段切为 Beginning、初始化 remaining = 1（生成器义务），并临时取出物理页容器。
         let mut memory = {
             let mut state = self.state.lock();
             assert_eq!(state.phase, Phase::New, "bio admitted twice");
@@ -507,10 +595,13 @@ impl BioInner {
                 .expect("bio memory missing at admission")
         };
 
+        // Step 2: 在自旋锁外逐段执行 DMA 缓存刷写/失效或内存盘 CPU 访问登记；一旦出错则回滚已开启的前缀段。
         let mut started = 0;
         let mut failure = None;
         for mapped in &mut memory {
-            // SAFETY: 唯一 admission 尚未发表 child；来源初始化和 CPU 别名义务由构造保证。
+            // SAFETY:
+            // 1. 当前独占处于 `Phase::Beginning`，尚未登记或发布任何硬件子请求；
+            // 2. `Bio::try_new` 的构造契约已保证写数据全部初始化且外部 CPU 冲突别名已终止。
             let result = unsafe {
                 match self.domain {
                     Some(domain) => mapped.begin_device_access(domain),
@@ -528,7 +619,7 @@ impl BioInner {
         }
         if failure.is_some() {
             for mapped in &mut memory[..started] {
-                // SAFETY: 尚无任何 child 或硬件引用，所有已开始访问可以立即归还。
+                // SAFETY: 请求仍处于 `Phase::Beginning`，尚未向任何硬件队列或工作线程暴露该映射段，可立即对称撤回访问权。
                 unsafe {
                     if self.domain.is_some() {
                         mapped
@@ -541,6 +632,7 @@ impl BioInner {
             }
         }
 
+        // Step 3: 重新加锁归还物理页容器；失败时回退到 Phase::New，成功时切入 Phase::Active 允许拆分登记子请求。
         let mut state = self.state.lock();
         assert_eq!(state.phase, Phase::Beginning);
         state.memory = Some(memory);
@@ -554,7 +646,7 @@ impl BioInner {
         Ok(())
     }
 
-    /// 按父逻辑次序在 avail 发表前登记一个 child，不分配完整 child 列表。
+    /// 在将硬件子请求写入设备可用环之前，按父请求内的连续字节顺序登记一个 `[offset, offset + length)` 子请求并递增未完成义务计数 `remaining`。
     pub(super) fn register_child(&self, offset: usize, length: usize) {
         let end = offset
             .checked_add(length)
@@ -583,7 +675,7 @@ impl BioInner {
             .expect("bio pending count overflow");
     }
 
-    /// driver.submit 成功后仍持同一 queue 锁登记真实接受，IRQ 尚不能认领完成。
+    /// 在底层驱动 `submit` 成功后（仍持有目标 `Disk.queue` 自旋锁，中断处理尚无法抢先认领完成），推进已实际提交给硬件的连续字节范围并累加写回统计量。
     pub(super) fn accept_child(&self, offset: usize, length: usize) {
         let end = offset.checked_add(length).expect("bio acceptance overflow");
         let mut state = self.state.lock();
@@ -609,8 +701,9 @@ impl BioInner {
         }
     }
 
-    /// 唯一 slot 完成者在 used 或已确认 reset 后结束 child；Task 回调须由 slot Work 执行。
-    /// 未发表的失败 child 也消费同一登记义务，生成者仍保住此前在途原页。
+    /// 在硬件中断收回请求槽、确认控制器重置完成或子请求提交前即失败时，结算单个子请求 `[offset, offset + length)` 的完成字节与错误。
+    ///
+    /// 若本子请求是整个 `Bio` 最后一个未完成的义务（此时生成器早已结束），则直接在当前上下文（中断或槽位专属 `completion_work`）中触发父请求收尾。
     pub(super) fn finish_child(
         bio: &BioArc,
         offset: usize,
@@ -663,8 +756,9 @@ impl BioInner {
         }
     }
 
-    /// 结束生成者账本；true 表示可睡完成及 accepted 尾部已移交构造期同域预留 Work。
-    /// accepted 生成者借用实际 DiskRef；只有独立完成 Work 接责时才取得强拥有。
+    /// 在普通可睡眠任务上下文中结束生成器的子请求拆分义务；若所有已登记子请求此前均已完成，则由当前生成器负责触发父请求收尾。
+    ///
+    /// 返回 `true` 表示本请求携带可睡眠的 `EndIo::Task` 回调，且收尾工作与队列生成器计数归还责任已异步移交给预分配的 `finalizer_work`。
     pub(super) fn finish_generation(
         bio: &BioArc,
         error: Option<(usize, BlockError)>,
@@ -695,7 +789,7 @@ impl BioInner {
         false
     }
 
-    /// 普通 Task 在未 admission 时立即失败，原 memory 从未交设备，回调仍在锁外。
+    /// 在普通可睡眠任务上下文中直接拒绝尚未准入（仍处于 `Phase::New`，物理页从未移交设备）的 `Bio`，在锁外执行回调并唤醒等待者。
     pub(super) fn reject(bio: &BioArc, error: BlockError) {
         sched::assert_switchable();
         let memory = {
@@ -717,7 +811,10 @@ impl BioInner {
         );
     }
 
-    /// 最后义务先锁外收原映射；非 slot 的 Task 完成独立排队，不阻塞批次生成者。
+    /// 当全部义务归零或准入前被拒绝时，统一在锁外收回物理页 DMA/CPU 访问权，并根据上下文立即完成或派发 `finalizer_work`。
+    ///
+    /// 参数 `device_owned` 指明物理页此前是否已通过 `begin` 移交给设备；参数 `queue_task` 指明遇到 `EndIo::Task` 时是否需要排入 `finalizer_work`
+    /// （槽位完成路径已在槽位专属 `Work` 线程上运行，传 `false` 直接同步执行回调；生成器或拒绝路径传 `true` 避免阻塞当前提交批次）。
     fn complete(
         bio: &BioArc,
         mut memory: BioMemory,
@@ -726,10 +823,12 @@ impl BioInner {
         owner: Option<&DiskRef>,
         queue_task: bool,
     ) -> bool {
+        // Step 1: 若物理页访问权曾移交给设备/CPU 拷贝通道，在自旋锁外统一执行缓存失效与访问权回收。
         if device_owned {
             for mapped in &mut memory {
-                // SAFETY: remaining 已归零并唯一移出 memory；已发表 child 只在真实 used
-                // 或确认 reset 后结束，未发表 child 没有设备引用，生成者也已结束。
+                // SAFETY:
+                // 1. `end_obligation` 仅在 `remaining == 0` 且 `!generating` 时将 `memory` 唯一移出，不会与其他线程并发回收；
+                // 2. 所有已提交硬件的子请求均已在收到完成中断或确认硬件重置停止 DMA 后调用 `finish_child`，设备不再访问这些物理页。
                 unsafe {
                     if bio.domain.is_some() {
                         mapped
@@ -742,6 +841,7 @@ impl BioInner {
             }
         }
 
+        // Step 2: 若当前不在槽位专属 Work 中且请求携带可睡眠的 EndIo::Task 回调，打包裸强引用票据并排入预分配的 finalizer_work 异步收尾。
         if queue_task && bio.needs_task() {
             let ticket = BioRawTicket::from_arc(Arc::clone(bio));
             let owned = ticket.pointer;
@@ -755,7 +855,7 @@ impl BioInner {
                 );
                 state.memory = Some(memory);
                 state.result = Some(result);
-                // 所有 child 已结束并从槽移出，临时 owner 没有 Disk→本 Bio 的返回边。
+                // 此时所有子请求均已从设备槽位移除，Disk 不再持有指向本 Bio 的反向强引用，暂存 DiskRef 不会形成引用环。
                 state.completion_owner = owner.cloned();
                 assert!(state.finalizer_ticket.is_none());
                 state.finalizer_ticket = Some(ticket);
@@ -774,29 +874,32 @@ impl BioInner {
             return true;
         }
 
+        // Step 3: 无需额外排队时，直接在当前上下文执行回调、结算 Folio 并发布完成状态。
         drop(bio.finalize(memory, result));
         false
     }
 
-    /// 唯一完成者锁外执行回调及 folio 收权，Release 发布父完成后移出 FS 占用。
-    /// 返回的占用由 accepted 生成者或 part 保活至各自队列尾，最后 put 不在状态锁内。
+    /// 在自旋锁外依次执行 `EndIo` 完成回调、结算各物理页 `Folio` 的读入/写回结果，随后切入 `Phase::Complete` 唤醒所有等待任务并返回挂载占用凭证以便在锁外释放。
     fn finalize(&self, mut memory: BioMemory, result: IoResult) -> Option<FsClaim> {
+        // Step 1: 物理页访问权已归还 CPU，调用注册的完成回调（只读借出结果与映射切片）。
         match self.end_io {
             Some(EndIo::Inline(callback)) => callback(&result, &memory),
             Some(EndIo::Task(callback)) => {
-                // child 尾部属于专用 slot Work，其它尾部属于构造期 Bio Work。
+                // 子请求最后结束时运行在槽位预留的 completion_work 线程上；生成器/拒绝路径运行在 Bio 预留的 finalizer_work 线程上。
                 sched::assert_switchable();
                 callback(&result, &memory);
             }
             None => {}
         }
 
+        // Step 2: 按父请求的连续成功字节前缀结算每个映射段关联的 Folio（唤醒页缓存读等待者或清除页写回标志并记录写回错误）。
         let mut remaining = result.completed;
         for mapped in &mut memory {
             let completed = remaining.min(mapped.len());
             remaining = remaining.saturating_sub(mapped.len());
-            // SAFETY: complete 已结束全部 child 与生成者并真实收权，回调全部返回；
-            // 读入沿父连续前缀，WB 沿同一父为该映射登记的真实接受与实际错误结束。
+            // SAFETY:
+            // 1. `complete` 已收回全部物理页的设备访问权，且上方 `EndIo` 回调已返回、不再持有任何映射借用；
+            // 2. 传入的 `completed` 严格截取自父请求的连续成功前缀，写回路径使用此前 `accept_child` 与 `finish_child` 登记的真实区间状态。
             unsafe {
                 mapped.complete_folio(IoResult {
                     completed,
@@ -805,6 +908,7 @@ impl BioInner {
             };
         }
 
+        // Step 3: 将物理页容器与最终结果存回状态锁，通过 Release 屏障设置 ready 标志并唤醒等待队列，最后将 FsClaim 移出锁外释放。
         let claim = {
             let mut state = self.state.lock();
             assert_eq!(state.phase, Phase::Finishing);
@@ -820,11 +924,12 @@ impl BioInner {
     }
 }
 
-/// 消费队列化的真实 Bio 拥有，归还生成者/临时 Disk；Work 票尾部自动释放一次性执行预留。
+/// `BioInner.finalizer_work` 的工作队列入口函数：在可睡眠工作线程中还原 `BioArc` 强引用，执行 `finalize` 收尾，并代生成器归还目标 `Disk` 的活跃生成计数与挂载占用。
 fn finalizer_callback(work: Pin<&Work>) {
     let pointer = work.context() as *const BioInner;
-    // SAFETY: complete 已把真实 raw strong 和原 allocator 整票放入本状态；
-    // 该 owning 票保地址至回调取走，Work 自身另有真实运行票。
+    // SAFETY:
+    // 1. `BioInner::complete` 在将本 `work` 入队前，已构造一份 `BioRawTicket`（持有一份未释放的 `BioArc` 强引用）存入 `state.finalizer_ticket`；
+    // 2. 在下方加锁取走 `ticket` 并还原为 `BioArc` 之前，该强引用保证 `pointer` 指向的 `BioInner` 持续有效且对齐。
     let inner = unsafe { &*pointer };
     let (ticket, memory, result, owner) = {
         let mut state = inner.state.lock();
@@ -851,14 +956,14 @@ fn finalizer_callback(work: Pin<&Work>) {
 }
 
 impl BioState {
-    /// 记录最小错误字节位置，后部反序成功不跨过前部失败形成虚假成功前缀。
+    /// 记录偏移最小的首个失败位置与错误码，确保后续乱序成功的子请求不会越过前部失败点夸大连续成功字节数。
     fn record_error(&mut self, offset: usize, error: BlockError) {
         if self.first_error.is_none_or(|(first, _)| offset < first) {
             self.first_error = Some((offset, error));
         }
     }
 
-    /// 消费一个已登记义务，只在最后归零时把唯一原页向锁外完成者移交。
+    /// 递减一项未完成义务计数 `remaining`；仅当计数归零（生成器与全部已登记子请求均已结束）时将阶段推进到 `Phase::Finishing`，并移出物理页容器与汇总后的 `IoResult` 交由锁外收尾。
     fn end_obligation(&mut self, len: usize) -> Option<(BioMemory, IoResult)> {
         assert!(0 < self.remaining, "bio obligation ended twice");
         self.remaining -= 1;

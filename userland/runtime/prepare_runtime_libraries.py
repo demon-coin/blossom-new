@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从明确的本地 libc 来源准备两族运行库，不修改原程序或解释器字段。"""
+"""从宿主机交叉工具链提取并校验 musl 与 glibc 动态运行库，安装到目标运行库目录并建立加载器符号链接。"""
 
 import argparse
 import os
@@ -11,6 +11,7 @@ import sys
 import tempfile
 
 
+# 各架构默认的交叉工具链运行库路径、期望的 readelf Machine 标识及动态链接器文件名。
 RUNTIME_LIBRARY_SOURCES = {
     "riscv64": (
         "/opt/riscv64--musl--bleeding-edge-2020.08-1/"
@@ -31,7 +32,7 @@ RUNTIME_LIBRARY_SOURCES = {
 
 
 def check_runtime_library_elf(source_path, expected_machine):
-    """保留 readelf 的原始输出，并要求来源是本架构的 ET_DYN 运行库。"""
+    """调用 `readelf` 检查源库文件并透传原始输出，验证其为匹配目标架构的 `ET_DYN` 共享库。"""
     print(f"Checking ELF source: {source_path}", flush=True)
     result = subprocess.run(
         ["readelf", "-h", "-l", str(source_path)],
@@ -52,7 +53,7 @@ def check_runtime_library_elf(source_path, expected_machine):
 
 
 def copy_runtime_library(source_path, destination_path):
-    """在目标目录内复制并替换单个库文件，不跟随已有目标链接写入来源。"""
+    """通过同目录临时文件复制并原子替换目标运行库，避免跟随目标路径上可能已有的符号链接。"""
     with tempfile.NamedTemporaryFile(
         dir=destination_path.parent, prefix=f".{destination_path.name}.", delete=False
     ) as stream:
@@ -66,7 +67,7 @@ def copy_runtime_library(source_path, destination_path):
 
 
 def install_loader_link(link_path, target):
-    """只替换具名文件或链接；已有目录保留并让调用失败。"""
+    """在 `link_path` 创建指向 `target` 的符号链接；若原路径为普通文件或符号链接则先移除。"""
     if link_path.is_symlink() or link_path.is_file():
         link_path.unlink()
     link_path.symlink_to(target)
@@ -75,7 +76,7 @@ def install_loader_link(link_path, target):
 
 def prepare_runtime_libraries(architecture, musl_libc_path, glibc_library_directory,
                               output_directory):
-    """先核齐本次全部来源，再更新输出树内固定的四个库文件及路径链接。"""
+    """先完整校验指定架构所需的 musl 与 glibc 源运行库，再统一复制到输出目录并建立动态链接器符号链接。"""
     _, _, expected_machine, musl_loader, glibc_loader = RUNTIME_LIBRARY_SOURCES[architecture]
     output_directory = output_directory.absolute()
     libraries = [
@@ -84,6 +85,7 @@ def prepare_runtime_libraries(architecture, musl_libc_path, glibc_library_direct
         (glibc_library_directory / "libm.so.6", output_directory / "glibc/lib/libm.so.6"),
         (glibc_library_directory / glibc_loader, output_directory / "glibc/lib" / glibc_loader),
     ]
+    # 解析源文件的真实路径，确保源文件为存在的普通文件且不与输出目标重合。
     resolved_libraries = []
     for source_path, destination_path in libraries:
         source_path = source_path.resolve(strict=True)
@@ -92,8 +94,10 @@ def prepare_runtime_libraries(architecture, musl_libc_path, glibc_library_direct
         if source_path == destination_path.resolve():
             raise ValueError(f"source and output must be separate: {source_path}")
         resolved_libraries.append((source_path, destination_path))
+    # 在写入任何输出文件前，先统一校验全部源运行库的 ELF 类型与目标架构。
     for source_path, _ in resolved_libraries:
         check_runtime_library_elf(source_path, expected_machine)
+    # 逐一复制运行库到输出目录，并创建动态链接器入口与 LoongArch64 的 lib64 兼容符号链接。
     for source_path, destination_path in resolved_libraries:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         copy_runtime_library(source_path, destination_path)
@@ -105,7 +109,7 @@ def prepare_runtime_libraries(architecture, musl_libc_path, glibc_library_direct
 
 
 def main(argv=None):
-    """解析架构和明确来源；缺库、工具、复制或链接失败都以非零状态结束。"""
+    """命令行入口：解析架构与运行库路径参数并执行准备流程，失败时输出错误并返回非零退出码。"""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--arch", choices=RUNTIME_LIBRARY_SOURCES, required=True)
     parser.add_argument("--musl-libc", type=Path)

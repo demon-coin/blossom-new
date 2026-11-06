@@ -1,4 +1,68 @@
-//! 用户进入、陷入与同一 Rust 调用续接；所有入口共享唯一 UserContext 布局。
+//! RISC-V 64 用户态进入（[`rv_run_user`]）、陷入返回（[`rv_user_trap_entry`]）与内核调用续接裸汇编实现。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于 `arch::riscv64::user` 底层，承接上层 [`super::run_user`] 与共享硬件中断入口
+//! （`crate::arch::riscv64::trap::rv_trap_entry`）之间的特权级切换：
+//! 1. **进入用户态（[`rv_run_user`]）**：将当前内核执行流的被调用者保存寄存器（Callee-saved）、`ra`、`gp`、`tp`
+//!    与 `sstatus` 保存在当前任务内核栈的 128 字节续接帧中，把 `UserContext` 地址写入 `sscratch`，随后恢复
+//!    用户浮点与整数寄存器并通过 `sret` 降至 U-mode。
+//! 2. **从用户态陷入（[`rv_user_trap_entry`]）**：当 U-mode 发生异常或中断时，先由 `rv_trap_entry` 通过
+//!    `csrrw sp, sscratch, sp` 换入 `UserContext` 指针并保存用户 `t0`，随后跳转到本模块的
+//!    [`rv_user_trap_entry`] 保存完整用户寄存器与异常 CSR，最后从内核栈续接帧恢复内核上下文并 `ret`
+//!    回到当初调用 [`rv_run_user`] 的同一处 Rust 调用点。
+//!
+//! # 核心设计与栈帧/寄存器交换契约
+//!
+//! ## 1. 内核栈续接帧布局（`KERNEL_CONTINUATION_SIZE = 128` 字节）
+//! 调用 [`rv_run_user`] 时在当前任务内核栈顶向下分配 128 字节（16 字节对齐），其栈顶地址存入
+//! `UserContext.kernel_sp`：
+//!
+//! ```text
+//! 高地址 (原内核 sp)
+//! +---------------------------------------------------------------+ 128 (KERNEL_CONTINUATION_SIZE)
+//! | sstatus : 进入前内核态 sstatus 快照 (FS=Off, SIE=0)           | 120 (KERNEL_STATUS_OFFSET)
+//! | s11     : 被调用者保存寄存器 x27                              | 112
+//! | s10     : 被调用者保存寄存器 x26                              | 104
+//! | ...     : s1..s9 (x9, x18..x25)                               | 32..96
+//! | s0 / fp : 帧指针 x8                                           | 24
+//! | tp      : 当前 CPU 的 CpuLocal 指针 x4                        | 16
+//! | gp      : 内核全局指针 x3                                     | 8
+//! | ra      : 返回 run_user 的返回地址 x1                         | 0   <-- UserContext.kernel_sp
+//! +---------------------------------------------------------------+ 低地址
+//! ```
+//!
+//! ## 2. `sscratch` 寄存器状态转换机
+//! `sscratch` 是区分 Trap 来源（U-mode 还是 S-mode）的唯一硬件判据：
+//!
+//! ```text
+//! [S-mode 正常运行]
+//!    sscratch == 0
+//!        |
+//!        | rv_run_user: 保存续接帧，写入 sscratch = &mut UserContext，执行 sret
+//!        v
+//! [U-mode 用户态运行]
+//!    sscratch == &mut UserContext, sp == 用户栈指针
+//!        |
+//!        | 触发中断/异常 -> 硬件跳入 rv_trap_entry:
+//!        |   csrrw sp, sscratch, sp (交换后 sp = &mut UserContext, sscratch = 用户 sp)
+//!        |   保存用户 t0 到 UserContext.gpr[5]，跳转至 rv_user_trap_entry
+//!        v
+//! [rv_user_trap_entry 保存用户现场]
+//!    csrr t0, sscratch (取出用户 sp 存入 gpr[2])
+//!    csrw sscratch, sp (在恢复内核 tp/gp 前保持 sscratch 指向 UserContext，以备窗口期故障诊断)
+//!    保存全部用户 GPR / FPR / FCSR / sepc / scause / stval
+//!    从 UserContext.kernel_sp 恢复内核 gp / tp / sstatus，随后清零 kernel_sp 与 sscratch
+//!        |
+//!        | 恢复 ra, s0..s11，释放 128B 续接帧，执行 ret
+//!        v
+//! [回到 S-mode run_user]
+//!    sscratch == 0
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 本模块全部运行在硬中断关闭（`sstatus.SIE == 0`）区间或 U-mode 下，不获取任何锁。
+//! - 续接帧中保存了当前 CPU 的 `tp`（`CpuLocal` 指针），因此从 `rv_run_user` 保存续接帧到
+//!   `rv_user_trap_entry` 返回的整个生命周期内**严禁调用调度器或跨 CPU 迁移任务**。
 
 use crate::arch::riscv64::{
     rv_kernel_fault, user::UserContext, SR_FS_DIRTY, SR_SPIE, SR_SPP, SR_UXL_64,
@@ -10,19 +74,27 @@ use core::{
     mem::{offset_of, size_of},
 };
 
-// 续接按 ra/gp/tp、十二个 callee-saved 和 sstatus 顺序保存。
+// 内核栈续接帧的偏移与总字节数：依次保存 ra/gp/tp（3 个字）、s0..s11（12 个字）以及 sstatus（1 个字），共 16 * 8 = 128 字节。
 const KERNEL_STATUS_OFFSET: usize = (3 + 12) * size_of::<usize>();
 const KERNEL_CONTINUATION_SIZE: usize = KERNEL_STATUS_OFFSET + size_of::<usize>();
 
-/// 保存当前 Task 的真实 Rust 续接，通过 sret 执行用户现场，陷入后返回同一次调用。
+/// 保存当前任务的内核态被调用者保存寄存器与状态字至内核栈续接帧，恢复 `context` 中的用户态现场并通过 `sret` 进入 U-mode；
+/// 待用户态触发下一次中断或异常后，由 [`rv_user_trap_entry`] 恢复续接帧并直接从本函数返回。
 ///
 /// # Safety
-/// context 必须由当前普通 Task 独占并位于活动根的内核映射；IRQ 关闭且内核 FS Off。
-/// 用户根、内核映射、context 与当前 Task 栈必须保活到返回，期间不得调用调度器。
+/// 1. `_context` 必须指向当前普通任务独占持有的有效 [`UserContext`]，且位于当前活动页表的内核高半映射中；
+/// 2. 调用前必须已关闭 S-mode 硬中断（`SIE == 0`）且内核浮点单元处于关闭状态（`sstatus.FS == Off`）；
+/// 3. 当前激活的用户页表、内核高半映射、`_context` 以及当前任务内核栈必须在本次调用返回前保持有效；
+/// 4. 在本函数返回前严禁触发线程调度或更改当前 CPU 的 `CpuLocal` 绑定。
 #[naked]
 #[no_mangle]
 pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut UserContext) {
-    // SAFETY: 调用者满足活动根、独占现场和栈寿命；128 字节续接保留完整内核 callee-saved 与状态。
+    // SAFETY:
+    // 1. 调用方 `run_user` 已通过前置断言确保硬中断关闭、`sstatus.FS == Off`，且 `a0`（`_context`）独占可写；
+    // 2. 在当前任务内核栈上向下分配的 128 字节续接帧完整保存了 C ABI 要求的 `ra`、`gp`、`tp`、`s0..s11` 与 `sstatus`，
+    //    由 `rv_user_trap_entry` 在陷入时对称恢复并平衡栈指针；
+    // 3. `sstatus` 被显式重写为仅开启 `UXL=64 | FS=Dirty | SPIE`（清除 `SPP`/`SUM`/`MXR`），并通过向 `context.stval`
+    //    执行哑 `sc.d` 清除可能残留的内核态 LR/SC 原子预约。
     unsafe {
         naked_asm!(
         r#"
@@ -51,7 +123,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
     csrw sscratch, a0
     mv sp, a0
 "#,
-        // 恢复全部用户浮点现场，并只构造许可的 sstatus 位，清除跨特权 LR/SC reservation。
+        // Step 2: 临时开启浮点单元（FS=Dirty）以加载用户态 f0..f31 与 fcsr，设置 sepc 与干净的用户态 sstatus，并清除 LR/SC 预约。
         r#"
     li t0, {fs_dirty}
     csrs sstatus, t0
@@ -98,7 +170,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
     addi t0, sp, {stval}
     sc.d zero, zero, (t0)
 "#,
-        // 最后恢复用户整数寄存器与用户 SP，通过 sret 降到用户特权级。
+        // Step 3: 恢复用户态通用整数寄存器 x1、x3..x31，最后将 sp 切换为用户栈指针 x2 并执行 sret 降至 U-mode。
         r#"
     ld x1, ({gpr} + 1 * 8)(sp)
     ld x3, ({gpr} + 3 * 8)(sp)
@@ -148,16 +220,23 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_run_user(_context: *mut Use
     }
 }
 
-/// 从公共 trap 向量接收受信 context，保存用户现场后恢复当前 Task 的原 Rust 续接。
+/// 承接来自公共陷阱向量 `rv_trap_entry` 的用户态陷入（或切换窗口期的 S-mode 致命故障），
+/// 将用户态寄存器完整保存至 [`UserContext`] 后恢复内核栈续接帧，返回到 [`rv_run_user`] 的调用点。
 ///
 /// # Safety
-/// 只能从公共向量跳入；SP 必须指向本次 rv_run_user 的独占 context，
-/// 用户 t0 已保存且 sscratch 仍持被中断的原 SP。context 中的真实 Task 续接必须存活；
-/// S 来源异常只能沿原 fatal 路径处理，不得当作用户 trap 返回。
+/// 1. 严禁从普通 Rust/C 代码直接调用，只能由 `rv_trap_entry` 在检测到 `sscratch != 0` 时通过 `jr` 跳入；
+/// 2. 跳入时 `sp` 必须指向本次 `rv_run_user` 设置的独占 [`UserContext`]，用户 `t0`（`x5`）已保存在 `gpr[5]`，
+///    且 `sscratch` 中暂存着被中断时刻的原 `sp`；
+/// 3. `UserContext.kernel_sp` 指向的内核栈续接帧必须存活且完好；若 `sstatus.SPP != 0`（表示在入口/出口极窄窗口内
+///    发生了 S-mode 异常），则必须沿标号 `2:` 转交 `rv_kernel_fault` 终止诊断，不得伪装成用户态 Trap 返回。
 #[naked]
 #[no_mangle]
 pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
-    // SAFETY: 公共向量已按 scratch 合同保存 t0；受信现场和续接在恢复 GP/TP/状态前保持可用。
+    // SAFETY:
+    // 1. 前置入口 `rv_trap_entry` 已完成 `sp` 与 `sscratch` 的原子交换并将用户 `t0` 存入 `gpr[5]`，当前 `sp` 指向有效的 `UserContext`；
+    // 2. 通过检查 `sstatus.SPP` 分流：若来自 U-mode（`SPP == 0`），则保存浮点上下文并从 `kernel_sp` 恢复内核 `gp`/`tp`/`sstatus`
+    //    及 `ra`/`s0..s11`，清零 `sscratch` 后安全 `ret` 回 `run_user`；
+    // 3. 若 `SPP != 0`，则同样先恢复内核 `gp`/`tp`/`sp` 并清零 `sscratch`，再调用永不返回的 `rv_kernel_fault`。
     unsafe {
         naked_asm!(
         r#"
@@ -207,7 +286,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     andi t0, t0, {spp}
     bnez t0, 2f
 "#,
-        // 确认用户来源后保存全部 FPR/FCSR，不能把用户 TLS 当作 CpuLocal。
+        // Step 2: 确认陷入源自 U-mode（SPP == 0）后，将用户态全部 32 个浮点寄存器与 fcsr 保存至 UserContext。
         r#"
     fsd f0, ({fpr} + 0 * 8)(sp)
     fsd f1, ({fpr} + 1 * 8)(sp)
@@ -244,7 +323,8 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     frcsr t0
     sd t0, {fcsr}(sp)
 "#,
-        // 从本次 Task 续接恢复受信 GP/TP/状态，清除 scratch 和 kernel_sp 后返回原 Rust 调用。
+        // Step 3: 从 UserContext.kernel_sp 指向的内核栈续接帧恢复内核 gp、tp 与 sstatus（此后再清零 kernel_sp 与 sscratch），
+        // 最后恢复 ra 与 s0..s11，释放 128 字节续接帧并通过 ret 返回 run_user。
         r#"
     ld t0, {kernel_sp}(sp)
     // 受信 TP/GP/状态恢复前保留 context 入口，S 来源故障仍能取得真实内核栈。
@@ -271,7 +351,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     addi sp, sp, {continuation_size}
     ret
 "#,
-        // 进入或退出窗口的 S 来源故障使用真实续接栈，保留原致命诊断路径。
+        // Step 4 (异常分支 2f): 若在进入/退出窗口内发生 S-mode 异常（SPP != 0），提取故障参数并切回内核续接栈调用 rv_kernel_fault。
         r#"
 
 2:
@@ -306,7 +386,7 @@ pub(in crate::arch::riscv64) unsafe extern "C" fn rv_user_trap_entry() -> ! {
     }
 }
 
-// 固定指令块只含局部分支，可整体复制到用户页；扩展选项不影响其他裸函数。
+// 内核测试（ktest）专用的位置无关用户态探测指令块：仅包含局部相对跳转，可整体拷贝至任意用户可执行页运行；使用 .option push/pop 隔离扩展指令集设置。
 #[cfg(feature = "ktest")]
 global_asm!(
     r#"

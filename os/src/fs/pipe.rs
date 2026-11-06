@@ -1,4 +1,56 @@
-//! 匿名管道的两个真实 OFD 共享一个按需原页环，描述符复制不增加端点。
+//! 匿名管道（Pipe）与按需分配物理页的环形字节流缓冲区。
+//!
+//! # 模块职责与架构定位
+//! 本模块实现两部分核心功能：
+//! 1. **通用物理页环形 FIFO 缓冲区（[`PipeBuffer<N>`]）**：按需分配单个 4 KiB 物理页槽位，支持尾部写合并、
+//!    消费完即刻归还物理页以及整页零拷贝转移；除本模块的匿名管道外，也供 `AF_UNIX` 流式套接字（`net/unix.rs`）复用。
+//! 2. **匿名管道打开文件对（[`PipeEnd`] 与 [`try_new`]）**：向上层系统调用（`pipe2`、`read`、`write`、
+//!    `splice`、`poll` / `epoll`）提供符合 POSIX 原子写（`PIPE_BUF`）与对端关闭语义（EOF / `SIGPIPE` + `EPIPE`）
+//!    的单向流式打开文件描述（OFD）。通过 `dup` 或 `fork` 复制描述符只会增加同一个 [`PipeEnd`] 的 `Arc` 引用计数，
+//!    只有最后一个强引用被销毁（Drop）时才会真正关闭该方向端点。
+//!
+//! # 核心设计与内存布局
+//!
+//! ## 1. 环形物理页槽位布局（[`PipeBuffer<N>`]）
+//! 环形数组共 `N` 个槽位（匿名管道默认 `SLOTS = 16`，总容量 64 KiB），空管道不预分配任何物理页：
+//!
+//! ```text
+//! PipeBuffer<16> 环形数组:
+//!   [ .. 空 .. | Slot(tail, 最早未读) | ... 中间满槽 ... | Slot(head-1, 最新写入) | .. 空 .. ]
+//!                 │                                          │
+//!                 ▼ 4096B 物理页                              ▼ 4096B 物理页
+//!   +-------------+------------------+         +-------------+----------+------------+
+//!   | 已消费前缀   | 未读有效字节      |         | 已消费/偏移  | 有效字节  | merge_space|
+//!   | 0..offset   | offset..+length  |         | 0..offset   | length   | 可追加后缀  |
+//!   +-------------+------------------+         +-------------+----------+------------+
+//! ```
+//! - **尾部合并写入**：当 `head - 1` 槽位的物理页尾部仍有剩余空间（`merge_space() > 0`）时，新写入的数据直接追加到该页末尾；
+//!   前端已被读取过的 `0..offset` 区域不会回绕复用，整槽的 `length` 归零后立即释放该物理页并推进 `tail`。
+//! - **整页零拷贝 `splice`**：管道到管道传输（[`PipeBuffer::splice_into`]）时，若 `tail` 槽位的数据全部位于本次请求长度内，
+//!   直接将整个 [`Slot`]（含底层 `OwnedPages` 所有权）移交给目标环形缓冲区，避免字节拷贝与页面重分配。
+//!
+//! ## 2. 无锁 `poll` 观察字（[`Pipe::observation`]）位域编码
+//! 为使高频的 `poll` / `epoll` 状态复查无需争抢 `Pipe::ring` 睡眠互斥锁，`Pipe` 维护一个 64 位原子快照，
+//! 每次在持有 `ring` 锁完成读写修改后通过 [`Pipe::publish`] 以 `Release` 内存序更新：
+//!
+//! ```text
+//! 63                           SPACE_SHIFT (17) 16                          0
+//! +--------------------------------------------+----------------------------+
+//! |    空闲物理槽字节容量 empty_slot_capacity     |   可读有效字节数 ring.len()  |
+//! |         ((16 - used) * 4096)               |        (0 ..= 65536)       |
+//! +--------------------------------------------+----------------------------+
+//! ```
+//! 注意：`poll` 写就绪（`POLLOUT`）仅依据是否存在至少一个完整空闲物理槽（`empty_slot_capacity > 0`）判定，
+//! 不因全满槽位的末页仍剩少量尾部合并空间而报告 `POLLOUT`，从而保证收到 `POLLOUT` 后的用户至少能无阻塞写入 `PIPE_BUF` 字节。
+//!
+//! # 锁获取顺序与并发契约
+//! 1. **跨文件与管道锁顺序**：普通文件偏移锁（由 `fs/transfer.rs` 在外层持有） -> `Pipe::ring` 睡眠互斥锁。
+//! 2. **双管道 `splice_to_pipe` 锁顺序**：当同时锁定输入与输出两个不同管道的 `ring` 睡眠互斥锁时，
+//!    严格按底层 `Arc::as_ptr(&pipe)` 指针地址从小到大顺序加锁，防止双向并发 `splice` 产生 AB-BA 死锁。
+//! 3. **通知与阻塞边界**：`Pipe::publish` 在持有 `ring` 睡眠锁期间仅调用无阻塞的 [`PollWaitHead::notify`]（内部仅持自旋锁）；
+//!    线程进入 [`PollContext::park_until`] 睡眠前必须释放所有 `Pipe::ring` 睡眠锁。
+//! 4. **反向监控注销顺序**：[`PipeEnd::drop`] 先调用 `WatchHead::release` 同步清理所有 `epoll` 监听项，
+//!    随后才将 `reader_open` / `writer_open` 置为 `false` 并唤醒对端等待队列。
 
 use alloc::sync::Arc;
 use core::ops::Range;
@@ -18,32 +70,49 @@ use crate::sync::SleepMutex;
 use crate::task::signal::SIGPIPE;
 use crate::wait::WaitResult;
 
+/// POSIX 保证单次 `write` 原子不交错的最大字节数（等于单个物理页大小 4096 字节）。
 pub const PIPE_BUF: usize = 4096;
+/// 匿名管道默认分配全部物理槽位时的最大总字节容量（16 页，共 65536 字节）。
 pub const PIPE_CAPACITY: usize = SLOTS * PIPE_BUF;
+/// 匿名管道环形缓冲区包含的物理页槽位数量。
 const SLOTS: usize = 16;
 
+/// 在 `Pipe::observation` 64 位原子状态字中存放高段“空闲槽字节容量”的左移位数（容纳 `0..=PIPE_CAPACITY` 所需的位宽，即 17 位）。
 const SPACE_SHIFT: u32 = usize::BITS - PIPE_CAPACITY.leading_zeros();
+/// 从 `Pipe::observation` 低位提取当前可读字节数（`0..=PIPE_CAPACITY`）的位掩码。
 const BYTE_MASK: u64 = (1 << SPACE_SHIFT) - 1;
 
+/// 为每个新创建的匿名管道分配进程内唯一伪 inode 编号的全局单调递增计数器。
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
 
+/// 环形缓冲区中的单个数据槽位，独占持有一整页（4096 字节）物理内存。
 struct Slot {
+    /// 槽位独占拥有的底层物理页（阶数 0，即单页 `PAGE_SIZE == PIPE_BUF`）。
     pages: OwnedPages,
+    /// 页内尚未被消费的有效数据起始字节偏移量（范围 `0..PIPE_BUF`）。
     offset: usize,
+    /// 从 `offset` 开始已写入且尚未被消费的有效字节长度（范围 `1..=PIPE_BUF - offset`，归零时立即释放本槽位）。
     length: usize,
 }
 
-/// 按需拥有原页的固定槽 FIFO，管道和匿名 socket 方向各自决定锁与关闭协议。
+/// 按需分配物理页的定长槽位环形 FIFO 缓冲区（由匿名管道和 `AF_UNIX` 流式套接字共享使用）。
+///
+/// 本结构本身不包含内部锁，调用方需通过外层互斥锁（如 `Pipe::ring`）串行化访问。
 pub(crate) struct PipeBuffer<const N: usize> {
+    /// 环形物理页槽位数组，仅在槽位存有未读数据时为 `Some(Slot)`。
     slots: [Option<Slot>; N],
+    /// 下一个待分配新物理页槽位的环形写下标（范围 `0..N`）。
     head: usize,
+    /// 最早包含未消费数据的物理页槽位环形读下标（范围 `0..N`；当 `used == 0` 时与 `head` 相等）。
     tail: usize,
+    /// 当前环形数组中处于占用状态的非空物理页槽位数量（范围 `0..=N`）。
     used: usize,
+    /// 所有占用槽位中尚未消费的有效数据总字节数。
     bytes: usize,
 }
 
 impl<const N: usize> PipeBuffer<N> {
-    /// 空 FIFO 不预分配数据页，槽数必须为正且每槽恰好拥有一个原页。
+    /// 创建一个空的环形页缓冲区（初始不分配任何物理页；编译/运行期要求槽位数 `N > 0` 且系统页大小等于 `PIPE_BUF`）。
     pub(crate) fn new() -> Self {
         assert!(0 < N);
         assert_eq!(mm::PAGE_SIZE, PIPE_BUF);
@@ -56,22 +125,22 @@ impl<const N: usize> PipeBuffer<N> {
         }
     }
 
-    /// 查询已经提交且尚未消费的字节量。
+    /// 返回缓冲区内已成功写入且尚未被读取消费的总字节数。
     pub(crate) fn len(&self) -> usize {
         self.bytes
     }
 
-    /// 查询是否还有可交付数据，不把空槽当成已提交字节。
+    /// 判断缓冲区当前是否没有任何可读字节。
     pub(crate) fn is_empty(&self) -> bool {
         self.bytes == 0
     }
 
-    /// 返回全部物理槽均为空时的固定字节容量。
+    /// 返回全部 `N` 个物理页槽位均写满时的理论最大字节容量（`N * PIPE_BUF`）。
     pub(crate) fn capacity(&self) -> usize {
         N * PIPE_BUF
     }
 
-    /// 只计算末页的可合并后缀，读过的前端空隙不能重新成为物理槽。
+    /// 计算最新写入槽位（`head - 1`）的物理页尾部剩余可合并追加字节数；缓冲区为空时返回 `0`。
     fn merge_space(&self) -> usize {
         if self.used == 0 {
             return 0;
@@ -80,17 +149,17 @@ impl<const N: usize> PipeBuffer<N> {
         PIPE_BUF - slot.offset - slot.length
     }
 
-    /// 容量由空闲物理槽及末页后缀组成，不由逻辑剩余字节推断。
+    /// 返回当前实际可立即写入的总字节空间（等于全部空闲物理槽容量加上最后一个占用页的尾部可合并空间）。
     pub(crate) fn space(&self) -> usize {
         self.empty_slot_capacity() + self.merge_space()
     }
 
-    /// 只报告空物理槽的容量，管道 poll 不因满槽末页仍可合并而写就绪。
+    /// 返回尚未分配使用的空闲物理槽所对应的整页字节容量（`(N - used) * PIPE_BUF`，供 `poll` 判定写就绪）。
     pub(crate) fn empty_slot_capacity(&self) -> usize {
         self.capacity() - self.used * PIPE_BUF
     }
 
-    /// 立即归还全部占用页并恢复空 FIFO 的索引和容量。
+    /// 立即释放全部已占用的物理页，并将环形队列的读写游标与字节计数重置为空状态。
     pub(crate) fn clear(&mut self) {
         self.slots.iter_mut().for_each(|slot| drop(slot.take()));
         self.head = 0;
@@ -99,7 +168,7 @@ impl<const N: usize> PipeBuffer<N> {
         self.bytes = 0;
     }
 
-    /// 仅消费实际交付量，最后一个字节交付后结束该槽页拥有。
+    /// 从最早的数据槽位（`tail`）消费前 `count` 个字节；若该槽位的有效字节全部消费完毕，立即释放其物理页并推进 `tail`。
     fn consume(&mut self, count: usize) {
         let slot = self.slots[self.tail].as_mut().unwrap();
         assert!(count <= slot.length);
@@ -113,15 +182,16 @@ impl<const N: usize> PipeBuffer<N> {
         }
     }
 
-    /// 借用最早槽已经发表的初始化前缀；调用者必须在借用结束后才消费或移动该槽。
+    /// 借用最早槽位（`tail`）中最多 `limit` 字节的已初始化未读数据切片（调用方须在借用结束后才能调用 `consume` 消费或释放该槽位）。
     fn front(&mut self, limit: usize) -> &[u8] {
         if self.is_empty() {
             return &[];
         }
         let slot = self.slots[self.tail].as_mut().unwrap();
         let count = limit.min(slot.length);
-        // SAFETY: 本槽仍独占原页，offset 和 length 只覆盖已提交字节；
-        // 返回借用受 ring 的独占借用限制，持有 ring 睡眠锁期间不能写槽或归页。
+        // SAFETY:
+        // 1. `slot.pages` 为当前槽位独占持有的 4096 字节已清零物理页，`slot.offset + count <= slot.offset + slot.length <= PIPE_BUF` 保证指针运算与切片长度不越界且已初始化；
+        // 2. 返回切片的生命周期绑定在 `&mut self` 独占借用上，期间调用方无法修改该槽位数据或释放物理页。
         unsafe {
             core::slice::from_raw_parts(
                 slot.pages.as_mut_ptr().cast::<u8>().add(slot.offset),
@@ -130,11 +200,12 @@ impl<const N: usize> PipeBuffer<N> {
         }
     }
 
-    /// 完整前槽直接转移原页拥有；部分槽复制到目标后仅消费目标真正接受的前缀。
+    /// 将当前缓冲区头部最多 `limit` 字节移入目标缓冲区 `target`：若整个 `tail` 槽位不超过 `limit` 则直接零拷贝转移物理页槽位，否则拷贝前缀并按实际接收量消费。
     fn splice_into(&mut self, target: &mut Self, limit: usize) -> Result<usize, FsError> {
         assert!(!self.is_empty());
         assert!(0 < target.empty_slot_capacity());
         let length = self.slots[self.tail].as_ref().unwrap().length;
+        // 快速路径：最早槽位的全部有效数据均在本次传输上限内，直接将整页 Slot 移交给目标空闲槽位。
         if length <= limit {
             let slot = self.slots[self.tail].take().unwrap();
             self.tail = (self.tail + 1) % N;
@@ -148,14 +219,15 @@ impl<const N: usize> PipeBuffer<N> {
             return Ok(length);
         }
 
+        // 慢速路径：请求长度小于当前整槽数据量，拷贝前缀追加到目标缓冲区，并仅消费目标实际接收的字节数。
         let accepted = target.append(&mut WriteBuffer::kernel(self.front(limit)))?;
         self.consume(accepted);
         Ok(accepted)
     }
 
-    /// 在调用者的睡眠锁内复制输入到末页或新槽；调用前必须有真实空间。
-    /// 一次只提交一个页后缀，失败不影响此前已发表的数据页。
+    /// 从写入源 `source` 拉取数据追加到最后一个槽位的尾部空闲区（若无尾部空间则分配新物理页槽位）；单次最多填满一个物理页后缀，若拷贝失败且新槽位为空则立即回收该空页。
     pub(crate) fn append(&mut self, source: &mut WriteBuffer<'_>) -> Result<usize, FsError> {
+        // Step 1: 若最新槽位无尾部剩余空间，分配一个已清零的新物理页挂入 `head` 槽位。
         if self.merge_space() == 0 {
             assert!(self.used < N);
             let pages = mm::alloc_pages(0, true).ok_or(FsError::NoMemory)?;
@@ -168,11 +240,13 @@ impl<const N: usize> PipeBuffer<N> {
             self.used += 1;
         }
 
+        // Step 2: 构造指向该页尾部可写区间 `offset..PIPE_BUF` 的可变字节切片，并从 `source` 拷贝数据。
         let index = (self.head + N - 1) % N;
         let slot = self.slots[index].as_mut().unwrap();
         let offset = slot.offset + slot.length;
-        // SAFETY: 本槽独占一个已清零的原页，调用者的睡眠锁排除读写和归还；
-        // 后缀完全位于页内，pull 不保存独占借用，结束后才更新长度或释放空槽。
+        // SAFETY:
+        // 1. `slot.pages` 为当前槽位独占持有的已清零物理页（大小 `PIPE_BUF`），且 `offset <= PIPE_BUF`，`offset..PIPE_BUF` 完全处于该页有效且已初始化范围内；
+        // 2. `&mut self` 保证无其他并发切片借用该页，`source.pull(dst)` 在返回前即结束对 `dst` 的借用，之后才更新 `slot.length` 或回收空槽。
         let dst = unsafe {
             core::slice::from_raw_parts_mut(
                 slot.pages.as_mut_ptr().cast::<u8>().add(offset),
@@ -180,6 +254,7 @@ impl<const N: usize> PipeBuffer<N> {
             )
         };
 
+        // Step 3: 提交成功拷贝的字节长度；若新分配槽位因用户态缺页错误等原因导致实际长度为 0，回滚释放该空物理页。
         let result = source.pull(dst);
         if let Ok(count) = result {
             slot.length += count;
@@ -193,8 +268,9 @@ impl<const N: usize> PipeBuffer<N> {
         result
     }
 
-    /// 在调用者的睡眠锁内逐槽交付，非 PEEK 只消费实际 copyout 差量。
-    /// 故障保留本次合法正前缀；PEEK 的局部游标不改变槽、页及 FIFO 索引。
+    /// 按 FIFO 顺序向读取目标 `target` 逐槽写出数据：当 `peek == false` 时实时消费已成功拷贝的字节并回收空页；当 `peek == true` 时仅移动局部游标而不消费缓冲区数据。
+    ///
+    /// 若中途发生用户态拷贝错误（如 `EFAULT`），若此前已成功传输了部分字节（Partial Progress）则返回已传输字节数，否则返回该错误。
     pub(crate) fn receive(
         &mut self,
         target: &mut ReadBuffer<'_>,
@@ -208,8 +284,9 @@ impl<const N: usize> PipeBuffer<N> {
             let slot = self.slots[index].as_mut().unwrap();
             let length = slot.length;
             let count = (length - offset).min(target.len() - target.copied());
-            // SAFETY: 槽独占的原页仍然存活，片段仅覆盖已提交的初始化字节；
-            // 调用者的睡眠锁排除并发写入及归页，push 不保存本页借用。
+            // SAFETY:
+            // 1. `slot.pages` 为当前槽位独占持有的存活物理页，区间 `slot.offset + offset .. +count` 完全落在已提交的有效初始化数据 `slot.offset .. +slot.length` 内；
+            // 2. `&mut self` 排除了并发写入或页面释放，`target.push(bytes)` 返回后不再保留 `bytes` 引用，随后才调用 `self.consume` 修改槽位。
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     slot.pages
@@ -243,21 +320,30 @@ impl<const N: usize> PipeBuffer<N> {
     }
 }
 
+/// 匿名管道读写两端共同持有的底层共享管道实体。
 struct Pipe {
+    /// 保护物理页环形缓冲区读写与槽位分配释放的睡眠互斥锁。
     ring: SleepMutex<PipeBuffer<SLOTS>>,
-    /// 一次原子观察同时保存数据量和物理空槽容量，末页合并后缀不授予poll写就绪。
+    /// 供 `poll` 无锁读取的 64 位原子状态快照（低 `SPACE_SHIFT` 位为可读字节数，高位为空闲物理槽字节容量）。
     observation: AtomicU64,
+    /// 读端打开文件描述（[`PipeEnd`]，`read == true`）是否仍然存活。
     reader_open: AtomicBool,
+    /// 写端打开文件描述（[`PipeEnd`]，`read == false`）是否仍然存活。
     writer_open: AtomicBool,
+    /// 通知等待“管道变为可读或写端挂断”订阅者的持续等待队列头。
     read_head: Arc<PollWaitHead>,
+    /// 通知等待“管道变为可写或读端关闭”订阅者的持续等待队列头。
     write_head: Arc<PollWaitHead>,
+    /// 两端 `fstat` 共享报告的进程内唯一匿名 FIFO 伪 inode 编号。
     inode: u64,
+    /// 创建该管道时的所有者用户 ID（供 `fstat` 报告）。
     uid: u32,
+    /// 创建该管道时的所有者组 ID（供 `fstat` 报告）。
     gid: u32,
 }
 
 impl Pipe {
-    /// 状态提交后发布查询快照并通知真正的读写源；通知不取得 ring 锁。
+    /// 在持有 `ring` 锁完成缓冲区状态变更后，发布最新原子容量快照并按需唤醒读/写端等待队列。
     fn publish(&self, ring: &PipeBuffer<SLOTS>, read_changed: bool, write_changed: bool) {
         self.observation.store(
             (ring.len() as u64) | ((ring.empty_slot_capacity() as u64) << SPACE_SHIFT),
@@ -274,15 +360,23 @@ impl Pipe {
     }
 }
 
-/// 管道打开实例私有持有原页环和方向，借用能力不增加端点数量。
+/// 匿名管道单侧（只读端或只写端）的打开文件描述对象（OFD）。
+///
+/// 每个管道创建时仅生成一读一写两个 `PipeEnd` 实例；`dup` / `fork` 共享同一个 `Arc<PipeEnd>`，不会产生额外的端点。
 pub struct PipeEnd {
+    /// 指向读写两端共享的底层管道实体。
     pipe: Arc<Pipe>,
+    /// 端点传输方向：`true` 表示只读端（`O_RDONLY`），`false` 表示只写端（`O_WRONLY`）。
     read: bool,
+    /// 该端点的打开文件状态标志（包含只读/只写访问模式及可通过 `fcntl` 动态修改的 `O_NONBLOCK` 等标志）。
     flags: AtomicU32,
+    /// 挂载在该端点上的 `epoll` 反向监控链表头，在端点最终关闭（Drop）时自动注销所有关联监听项。
     watches: Arc<WatchHead>,
 }
 
-/// 按创建者凭据准备两个实际OFD，CLOEXEC留给描述符槽；未发表失败归还原拥有。
+/// 按指定标志 `flags`（仅允许 `O_NONBLOCK` 与 `O_CLOEXEC`）和创建者凭据 `(uid, gid)` 创建一对相连的匿名管道 `(读端 FileRef, 写端 FileRef)`。
+///
+/// `O_NONBLOCK` 直接写入读写两个打开文件描述的状态字；`O_CLOEXEC` 由上层系统调用在安装文件描述符槽位时设置。
 pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsError> {
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(FsError::InvalidOperation);
@@ -326,7 +420,7 @@ pub fn try_new(flags: u32, uid: u32, gid: u32) -> Result<(FileRef, FileRef), FsE
 }
 
 impl PipeEnd {
-    /// 确需阻塞时建立有限源登记，之后必须重新扫描业务状态，不能直接睡眠。
+    /// 在首次确认需要阻塞等待时创建 `PollContext` 与单槽位 `PollTable` 并注册当前端点的等待队列头（返回后调用方须先复查状态再决定是否睡眠）。
     fn prepare_wait(&self) -> Result<(Arc<PollContext>, PollTable), FsError> {
         let context = PollContext::try_new()?;
         let sink: Arc<dyn PollNotify> = context.clone();
@@ -335,7 +429,7 @@ impl PipeEnd {
         Ok((context, table))
     }
 
-    /// 无进度返回具体错误，已交付或已提交的正前缀优先保留。
+    /// 统一处理部分传输后的错误返回：若尚未传输任何字节（`count == 0`）则返回 `Err(error)`，否则优先保留并返回已成功传输的字节数 `Ok(count)`。
     fn progress(count: usize, error: FsError) -> Result<usize, FsError> {
         if count == 0 {
             Err(error)
@@ -344,7 +438,7 @@ impl PipeEnd {
         }
     }
 
-    /// 无读端的非零用户写发送线程定向内核信号，内核调用没有用户信号副作用。
+    /// 处理读端已关闭时的管道写入：若调用者为用户态线程则向其发送线程定向的 `SIGPIPE` 信号，随后按已有传输进度返回已写字节数或 `FsError::BrokenPipe`（`EPIPE`）。
     fn broken_pipe(&self, caller: FileIoContext<'_>, count: usize) -> Result<usize, FsError> {
         if let FileIoContext::User(user) = caller {
             user.send_kernel_signal(SIGPIPE);
@@ -352,17 +446,17 @@ impl PipeEnd {
         Self::progress(count, FsError::BrokenPipe)
     }
 
-    /// 比较实际管道页环身份，读写两端属于同一 pipe 时也返回相同。
+    /// 判断两个管道端点是否连接在同一个底层 `Pipe` 实例上（同一管道的读端与写端比较也会返回 `true`）。
     pub(crate) fn same_pipe(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.pipe, &other.pipe)
     }
 
-    /// 合并本次 splice 标志和实际管道 OFD 状态，不读取普通文件的 NONBLOCK。
+    /// 判断一次 `splice` 操作在当前管道端点上是否应以非阻塞模式运行（合并 `SPLICE_F_NONBLOCK` 请求参数与本端点的 `O_NONBLOCK` 状态位）。
     fn splice_nonblocking(&self, requested: bool) -> bool {
         requested || self.flags() & O_NONBLOCK != 0
     }
 
-    /// 文件位置已经在环之前固定；先按明确位置读取，再按实际发表量报告源进度。
+    /// 实现“普通文件 -> 管道写端”的 `splice` 传输：从 `file` 的指定偏移 `offset` 处分块读取数据写入当前管道写端（外层调用方已预先锁定文件偏移并在返回后按实际写入管道字节数推进偏移）。
     pub(crate) fn splice_from_file(
         &self,
         file: &InodeFile,
@@ -380,6 +474,7 @@ impl PipeEnd {
         let mut copied = 0;
         let mut scratch = [0u8; PIPE_BUF];
         loop {
+            // Step 1: 清除上一轮遗留的通知标志，并锁定管道环形缓冲区推进文件读取与管道写入。
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
@@ -429,6 +524,7 @@ impl PipeEnd {
                 }
             }
 
+            // Step 2: 管道已满且尚未写入任何字节，在释放 `ring` 锁后注册等待表或进入可中断睡眠等待读端腾出空槽。
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -438,7 +534,7 @@ impl PipeEnd {
         }
     }
 
-    /// 目标 inode 接受前缀之后才消费源槽；文件同步由调用者在位置和环锁外完成。
+    /// 实现“管道读端 -> 普通文件”的 `splice` 传输：借用当前管道头部已提交切片写入目标文件 `offset` 处，仅在目标文件成功接收后才消费管道字节（文件元数据同步由外层在释放锁后完成）。
     pub(crate) fn splice_to_file(
         &self,
         file: &InodeFile,
@@ -455,6 +551,7 @@ impl PipeEnd {
         let mut interrupted = false;
         let mut copied = 0;
         loop {
+            // Step 1: 检查待处理信号并锁定管道环形缓冲区，将头部槽位数据切片直接写入目标文件。
             if crate::fs::transfer::interruption_pending(caller) {
                 return Self::progress(copied, FsError::Interrupted);
             }
@@ -497,6 +594,7 @@ impl PipeEnd {
                 }
             }
 
+            // Step 2: 管道为空且写端仍存活，在释放 `ring` 锁后注册等待表或睡眠等待写端写入数据。
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -506,7 +604,7 @@ impl PipeEnd {
         }
     }
 
-    /// 按真实 pipe 地址锁住两个环，等待前释放两环；整槽只移动一次原页拥有。
+    /// 实现“源管道读端 -> 目标管道写端”的 `splice` 传输：按底层 `Pipe` 指针地址升序锁定双环，整槽满足上限时直接零拷贝转移物理页所有权，阻塞前释放双环锁。
     pub(crate) fn splice_to_pipe(
         &self,
         target: &Self,
@@ -527,6 +625,7 @@ impl PipeEnd {
             if let Some((_, context, _)) = &waiting {
                 context.clear_triggered();
             }
+            // Step 1: 严格按底层 `Pipe` 地址从小到大顺序获取两个管道的 `ring` 睡眠锁，防止双向并发 `splice` 产生 AB-BA 死锁。
             let wait_input = {
                 let (mut input, mut output) = if Arc::as_ptr(&self.pipe) < Arc::as_ptr(&target.pipe)
                 {
@@ -538,6 +637,8 @@ impl PipeEnd {
                     let input = self.pipe.ring.lock();
                     (input, output)
                 };
+
+                // Step 2: 在双锁保护下循环将源管道槽位转移或前缀拷贝至目标管道，并实时发布两端状态快照。
                 let mut copied = 0;
                 while copied < length {
                     if !target.pipe.reader_open.load(Ordering::Acquire) {
@@ -570,7 +671,7 @@ impl PipeEnd {
                 input.is_empty()
             };
 
-            // 登记只覆盖当前真正阻塞的端点；下一次锁内重扫后才允许 park。
+            // Step 3: 释放双环锁后，仅针对当前真正导致阻塞的那一端（源空等输入 `wait_input == true`，或目标满等输出）注册等待或进入睡眠；若阻塞方向切换则重建订阅并回到循环顶部重扫。
             if waiting
                 .as_ref()
                 .is_some_and(|(input, _, _)| *input == wait_input)
@@ -589,7 +690,7 @@ impl PipeEnd {
 }
 
 impl Pollable for PipeEnd {
-    /// 首轮先登记该端实际源，再以原子快照观察容量与最后端点关闭事实。
+    /// 查询管道端点的即时就绪事件掩码：首轮将对应方向的等待队列头注册到 `table`，随后无锁读取 `observation` 原子快照与对端存活状态。
     fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
         if let Some(table) = table {
             table.register(if self.read {
@@ -621,12 +722,12 @@ impl Pollable for PipeEnd {
 }
 
 impl FileLike for PipeEnd {
-    /// 跨文件传输借用本实际端点，字段及原页拥有仍由端点私有维护。
+    /// 返回对当前 [`PipeEnd`] 的引用，供 `splice` 等跨文件传输路径直接识别并操作匿名管道端点。
     fn pipe_end(&self) -> Option<&PipeEnd> {
         Some(self)
     }
 
-    /// 先交付现有尾部，只消费 copyout 的实际差量；空且写 OFD 已结束才返回 EOF。
+    /// 从管道读端读取数据写入 `target`：只要读到至少 1 个字节或写端已全部关闭（返回 0 表示 EOF）即立即返回；否则按阻塞/非阻塞策略等待写端写入。
     fn read_into(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -675,7 +776,7 @@ impl FileLike for PipeEnd {
         }
     }
 
-    /// 管道没有可定位位置，pread 总是返回 ESPIPE。
+    /// 匿名管道是字节流，无文件偏移概念，`pread` 固定返回 `FsError::IllegalSeek`（`ESPIPE`）。
     fn read_at_into(
         &self,
         _offset: u64,
@@ -685,50 +786,50 @@ impl FileLike for PipeEnd {
         Err(FsError::IllegalSeek)
     }
 
-    /// 匿名端点没有目录路径。
+    /// 匿名管道端点没有关联的文件系统路径。
     fn path(&self) -> Option<&Path> {
         None
     }
-    /// 匿名流没有文件映射 inode。
+    /// 匿名管道不支持 `mmap` 文件内存映射。
     fn mapping_inode(&self) -> Option<&InodeRef> {
         None
     }
-    /// 每个端点提供自己的实际持续源。
+    /// 暴露 `Pollable` 接口以支持 `poll` / `select` / `epoll` 事件监听。
     fn pollable(&self) -> Option<&dyn Pollable> {
         Some(self)
     }
-    /// 反向登记属于此打开端点，复制描述符共享同一份末释放责任。
+    /// 返回该打开端点的 `epoll` 反向监控链表头（复制出的文件描述符共享同一个端点与析构注销时机）。
     fn watch_head(&self) -> Option<&Arc<WatchHead>> {
         Some(&self.watches)
     }
 
-    /// 访问模式属于该 OFD，CLOEXEC 不进入对象。
+    /// 读取当前打开文件描述的访问模式与状态标志（不含描述符槽位级别的 `O_CLOEXEC`）。
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
     }
-    /// 同一原子读改写提交可变状态位，保留端点访问模式与不可变打开位。
+    /// 按 `fcntl(F_SETFL)` 规则原子更新可变状态标志，保持端点固有的只读/只写访问模式不变。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
     }
-    /// 只原子修改端点 OFD 的非阻塞位，dup 与 fork 共享原状态。
+    /// 原子设置或清除该管道端点的 `O_NONBLOCK` 标志（通过 `dup` / `fork` 共享该端点的描述符同步生效）。
     fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
         set_nonblocking(&self.flags, enabled)
     }
 
-    /// 流不能截断。
+    /// 管道字节流不支持 `ftruncate` 截断。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
     }
-    /// 管道没有需要同步的文件存储。
+    /// 匿名管道驻留内存，无底层持久化存储需要 `fsync` 同步。
     fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
     }
-    /// 管道没有共享字节位置。
+    /// 匿名管道不支持 `lseek` 定位，固定返回 `FsError::IllegalSeek`（`ESPIPE`）。
     fn seek(&self, _from: SeekFrom) -> Result<u64, FsError> {
         Err(FsError::IllegalSeek)
     }
 
-    /// 两端共享稳定匿名 FIFO 身份，不创建磁盘 Path、inode 或 Mount。
+    /// 返回匿名管道的 `fstat` 属性（读写两端共享相同的伪 inode 编号，类型为 `S_IFIFO | 0600`，块大小为 `PIPE_BUF`）。
     fn stat(&self) -> Result<FileStat, FsError> {
         let zero = InodeTime {
             seconds: 0,
@@ -752,11 +853,11 @@ impl FileLike for PipeEnd {
         })
     }
 
-    /// 端点不提供目录项。
+    /// 管道端点不是目录，不支持 `readdir`。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         Err(FsError::NotDirectory)
     }
-    /// 端点不提供目录交付能力。
+    /// 管道端点不是目录，不支持目录项枚举。
     fn for_each_dirent(
         &self,
         _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
@@ -764,7 +865,7 @@ impl FileLike for PipeEnd {
         Err(FsError::NotDirectory)
     }
 
-    /// 小总请求在一个状态持有期内提交，容量不足先等待；大请求保留真实正前缀。
+    /// 向管道写端写入数据：总长度不超过 `PIPE_BUF` 的小请求遵循 POSIX 原子写语义（剩余空间不足以容纳整笔请求时先等待而非拆分写入）；大于 `PIPE_BUF` 的请求分段写入并在中途出错或阻塞时保留已成功写入的字节数。
     fn write_from(
         &self,
         source: &mut WriteBuffer<'_>,
@@ -783,6 +884,7 @@ impl FileLike for PipeEnd {
         let mut waiting: Option<(Arc<PollContext>, PollTable)> = None;
         let mut interrupted = false;
         loop {
+            // Step 1: 清除旧通知标志并获取管道 `ring` 锁，校验读端仍处于打开状态（若读端已关闭则触发 `SIGPIPE` 并返回 `EPIPE`）。
             if let Some((context, _)) = &waiting {
                 context.clear_triggered();
             }
@@ -792,6 +894,7 @@ impl FileLike for PipeEnd {
                     return self.broken_pipe(caller, written);
                 }
                 let remaining = source.len() - source.copied();
+                // Step 2: 若为大于 `PIPE_BUF` 的普通写，或当前可用总空间足以一次性容纳整个小请求（`<= PIPE_BUF`），则在本次持锁期内循环追加写入并唤醒读端。
                 if !small || remaining <= ring.space() {
                     while source.copied() < source.len() && 0 < ring.space() {
                         if !self.pipe.reader_open.load(Ordering::Acquire) {
@@ -835,6 +938,7 @@ impl FileLike for PipeEnd {
                 }
             }
 
+            // Step 3: 缓冲区空间不足以完成本次写入，释放 `ring` 锁后注册等待队列或进入睡眠等待读端消费腾出空间。
             if let Some((context, _)) = &waiting {
                 interrupted = context.park_until(matches!(caller, FileIoContext::User(_)), None)
                     == WaitResult::Interrupted;
@@ -847,7 +951,7 @@ impl FileLike for PipeEnd {
         }
     }
 
-    /// 管道不能执行按位置写入。
+    /// 匿名管道不支持带偏移量的随机写入，`pwrite` 固定返回 `FsError::IllegalSeek`（`ESPIPE`）。
     fn write_at_from(
         &self,
         _offset: u64,
@@ -859,7 +963,7 @@ impl FileLike for PipeEnd {
 }
 
 impl Drop for PipeEnd {
-    /// 末OFD先同步撤全部持久watch，再发布端点关闭和通知对端；复制描述符不提前关闭。
+    /// 当该方向打开文件描述的最后一个强引用被释放时：先同步注销挂载在本端点上的所有 `epoll` 监听项，再将对应端点的打开标志置为 `false` 并向对端广播 `POLLERR`（读端关闭）或 `POLLHUP`（写端关闭）。
     fn drop(&mut self) {
         self.watches.release();
         if self.read {

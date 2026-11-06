@@ -1,6 +1,6 @@
-    # 定义数据段，用于存储文件系统镜像
+    # 历史内嵌根文件系统镜像数据段（LoongArch64 遗留构建路径，当前生产启动改用 VirtIO/SD/SATA/RAM 块设备）。
+    # 放入 .data 段并导出起止符号 simg / eimg，按 4KiB（2^12 字节）页边界对齐以便直接按页映射。
     .section .data
-    # 声明两个全局符号，分别表示镜像起始地址和结束地址
     .global simg
     .global eimg
     # 将数据对齐到2^12次方也就是4096B

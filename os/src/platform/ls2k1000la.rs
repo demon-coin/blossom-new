@@ -1,4 +1,76 @@
-//! 2K1000LA 的 LIOINTC、Loongson PCI 与原生外设绑定。
+//! 龙芯 2K1000LA（LoongArch64 双核 SoC）开发板的固件交接解析与设备树资源发现模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于平台抽象层（`crate::platform`）下，承担两项核心任务：
+//! 1. **固件引导参数交接（[`boot_parameters`]）**：在 LoongArch64 引导最早期，从固件传入的 `a0..a3`
+//!    寄存器中解析出扁平设备树（DTB）与内核命令行的物理地址，兼容 UHI（Unified Hosting Interface）、
+//!    显式 `a3` DTB 传参以及 U-Boot `bootm` 的 EFI64 系统表（`EFI_SYSTEM_TABLE`）交接协议。
+//! 2. **板级设备树资源发现（[`discover`]）**：在识别出当前平台为 `Platform::Ls2k1000la` 后，解析并校验
+//!    双 Bank 传统 I/O 中断控制器（`loongson,liointc-2.0`）、RTC、电源管理控制器（PMC）以及片上外设
+//!    （支持标准 Loongson PCI 拓扑或无 PCI Host 的纯 MMIO 设备树绑定），写入 [`BootInfo`]。
+//!
+//! # 核心设计与硬件拓扑
+//! ## 1. 固件交接与 EFI64 系统表布局
+//! LoongArch 固件可能传入物理地址，或带直接映射窗口（DMW，`0x8000_...` / `0x9000_...`）前缀的虚拟地址。
+//! 当通过 EFI64 系统表传递 DTB 时，内存结构如下：
+//!
+//! ```text
+//!   a0..a3 固件参数:
+//!   +-----------------------------------------------------------------------+
+//!   | 分支 A (UHI):       a0 == usize::MAX - 1, a1 = DTB 地址               |
+//!   | 分支 B (显式 a3):   a0 <= 1, a1 = cmdline, a3 = DTB 地址 (非 0)       |
+//!   | 分支 C (EFI64):     a0 <= 1, a1 = cmdline, a2 = EFI_SYSTEM_TABLE 地址 |
+//!   +-----------------------------------------------------------------------+
+//!                                                     |
+//!                                                     v
+//!   EFI_SYSTEM_TABLE (最小 0x78 字节):
+//!   +------------------+----------------------------------------------------+
+//!   | 0x00..0x08       | Signature = 0x5453_5953_2049_4249 ("IBI SYST")     |
+//!   | 0x0c..0x10       | HeaderSize (>= 0x78)                               |
+//!   | 0x68..0x70       | NumberOfTableEntries (nr_tables)                   |
+//!   | 0x70..0x78       | ConfigurationTable 数组指针                        |
+//!   +------------------+----------------------------------------------------+
+//!                                                     |
+//!                                                     v
+//!   EFI_CONFIGURATION_TABLE 数组 (每项 24 字节):
+//!   +------------------+----------------------------------------------------+
+//!   | 0x00..0x10 (16B) | VendorGuid (匹配唯一 EFI_FDT_GUID)                 |
+//!   | 0x10..0x18 (8B)  | VendorTable -> DTB 物理/DMW 地址                   |
+//!   +------------------+----------------------------------------------------+
+//! ```
+//!
+//! ## 2. 双 Bank LIOINTC 中断路由与片上 PCI/MMIO 拓扑
+//! 2K1000LA 包含两个 `liointc-2.0` 控制器（Bank 0 与 Bank 1），每个 Bank 管理 32 个高电平触发中断源，
+//! 分别汇总到 CPU 中断控制器的父中断线 IP2（cause = 2）与 IP3（cause = 3），拼接为 0..64 的统一外部中断域：
+//!
+//! ```text
+//!                  +---------------------------------------------+
+//!                  |   loongson,cpu-interrupt-controller (CPU)   |
+//!                  +---------------------------------------------+
+//!                             ^                       ^
+//!                   cause = 2 |                       | cause = 3
+//!              +--------------+-------+       +-------+--------------+
+//!              | LIOINTC0 (Bank 0)    |       | LIOINTC1 (Bank 1)    |
+//!              | main(0x40), isr0/1   |       | main(0x40), isr0/1   |
+//!              | parent_map=[~0,0,0,0]|       | parent_map=[0,~0,0,0]|
+//!              | 外部 IRQ 编号: 0..31 |       | 外部 IRQ 编号: 32..63|
+//!              +----------------------+       +----------------------+
+//!                         ^                               ^
+//!                         +---------------+---------------+
+//!                                         |
+//!            +----------------------------+----------------------------+
+//!            | 模式 1: 片上 PCI 拓扑 (loongson,ls2k-pci)               | 模式 2: 原生 MMIO 拓扑
+//!            | - CFG0 (类型 0 配置窗口) + CFG1 (类型 1 配置窗口)       | (无 PCI Host 时回退)
+//!            | - 子节点 sata@8,0 (BDF 00:08.0) -> AHCI                 | - AHCI MMIO 节点
+//!            | - 子节点 ethernet@3,0 (BDF 00:03.0) -> GMAC0            | - ethernet0 DWMAC 节点
+//!            +---------------------------------------------------------+
+//!
+//!   PCI 子节点 5-cell reg 格式: [ <phys.hi (BDF 位于 bits[23:8])>, 0, 0, 0, 0 ]
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! 本模块仅在引导早期单核（BSP）串行初始化阶段运行，不获取任何运行期锁。固件交接阶段直接借用只读的
+//! 固件内存切片，解析完成后仅保留归一化后的物理地址，不跨越初始化阶段保留裸切片引用。
 
 #[cfg(target_arch = "loongarch64")]
 use core::convert::{TryFrom, TryInto};
@@ -21,10 +93,14 @@ use crate::platform::layout::{
     DMW_ADDRESS_END, DMW_ADDRESS_MASK, DMW_CACHED_VSEG, DMW_UNCACHED_VSEG, DMW_VSEG_SHIFT,
 };
 
-/// 固件交接中已归一化的物理地址，解析完成后不保留 EFI 表借用。
+/// 固件交接阶段解析并归一化后的引导参数物理地址。
+///
+/// 解析完成后仅保存纯物理地址数值（已剥离 DMW 虚拟段前缀），不再借用 EFI 系统表或配置表内存。
 #[cfg(target_arch = "loongarch64")]
 pub(super) struct FirmwareParameters {
+    /// 扁平设备树（DTB）在物理内存中的起始地址（字节，非零）。
     pub(super) dtb: usize,
+    /// 可选的内核命令行以 NUL 结尾字符串的物理起始地址（字节，非零）。
     pub(super) command_line: Option<usize>,
 }
 
@@ -59,14 +135,23 @@ const PCI_BDF_MASK: u32 = ((u8::MAX as u32) << PCI_BUS_SHIFT)
     | (((PCI_DEVICE_COUNT - 1) as u32) << PCI_DEVICE_SHIFT)
     | (((PCI_FUNCTION_COUNT - 1) as u32) << PCI_FUNCTION_SHIFT);
 
-/// 一次解释 UHI、显式 a3 DTB 或 EFI64 bootm 交接，不扫描物理内存。
+/// 解析 LoongArch64 固件传入的四个引导寄存器（`a0..a3`），提取 DTB 与内核命令行的物理地址。
+///
+/// 调用上下文：引导最早期单核（BSP）环境，在正式解析 FDT 前由 `platform` 初始化入口调用。
+/// 支持三种固件交接协议：
+/// 1. UHI 协议：`a0 == usize::MAX - 1`，`a1` 为 DTB 地址，无独立命令行指针。
+/// 2. 显式 `a3` 传参：`a0 <= 1` 且 `a3 != 0`，`a3` 为 DTB 地址，`a1`（若非零）为命令行地址。
+/// 3. EFI64 系统表传参：`a0 <= 1`、`a3 == 0` 且 `a2 != 0`，从 `a2` 指向的 `EFI_SYSTEM_TABLE` 中查找 FDT。
 ///
 /// # Safety
-/// 固件须保证所选 ABI 引用的 EFI 系统表、其声明的完整头部与配置表数组在解析期间可读、
-/// 无并发修改，且对应 RAM 映射已经建立；内容校验不能证明指针可读。
-/// 返回的 DTB 与命令行仍由调用者保活，直到完整 FDT 解析和命令行复制结束。
+/// 1. 当走 EFI64 分支（`args[0] <= 1 && args[3] == 0 && args[2] != 0`）时，调用方与固件必须保证 `args[2]`
+///    指向的 `EFI_SYSTEM_TABLE` 头部及其声明的 `ConfigurationTable` 数组在本次函数执行期间位于已映射的
+///    有效 RAM 中、可读且不会发生并发修改。
+/// 2. 返回的 `dtb` 与 `command_line` 物理地址对应的内存区域必须由调用方继续保持存活且不被覆盖，
+///    直到后续 FDT 解析与命令行拷贝全部完成。
 #[cfg(target_arch = "loongarch64")]
 pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParameters, &'static str> {
+    // Step 1: 优先识别 UHI 标准交接（a0 = -2，a1 = DTB 地址）。
     if args[0] == UHI_FDT_HANDOFF {
         return Ok(FirmwareParameters {
             dtb: physical(args[1])?,
@@ -74,15 +159,19 @@ pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParamet
         });
     }
 
+    // Step 2: 在传统/EFI 引导协议（a0 <= 1）下提取可选的 a1 内核命令行地址。
     let command_line = if args[0] <= 1 && args[1] != 0 {
         Some(physical(args[1])?)
     } else {
         None
     };
+
+    // Step 3: 优先使用 a3 显式传入的 DTB 地址；若 a3 为 0，则从 a2 的 EFI64 系统表中检索 FDT GUID。
     let dtb = if args[3] != 0 {
         physical(args[3])?
     } else if args[0] <= 1 && args[2] != 0 {
-        // SAFETY: 调用者保证 EFI 系统表及其声明的配置表在本次解析期间可读且不变。
+        // SAFETY: 前置条件已确认当前处于 EFI64 交接分支（args[0] <= 1 且 args[2] != 0）；
+        // 根据本函数的 # Safety 契约，固件与调用方保证 args[2] 指向的 EFI 系统表及配置表在解析期间可读且无并发修改。
         unsafe { efi_dtb(args[2])? }
     } else {
         return Err("LoongArch firmware did not supply a supported OS DTB handoff");
@@ -90,14 +179,18 @@ pub(super) unsafe fn boot_parameters(args: [usize; 4]) -> Result<FirmwareParamet
     Ok(FirmwareParameters { dtb, command_line })
 }
 
-/// 从 EFI64 系统表的配置表数组取得唯一 FDT GUID 对应的物理地址。
+/// 从 EFI64 系统表（`EFI_SYSTEM_TABLE`）的配置表数组中查找唯一匹配的 `EFI_FDT_GUID`，返回 DTB 物理地址。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`boot_parameters`] 调用。
 ///
 /// # Safety
-/// 调用者须保活系统表声明的完整头部与 nr_tables 个配置表项，保证解析期间可读且无并发修改；
-/// 所有物理地址的当前 RAM 映射须已建立，返回的 DTB 另由上层保活并校验。
+/// 1. 调用方必须保证 `address` 指向的 `EFI_SYSTEM_TABLE` 结构体（含完整 `HeaderSize` 字节）及
+///    `ConfigurationTable` 指向的 `NumberOfTableEntries` 个配置表项位于已建立 DMW 映射的物理内存中。
+/// 2. 上述固件内存区域在本次函数执行期间必须可读、对齐合法且不存在任何并发写入。
 #[cfg(target_arch = "loongarch64")]
 unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
-    // SAFETY: 调用者保证 EFI64 系统表的固定字段可读且不变；此处只借用最小布局。
+    // Step 1: 借用固定最小长度（0x78 字节）的系统表头部，校验签名与声明的 HeaderSize。
+    // SAFETY: 调用方契约保证 address 处至少 EFI_SYSTEM_TABLE_SIZE 字节的系统表头部已映射、可读且无并发修改。
     let header = unsafe { firmware_bytes(address, EFI_SYSTEM_TABLE_SIZE)? };
     if u64::from_le_bytes(header[..8].try_into().unwrap()) != EFI_SYSTEM_TABLE_SIGNATURE {
         return Err("EFI system table signature is invalid");
@@ -110,9 +203,11 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
     if header_size < EFI_SYSTEM_TABLE_SIZE {
         return Err("EFI system table header is too small");
     }
-    // SAFETY: 调用者保证头部声明的存储范围可读且不变；长度仅作表示范围校验，不证明可读性。
+    // SAFETY: 前置检查已确认 header_size >= EFI_SYSTEM_TABLE_SIZE，调用方契约保证系统表声明的完整头部范围可读且不变；
+    // 此处调用 firmware_bytes 校验完整 header_size 在物理与 DMW 虚拟地址空间内不发生算术溢出或越界。
     unsafe { firmware_bytes(address, header_size)? };
 
+    // Step 2: 读取配置表项数量与配置表数组基地址，检查总字节数不发生乘法溢出后借用整个配置表数组。
     let count = usize::try_from(u64::from_le_bytes(
         header[EFI_NR_TABLES_OFFSET..EFI_NR_TABLES_OFFSET + 8]
             .try_into()
@@ -128,9 +223,10 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
     let size = count
         .checked_mul(EFI_CONFIG_TABLE_SIZE)
         .ok_or("EFI configuration table array size overflows")?;
-    // SAFETY: 调用者保证 nr_tables 个 EFI64 表项可读且不变；乘法及地址表示范围在借用前检查。
+    // SAFETY: checked_mul 已排除长度溢出，调用方契约保证 tables_address 指向的 count 个配置表项可读且无并发修改。
     let tables = unsafe { firmware_bytes(tables_address, size)? };
 
+    // Step 3: 遍历所有 24 字节配置表项，匹配唯一的 EFI_FDT_GUID 并将其表指针归一化为物理地址。
     let mut dtb = None;
     for entry in tables.chunks_exact(EFI_CONFIG_TABLE_SIZE) {
         if entry[..EFI_CONFIG_TABLE_POINTER_OFFSET] != EFI_FDT_GUID {
@@ -148,10 +244,14 @@ unsafe fn efi_dtb(address: usize) -> Result<usize, &'static str> {
     dtb.ok_or("EFI FDT configuration table GUID is missing")
 }
 
-/// 检查固件存储的地址表示范围后借用字节，不推断实际可读性。
+/// 校验固件地址与长度在物理及 DMW 虚拟空间内的可表示性，并构造只读字节切片。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`efi_dtb`] 调用。
 ///
 /// # Safety
-/// 调用者须保证指定范围在返回借用存续期间可读且无并发修改，并已建立当前 RAM 映射。
+/// 1. 调用方必须保证归一化后的物理区间 `[physical(address), physical(address) + size)` 位于真实 RAM 中，
+///    且通过内核 DMW 映射（`crate::arch::phys_to_virt`）可安全读取。
+/// 2. 在返回的切片生命周期 `'a` 内，该内存区域内容必须已初始化且不存在任何并发写入。
 #[cfg(target_arch = "loongarch64")]
 unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'static str> {
     let address = physical(address)?;
@@ -165,11 +265,17 @@ unsafe fn firmware_bytes<'a>(address: usize, size: usize) -> Result<&'a [u8], &'
     if (pointer as usize).checked_add(size).is_none() {
         return Err("firmware virtual storage range overflows");
     }
-    // SAFETY: 可读性、无并发写及借用寿命由调用者保证；非空地址、切片长度与地址加法已检查。
+    // SAFETY:
+    // 1. `physical(address)?` 已保证物理地址非零，转换后的 DMW 虚拟地址 `pointer` 非空且滿足 `u8` 的 1 字节对齐；
+    // 2. 前置判断已确认 `size <= isize::MAX` 且物理/虚拟起止地址加法均不溢出、不超过 `DMW_ADDRESS_END`；
+    // 3. 调用方契约保证该段固件内存已在 DMW 映射下可读且在生命周期 `'a` 内无并发修改。
     Ok(unsafe { core::slice::from_raw_parts(pointer, size) })
 }
 
-/// 固件可传物理地址或 cached/uncached DMW 地址；其他地址类别拒绝。
+/// 将固件传入的物理地址或 Cached/Uncached DMW 窗口地址归一化为非零物理地址。
+///
+/// 调用上下文：引导早期单核（BSP）环境。拒绝不在 `0`、`DMW_UNCACHED_VSEG`、`DMW_CACHED_VSEG`
+/// 三个窗口内的非法段前缀，以及掩码后为 0 的空地址。
 #[cfg(target_arch = "loongarch64")]
 fn physical(address: usize) -> Result<usize, &'static str> {
     if !matches!(
@@ -185,12 +291,24 @@ fn physical(address: usize) -> Result<usize, &'static str> {
     Ok(address)
 }
 
-/// 由实际 LIOINTC 与 PCI 身份构造板快照，PCI reg 从不作为 BAR。
+/// 从设备树中发现并校验龙芯 2K1000LA 开发板的 LIOINTC、RTC、PMC 及 PCI/MMIO 外设资源。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 `platform::discover` 在识别到 `Platform::Ls2k1000la` 时调用。
+///
+/// 参数：
+/// - `tree`：扁平设备树只读视图。
+/// - `uart`：已选定的控制台串口节点，用于解析其在双 Bank LIOINTC 下的统一中断号。
+/// - `info`：待填充的全局引导信息结构。
+///
+/// 返回值：
+/// - `Ok(())`：所有板级中断控制器、电源控制器与存储/网络外设均通过绑定校验并已写入 `info`。
+/// - `Err(&'static str)`：LIOINTC 缺失或路由不匹配、CPU 核号越界、RTC/PMC 缺失或外设绑定非法。
 pub(super) fn discover<'a>(
     tree: &'a Fdt<'a>,
     uart: Node<'a>,
     info: &mut BootInfo,
 ) -> Result<(), &'static str> {
+    // Step 1: 扫描并校验两个 liointc-2.0 中断控制器（分别对应 CPU 父中断 cause 2 和 cause 3）。
     let mut banks = [None; 2];
     for node in tree
         .all_nodes()
@@ -247,6 +365,7 @@ pub(super) fn discover<'a>(
         banks[index] = Some(node);
     }
 
+    // Step 2: 汇总双 Bank LIOINTC（共 64 个中断源），解析串口中断号并校验双核 LA264 CPU 物理编号（0..2）。
     let banks = [
         banks[0].ok_or("FDT LIOINTC0 is missing")?,
         banks[1].ok_or("FDT LIOINTC1 is missing")?,
@@ -263,6 +382,7 @@ pub(super) fn discover<'a>(
         return Err("FDT LA264 hardware CPU ID exceeds the dual-core board");
     }
 
+    // Step 3: 发现唯一的 RTC 与电源管理控制器（PMC），提取 syscon-reboot / syscon-poweroff 子节点配置。
     let rtc = unique(tree, "loongson,ls2k1000-rtc")?;
     info.rtc = single_region(tree, rtc)?;
 
@@ -277,10 +397,14 @@ pub(super) fn discover<'a>(
         }
     }
 
+    // Step 4: 发现片上 PCI 拓扑（或无 PCI Host 时的原生 MMIO AHCI/GMAC 外设）。
     discover_pci(tree, banks, info)
 }
 
-/// 读取一个板级 syscon 动作并验证寄存器范围。
+/// 解析 PMC 子节点（`syscon-reboot` 或 `syscon-poweroff`）中的寄存器偏移、掩码与触发值。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`discover`] 调用。校验偏移量按 4 字节对齐、
+/// 不超出 PMC 寄存器窗口范围，且写入值不超出掩码覆盖的位。
 fn power_action(node: Node<'_>, registers: Region) -> Result<SysconAction, &'static str> {
     let offset = number(node, "offset")?;
     let mask = number(node, "mask")?;
@@ -299,7 +423,9 @@ fn power_action(node: Node<'_>, registers: Region) -> Result<SysconAction, &'sta
     })
 }
 
-/// 取得唯一的实际控制器绑定。
+/// 在设备树中查找唯一启用且匹配指定 `compatible` 字符串的板级控制器节点。
+///
+/// 调用上下文：引导早期单核（BSP）环境。若节点缺失或存在多个启用实例则返回错误。
 fn unique<'a>(tree: &'a Fdt<'a>, binding: &str) -> Result<Node<'a>, &'static str> {
     let mut nodes = tree
         .all_nodes()
@@ -313,7 +439,10 @@ fn unique<'a>(tree: &'a Fdt<'a>, binding: &str) -> Result<Node<'a>, &'static str
     Ok(node)
 }
 
-/// 将真实 LIOINTC bank/source 规范为单一外部 IRQ 域编号。
+/// 将外设节点在 LIOINTC Bank 0 或 Bank 1 下的局部中断号转换为统一的 `0..64` 外部中断编号。
+///
+/// 调用上下文：引导早期单核（BSP）环境。支持解析 `interrupts-extended`（3 cells：phandle + source + flags）
+/// 与传统 `interrupts`（2 cells：source + flags），要求触发方式必须为高电平触发（`IRQ_TYPE_LEVEL_HIGH`）。
 fn lio_irq<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,
@@ -351,12 +480,16 @@ fn lio_irq<'a>(
     Ok(index as u32 * u32::BITS + source)
 }
 
-/// 收集 Loongson CFG0/CFG1、窗口与所选集成功能资源，保留 SATA 节点显式声明的端口图。
+/// 解析龙芯 2K1000LA 的片上 PCI 主桥（`loongson,ls2k-pci`）及其集成的 SATA（`sata@8,0`）与网卡（`ethernet@3,0`）功能。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`discover`] 调用。若设备树中不存在任何启用的 PCI Host，
+/// 则自动转入 [`discover_mmio`] 解析纯 MMIO 绑定形式的外设。
 fn discover_pci<'a>(
     tree: &'a Fdt<'a>,
     banks: [Node<'a>; 2],
     info: &mut BootInfo,
 ) -> Result<(), &'static str> {
+    // Step 1: 查找唯一的 loongson,ls2k-pci 主桥；若不存在任何 PCI 节点，则回退到纯 MMIO 外设发现流程。
     let mut hosts = tree
         .all_nodes()
         .filter(|node| enabled(*node) && compatible(*node, "loongson,ls2k-pci"));
@@ -372,6 +505,7 @@ fn discover_pci<'a>(
         return Err("FDT Loongson PCI host is duplicated");
     }
 
+    // Step 2: 提取 Loongson 专用 CFG0（类型 0 配置空间）与 CFG1（类型 1 配置空间）窗口及总线号范围。
     identity_address(tree, host)?;
     let mut registers = regions(host)?;
     info.pci.configuration = registers.next().ok_or("FDT Loongson CFG0 is missing")??;
@@ -390,6 +524,7 @@ fn discover_pci<'a>(
     info.pci.bus_start = 0;
     info.pci.bus_end = word(buses, FDT_CELL_BYTES)?;
 
+    // Step 3: 解析 PCI 主桥的 ranges 地址转换窗口（I/O、32 位内存、64 位内存），用于后续 BAR 分配与校验。
     let ranges = property(host, "ranges")?;
     if ranges.is_empty() || ranges.len() % PCI_RANGE_BYTES != 0 {
         return Err("FDT Loongson PCI ranges are truncated");
@@ -418,6 +553,7 @@ fn discover_pci<'a>(
         info.pci.range_count += 1;
     }
 
+    // Step 4: 提取 PCI 主桥下的 sata@8,0（AHCI）与 ethernet@3,0（GMAC0）子节点，记录其 BDF 身份与固定中断路由。
     info.pci.intx_mask = [PCI_BDF_MASK, 0, 0, 0];
     let sata = host
         .children()
@@ -446,7 +582,11 @@ fn discover_pci<'a>(
     Ok(())
 }
 
-/// PCI 五 cell reg 中只有首 cell 的 BDF 构成配置身份，其零 size 不建立 MMIO。
+/// 解析 PCI 子节点的 5-cell `reg` 属性，提取其配置空间 BDF（Bus/Device/Function）标识、LIOINTC 中断号与 DMA 一致性属性。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`discover_pci`] 调用。
+/// 根据 IEEE 1275 PCI 绑定规范，片上 PCI 功能节点的 `reg` 首 cell 存放 BDF 编码，后 4 个 cell（基地址与长度）
+/// 均为 0；实际的控制器寄存器基地址（BAR）将在内核 PCI 枚举阶段从 PCI 配置空间读取或分配。
 fn pci_function<'a>(
     tree: &'a Fdt<'a>,
     node: Node<'a>,
@@ -469,7 +609,10 @@ fn pci_function<'a>(
     })
 }
 
-/// 所选集成功能按完整 BDF 取得 DTS 中固定连线，不使用配置 interrupt-line。
+/// 将片上 PCI 功能的完整 BDF 标识与设备树中声明的 LIOINTC 中断源写入 `info.pci.intx_routes` 路由表。
+///
+/// 调用上下文：引导早期单核（BSP）环境，由 [`discover_pci`] 调用。2K1000LA 片上集成的 PCI 外设
+/// 采用固定硬连线直连 LIOINTC，不依赖 PCI 配置空间中的 `Interrupt Line` 寄存器。
 fn add_route(info: &mut BootInfo, function: PciFunctionResource) -> Result<(), &'static str> {
     if info.pci.intx_route_count == info.pci.intx_routes.len() {
         return Err("FDT PCI function route capacity exceeded");
@@ -489,7 +632,10 @@ fn add_route(info: &mut BootInfo, function: PciFunctionResource) -> Result<(), &
     Ok(())
 }
 
-/// 无 PCI host 的自定义树只接受真实 MMIO 绑定，不把 PCI 子节点的 reg 重新解释。
+/// 在未启用 PCI 主桥的设备树中，直接按平台 MMIO 绑定解析 AHCI 与千兆网卡（`ethernet0`）资源。
+///
+/// 调用上下文：引导早期单核（BSP）环境，当 [`discover_pci`] 检测到设备树不含任何启用的 PCI Host 时调用。
+/// 此时要求 AHCI 节点不能挂在 `device_type = "pci"` 的父总线之下，且必须提供完整的 MMIO 寄存器窗口。
 fn discover_mmio<'a>(
     tree: &'a Fdt<'a>,
     banks: [Node<'a>; 2],
@@ -512,6 +658,7 @@ fn discover_mmio<'a>(
     if sata_nodes.next().is_some() {
         return Err("FDT native AHCI MMIO binding is duplicated");
     }
+    // Step 1: 校验 AHCI 节点不位于 PCI 总线下，提取并验证其 MMIO 寄存器窗口、DMA 掩码与中断号。
     let bus = parent(tree, sata).ok_or("FDT AHCI parent bus is missing")?;
     if bus.property("device_type").and_then(|p| p.as_str()) == Some("pci") {
         return Err("FDT AHCI PCI identity cannot be used as MMIO");
@@ -539,6 +686,7 @@ fn discover_mmio<'a>(
         ports_implemented: resources::optional_number(sata, "ports-implemented")?,
     });
 
+    // Step 2: 解析别名 ethernet0 指向的 DWMAC1000 MMIO 网卡节点，校验其寄存器窗口长度与 LIOINTC 中断号。
     let mac = resources::alias(tree, "ethernet0")?;
     if !(compatible(mac, "snps,dwmac-3.70a") || compatible(mac, "snps,arc-dwmac-3.70a")) {
         return Err("FDT ethernet0 is not a DWMAC1000 MMIO binding");

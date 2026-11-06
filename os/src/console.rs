@@ -1,4 +1,62 @@
-//! 选定串口的低层拥有者；正常访问共享一把端口短锁，故障输出不等待业务锁。
+//! 16550 / Synopsys DesignWare APB UART 控制台与串口底层驱动模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块是内核唯一控制台串口（UART）的底层硬件拥有者，向上层提供三类核心服务：
+//! 1. **早期与应急输出（[`early_write`]、[`fatal`]、[`panic`]、[`board_stop`]）**：在内存分配器、调度器或
+//!    设备树尚未就绪时提供同步轮询输出；在内核崩溃（Panic）或致命异常时提供无需获取自旋锁、带轮询次数上限
+//!    （[`EMERGENCY_POLL_BUDGET`]）的应急输出，防止死锁或因硬件故障永久卡死。
+//! 2. **TTY 行规程与内核日志的异步收发支撑（[`try_write`]、[`read_received`]、[`configure_serial`]）**：
+//!    上层 `crate::fs::tty` 与 `crate::klog` 通过本模块非阻塞地向硬件发送 FIFO 写入字节，并在中断处理函数
+//!    （[`uart_handler`]）将接收字节与线路状态（LSR）采样存入软件环形缓冲区（[`RxState`]）后唤醒工作任务消费。
+//! 3. **内核自测（`ktest`）控制通道与测试观测（[`testing`]）**：在启用 `ktest` 特性时，支持宿主机评测器与
+//!    内核测试框架在同一个物理串口上复用“命令握手字节（`H` / `ACK`）”与“被测负载字节”，并提供精确的接收配额控制。
+//!
+//! # 核心设计与寄存器/状态机布局
+//! ## 1. 16550 / DesignWare APB UART 寄存器窗口与 DLAB 复用布局
+//! 串口寄存器地址由 `base + (offset << reg_shift)` 计算，支持 1 字节（标准 NS16550A）或 4 字节（JH7110
+//! DesignWare APB UART）总线访问宽度。当线路控制寄存器（`LCR`）最高位 `DLAB`（Bit 7）置 1 时，偏移 0 和 1
+//! 从数据收发/中断使能切换为波特率分频锁存器（`DLL`/`DLM`）：
+//!
+//! ```text
+//!   寄存器逻辑偏移 | DLAB = 0 (常规收发模式)        | DLAB = 1 (波特率分频配置模式)
+//!   ---------------+--------------------------------+-------------------------------
+//!   0x00           | RBR (读接收) / THR (写发送)    | DLL (分频系数低 8 位)
+//!   0x01           | IER (中断使能: RX=bit0,TX=bit1)| DLM (分频系数高 8 位)
+//!   0x02           | IIR (读中断标识) / FCR (写FIFO)| IIR / FCR
+//!   0x03           | LCR (字长/停止位/校验/DLAB位)  | LCR (bit7 = DLAB = 1)
+//!   0x04           | MCR (DTR=bit0, RTS=bit1, LOOP) | MCR
+//!   0x05           | LSR (DR=bit0, THRE=bit5, TEMT) | LSR (读操作会清除错误位)
+//!   0x06           | MSR (调制解调器状态)           | MSR
+//!   0x1f (仅 DW)   | USR (DesignWare 状态: BUSY=b0) | USR
+//! ```
+//!
+//! ## 2. DesignWare APB UART 忙状态（Busy-Detect）与安全重配流程
+//! 在 Synopsys DesignWare APB UART（如 VisionFive 2）上，若在串口仍处于收发忙状态（`USR.BUSY == 1`）时改写
+//! `LCR`，硬件会触发 `IIR_BUSY`（`0x07`）中断并拒绝写入。因此 [`configure_line`] 按以下状态机安全切换线路参数：
+//!
+//! ```text
+//!   [持 PORT 自旋锁, 关 IER]
+//!            |
+//!            v
+//!   1. 轮询 LSR 直至 TEMT=1 (排空硬件发送移位寄存器，期间順带保存已到达的 RBR 字节)
+//!            |
+//!            v
+//!   2. 置位 MCR.LOOPBACK (隔离外部 RX 引脚，防止新字节继续进入移位器导致 BUSY 不落)
+//!            |
+//!            v
+//!   3. 轮询 LSR 与 DW_USR 直至 USR.BUSY=0 (保存隔离前残留的 RBR 采样)
+//!            |
+//!            v
+//!   4. 置 LCR.DLAB=1 -> 写 DLL/DLM -> 读回确认 -> 清 LCR.DLAB=0 -> 恢复 MCR 与 IER
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - **`PORT`（[`SpinLock<RxState>`]）**：保护 UART 寄存器组的互斥访问（特别是 `LCR.DLAB` 切换窗口与 `LSR`
+//!   读后清错误位与 `DATA` 读取的配对）以及软件接收环形缓冲区。该自旋锁在持锁期间自动关闭本地中断，属于最底层叶子锁。
+//! - **`testing::UART_REGISTRATION`（仅 `ktest`）**：保护默认 UART 中断注册句柄（`IrqRegistration`）的存取。
+//! - **严禁在持有 `PORT` 锁时调用外部通知或睡眠接口**：`crate::fs::tty::schedule_receive`、
+//!   `crate::fs::tty::schedule_transmit`、`TX_WAIT.wake_all` 以及 `IrqRegistration::disable_sync` / `unregister_sync`
+//!   **必须**在释放 `PORT` 自旋锁之后调用，否则会导致中断处理函数或工作队列重入死锁。
 
 use crate::sync::SpinLock;
 use crate::wait::WaitQueue;
@@ -8,13 +66,19 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use spin::Once;
 
+/// 串口硬件的只读几何参数与时钟配置快照，在引导期由 [`configure_resources`] 一次性初始化。
 struct PortResources {
+    /// 串口寄存器组的物理基地址（字节）。
     base: usize,
+    /// 单个寄存器的 MMIO 总线访问宽度（字节，仅支持 `1` 或 `4`）。
     width: u32,
+    /// 相邻逻辑寄存器编号之间的地址左移位数（字节偏移 = `offset << shift`）。
     shift: u32,
+    /// 波特率分频器基准频率（Hz，等于输入时钟频率除以 16，即分频系数为 1 时的最高波特率）。
     baud_base: u32,
+    /// 是否为具有 `DW_USR` 寄存器与忙检测（Busy-Detect）语义的 Synopsys DesignWare APB UART。
     dw_apb: bool,
-    /// 平台为控制台声明的工作波特率；线路速率由固件建立，内核首次打开不改写。
+    /// 设备树或平台声明的控制台默认工作波特率（bps）；固件已在引导前配好线路，内核首次打开终端时保持该速率。
     console_baud: u32,
 }
 
@@ -42,7 +106,7 @@ const THRE_INTERRUPT: u8 = 2;
 
 const TX_BUDGET: usize = 16;
 const MCR: usize = 4;
-// DLL/DLM 与 DATA/IER 共用偏移，访问前必须先置 LCR 的 DLAB，之后立即恢复。
+// DLL/DLM 与 DATA/IER 共享逻辑偏移 0 和 1；访问前必须先置位 LCR 的 DLAB 位，访问后立即清零恢复。
 const DLL: usize = 0;
 const DLM: usize = 1;
 const DLAB: u8 = 0x80;
@@ -67,7 +131,7 @@ const FCR_ENABLE_FIFO: u8 = 1;
 const FCR_CLEAR_RECEIVER: u8 = 1 << 1;
 const FCR_CLEAR_TRANSMITTER: u8 = 1 << 2;
 
-// 保留 IIR 的 no-interrupt 位，DW busy-detect 的编码也使用最低位。
+// IIR 低 4 位编码中断原因，其中 bit 0 为 1 表示无挂起中断；DesignWare 的 busy-detect (0x07) 同样落在低 4 位。
 const IIR_STATUS_MASK: u8 = 0x0f;
 const IIR_NO_INTERRUPT: u8 = 1;
 const IIR_MODEM_STATUS: u8 = 0;
@@ -80,79 +144,90 @@ const QEMU_LOONGARCH_BAUD_BASE: u32 = 115_200;
 
 const RX_IRQ_BUDGET: usize = 16;
 
-// 整条应急消息最多读取这些次 LSR，不依赖时钟或其他 CPU 的进度。
+// 单次应急打印允许轮询读取 LSR 的最大次数上限，避免硬件故障时死循环，且不依赖时钟或其他 CPU。
 const EMERGENCY_POLL_BUDGET: usize = 10_000;
 
 static PORT: SpinLock<RxState> = SpinLock::new(RxState::new());
 static TX_WAIT: WaitQueue = WaitQueue::new();
 static RECEIVED: AtomicUsize = AtomicUsize::new(0);
-// MCR 的 DTR/RTS 位在部分板卡不可回读，差异只报告一次以免每次打开都刷屏。
+// 部分硬件（如无调制解调器控制线的精简 UART）不支持回读 MCR 的 DTR/RTS 位，不一致告警仅打印一次以防刷屏。
 static READBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static LAST_BYTE: AtomicU8 = AtomicU8::new(0);
 
-/// 中断已从 FIFO 取出的一个真实字节及其同步读取的 LSR。
+/// 中断处理函数或线路重配流程从硬件接收 FIFO 中取出的单个字节及其关联的线路状态样本。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RxSample {
-    /// 硬件 DATA 原始字节，不把 NUL 或 FF 当作空位。
+    /// 从硬件 `DATA`（`RBR`）寄存器读取的原始 8 位数据（`0x00` 或 `0xff` 均为有效数据字节）。
     pub byte: u8,
-    /// 读取 DATA 前同步取得的 LSR，携带该字节的线路错误位。
+    /// 读取该 `DATA` 字节前紧邻读取的 `LSR` 寄存器快照，保留与该字节对应的帧错误、奇偶校验错误、Break 或硬件溢出位。
     pub status: u8,
 }
 
-/// TTY 预先验证的串口寄存器目标；调用者保证分频可表示、行控已合法且 DLAB 为零。
+/// TTY 层请求应用到串口硬件的目标线路配置参数。
+///
+/// 调用方需保证 `divisor` 非零、字长与校验位合法，且 `line_control` 未置位 `DLAB`（Bit 7 为 0）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SerialConfig {
-    /// 目标分频值，写入 DLL/DLM。
+    /// 写入 `DLL`/`DLM` 的 16 位波特率分频系数（`baud_base / target_baud`）。
     pub divisor: u16,
-    /// 目标 LCR，携带 5–8 位字长、停止位与校验位，不含 DLAB。
+    /// 待写入 `LCR` 寄存器的控制字节（包含 5..=8 位数据位长、停止位与奇偶校验位，且 `DLAB` 位必须为 0）。
     pub line_control: u8,
-    /// CREAD 是否要求打开接收中断。
+    /// 终端 `termios` 的 `CREAD` 是否开启；为 `true` 时允许使能硬件接收中断（`RECEIVE_INTERRUPT`）。
     pub receiver: bool,
-    /// 是否置 DTR 输出线。
+    /// 是否拉高数据终端就绪（`DTR`）调制解调器控制线。
     pub dtr: bool,
-    /// 是否置 RTS 输出线。
+    /// 是否拉高请求发送（`RTS`）调制解调器控制线。
     pub rts: bool,
 }
 
-/// 端口锁内的硬件状态；分频来自最近一次已确认配置，其余字段直接回读。
+/// 在 `PORT` 自旋锁保护下回读到的串口硬件寄存器状态快照。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SerialSnapshot {
-    /// 最近一次 DLL/DLM 真实回读的分频值。
+    /// 最近一次在 `DLAB = 1` 窗口内从 `DLL`/`DLM` 实际回读到的 16 位分频系数。
     pub divisor: u16,
-    /// 回读 LCR。
+    /// 从硬件 `LCR` 寄存器回读的值。
     pub line_control: u8,
-    /// 回读 IER。
+    /// 从硬件 `IER` 寄存器回读的值。
     pub ier: u8,
-    /// 回读 MCR。
+    /// 从硬件 `MCR` 寄存器回读的值。
     pub mcr: u8,
-    /// 回读 LSR。
+    /// 从硬件 `LSR` 寄存器回读的值。
     pub lsr: u8,
-    /// 本平台固定 QEMU 串口 baudbase。
+    /// 当前串口硬件的波特率分频基准频率（Hz，等于输入时钟除以 16）。
     pub baud_base: u32,
 }
 
-/// 软件接收环容量；固定项数，不随终端模式或测试阶段改变。
+/// 软件接收环形缓冲区的固定容量（采样个数）。
 const RX_CAPACITY: usize = 1024;
 
-/// 端口锁内唯一的接收状态；IRQ 和 DW 配置隔离窗采样，行规程工作消费原环。
+/// 由 `PORT` 自旋锁保护的串口接收环形缓冲区与线路状态。
+///
+/// 中断处理函数与 DesignWare 线路重配窗口负责向缓冲区推入 [`RxSample`]，TTY 行规程工作任务负责弹出消费。
 struct RxState {
+    /// 存放接收字节与 `LSR` 状态的固定大小环形数组。
     samples: [RxSample; RX_CAPACITY],
+    /// 下一个新采样写入的环形缓冲区下标（`0..RX_CAPACITY`）。
     head: usize,
+    /// 下一个待消费采样读取的环形缓冲区下标（`0..RX_CAPACITY`）。
     tail: usize,
+    /// 当前环形缓冲区内尚未被上层取走的采样数量（`0..=RX_CAPACITY`）。
     len: usize,
+    /// 因软件环形缓冲区已满（`len == RX_CAPACITY`）而被迫丢弃的采样累计次数。
     overrun: usize,
-    /// 最近一次受确认的分频和 LCR，避免相同线路参数反复中断收发。
+    /// 最近一次已写入硬件并确认的 `(divisor, lcr)` 组合，用于在参数未变时跳过耗时的硬件重配与排空等待。
     line_settings: Option<(u16, u8)>,
+    /// `ktest` 模式下当前测试段允许通过接收中断消费的剩余字节配额；耗尽时在锁内自动关闭接收中断。
     #[cfg(feature = "ktest")]
     quota: Option<usize>,
+    /// `ktest` 模式下是否已由测试框架独占接管接收控制权。
     #[cfg(feature = "ktest")]
     test_control_owned: bool,
+    /// `ktest` 模式下接收到的采样是否同时送入 TTY 软件环形缓冲区并通知行规程。
     #[cfg(feature = "ktest")]
     tty_attached: bool,
 }
-
 impl RxState {
-    /// 建立空接收环；线路回读、测试配额、控制声明与 TTY 接收附着初始均为空。
+    /// 创建初始为空的串口接收状态；环形缓冲区为空，且未记录历史线路配置或测试控制状态。
     const fn new() -> Self {
         Self {
             samples: [RxSample { byte: 0, status: 0 }; RX_CAPACITY],
@@ -170,7 +245,7 @@ impl RxState {
         }
     }
 
-    /// 环未满时入队一个中断采样，环满时只计真实丢弃。
+    /// 当软件环形缓冲区未满时入队一个接收采样；若已满则递增 `overrun` 溢出丢包计数。
     fn push(&mut self, sample: RxSample) {
         if self.len < RX_CAPACITY {
             self.samples[self.head] = sample;
@@ -181,7 +256,7 @@ impl RxState {
         }
     }
 
-    /// 按生产顺序取出最多调用者缓冲区长度的采样，返回实际取出数。
+    /// 按先进先出（FIFO）顺序从环形缓冲区弹出最多 `out.len()` 个采样写入 `out`，返回实际取出的采样个数。
     fn pop(&mut self, out: &mut [RxSample]) -> usize {
         let mut count = 0;
         while count < out.len() && 0 < self.len {
@@ -193,7 +268,7 @@ impl RxState {
         count
     }
 
-    /// 消费一个测试配额；收齐本段最后一个字节时清配额并返回真。
+    /// 在 `ktest` 模式下扣减 1 字节的测试接收配额；当配额恰好减至 0 时清除配额并返回 `true`。
     #[cfg(feature = "ktest")]
     fn consume_quota(&mut self) -> bool {
         if let Some(remaining) = self.quota {
@@ -210,7 +285,10 @@ impl RxState {
     }
 }
 
-/// 固件资源发表前仅使用编译平台的早期 UART 几何；正常路径消费同一设备快照。
+/// 计算指定逻辑寄存器编号对应的内核 MMIO 虚拟地址与总线访问字节宽度。
+///
+/// 调用上下文：任意上下文（含早期引导、常规收发及 Panic 应急路径）。
+/// 在 [`configure_resources`] 公布设备树资源前，使用编译期目标平台的默认早期串口几何参数。
 fn register(offset: usize) -> (usize, u32) {
     if let Some(resource) = RESOURCES.get() {
         return (
@@ -234,11 +312,15 @@ fn register(offset: usize) -> (usize, u32) {
     )
 }
 
-/// 按资源声明的访问宽度读取寄存器；窄 UART 数据位保留低八位。
+/// 按串口寄存器声明的总线宽度读取单个逻辑寄存器，并返回低 8 位有效值。
+///
+/// 调用上下文：持有 `PORT` 自旋锁的常规路径、中断处理函数或无锁的 Panic 应急输出路径。
 fn read_register(offset: usize) -> u8 {
     let (address, width) = register(offset);
-    // SAFETY: 早期编译资源与已验证 DT 资源指向同一永久 UART 映射；
-    // 宽度仅为 1/4，四字节模式的基址和 stride 均对齐，offset 来自有效寄存器编号。
+    // SAFETY:
+    // 1. 引导早期硬编码基址与 [`configure_resources`] 校验后的基址相等，且均已通过内核永久 MMIO 映射暴露；
+    // 2. `width` 仅取 1 或 4，4 字节宽度下基址与 `offset << 2` 均满足 `u32` 的 4 字节对齐要求；
+    // 3. `offset` 均来自本模块定义的合法 UART 寄存器常量，使用 `read_volatile` 符合设备寄存器无别名读取要求。
     unsafe {
         match width {
             1 => (address as *const u8).read_volatile(),
@@ -248,11 +330,14 @@ fn read_register(offset: usize) -> u8 {
     }
 }
 
-/// 按 UART 真实总线宽度写入寄存器，不把四字节设备拆成字节访问。
+/// 按串口寄存器声明的总线宽度向单个逻辑寄存器写入 8 位值（4 字节宽度下零扩展为 `u32` 写入）。
+///
+/// 调用上下文：持有 `PORT` 自旋锁的常规路径、中断处理函数或无锁的 Panic 应急输出路径。
 fn write_register(offset: usize, value: u8) {
     let (address, width) = register(offset);
-    // SAFETY: 寄存器范围、对齐和永久映射与 read_register 相同；
-    // 普通访问由 PORT 串行，故障路径不建立设备内存引用。
+    // SAFETY:
+    // 1. 寄存器地址位于永久建立的内核 MMIO 映射区域内，`width` 为 1 或 4 且满足对应类型的对齐要求；
+    // 2. 常规运行期访问由 `PORT` 自旋锁串行化，崩溃应急路径仅作单向 `write_volatile` 硬件寄存器写入，不创建 Rust 引用。
     unsafe {
         match width {
             1 => (address as *mut u8).write_volatile(value),
@@ -262,7 +347,9 @@ fn write_register(offset: usize, value: u8) {
     }
 }
 
-/// BSP 在资源和永久映射建立后一次发表 UART 几何与实际输入时钟。
+/// 在主核（BSP）完成设备树解析与永久页表映射后，一次性公布控制台串口的寄存器几何参数与时钟基准。
+///
+/// 调用上下文：引导早期单核（BSP）初始化阶段，仅可调用一次。
 pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
     assert!(
         RESOURCES.get().is_none(),
@@ -296,7 +383,7 @@ pub(crate) fn configure_resources(info: &crate::boot::BootInfo) {
     });
 }
 
-/// 判断当前串口是否具有 DesignWare 的 USR 与 busy-detect 语义。
+/// 判断当前平台串口是否为具有 `DW_USR` 状态寄存器与 Busy-Detect 机制的 Synopsys DesignWare APB UART。
 fn dw_apb() -> bool {
     RESOURCES
         .get()
@@ -305,7 +392,9 @@ fn dw_apb() -> bool {
         })
 }
 
-/// 持有 PORT 且 DW 已隔离外部 RX 并确认空闲时切换 LCR，禁止未进入 DLAB 就访问分频别名。
+/// 向线路控制寄存器（`LCR`）写入新值，并在 DesignWare UART 上立即回读校验除粘性奇偶位外的控制位已生效。
+///
+/// 调用上下文：必须持有 `PORT` 自旋锁；在 DesignWare UART 上调用方需先完成发送排空与接收回环隔离。
 fn write_line_control(value: u8) {
     write_register(LCR, value);
     if dw_apb() {
@@ -317,8 +406,10 @@ fn write_line_control(value: u8) {
     }
 }
 
-/// 保存调用者读取的 LSR 及对应 RBR 字节；DLAB 须清零且没有测试控制者。
-/// LSR 错误位读后清，必须消费该快照后才能再读 LSR；本入口不增加 IRQ 计数。
+/// 若传入的 `LSR` 状态字表明接收数据就绪（`DATA_READY`），则立即读取 `DATA` 寄存器并将字节与该 `LSR` 快照压入接收环。
+///
+/// 调用上下文：必须持有 `PORT` 自旋锁且 `LCR.DLAB == 0`。由于读取 `LSR` 会自动清除硬件中的溢出/奇偶/帧错误标志，
+/// 调用方在读取 `LSR` 后必须先通过本函数保存对应字节与错误位快照，随后才能再次读取 `LSR`。
 fn preserve_pending_receive(port: &mut RxState, status: u8) -> bool {
     if status & DATA_READY == 0 {
         return false;
@@ -328,7 +419,10 @@ fn preserve_pending_receive(port: &mut RxState, status: u8) -> bool {
     true
 }
 
-/// 持有 PORT 时仅更新真正变化的线路参数，返回实际分频及需要通知的接收进展。
+/// 在持有 `PORT` 自旋锁的前提下更新串口分频系数与 `LCR` 线路控制参数，返回回读确认的分频值及期间是否收到新数据。
+///
+/// 调用上下文：由 [`configure_serial`] 在持有 `PORT` 自旋锁且已关闭 `IER` 中断时调用。
+/// 若目标 `(divisor, line_control)` 与上次已生效的配置相同，则直接返回而不触碰硬件。
 fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u16, bool) {
     if port.line_settings == Some((config.divisor, config.line_control)) {
         return (config.divisor, false);
@@ -341,7 +435,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
             !port.test_control_owned,
             "DW UART line reconfiguration requires released receive control"
         );
-        // 只排空已经进入硬件的 TX；PORT 阻止其它输出者继续填充，不等待软件输出队列。
+        // Step 1 (DesignWare): 轮询等待硬件发送移位器与发送 FIFO 彻底排空（TEMT = 1），期间顺带拾取已到达的接收字节。
         loop {
             let status = read_register(LSR);
             received |= preserve_pending_receive(port, status);
@@ -351,7 +445,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
             spin_loop();
         }
 
-        // BUSY 包含 RBR 数据。先隔离外部 RX，再保存残留采样，使空闲等待不依赖被阻止的 IRQ。
+        // Step 2 (DesignWare): 开启 MCR 回环模式以隔离外部 RX 引脚，排空残留接收字节并等待控制器退出 BUSY 状态。
         write_register(MCR, saved_mcr | LOOPBACK);
         loop {
             let status = read_register(LSR);
@@ -363,6 +457,7 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
         }
     }
 
+    // Step 3: 置位 DLAB 进入分频锁存器窗口，写入 16 位分频值并回读确认，随后清除 DLAB 恢复常规寄存器视图。
     write_line_control(config.line_control | DLAB);
     write_register(DLL, config.divisor as u8);
     write_register(DLM, (config.divisor >> 8) as u8);
@@ -374,7 +469,9 @@ fn configure_line(port: &mut RxState, config: SerialConfig, saved_mcr: u8) -> (u
     (divisor, received)
 }
 
-/// 已停其它核和本核事件后关闭 UART 中断并排空末尾停止诊断；不确认物理断电，返回后不得再启动输出者。
+/// 在真实开发板关机或重启前，关闭串口中断并同步输出停机诊断信息，等待硬件发送移位器彻底排空。
+///
+/// 调用上下文：其它从核（AP）与本核本地事件源均已停止后的最终停机阶段（非 `ktest` 构建）。
 #[cfg(not(feature = "ktest"))]
 pub(crate) fn board_stop() {
     let platform = match crate::platform::current() {
@@ -395,7 +492,9 @@ pub(crate) fn board_stop() {
     }
 }
 
-/// 当前核的事件源已关闭时输出有界致命停止诊断；不等待端口锁，也不声称其它核或设备已停止。
+/// 在 `ktest` 构建的当前 CPU 致命停止路径中，关闭串口中断并通过有界轮询输出停机诊断信息。
+///
+/// 调用上下文：当前核本地中断与事件源已关闭的异常/关机末尾；不获取 `PORT` 自旋锁，防止与其他核死锁。
 #[cfg(feature = "ktest")]
 pub(crate) fn board_stop_current_cpu() {
     let platform = match crate::platform::current() {
@@ -410,7 +509,9 @@ pub(crate) fn board_stop_current_cpu() {
     ));
 }
 
-/// 等待真实 TX 空位后写一个字节，保持输出顺序。
+/// 轮询等待发送保持寄存器就绪（`LSR.THRE == 1`）后向硬件写入单个字节。
+///
+/// 调用上下文：引导早期输出或停机诊断路径，调用方已持有 `PORT` 自旋锁。
 fn put_byte(byte: u8) {
     while read_register(LSR) & TRANSMIT_READY == 0 {
         spin_loop();
@@ -418,10 +519,11 @@ fn put_byte(byte: u8) {
     write_register(DATA, byte);
 }
 
+/// 持有 `PORT` 自旋锁时的同步阻塞格式化输出器。
 struct PortWriter;
 
 impl Write for PortWriter {
-    /// 按原始 UTF-8 字节输出一个有限字符串，不申请内存。
+    /// 按字节顺序将字符串同步轮询写入串口发送寄存器，不分配任何堆内存。
     fn write_str(&mut self, text: &str) -> fmt::Result {
         for byte in text.bytes() {
             put_byte(byte);
@@ -430,14 +532,18 @@ impl Write for PortWriter {
     }
 }
 
+/// 带总轮询次数预算的应急格式化输出器，用于 Panic 和致命异常路径以防硬件挂死。
 struct EmergencyWriter<R, W> {
+    /// 当前整条消息剩余允许调用 `read_status` 的最大次数。
     remaining: usize,
+    /// 读取串口线路状态寄存器（`LSR`）的闭包。
     read_status: R,
+    /// 向串口数据寄存器（`DATA`）写入单个字节的闭包。
     write_byte: W,
 }
 
 impl<R: FnMut() -> u8, W: FnMut(u8)> Write for EmergencyWriter<R, W> {
-    /// 每次状态读取消耗整条消息的共享预算；耗尽后丢弃剩余字节并报告格式化错误。
+    /// 在共享的轮询预算内输出字符串；每次查询状态消耗 1 次预算，预算耗尽时立即中断并返回 `fmt::Error`。
     fn write_str(&mut self, text: &str) -> fmt::Result {
         for byte in text.bytes() {
             loop {
@@ -456,7 +562,7 @@ impl<R: FnMut() -> u8, W: FnMut(u8)> Write for EmergencyWriter<R, W> {
     }
 }
 
-/// 在栈上建立一次应急输出预算；UART 映射由所有 Rust 引导入口建立并永久保留。
+/// 创建绑定到真实串口寄存器、带 [`EMERGENCY_POLL_BUDGET`] 次状态轮询上限的栈上应急输出器。
 fn emergency_writer() -> impl Write {
     EmergencyWriter {
         remaining: EMERGENCY_POLL_BUDGET,
@@ -465,7 +571,7 @@ fn emergency_writer() -> impl Write {
     }
 }
 
-/// 独立验证一种真实 writer 预算场景，不将多个旧断言组绑定为一个测试实例。
+/// 单元测试辅助函数：验证 [`EmergencyWriter`] 在阻塞（0）、跨次调用共享预算（1）及始终就绪（2）三种场景下的预算扣减行为。
 #[cfg(feature = "ktest")]
 fn emergency_budget(mode: u8) -> bool {
     match mode {
@@ -539,7 +645,9 @@ fn emergency_budget(mode: u8) -> bool {
     }
 }
 
-/// 接管中断与 FIFO；DW 保留固件线路参数，直到 TTY 在正式配置窗内更新。
+/// 初始化控制台串口硬件：关闭所有串口中断、在非 DesignWare 串口上设为 8N1，并启用及清空硬件收发 FIFO。
+///
+/// 调用上下文：引导早期单核（BSP）初始化阶段。DesignWare UART 保留固件已建立的线路控制参数，直到后续 TTY 层正式配置。
 pub fn initialize() {
     let _port = PORT.lock();
     write_register(IER, 0);
@@ -552,7 +660,7 @@ pub fn initialize() {
     );
 }
 
-/// 引导阶段同步输出，不获取任务/PID、分配内存或重新探测硬件。
+/// 引导阶段的同步格式化输出入口，在 `PORT` 自旋锁保护下直接轮询发送，不依赖调度器、堆分配或中断。
 pub fn early_write(arguments: fmt::Arguments<'_>) {
     let _port = PORT.lock();
     PortWriter
@@ -560,8 +668,10 @@ pub fn early_write(arguments: fmt::Arguments<'_>) {
         .expect("UART formatting failed");
 }
 
-/// 测试控制者轮询消费 RX；调用前未开放接收中断，或已在同一端口锁下关闭 IER。
-/// 已登记的 action 不得在本次控制字节握手期间重新开启 RX，避免与 FIFO 消费竞争。
+/// 在 `ktest` 模式下由测试控制线程轮询读取单个串口控制字节（如宿主机握手命令 `H` 或确认字节 `ACK`）。
+///
+/// 调用上下文：调用前必须确保硬件接收中断（`RECEIVE_INTERRUPT`）已关闭，且期间没有任何中断回调会重新开启接收中断，
+/// 防止中断处理函数与本轮询循环竞争消费硬件接收 FIFO 中的字节。
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_read_byte() -> u8 {
     loop {
@@ -574,21 +684,25 @@ pub(crate) fn ktest_read_byte() -> u8 {
     }
 }
 
-/// 真实 H 已由默认 RX IRQ 消费后，只关闭接收中断，让后续 ACK 留在 FIFO。
-/// 同一 fixture 独占控制输入直到 ACK 轮询完成；TX 的实际中断与唤醒路径保持开放。
+/// 在 `ktest` 模式下仅清除 `IER` 的接收中断使能位，保留发送中断使能位不变。
+///
+/// 调用上下文：当宿主机发出的起始握手字节 `H` 已被接收中断消费后，测试框架调用本函数关闭接收中断，
+/// 使后续到达的确认字节 `ACK` 保留在硬件 FIFO 中供 [`ktest_read_byte`] 轮询读取。
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_disable_receive_interrupts() {
     let _port = PORT.lock();
     write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
 }
 
-/// 真实故障控制者使用整条消息的有界预算，不等待 PORT 或任何任务进度。
+/// 在 `ktest` 故障报告路径中使用带轮询预算的应急输出器打印格式化诊断文本，不获取 `PORT` 自旋锁。
 #[cfg(feature = "ktest")]
 pub(crate) fn emergency_write(arguments: fmt::Arguments<'_>) {
     let _ = emergency_writer().write_fmt(arguments);
 }
 
-/// 在端口短锁内最多提交十六个实际可接受字节，无等待、格式化或换行转换；接受字节后在锁外提示行规程复查实际发送队列。
+/// 在 `PORT` 自旋锁临界区内非阻塞地向硬件发送 FIFO 写入最多 [`TX_BUDGET`]（16）个原始字节，返回实际写入的字节数。
+///
+/// 调用上下文：由 TTY 行规程或内核日志（`klog`）发送路径调用；本函数不做阻塞等待、格式化或换行符转换。
 pub fn try_write(bytes: &[u8]) -> usize {
     let accepted = {
         let _port = PORT.lock();
@@ -613,19 +727,25 @@ pub fn try_write(bytes: &[u8]) -> usize {
         }
         accepted
     };
-    // klog 与行规程共享同一端口；THRE 中断可能已被另一方关闭，成功写入后必须提示复查实际队列。
+    // 内核日志（klog）与 TTY 行规程共享同一个物理串口；由于另一方可能已关闭 THRE 发送中断，
+    // 本次成功向硬件写入字节后必须在释放 PORT 锁后通知 TTY 行规程复查其待发送队列。
     if 0 < accepted {
         crate::fs::tty::schedule_transmit();
     }
     accepted
 }
 
-/// 返回永久发送等待源；登记节点后才允许使能并复查硬件条件。
+/// 返回全局串口发送等待队列（[`TX_WAIT`]）的静态引用。
+///
+/// 调用上下文：发送方在因硬件 FIFO 满而准备休眠前，应先将等待节点登记到该等待队列，再调用 [`arm_tx_interrupt`]。
 pub(crate) fn tx_wait_queue() -> &'static WaitQueue {
     &TX_WAIT
 }
 
-/// 登记者在同一端口锁内合并发送使能并重读真实空位，已有空位时撤销无必要通知。
+/// 在 `PORT` 自旋锁保护下开启发送保持寄存器空（`THRE`）中断并立即复查 `LSR.THRE` 状态。
+///
+/// 调用上下文：当 `try_write` 因发送 FIFO 已满返回 0 后，调用方在登记等待队列或准备让出 CPU 前调用。
+/// 若开启中断后复查发现 `LSR.THRE` 已经就绪（返回 `true`），则立即撤回 `TRANSMIT_INTERRUPT` 使能位以避免多余中断。
 pub(crate) fn arm_tx_interrupt() -> bool {
     let _port = PORT.lock();
     let ier = read_register(IER);
@@ -637,20 +757,24 @@ pub(crate) fn arm_tx_interrupt() -> bool {
     ready
 }
 
-/// 开启真实接收中断，源的注册与屏蔽由 IRQ 描述符负责。
+/// 在 `PORT` 自旋锁保护下开启串口硬件接收中断（`IER.RECEIVE_INTERRUPT`）。
 pub fn enable_receive_interrupts() {
     let _port = PORT.lock();
     write_register(IER, read_register(IER) | RECEIVE_INTERRUPT);
 }
 
-/// 在同步注销 action 前停止 UART 的 RX/TX 中断产生，不消费 FIFO 中的待收字节。
+/// 在 `ktest` 模式下将串口 `IER` 寄存器清零以关闭全部收发中断，不读取或丢弃硬件 FIFO 中已有的待收字节。
+///
+/// 调用上下文：在同步注销（`unregister_sync`）串口中断处理函数之前调用，确保硬件不再产生新的中断请求。
 #[cfg(feature = "ktest")]
 pub fn disable_interrupts() {
     let _port = PORT.lock();
     write_register(IER, 0);
 }
 
-/// 返回硬件资源的真实 baudbase；QEMU 的 serial_mm_init 参数不等同 DT 时钟除十六。
+/// 返回当前串口的波特率分频基准频率（`baud_base`，单位 Hz）。
+///
+/// 注意：在 QEMU `virt` 平台上返回 QEMU `serial_mm_init` 模拟器的固定基准频率，真机平台返回输入时钟频率除以 16。
 pub fn baud_base() -> u32 {
     RESOURCES
         .get()
@@ -658,7 +782,7 @@ pub fn baud_base() -> u32 {
         .baud_base
 }
 
-/// 返回平台为控制台声明的工作波特率，供首次打开时保持既有线路速率。
+/// 返回平台或设备树为控制台声明的默认工作波特率（bps），供 TTY 首次初始化时保持与引导固件一致的线路速率。
 pub fn console_baud() -> u32 {
     RESOURCES
         .get()
@@ -666,18 +790,20 @@ pub fn console_baud() -> u32 {
         .console_baud
 }
 
-/// 只读真实 LSR 的 TEMT 位；不用时钟延时代替硬件发送空标志。
+/// 在 `PORT` 自旋锁保护下读取硬件 `LSR` 的 `TEMT`（Bit 6）标志，判断发送 FIFO 与发送移位寄存器是否已全部排空。
 pub fn transmitter_empty() -> bool {
     let _port = PORT.lock();
     read_register(LSR) & TRANSMITTER_EMPTY != 0
 }
 
-/// 从软件接收环取出最多调用者缓冲区长度的真实采样，不触碰硬件 FIFO。
+/// 在 `PORT` 自旋锁保护下从软件接收环形缓冲区弹出最多 `samples.len()` 个采样写入 `samples`，返回实际取出的数量。
 pub fn read_received(samples: &mut [RxSample]) -> usize {
     PORT.lock().pop(samples)
 }
 
-/// 在端口短锁内丢弃软件接收环全部未消费采样；仅清环指针与长度，不读硬件 FIFO，不改测试控制、配额、丢弃计数、接收统计与发送路径。
+/// 在 `PORT` 自旋锁保护下清空软件接收环形缓冲区中的所有未消费采样（重置 `head`、`tail`、`len` 为 0）。
+///
+/// 调用上下文：终端执行输入刷新（如 `TCIFLUSH`）时调用；仅清空软件环形缓冲区，不读取硬件 FIFO，也不修改测试配额或统计计数。
 pub fn discard_received() {
     let mut port = PORT.lock();
     port.head = 0;
@@ -685,7 +811,9 @@ pub fn discard_received() {
     port.len = 0;
 }
 
-/// 在 PORT 内提交预验证的串口参数，恢复实际 MCR/IER 后才允许普通 DATA/IER 访问；配置窗采样在锁外通知原行规程工作。
+/// 在 `PORT` 自旋锁保护下应用 [`SerialConfig`] 串口参数，并在释放锁后唤醒 TTY 接收任务处理重配期间捕获的字节。
+///
+/// 调用上下文：由 TTY 层在初始化或处理 `tcsetattr` 等终端配置变更时调用。要求 `config.line_control` 的 `DLAB` 位必须为 0。
 pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     assert_eq!(
         config.line_control & DLAB,
@@ -693,11 +821,14 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         "UART line control must not set DLAB"
     );
 
+    // Step 1: 获取 PORT 锁，保存原 IER/MCR 并暂时关闭串口中断，随后调用 configure_line 更新分频系数与 LCR。
     let mut port = PORT.lock();
     let saved_ier = read_register(IER);
     let saved_mcr = read_register(MCR);
     write_register(IER, 0);
     let (divisor, received) = configure_line(&mut port, config, saved_mcr);
+
+    // Step 2: 根据配置更新 MCR 的 DTR/RTS 控制线，并恢复 IER（保留原发送中断位，按 CREAD 与测试控制状态决定接收中断位）。
     let mut mcr = saved_mcr & !(DATA_TERMINAL_READY | REQUEST_TO_SEND);
     if config.dtr {
         mcr |= DATA_TERMINAL_READY;
@@ -720,6 +851,8 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         ier |= RECEIVE_INTERRUPT;
     }
     write_register(IER, ier);
+
+    // Step 3: 回读寄存器生成状态快照，断言 DLAB 已清零后释放 PORT 自旋锁。
     let snapshot = SerialSnapshot {
         divisor,
         line_control: read_register(LCR),
@@ -728,8 +861,7 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
         lsr: read_register(LSR),
         baud_base: baud_base(),
     };
-    // DLAB 未清会让 DATA/IER 变成分频别名，后续输出与配置都会落到错误寄存器；
-    // 该后置条件必须在释放端口锁前成立，避免其它消费者取得端口后继续用错寄存器组。
+    // 若释放锁前 DLAB 仍未清零，偏移 0 和 1 将停留在分频锁存器视图，导致后续 DATA/IER 读写访问错误寄存器。
     assert_eq!(
         snapshot.line_control & DLAB,
         0,
@@ -737,11 +869,12 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     );
     drop(port);
 
+    // Step 4: 在锁外通知 TTY 行规程消费重配窗口内收到的字节，并对首次出现的寄存器回读差异打印单次诊断日志。
     if received {
         crate::fs::tty::schedule_receive();
     }
 
-    // 常规配置不以回读相等作为致命条件；保留完整差异作为硬件事实。
+    // 部分板卡或模拟器对 MCR 等控制位不支持完整回读，回读差异仅做一次性日志记录而不视为致命错误。
     if (snapshot.divisor != config.divisor
         || snapshot.line_control != config.line_control
         || snapshot.ier != ier
@@ -763,30 +896,34 @@ pub fn configure_serial(config: SerialConfig) -> SerialSnapshot {
     snapshot
 }
 
-/// 先核对本端口真实 IIR，仅处理自身的有限 RX/TX，并在锁外通知等待者。
+/// 默认的控制台串口外部中断处理函数（每次中断最多读取 [`RX_IRQ_BUDGET`] 个接收字节，不主动关闭接收中断）。
 ///
 /// # Safety
-/// 只作为当前 UART 的 IRQ action 调用；端口映射已建立，当前是非嵌套硬中断，
-/// 且调用者没有持有 PORT。此 handler 不使用 context。
+/// 1. 仅可作为当前控制台 UART 硬件中断源的 IRQ 处理回调注册并调用，调用时串口永久 MMIO 映射必须已建立。
+/// 2. 调用方必须处于本地中断已关闭的硬中断上下文，且在调用本函数前未持有 `PORT` 自旋锁（避免同核重入死锁）。
+/// 3. `_context` 参数在本函数中不使用，允许传入空指针。
 pub unsafe fn uart_handler(_context: *mut ()) -> bool {
     handle_uart::<RX_IRQ_BUDGET, false>()
 }
 
-/// 测试 action 仅消费一个真实 payload 字节，在同一端口锁内立即关闭 RX/TX 中断。
+/// `ktest` 专用的单字节测试中断处理函数：最多从硬件读取 1 个接收字节，并在读取后立即在 `PORT` 锁内将 `IER` 清零。
 ///
 /// # Safety
-/// 仅作为已登记的真实 UART IRQ action 调用，遵守 uart_handler 的入口要求。
-/// 原 default action 已停止并同步注销；调用者先轮询消费 H，再开启 RX，且本阶段
-/// 仅允许一个 payload 字节，直到轮询 ACK 完成前不得再次开启 UART 中断。
+/// 1. 必须满足 [`uart_handler`] 的全部安全前提条件（串口映射已建立、处于非重入硬中断上下文且未持有 `PORT` 锁）。
+/// 2. 注册并启用本回调前，默认的 [`uart_handler`] 必须已停止并完成同步注销（`unregister_sync`），保证同一时刻只有一个回调处理串口中断。
+/// 3. 调用方须先通过轮询读走握手命令字节 `H` 再开启接收中断；本回调读取 1 个负载字节并关闭 `IER` 后，在轮询读走后续 `ACK` 字节前不得再次开启串口中断。
 #[cfg(feature = "ktest")]
 pub(crate) unsafe fn ktest_uart_handler_one(_context: *mut ()) -> bool {
     handle_uart::<1, true>()
 }
 
-/// 两个入口共享实际 IIR/RX/TX 流程；普通构建始终将真实采样送入行规程，测试构建只在 TTY 接收附着时入软件环并在锁外通知，原计数、配额和发送流程保持独立。
+/// 串口中断处理的核心实现，由常量泛型控制单次接收字节上限（`RX_BUDGET`）以及是否在收到首个字节后立即关闭全部中断（`STOP_RX`）。
+///
+/// 调用上下文：硬中断上下文，由 [`uart_handler`] 或 [`ktest_uart_handler_one`] 调用。
 #[inline(always)]
 fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     let (produced, notify_tx) = {
+        // Step 1: 获取 PORT 自旋锁，读取 IIR 处理 DesignWare 忙检测（读 USR 清除）、无挂起中断、空超时及调制解调器状态中断。
         let mut port = PORT.lock();
         let first_interrupt = read_register(IIR) & IIR_STATUS_MASK;
         if first_interrupt == IIR_BUSY && dw_apb() {
@@ -804,6 +941,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
             let _ = read_register(MSR);
         }
 
+        // Step 2: 若接收中断已使能，循环读取最多 RX_BUDGET 个字节与配对的 LSR 快照，按需压入软件接收环并更新计数与测试配额。
         let mut produced = 0;
         #[cfg(feature = "ktest")]
         let tty_attached = port.tty_attached;
@@ -821,7 +959,7 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                     produced += 1;
                 }
                 if STOP_RX {
-                    // 必须紧跟 DATA 读取并留在 PORT 锁内；不得轮询或读取后续 ACK 字节。
+                    // 单字节测试模式下必须在读取 DATA 后立即在同一个 PORT 临界区内清零 IER，把后续 ACK 字节留在硬件 FIFO 中。
                     write_register(IER, 0);
                 }
                 #[cfg(feature = "ktest")]
@@ -830,13 +968,14 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                 RECEIVED.fetch_add(1, Ordering::Release);
                 #[cfg(feature = "ktest")]
                 if quota_done {
-                    // 本段最后一个字节已收齐；同锁只关接收位，保留发送中断。
+                    // 当前测试段的接收配额已全部收齐，在锁内仅关闭接收中断位，保留发送中断使能位。
                     write_register(IER, read_register(IER) & !RECEIVE_INTERRUPT);
                     break;
                 }
             }
         }
 
+        // Step 3: 复查 IIR、IER 与 LSR 发送就绪位；若发送中断已使能且 THR 已空，则关闭发送中断位以防水平触发风暴，并记录唤醒标志。
         let last_interrupt = read_register(IIR) & IIR_STATUS_MASK;
         let ier = read_register(IER);
         let ready = read_register(LSR) & TRANSMIT_READY != 0;
@@ -850,11 +989,12 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        // IIR 读取确认真实 THRE；接收优先级较高时仍以真实 LSR 关闭已满足的 TX 请求。
+        // 读取 IIR 可清除部分硬件的 THRE 中断挂起状态；即使高优先级的接收中断掩盖了 IIR 编码，也根据 LSR 实际空位一并完成发送通知。
         let _ = (first_interrupt, last_interrupt);
         (produced, notify_tx)
     };
 
+    // Step 4: 释放 PORT 自旋锁后，在锁外唤醒等待发送的任务并调度 TTY 收发工作队列。
     if 0 < produced {
         crate::fs::tty::schedule_receive();
     }
@@ -868,26 +1008,28 @@ fn handle_uart<const RX_BUDGET: usize, const STOP_RX: bool>() -> bool {
     true
 }
 
-/// 返回由真实接收中断消费的字节数量。
+/// 返回自系统启动以来由串口接收中断累计读取的字节总数（`Acquire` 内存序）。
 #[cfg(feature = "ktest")]
 pub fn received() -> usize {
     RECEIVED.load(Ordering::Acquire)
 }
 
-/// 返回最后一个已经由中断消费的原始字节。
+/// 返回最近一次由串口接收中断读取到的原始数据字节。
 #[cfg(feature = "ktest")]
 pub fn last_byte() -> u8 {
     LAST_BYTE.load(Ordering::Relaxed)
 }
 
-/// 测试仅观察硬件已到达的数据，不从轮询路径消费 RX。
+/// 在 `PORT` 自旋锁保护下检查硬件 `LSR.DATA_READY` 位是否置位（仅观测是否有待收数据，不读取 `DATA` 寄存器）。
 #[cfg(feature = "ktest")]
 pub fn receive_pending() -> bool {
     let _port = PORT.lock();
     read_register(LSR) & DATA_READY != 0
 }
 
-/// 在共享轮询预算内记录真实致命异常现场并停止，不等待故障核持有的锁。
+/// 内核致命CPU异常（Fatal Trap）终结入口：关闭本地中断，在共享轮询预算内打印异常寄存器现场，随后永久休眠当前核。
+///
+/// 调用上下文：不可恢复的硬件异常上下文（非 `ktest` 构建）；不获取 `PORT` 锁，避免在持锁崩溃时发生二次死锁。
 #[cfg(not(feature = "ktest"))]
 pub fn fatal(pc: usize, sp: usize, cause: usize, bad_address: usize) -> ! {
     let _ = crate::arch::irq_save();
@@ -900,7 +1042,9 @@ pub fn fatal(pc: usize, sp: usize, cause: usize, bad_address: usize) -> ! {
     }
 }
 
-/// 在共享轮询预算内打印内部不变量失败的原始位置和原因，随后永久停止当前核。
+/// 内核 Panic 终结入口：关闭本地中断，在共享轮询预算内输出 Panic 位置与原因，随后永久休眠当前核。
+///
+/// 调用上下文：`#[panic_handler]` 崩溃处理上下文（非 `ktest` 构建）；不获取 `PORT` 锁。
 #[cfg(not(feature = "ktest"))]
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let _ = crate::arch::irq_save();
@@ -910,7 +1054,7 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
 }
 
-/// 使用唯一 UART 端口输出引导阶段换行信息。
+/// 向控制台串口同步打印带换行符的早期引导日志宏（内部调用 [`early_write`]）。
 #[macro_export]
 macro_rules! early_println {
     () => { $crate::console::early_write(format_args!("\n")) };
@@ -919,7 +1063,7 @@ macro_rules! early_println {
     };
 }
 
-/// 测试观察唯一真实端口活动；ktest 另保存可移动的 default action 责任，不建立第二套驱动。
+/// 内核自测（`ktest`）专用的串口观测、中断注册句柄移交与分段接收配额控制子模块。
 #[cfg(feature = "ktest")]
 pub mod testing {
     use super::*;
@@ -927,10 +1071,10 @@ pub mod testing {
     #[cfg(feature = "ktest")]
     static UART_REGISTRATION: SpinLock<Option<crate::irq::IrqRegistration>> = SpinLock::new(None);
 
-    /// 取走唯一 default UART action 的真实 token，不改变设备 IER 或 action 准入。
+    /// 取出保存的默认串口中断注册句柄（[`crate::irq::IrqRegistration`]），供测试线程暂停或临时替换中断回调。
     ///
-    /// 仅 Thread 控制者调用；同 token 暂停时须 disable_sync 后归还，替换 action 时须
-    /// unregister_sync 后登记并归还新 token。空槽返回错误；不得持有 PORT 或回调退出所需锁。
+    /// 调用上下文：仅允许在可调度的测试控制线程中调用，且调用时不得持有 `PORT` 锁或阻塞中断回调退出的其他锁。
+    /// 取出句柄后，调用方必须负责在测试结束前通过 [`restore_uart_registration`] 归还默认句柄。
     #[cfg(feature = "ktest")]
     pub fn take_uart_registration() -> Result<crate::irq::IrqRegistration, ::ktest::TestError> {
         UART_REGISTRATION.lock().take().ok_or(::ktest::TestError(
@@ -938,13 +1082,11 @@ pub mod testing {
         ))
     }
 
-    /// 首次登记、同步暂停后归还同一 token，或替换 action 后归还新 default token，并开放其准入。
+    /// 首次安装或归还默认串口中断注册句柄（[`uart_handler`]），并在槽锁内启用该中断回调准入。
     ///
-    /// 传入 token 必须属于当前 UART 的永久 uart_handler/null context。同 token 归还前已
-    /// disable_sync；替换前已停止并同步注销旧/测试 action。UART RX IER 保持关闭，发送位
-    /// 可以保留；本函数不改 IER。允许首次登记的 BSP 或后续 Thread 控制者调用，不得从
-    /// 同线 handler 或持有其退出所需的 PORT/其他锁调用。双拥有时保留原槽责任，拒绝的
-    /// token 与不可启用的 token 均在槽锁外同步注销后返回错误，不遗失活 action 责任。
+    /// 调用上下文：由引导主核（BSP）首次注册时，或由测试控制线程在完成 `disable_sync` / 卸载测试专用回调后调用；
+    /// 调用时不得处于串口中断回调内部，也不得持有 `PORT` 自旋锁。若槽位已被占用或句柄无法启用，则在释放槽锁后
+    /// 同步注销（`unregister_sync`）传入的句柄并返回错误，避免泄漏活动的 IRQ 注册项。
     #[cfg(feature = "ktest")]
     pub fn restore_uart_registration(
         registration: crate::irq::IrqRegistration,
@@ -953,7 +1095,7 @@ pub mod testing {
         let error = if slot.is_some() {
             ::ktest::TestError("default UART registration is already installed")
         } else {
-            // enable/is_enabled 仅取短锁，不等待 handler；handler 不访问此拥有者槽。
+            // enable/is_enabled 仅获取 IRQ 描述符内部自旋锁，不会阻塞等待中断处理函数退出。
             registration.enable();
             if registration.is_enabled() {
                 *slot = Some(registration);
@@ -966,18 +1108,22 @@ pub mod testing {
         Err(error)
     }
 
-    /// 独立检查真实应急 writer 的预算：0 停滞，1 跨字符串共享，2 恒可发送。
-    /// 这是确定性 writer 算法验收，不伪称 UART 硬件 IRQ 或硬件 LSR。
+    /// 执行 [`EmergencyWriter`] 轮询预算单元测试（`mode`：`0` 持续忙超时，`1` 跨多次写入共享预算，`2` 始终就绪）。
     #[cfg(feature = "ktest")]
     pub(crate) fn emergency_budget(mode: u8) -> bool {
         super::emergency_budget(mode)
     }
 
+    /// `ktest` 模式下统计串口发送路径行为的原子计数器集合。
     #[cfg(feature = "ktest")]
     pub(super) struct Counters {
+        /// [`try_write`] 成功写入硬件 `DATA` 寄存器的累计字节数。
         pub(super) accepted: AtomicUsize,
+        /// [`try_write`] 传入非空切片但因 `LSR.THRE == 0` 而写入 0 字节的累计次数。
         pub(super) zero_writes: AtomicUsize,
+        /// 中断处理函数观察到 `THRE` 发送中断并完成处理的累计次数。
         pub(super) tx_interrupts: AtomicUsize,
+        /// 发送中断唤醒 [`TX_WAIT`] 等待队列中睡眠任务的累计数量。
         pub(super) wakes: AtomicUsize,
     }
 
@@ -989,16 +1135,21 @@ pub mod testing {
         wakes: AtomicUsize::new(0),
     };
 
+    /// `ktest` 模式下串口发送路径统计计数器的时间点快照。
     #[cfg(feature = "ktest")]
     #[derive(Clone, Copy)]
     pub struct Snapshot {
+        /// [`try_write`] 成功写入硬件 `DATA` 寄存器的累计字节数。
         pub accepted: usize,
+        /// [`try_write`] 传入非空切片但因硬件发送未就绪而返回 0 的累计次数。
         pub zero_writes: usize,
+        /// 中断处理函数处理 `THRE` 发送就绪中断的累计次数。
         pub tx_interrupts: usize,
+        /// 发送就绪中断从 [`TX_WAIT`] 唤醒的任务累计数量。
         pub wakes: usize,
     }
 
-    /// 读取实际接受、拒写、THRE 中断与成功通知计数，不读取或消费 RX。
+    /// 读取当前串口发送路径统计计数器的快照（不影响接收缓冲区或硬件寄存器状态）。
     #[cfg(feature = "ktest")]
     pub fn snapshot() -> Snapshot {
         Snapshot {
@@ -1008,9 +1159,9 @@ pub mod testing {
             wakes: COUNTERS.wakes.load(Ordering::Relaxed),
         }
     }
-
-    /// 在同一端口锁内保存并返回原 RX 中断位，声明本段测试接收控制并关闭 RX，发送位原样保留。
-    /// 调用前不得已有控制或残留配额；失败不清除控制，由用例中止处理，不发表新的配额。
+    /// 在 `PORT` 自旋锁内声明独占测试接收控制权，关闭硬件 `RECEIVE_INTERRUPT` 并返回此前接收中断是否开启。
+    ///
+    /// 调用上下文：测试框架开始一段串口接收测试或握手前调用；调用前不得已处于测试控制状态或留有未消费完的配额。
     #[cfg(feature = "ktest")]
     pub fn claim_receive_control() -> bool {
         let mut port = super::PORT.lock();
@@ -1028,7 +1179,7 @@ pub mod testing {
         ier & RECEIVE_INTERRUPT != 0
     }
 
-    /// 在 PORT 锁内核对测试控制已独占、接收 producer 已关且配额为空，不改变状态。
+    /// 在持有 `PORT` 锁的前提下校验当前已声明测试接收控制权、硬件接收中断已关闭且接收配额已清零。
     fn check_receive_control(port: &RxState) -> ::ktest::TestResult {
         if !port.test_control_owned {
             return Err(::ktest::TestError("UART test receive control is not owned"));
@@ -1046,9 +1197,11 @@ pub mod testing {
         Ok(())
     }
 
-    /// 在独占测试控制且 RX 关闭、配额为空时同步唯一 default action 的完整回调尾部。
-    /// 仅可服务 IRQ 的 Thread 控制者调用，不得持回调退出所需锁；锁外暂停并恢复同一
-    /// 未注销 token，设备 IER 与计数不变。失败保留接收控制，由调用者按真实错误结束拥有。
+    /// 等待当前正在执行的默认串口中断处理函数彻底执行完毕并退出。
+    ///
+    /// 调用上下文：必须处于可调度的线程上下文，已通过 [`claim_receive_control`] 取得控制权、关闭硬件接收中断且配额已耗尽；
+    /// 调用时不得持有 `PORT` 锁。内部通过临时取出默认注册句柄、执行 `disable_sync` 再重新启用归还，确保此前已经在途的
+    /// 中断回调彻底退出。
     pub fn synchronize_receive_irq() -> ::ktest::TestResult {
         crate::sched::assert_switchable();
         {
@@ -1060,8 +1213,10 @@ pub mod testing {
         restore_uart_registration(registration)
     }
 
-    /// 同步原 IRQ 尾部后在 PORT 锁内提交测试接收去向；调用前须已 claim 且 RX 关闭、配额为空。
-    /// 附着要求旧软件环为空；撤附着保留已接受采样供原 Work 完成，发送与设备配置不变。
+    /// 在等待在途串口中断处理函数彻底退出后，设置后续中断接收到的字节是否送入 TTY 软件环形缓冲区。
+    ///
+    /// 调用上下文：已获取测试接收控制权、关闭硬件接收中断且配额已清零的可调度线程。当 `attached` 为 `true` 时，
+    /// 要求软件接收环形缓冲区当前必须为空。
     pub fn set_tty_receive(attached: bool) -> ::ktest::TestResult {
         synchronize_receive_irq()?;
         let mut port = PORT.lock();
@@ -1075,8 +1230,10 @@ pub mod testing {
         Ok(())
     }
 
-    /// 在同一端口锁内核对前段已收尾后发表本段剩余接收配额并打开真实接收中断；零长度不发表配额也不打开接收。
-    /// 调用前已声明本段测试接收控制、关闭接收中断、轮询消费本段 H，并清空前段行规程工作与软件环；本函数只置接收位，发送中断位原样保留。最后字节关接收后控制保持，直到 ACK 被轮询读走再释放。
+    /// 在 `PORT` 自旋锁内设置本段测试允许接收中断消费的字节配额 `length`，并在 `length > 0` 时开启硬件接收中断。
+    ///
+    /// 调用上下文：调用方须已取得测试接收控制权、关闭硬件接收中断、通过轮询读走握手命令字节 `H`，且已排空软件接收环。
+    /// 当中断处理函数收满 `length` 个字节后会自动在锁内关闭接收中断，使紧随其后的确认字节 `ACK` 留在硬件 FIFO 中供轮询读取。
     #[cfg(feature = "ktest")]
     pub fn arm_receive_bytes(length: usize) {
         let mut port = super::PORT.lock();
@@ -1106,20 +1263,21 @@ pub mod testing {
         }
     }
 
-    /// 返回当前测试段剩余接收配额；无配额或已收齐时为 None。
+    /// 返回当前测试段尚未被接收中断消费的剩余字节配额；若未设置配额或已全部收齐则返回 `None`。
     #[cfg(feature = "ktest")]
     pub fn receive_quota_remaining() -> Option<usize> {
         super::PORT.lock().quota
     }
 
-    /// 只观察软件接收环是否为空，供测试阶段边界核对，不取出任何采样。
+    /// 判断软件接收环形缓冲区当前是否为空（仅检查 `len == 0`，不弹出任何数据）。
     #[cfg(feature = "ktest")]
     pub fn receive_queue_empty() -> bool {
         super::PORT.lock().len == 0
     }
 
-    /// 在同一端口锁内核对本段已收尾后释放测试接收控制，按调用者保存的真实接收状态恢复 RX，发送位原样保留。
-    /// 调用前配额已耗尽、软件环已空且 ACK 已被轮询读走；TTY 传当前 CREAD，通用控制握手传 claim 保存的原 RX 位。
+    /// 在确认本段测试配额已耗尽且软件接收环已清空后，释放测试接收控制权并根据 `receiver` 恢复硬件接收中断使能位。
+    ///
+    /// 调用上下文：测试段结束且已通过轮询读走握手确认字节 `ACK` 后调用；保留 `IER` 中的发送中断使能位不变。
     #[cfg(feature = "ktest")]
     pub fn release_receive_control(receiver: bool) {
         let mut port = super::PORT.lock();

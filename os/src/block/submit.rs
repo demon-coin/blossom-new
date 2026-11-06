@@ -1,4 +1,56 @@
-//! 显式批次只保留固定生成者与准备槽，设备访问始终使用原页的有界 SG。
+//! 块 I/O 提交引擎、批次合并与散聚段拆分（Bio Submit / Merge / Split）模块。
+//!
+//! ## 模块职责与架构定位
+//! 本模块连接上层逻辑块请求（`Bio` / 页缓存 `FolioRead` / 回写 `FolioWriteback`）与下层物理设备请求槽
+//! （`Disk` 的 `PreparingSlot`）。它负责验证挂载占用权限（`FsClaim`）、以固定大小批次（最多 `MAX_BATCH = 8`）
+//! 接纳逻辑父请求，并在满足设备硬件限额的前提下执行相邻请求合并（Merge）与超限拆分（Split），
+//! 直接利用物理页原始地址构造散聚列表（Scatter-Gather List，简称 SG）提交给设备驱动，全程无需中间回弹缓冲区（Bounce Buffer）。
+//! - **上游调用者**：文件系统挂载占用（`FsClaim`）、页缓存与元数据缓存（`crate::cache`）、文件读写与后台回写（`crate::fs`）
+//!   以及无挂载视图的裸盘访问接口（`Disk::submit_bio` / `Disk::read_exact_at`）。
+//! - **下游依赖**：逻辑块请求状态机（`crate::block::bio`）、物理磁盘请求槽与准入队列（`crate::block::disk`）、
+//!   预留内存池（`crate::block::reserve`）以及物理页 DMA 映射原语（`crate::mm::dma`）。
+//!
+//! ## 核心设计与提交流水线
+//!
+//! ### 1. 批次准入、合并与拆分的父子映射关系
+//! 提交路径按最多 `MAX_BATCH`（8 个）父 `Bio` 为一波进入准入（`admit_from`），生成 `ActiveBio` 生成者守卫；
+//! 随后在循环中依次申请物理请求槽（`PreparingSlot`），按硬件队列限额（`QueueLimits`）填充子请求（Child）：
+//!
+//! ```text
+//!   上层提交批次:  [ Parent Bio 0 (16 KiB) ]  [ Parent Bio 1 (4 KiB, 扇区紧邻) ]  [ Parent Bio 2 ... ]
+//!                         │        │                       │
+//!          硬件单槽上限拆分 │        └───────────┬───────────┘ 扇区连续且同向 -> 合并进同一请求槽
+//!                         ▼                    ▼
+//!   硬件请求槽:    ┌──────────────┐     ┌─────────────────────────┐
+//!   PreparingSlot  │ Child Slot A │     │      Child Slot B       │
+//!                  │  parts: [0]  │     │  parts: [0(尾), 1(全)]  │
+//!                  │  SG: 原物理页 │     │  SG: 物理连续段自动拼接 │
+//!                  └──────┬───────┘     └────────────┬────────────┘
+//!                         └─────────────┬────────────┘
+//!                                       ▼
+//!                          slot.publish() 移交设备驱动队列
+//!                          全部生成结束后 self.unplug() 触发硬件通知
+//! ```
+//!
+//! ### 2. 两阶段计划提交与部分进度保留（`GenerationPlan`）
+//! 在向 `PreparingSlot` 填充散聚段期间，`prepare_child` 只在栈上局部副本 `GenerationPlan` 中试探推进
+//! 各父 `Bio` 的段游标（`SegmentCursor`），并在末尾按设备 `logical_block_size` 向下对齐裁剪未满一个逻辑块的尾段（`trim_tail`）。
+//! 只有当 `slot.publish()` 成功将子请求送入硬件队列后，才将 `GenerationPlan` 记录的字节数与游标正式写回 `ActiveBio`。
+//! 若中途因内存不足或队列停机出错，已发表的前置子请求继续正常由硬件完成，`ActiveBio::finish` 仅对未生成的剩余后缀报告错误偏移。
+//!
+//! ### 3. 页缓存批量读与后台回写通道
+//! - **批量预读（`FsClaim::read_folio_batch`）**：将磁盘偏移连续的整页 `FolioRead` 合并进同一个多页父 `Bio`，
+//!   凑满最多 8 个父 `Bio` 后异步批量提交，无需逐页同步阻塞。
+//! - **受限回写批次（`FsClaim::writeback_batch`）**：配合预留池通道（`BioLane` / `BioLease`），在零堆分配条件下
+//!   构造最多 8 个回写父 `Bio` 批量提交，随后逐个等待 DMA 彻底结束并回收预留的 `Vec` 与 `Arc` 控制块，供下一波次复用。
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **禁止持有当前任务引用跨睡眠点**：所有可能阻塞的入口均先执行 `drop(task::current_task())`，避免栈上残留任务强引用。
+//! 2. **队列锁外完成可失败准备**：物理页分配、`Vec::try_reserve_exact`、DMA 映射校验以及 `PreparingSlot` 的散聚表拼接
+//!    全部在 `Disk::queue` 自旋锁外执行，避免在关中断自旋锁内执行耗时计算或内存分配。
+//! 3. **锁层级顺序**：`BioReserve::state`（预留池自旋锁，仅在租借/归还槽位瞬间短暂获取）与 `Disk::queue`（磁盘队列自旋锁，
+//!    仅在 `admit_from`、`reserve_slot`、`publish`、`unplug` 瞬间获取）彼此独立、互不嵌套；`READ_BATCH` 测试诊断锁仅在
+//!    `submit_batch` 返回后单独获取。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,15 +73,20 @@ use crate::mm::{alloc_pages, FolioRead, FolioWriteback, PAGE_SIZE};
 use crate::sync::SpinLock;
 use crate::task;
 
-/// 当前位置只引用父 Bio 的段编号，跨 child 保留游标避免从首页反复扫描。
+/// 父 `Bio` 内部 DMA 映射段数组的扫描游标。
+///
+/// 当一个大 `Bio` 被拆分为多个硬件子请求（`PreparingSlot`）时，跨子请求保留当前段下标与段内字节偏移，
+/// 避免每次拆分都从第 0 个映射段重新线性扫描。该游标仅记录位置数值，不持有物理页所有权，也不解引用页内数据。
 #[derive(Clone, Copy, Default)]
 struct SegmentCursor {
+    /// 当前扫描到的父 `Bio` 映射段下标（对应 `BioInner::segment(index)`）。
     index: usize,
+    /// 当前映射段内已消费的字节偏移量（范围 `0..segment.length`）。
     within: usize,
 }
 
 impl SegmentCursor {
-    /// 按真实原段消耗字节；游标从不复制页拥有权或访问 payload。
+    /// 沿父 `Bio` 的映射段向前推进 `bytes` 字节；若越过段边界则自动切换到下一段，超出总范围则返回 `BlockError::InvalidRange`。
     fn advance(&mut self, bio: &BioInner, mut bytes: usize) -> Result<(), BlockError> {
         while 0 < bytes {
             let segment = bio.segment(self.index).ok_or(BlockError::InvalidRange)?;
@@ -51,49 +108,75 @@ impl SegmentCursor {
     }
 }
 
-/// 尚未发表的计划只保存固定元数据，发表成功后才推进各父的已生成位置。
+/// 单个硬件子请求槽（`PreparingSlot`）在正式发布前的段推进计划。
+///
+/// 在 `prepare_child` 阶段仅在栈上保存各参与父 `Bio` 的消费长度与更新后的游标；
+/// 只有当 `slot.publish()` 成功将子请求提交到设备队列后，调用方才按本计划推进各 `ActiveBio` 的已生成偏移量。
 struct GenerationPlan {
+    /// 本子请求包含的各个分片（Part）在 `active` 批次数组中的父 `Bio` 下标，有效元素数为 `0..count`。
     indices: [usize; MAX_BATCH],
+    /// 与 `indices` 一一对应的各父 `Bio` 在本子请求中实际消费的字节长度（单位：字节）。
     lengths: [usize; MAX_BATCH],
+    /// 假设本子请求发布成功后，批次内各父 `Bio` 对应的最新段扫描游标快照。
     cursors: [SegmentCursor; MAX_BATCH],
+    /// 本子请求实际合并纳入的父 `Bio` 分片数量（范围 `1..=MAX_BATCH`）。
     count: usize,
+    /// 测试统计：本子请求中包含“非零起始偏移（即父 `Bio` 被拆分后的后续分片）”的分片计数。
     #[cfg(feature = "ktest")]
     splits: usize,
 }
 
+/// 内核测试（`ktest`）中单波批量读最多捕获的物理页与 DMA 地址样本数。
 #[cfg(feature = "ktest")]
 const READ_BATCH_CAPTURE_PAGES: usize = 32;
 
-/// 最近一波原页读的真实接受事实；地址只复制数值，不延长页、inode 或 claim 的寿命。
+/// 内核测试（`ktest`）用于验证最近一波页缓存批量读（`read_folio_batch`）提交情况的诊断快照。
+///
+/// 快照仅复制物理地址与 DMA 地址的数值，不持有物理页、Inode 或 `FsClaim` 的引用计数，不影响正常资源回收生命周期。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadBatchSnapshot {
+    /// 全局单调递增（回绕）的读批次发布序号，用于区分先后多次批量读操作。
     pub sequence: u64,
+    /// 本波批量读所属目标磁盘的唯一标识。
     pub disk: DiskIdentity,
+    /// 本波中至少有 1 个字节被设备驱动实际接收的父 `Bio` 数量。
     pub bios: usize,
+    /// 本波中被设备驱动实际接收超过 1 张物理页（即成功触发连续页合并）的父 `Bio` 数量。
     pub multi_page_bios: usize,
+    /// 本波中被设备驱动实际完整接收的物理页总数。
     pub pages: usize,
+    /// 本波中被设备驱动实际接收的总字节数（单位：字节）。
     pub accepted_bytes: usize,
+    /// 本波首个父 `Bio` 的起始 512B 扇区号；若批次为空则为 `0`。
     pub first_sector: u64,
-    /// 只保存本波前三十二个原映射中已完整接受的页，数组有效长度由本字段给出。
+    /// `phys_addrs` 与 `dma_addrs` 数组中实际填入的有效页数（最多 `READ_BATCH_CAPTURE_PAGES` 页，且仅保留驱动已接收的完整页）。
     pub captured_pages: usize,
+    /// 捕获的前 `captured_pages` 张已接收页面的 CPU 物理起始地址（单位：字节）。
     pub phys_addrs: [usize; READ_BATCH_CAPTURE_PAGES],
+    /// 捕获的前 `captured_pages` 张已接收页面的设备侧 DMA 起始地址（单位：字节）。
     pub dma_addrs: [u64; READ_BATCH_CAPTURE_PAGES],
 }
 
+/// 全局最近一次页缓存批量读的诊断快照存储（受自旋锁保护，仅在 `ktest` 启用时编译）。
 #[cfg(feature = "ktest")]
 static READ_BATCH: SpinLock<Option<ReadBatchSnapshot>> = SpinLock::new(None);
 
-/// 提交前保存原映射地址，提交后只读取原父接受账，设备完成者不访问本诊断存储。
+/// 单波批量读提交前后的观测辅助收集器。
+///
+/// 在 `Bio` 提交给设备之前预先提取物理页与 DMA 地址，并持有各父请求的 `BioCompletion` 观察句柄；
+/// 提交返回后通过 `BioCompletion` 查询实际被驱动接收的字节数，从而避免与设备中断完成路径移走 `BioMemory` 发生数据竞争。
 #[cfg(feature = "ktest")]
 struct ReadBatchObservation {
+    /// 待筛选并发布的读批次快照草稿（初始保存提交前采集的候选页地址）。
     snapshot: ReadBatchSnapshot,
+    /// 本波各槽位父 `Bio` 的完成观察句柄及其提交时的总页数 `(completion, pages)`。
     parents: [Option<(BioCompletion, usize)>; MAX_BATCH],
 }
 
 #[cfg(feature = "ktest")]
 impl ReadBatchObservation {
-    /// 原 Bio 尚未交设备时复制地址并保有限父观察者，避免与完成者移出 memory 的窗口竞争。
+    /// 在父 `Bio` 尚未提交给设备驱动前采集最多 32 张候选页的物理地址与 DMA 地址，并克隆各父请求的 `BioCompletion` 句柄。
     fn new(claim: &FsClaim, bios: &[Bio]) -> Self {
         let mut observed = Self {
             snapshot: ReadBatchSnapshot {
@@ -135,7 +218,7 @@ impl ReadBatchObservation {
         observed
     }
 
-    /// 只统计实际 driver.submit 接受的完整原页；登记、尝试或失败父不冒充已提交。
+    /// 在 `submit_batch` 返回后查询各父请求实际被设备驱动接收的字节数，剔除未被接收的页面并将最终统计快照写入全局 `READ_BATCH`。
     fn publish(mut self) {
         let captured = self.snapshot.captured_pages;
         let mut source = 0;
@@ -165,18 +248,23 @@ impl ReadBatchObservation {
 }
 
 impl FsClaim {
-    /// 以本占用提交 FS 请求，Write 仅允许 RW；Read 与设备支持的 Flush 可由 RO 使用。
-    /// 接受的请求独立保占用至生成、设备收权、回调及原队列资源的全部尾部结束。
+    /// 在当前文件系统挂载占用（`FsClaim`）下提交单个块请求 `Bio`。
+    ///
+    /// 写请求（`Write`）仅在读写挂载（`AccessMode::ReadWrite`）下被准入；读请求（`Read`）与设备支持的刷盘（`Flush`）
+    /// 可在只读挂载下执行。通过准入的请求会独立持有一份 `FsClaim` 克隆，直到子请求生成、设备 DMA 访问权收回、
+    /// 完成回调以及请求槽队列计数清理全部执行完毕后才释放。
     pub fn submit_bio(&self, bio: Bio) {
         self.disk().submit_bio_from(bio, Some(self));
     }
 
-    /// 显式 FS 批次沿同一原 Bio 准入、有限合并及 split 路径，不另建提交引擎。
+    /// 在当前挂载占用下批量提交一组 `Bio`，复用与单请求相同的准入校验、相邻扇区合并与超限拆分流水线。
     pub fn submit_batch(&self, bios: impl IntoIterator<Item = Bio>) {
         self.disk().submit_batch_from(bios, Some(self));
     }
 
-    /// 同步字节读取保实际范围占用到 slot 真尾，返回前只复制完整成功的数据。
+    /// 按卷内相对字节偏移 `offset` 同步读取精确长度的数据到 `dst`（调用者位于普通可睡眠任务上下文）。
+    ///
+    /// 请求在在途期间持续持有 `FsClaim` 直到硬件请求槽彻底结束并收回 DMA 访问权；仅当整段范围完整读取成功时才将数据拷贝至 `dst`。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(dead_code, reason = "文件写入和截断测试通过原 FS 占用读取实际设备字节")
@@ -189,7 +277,9 @@ impl FsClaim {
         result
     }
 
-    /// 将卷内准确原页范围换算一次，并保本占用至 accepted 与 slot 的全部完成尾。
+    /// 将卷内相对字节偏移 `byte` 换算为磁盘绝对偏移，使用传入的 `memory` 容器同步将整段 `FolioRead` 读入物理页。
+    ///
+    /// 若卷边界校验失败则立即在 `read` 上发布错误并返回；提交后等待设备 DMA 彻底完成、收回页面访问权并校验无短读（`ShortIo`）。
     pub(crate) fn load_folio(
         &self,
         byte: u64,
@@ -218,7 +308,9 @@ impl FsClaim {
         Ok(())
     }
 
-    /// 页内分段读取携带实际卷占用，成功后原读入者继续拥有未完成的页面。
+    /// 按卷内相对字节偏移 `byte` 同步读取数据至物理页的指定子区间 `[offset, offset + len)`。
+    ///
+    /// 适用于文件块大小小于 4KiB 时的页内分段填充：本次子区间 DMA 彻底结束并收回访问权后，将仍持有页内容锁的 `FolioRead` 返还调用方继续填充其余区间。
     pub fn fill_folio_range(
         &self,
         byte: u64,
@@ -244,8 +336,10 @@ impl FsClaim {
         finish_folio_range(completion, result, len)
     }
 
-    /// 连续磁盘范围组合多个整页读入凭证，每波最多八父，提交后不逐页等待真实完成。
-    /// 准备拒尾仍提交已有父，所有未交设备的原凭证发布同一个具体准备错误。
+    /// 批量合并并异步提交一组整页读入请求 `ranges`（元素为 `(卷内字节偏移, FolioRead)`），不在本函数内阻塞等待设备 I/O 完成。
+    ///
+    /// 每波最多构造 `MAX_BATCH`（8 个）父 `Bio`；每个父 `Bio` 自动合并磁盘字节偏移连续的多个整页 `FolioRead`。
+    /// 若中途某页映射或内存准备失败，仍先将当前波次已成功准备的父 `Bio` 提交给设备，随后为剩余未提交的所有 `FolioRead` 发布该准备错误并返回。
     pub(crate) fn read_folio_batch(
         &self,
         ranges: &mut Vec<(u64, FolioRead)>,
@@ -257,6 +351,7 @@ impl FsClaim {
                 fail_pending_reads(&mut pending, BlockError::NoMemory);
                 return Err(BlockError::NoMemory);
             }
+            // Step 1: 从待处理队列中依次提取连续整页区间，最多构造 MAX_BATCH 个父 Bio。
             let mut preparation_error = None;
             for _ in 0..MAX_BATCH {
                 if pending.len() == 0 {
@@ -277,6 +372,7 @@ impl FsClaim {
                 }
             }
 
+            // Step 2: 批量提交本波已就绪的父 Bio；即使后续页面准备出错，也不丢弃本波已构造的前缀请求。
             #[cfg(feature = "ktest")]
             let observation = ReadBatchObservation::new(self, &bios);
             self.submit_batch(bios);
@@ -290,7 +386,10 @@ impl FsClaim {
         Ok(())
     }
 
-    /// 只合并整页且物理 byte 相邻的读范围，部分映射准备失败时保留已映射前缀供本波提交。
+    /// 从 `pending` 头部扫描并消费一段磁盘字节相邻的整页 `FolioRead`，打包构造为单个多页读 `Bio`。
+    ///
+    /// 若扫描前缀中第 `k`（`k > 0`）张页在建立 `MappedPages` 时失败，会立即结束该失败页的读凭证，
+    /// 并用前 `k` 张已成功映射的页面构造合法 `Bio` 连同 `Some(error)` 一并返回，供上层先提交已就绪前缀。
     fn prepare_read_bio(
         &self,
         pending: &mut alloc::vec::Drain<'_, (u64, FolioRead)>,
@@ -299,6 +398,7 @@ impl FsClaim {
         if byte_offset % SECTOR_BYTES != 0 {
             return Err(BlockError::Misaligned);
         }
+        // Step 1: 预览并统计从队首起磁盘偏移严格连续、且均为完整 4KiB 页面的最大可合并页数。
         let mut end = byte_offset;
         let mut count = 0;
         for (offset, read) in pending.as_slice() {
@@ -317,6 +417,7 @@ impl FsClaim {
             return Err(BlockError::InvalidRange);
         }
 
+        // Step 2: 预分配映射段容器，并将连续前缀中的 FolioRead 逐个转换为 DMA 映射页。
         let mut memory = Vec::new_in(BioAllocator::Heap);
         memory
             .try_reserve_exact(count)
@@ -338,9 +439,11 @@ impl FsClaim {
             return Err(preparation_error.expect("empty read batch has no preparation error"));
         }
 
-        // SAFETY: 每份 read 独占一个原页内容锁且保原 inode，CPU 初始化别名均已结束。
-        // 连续磁盘范围直接映射这些原页；无回调，Bio 在全部真实 child 和生成者结束后
-        // 才收权并发布各页结果，FS claim 由同一正式准入保存到原队列全尾。
+        // Step 3: 将卷内偏移换算为物理扇区号并构造多页读 Bio。
+        // SAFETY:
+        // 1. `memory` 中的每个 `MappedPages` 均由独占页内容锁（`CONTENT_LOCKED`）且保活所属 Inode 的 `FolioRead` 构造，调用前无任何活跃的 CPU 切片借用；
+        // 2. 操作类型为 `BlkOperation::Read` 且 `end_io` 为 `None`，不要求物理页初始数据有效，也不存在回调并发访问；
+        // 3. `Bio` 会在所有硬件子请求与生成者全部执行完毕、收回物理页 DMA 访问权后才完成各页的 `FolioRead` 凭证。
         let bio = unsafe {
             Bio::try_new(
                 self.disk(),
@@ -356,15 +459,18 @@ impl FsClaim {
         Ok((bio, preparation_error))
     }
 
-    /// 复制最近本盘读批次的真实接受事实，不等待或控制 I/O，也不保存设备拥有者。
+    /// 读取全局最近一次批量读诊断快照；仅当该快照属于当前 `FsClaim` 所在的同一块物理磁盘时才返回。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_read_batch_snapshot(&self) -> Option<ReadBatchSnapshot> {
         let snapshot = *READ_BATCH.lock();
         snapshot.filter(|snapshot| snapshot.disk == self.disk().identity())
     }
 
-    /// 多原页相邻范围共用一个父，固定父槽和观察者复用同一预建窗口。
-    /// 准备拒尾仍先提交已映射前缀，实际全尾后才允许 book 内的后继窗重用存储。
+    /// 分波次批量提交并同步等待一组脏页回写凭证 `ranges`（元素为 `(磁盘绝对字节偏移, FolioWriteback)`）。
+    ///
+    /// 若传入预留池通道 `lane`（`BioLane`），则使用零堆分配的预留槽位构造每波最多 `lane.len()` 个父 `Bio`，
+    /// 相邻磁盘字节范围自动合并进同一个父 `Bio`（受单槽最多 8 个映射段限制）。每波调用 `submit_batch` 后，
+    /// 同步等待本波全部父 `Bio` 完成 DMA 并取回释放 `BioMemory` 与 `BioCompletion`，确保预留池控制块与载荷块归还后才进入下一波复用。
     pub(crate) fn writeback_batch(
         &self,
         ranges: &mut Vec<(u64, FolioWriteback)>,
@@ -378,6 +484,7 @@ impl FsClaim {
         assert!(completions.iter().all(Option::is_none));
         let mut pending = ranges.drain(..);
         while pending.len() != 0 {
+            // Step 1: 获取本波首个可用槽位（允许在尚未持有任何未提交 Bio 时睡眠等待预留槽归还）。
             let width = lane.map_or(MAX_BATCH, BioLane::len);
             let (first_slot, mut first_lease) = match lane {
                 Some(lane) => {
@@ -386,6 +493,7 @@ impl FsClaim {
                 }
                 None => (0, None),
             };
+            // Step 2: 轮询通道内其余槽位（后续槽位采用非阻塞 try_lease，避免携已构造的未提交 Bio 睡眠死锁）。
             let mut preparation_error = None;
             for step in 0..width {
                 let slot = (first_slot + step) % width;
@@ -425,6 +533,7 @@ impl FsClaim {
                 }
             }
 
+            // Step 3: 批量提交本波全部回写父 Bio，随后逐一等待硬件完成并主动回收 memory/completion 以归还预留池块。
             self.submit_batch(bios.iter_mut().filter_map(Option::take));
             let mut first_error = None;
             for entry in completions.iter_mut() {
@@ -454,7 +563,9 @@ impl FsClaim {
         Ok(())
     }
 
-    /// 只合并真实连续 byte 范围，储备父最多八映射；失败前的映射仍构造真实父提交。
+    /// 从 `pending` 头部消费一段磁盘绝对字节偏移连续的 `FolioWriteback`（不超过分配器的 `mapping_limit` 上限），构造单个回写 `Bio`。
+    ///
+    /// 若首项之后某张页的 DMA 映射校验失败，该失败凭证会被立即析构回滚，此前已成功放入 `memory` 的连续前缀仍会正常构造为 `Bio` 返回提交。
     fn prepare_writeback_bio(
         &self,
         pending: &mut alloc::vec::Drain<'_, (u64, FolioWriteback)>,
@@ -506,8 +617,9 @@ impl FsClaim {
             return Err(preparation_error.expect("empty writeback prefix has no error"));
         }
 
-        // SAFETY: 凭证来自已初始化原页，已完成共享撤权及 CSD，不导出内容切片。
-        // 每映射只记录自己的真实接受和未接受恢复；全部 child 与生成者收权前不结束 WB。
+        // SAFETY:
+        // 1. 每个 `FolioWriteback` 均源自已完成初始化的缓存页，且在创建回写凭证时已完成页表写权限清理与缓存同步，不存在导出给外部的可变切片；
+        // 2. 操作类型为 `BlkOperation::Write` 且无完成回调，`Bio` 保证在生成者及所有拆分子请求的设备 DMA 访问权全部收回后，才逐页结算回写完成状态。
         let bio = unsafe {
             Bio::try_new(
                 self.disk(),
@@ -522,10 +634,11 @@ impl FsClaim {
         Ok((bio, len, preparation_error))
     }
 
-    /// 使用调用者业务锁外准备的同一来源提交真实 FLUSH，内部观察者全部结束后返回。
+    /// 使用调用方在业务锁外预先准备的空 `BioMemory` 容器向磁盘提交同步 `Flush` 请求，等待设备刷盘彻底完成并回收容器内存后返回。
     pub(crate) fn flush(&self, memory: BioMemory) -> Result<(), BlockError> {
-        // SAFETY: Flush 没有数据映射或 CPU 别名，也不含回调；
-        // genuine Bio 仍承担生成者、全部 child 和真实完成责任。
+        // SAFETY:
+        // 1. `BlkOperation::Flush` 不携带任何数据映射段（`memory` 为空），不存在物理页初始化要求或 CPU/DMA 内存别名；
+        // 2. `end_io` 为 `None`，无回调并发访问风险。
         let bio = unsafe { Bio::try_new(self.disk(), BlkOperation::Flush, 0, memory, 0, None) }?;
         let completion = bio.completion();
         self.submit_bio(bio);
@@ -538,16 +651,18 @@ impl FsClaim {
     }
 }
 
-/// 所有这些读入凭证都尚未交设备，逐份结束准确失败责任，不由析构改成取消错误。
+/// 遍历尚未提交给设备的剩余 `FolioRead` 队列，逐一以具体准备错误 `error` 结束读入等待（避免直接 Drop 被统一替换为取消错误）。
 fn fail_pending_reads(pending: &mut alloc::vec::Drain<'_, (u64, FolioRead)>, error: BlockError) {
     for (_, read) in pending {
         fail_read(read, error);
     }
 }
 
-/// 准备失败直接发布原页错误；失败不初始化字节、不零填或重读。
+/// 在尚未提交给设备驱动的 `FolioRead` 上直接发布准备阶段错误 `error`（完成字节数为 `0`）。
 fn fail_read(mut read: FolioRead, error: BlockError) {
-    // SAFETY: 本凭证从未交设备，CPU 借用已结束；零完成错误不授予任何内容访问。
+    // SAFETY:
+    // 1. 该 `read` 凭证从未移交块设备或建立活跃 DMA 映射，且调用方未保留任何页内字节借用；
+    // 2. 传入 `completed: 0` 与 `Some(error)` 不会标记页面任何字节已初始化，等待该页的任务将收到准确的错误码。
     unsafe {
         read.complete(IoResult {
             completed: 0,
@@ -557,12 +672,12 @@ fn fail_read(mut read: FolioRead, error: BlockError) {
 }
 
 impl Disk {
-    /// raw 提交不携 FS 授权，任何活占用期间拒绝 Write；父完成仍由观察者等待。
+    /// 在无文件系统挂载占用的裸盘模式下提交单个 `Bio`（存在活跃文件系统占用期间拒绝裸盘写请求；完成结果由调用方持有的 `BioCompletion` 观察）。
     pub(crate) fn submit_bio(self: &DiskRef, bio: Bio) {
         self.submit_bio_from(bio, None);
     }
 
-    /// 唯一单父提交先验证来源，再同步生成原 child；失败仍 kick 已发表前缀。
+    /// 校验单个 `Bio` 的准入权限并同步将其拆分生成硬件子请求；若准入被拒则先刷出队列中已就绪的前置请求再拒绝当前 `Bio`。
     fn submit_bio_from(self: &DiskRef, bio: Bio, claim: Option<&FsClaim>) {
         drop(task::current_task());
         let mut active: [Option<ActiveBio<'_>>; MAX_BATCH] = [const { None }; MAX_BATCH];
@@ -577,7 +692,7 @@ impl Disk {
         self.submit_accepted(&mut active);
     }
 
-    /// raw 批次没有 FS 授权，每组最多八个生成者，组内相邻普通范围才允许合并。
+    /// 在无文件系统挂载占用的裸盘模式下批量提交一组 `Bio`（按每波最多 `MAX_BATCH` 个分组处理，支持同波次内相邻读写请求合并）。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -589,7 +704,7 @@ impl Disk {
         self.submit_batch_from(bios, None);
     }
 
-    /// 两种来源共用批次准入及 child 生成，拒绝的父只清自身准备资源。
+    /// 按每波最多 `MAX_BATCH`（8 个）父请求对迭代器执行准入校验与硬件子请求生成；准入失败的单个请求立即就地拒绝，不影响同波次其他合法请求。
     fn submit_batch_from(
         self: &DiskRef,
         bios: impl IntoIterator<Item = Bio>,
@@ -618,7 +733,9 @@ impl Disk {
         }
     }
 
-    /// 每个 accepted root 都在通知已发表前缀后结束生成责任，失败不取消旧 child。
+    /// 为当前批次所有已通过准入的 `ActiveBio` 生成硬件子请求，调用 `unplug` 通知驱动，并结算每个父请求的生成者生命周期。
+    ///
+    /// 若子请求生成中途发生错误，此前已成功发布到硬件队列的子请求继续正常执行，`finish` 仅在尚未生成完毕的父请求上记录错误发生的起始偏移。
     fn submit_accepted(&self, active: &mut [Option<ActiveBio<'_>>; MAX_BATCH]) {
         let mut generated = [false; MAX_BATCH];
         let error = self.generate_children(active, &mut generated).err();
@@ -635,7 +752,7 @@ impl Disk {
         }
     }
 
-    /// 准备与发表按 child 顺序执行；描述符等待由同一个 PreparingSlot 保有 SG。
+    /// 按顺序逐个申请硬件请求槽（`PreparingSlot`），在锁外填充散聚列表并发布子请求，直到批次内所有父 `Bio` 全部生成完毕。
     fn generate_children(
         &self,
         active: &mut [Option<ActiveBio<'_>>; MAX_BATCH],
@@ -644,8 +761,10 @@ impl Disk {
         let mut cursors = [SegmentCursor::default(); MAX_BATCH];
         let mut next = next_active(active, 0);
         while next < MAX_BATCH {
+            // Step 1: 申请空闲硬件请求槽（若槽位暂满则在队列锁外睡眠等待），并在锁外构造子请求散聚表计划。
             let mut slot = self.reserve_slot()?;
             let plan = self.prepare_child(&mut slot, active, cursors, next)?;
+            // Step 2: 将填充完毕的硬件请求槽正式发布到设备队列；发布成功后才推进各父请求的已生成字节偏移与段游标。
             slot.publish()?;
             #[cfg(feature = "ktest")]
             self.record_generation(plan.splits, plan.count - 1);
@@ -666,7 +785,7 @@ impl Disk {
         Ok(())
     }
 
-    /// 锁外填充一个固定槽，逐父裁剪到逻辑块边界后才保存对应完成义务。
+    /// 在队列锁外向单个硬件请求槽 `slot` 填充子请求，尽可能合并批次中扇区紧邻且方向相同的后续父 `Bio`，返回本次填充的 `GenerationPlan`。
     fn prepare_child(
         &self,
         slot: &mut PreparingSlot<'_>,
@@ -689,6 +808,7 @@ impl Disk {
             #[cfg(feature = "ktest")]
             splits: 0,
         };
+        // Step 1: Flush 请求不含数据载荷且不可与其他请求合并，单独占用一个硬件请求槽。
         if operation == BlkOperation::Flush {
             slot.push_part(Arc::clone(&root.bio), 0, 0)?;
             slot.configure(operation, 0, 0)?;
@@ -697,6 +817,7 @@ impl Disk {
             return Ok(plan);
         }
 
+        // Step 2: 读写请求从首个活跃父 Bio 开始，在硬件单槽字节上限（max_bytes）、段数上限（max_segments）与分片数上限内顺序扫描可合并的相邻请求。
         let limits = self.limits();
         let mut bytes = 0;
         let mut index = first;
@@ -713,7 +834,7 @@ impl Disk {
             if bio.operation() != operation || current_sector != end_sector {
                 break;
             }
-            // 可睡回调可能等待相邻父；合并到同一槽会让它阻塞后续 part 的完成。
+            // 若任一请求带有可睡眠 Task 完成回调，其回调可能等待相邻请求，禁止将其与其他父请求合并进同一请求槽以免互相阻塞完成。
             if plan.count != 0 && (root.bio.needs_task() || bio.needs_task()) {
                 break;
             }
@@ -744,12 +865,13 @@ impl Disk {
             }
             index = next_active(active, index + 1);
         }
+        // Step 3: 写入操作码、起始扇区与总字节数，完成硬件请求槽的协议头配置。
         debug_assert!(0 < bytes && !slot.sg().is_empty());
         slot.configure(operation, sector, bytes)?;
         Ok(plan)
     }
 
-    /// 将原 folio 的完整读入范围交给 Bio，等待真实 DMA 全尾及内容结果发布。
+    /// 在无文件系统挂载占用的裸盘模式下，按磁盘绝对字节偏移 `byte_offset` 将整张 `FolioRead` 同步读入物理页，等待 DMA 完成并校验无短读。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -777,7 +899,7 @@ impl Disk {
         Ok(())
     }
 
-    /// 锁外准备原页 Bio 并同步等待；None 结束完整读，子范围成功后由来源继续填页。
+    /// 在队列锁外校验偏移对齐、建立物理页或页内子区间 `range` 的 DMA 映射并提交读 `Bio`，同步阻塞等待硬件完成后返回观察句柄与 I/O 结果。
     fn read_folio_bio(
         self: &DiskRef,
         byte_offset: u64,
@@ -795,8 +917,9 @@ impl Disk {
                 .map_err(|_| BlockError::NoMemory)
         };
         if let Err(error) = prepared {
-            // SAFETY: read 尚未映射或交设备，调用期间 CPU 可变借用已结束；
-            // 错误不授予任何初始化范围，所有等待者取得同一真实错误。
+            // SAFETY:
+            // 1. `read` 尚未封装为 DMA 映射段，也未提交给设备，调用期间无任何活跃的 CPU 页内切片借用；
+            // 2. 传入 `completed: 0` 与准备错误不会暴露未初始化字节，所有等待该页就绪的任务将收到同一错误。
             unsafe {
                 read.complete(IoResult {
                     completed: 0,
@@ -814,7 +937,9 @@ impl Disk {
             Ok(mapped) => mapped,
             Err((error, mut read)) => {
                 let error = BlockError::from(error);
-                // SAFETY: 映射准备失败，设备从未取得范围，失败不发布可读内容。
+                // SAFETY:
+                // 1. DMA 映射校验失败并原样退回 `read` 所有权，设备从未接触该物理页；
+                // 2. 以 `completed: 0` 结束读凭证不会发布任何未初始化的页内容。
                 unsafe {
                     read.complete(IoResult {
                         completed: 0,
@@ -826,8 +951,9 @@ impl Disk {
         };
 
         memory.push(mapped);
-        // SAFETY: 唯一 read owner 保活并独占内容锁，全部 CPU 借用已经结束；
-        // Read 无回调且不要求初始内容有效，Bio 全尾真实收权后才结束本段责任。
+        // SAFETY:
+        // 1. `mapped` 独占持有页内容锁（`CONTENT_LOCKED`）并保活底层物理页与所属对象，不存在并发 CPU 切片借用；
+        // 2. 操作类型为 `BlkOperation::Read` 且无完成回调，`Bio` 保证在所有子请求完成并收回物理页 DMA 访问权后才结算读凭证。
         let bio = unsafe {
             Bio::try_new(
                 self,
@@ -845,8 +971,9 @@ impl Disk {
         Ok((completion, result))
     }
 
-    /// 普通 Task 用请求自有零页完成字节范围读取，只有全长成功才修改调用者缓冲区。
-    /// 非空范围必须符合设备逻辑块对齐；文件页填充直接使用自己的页提交 Bio。
+    /// 在普通可睡眠任务上下文中，使用临时分配的零初始化物理页从磁盘绝对字节偏移 `offset` 同步读取数据到 `dst`。
+    ///
+    /// 非空读取范围的起始偏移与长度均须对齐设备 `logical_block_size`；仅在全部字节读取成功后才将页面数据拷贝至调用方缓冲区 `dst`。
     pub fn read_exact_at(self: &DiskRef, offset: u64, dst: &mut [u8]) -> Result<(), BlockError> {
         drop(task::current_task());
         let result = self.read_with_pages(offset, dst, None);
@@ -854,13 +981,14 @@ impl Disk {
         result
     }
 
-    /// 所有 fallible 页与 Vec 准备都在队列锁外，错误完成仍通过原拥有者归还原阶。
+    /// 在队列锁外校验设备容量与逻辑块对齐、逐页分配零页提交读 `Bio`，并在收回 DMA 访问权后将完整读取的数据复制到 `dst`。
     fn read_with_pages(
         self: &DiskRef,
         offset: u64,
         dst: &mut [u8],
         claim: Option<&FsClaim>,
     ) -> Result<(), BlockError> {
+        // Step 1: 校验磁盘容量上界、空切片快速返回以及设备逻辑块大小（logical_block_size）对齐。
         let limits = self.limits();
         let logical = u64::from(limits.logical_block_size);
         let capacity = limits
@@ -880,6 +1008,7 @@ impl Disk {
             return Err(BlockError::Misaligned);
         }
 
+        // Step 2: 在队列锁外按 4KiB 粒度申请清零物理页并建立 DeviceToDriver 方向的 DMA 映射列表。
         let total = dst.len();
         let page_count = total / PAGE_SIZE + usize::from(total % PAGE_SIZE != 0);
         let mut memory = Vec::new_in(BioAllocator::Heap);
@@ -896,8 +1025,10 @@ impl Disk {
             remaining -= length;
         }
 
-        // SAFETY: 每个映射持有独占原零页，全部 CPU 别名在移入前结束；读请求无回调，
-        // 页在 Bio 最终完成前不被 CPU 使用，失败与短读也不将未成功数据复制到 dst。
+        // Step 3: 提交读 Bio 并等待硬件完成，收回临时物理页访问权后校验全长无误再拷贝至 dst。
+        // SAFETY:
+        // 1. `memory` 中每个映射均独占刚分配且已整页清零的 `OwnedPages`，移入 `Bio` 前无任何 CPU 切片别名；
+        // 2. 操作类型为 `BlkOperation::Read` 且无回调，在 `completion.wait()` 与 `take_memory()` 返回前 CPU 不会读取这些页面。
         let bio = unsafe {
             Bio::try_new(
                 self,
@@ -922,8 +1053,9 @@ impl Disk {
 
         let mut copied = 0;
         for mapped in &memory {
-            // SAFETY: 原页分配时整页清零，整个读取范围已全长成功；wait/take_memory
-            // 已结束所有 child 的 DMA 并收回 CPU 拥有权，局部拥有者禁止并发写与提前归还。
+            // SAFETY:
+            // 1. 底层物理页在分配时已整页清零，且上方已校验无错误且 `result.completed == total`；
+            // 2. `completion.wait()` 与 `completion.take_memory()` 已确保所有子请求结束 DMA 并收回 CPU 访问权，`memory` 为当前栈帧独占持有，无并发写入。
             let bytes = unsafe { mapped.bytes() };
             let length = mapped.len();
             dst[copied..copied + length].copy_from_slice(bytes);
@@ -934,7 +1066,7 @@ impl Disk {
     }
 }
 
-/// 完整收权后移回原分段读入者，短结果结束真实失败而不授予尾部访问。
+/// 在页内子区间读 `Bio` 完成后收回物理页访问权并取回 `FolioRead`；若发生短读（`ShortIo`）则立即在读凭证上登记失败并返回错误。
 fn finish_folio_range(
     completion: BioCompletion,
     result: IoResult,
@@ -950,7 +1082,9 @@ fn finish_folio_range(
         .expect("single folio payload is missing")
         .into_folio();
     if result.completed != len {
-        // SAFETY: completion 已结束全部子请求并收权，短结果不授予未初始化尾部访问权。
+        // SAFETY:
+        // 1. 上方 `take_memory()` 与 `into_folio()` 已确认全部硬件子请求执行完毕并收回物理页 DMA 访问权；
+        // 2. 传入 `Some(BlockError::ShortIo)` 终止读凭证，不会将未读满的尾部区间标记为已初始化可读。
         unsafe {
             read.complete(IoResult {
                 completed: result.completed,
@@ -962,20 +1096,23 @@ fn finish_folio_range(
     Ok(read)
 }
 
-/// 略过被 admission 拒绝的 root，不为批次建立第二份拥有队列。
+/// 从批次槽位下标 `start` 起向后查找下一个已通过准入的 `ActiveBio` 下标；若后续全为空则返回 `MAX_BATCH`。
 fn next_active(active: &[Option<ActiveBio<'_>>; MAX_BATCH], start: usize) -> usize {
     (start..MAX_BATCH)
         .find(|index| active[*index].is_some())
         .unwrap_or(MAX_BATCH)
 }
 
-/// 先取有限最小值再加一，完整边界掩码与地址零不能使边界额度溢出。
+/// 计算从物理地址 `address` 开始的单个散聚段最大允许字节数（同时受限于设备 `dma_boundary_mask` 跨界掩码与 `max_segment_bytes` 上限）。
+///
+/// 先在减一后的无符号域取最小值再加一，防止 `dma_boundary_mask == u64::MAX` 且 `address == 0` 时发生 `u64` 加法溢出。
 fn segment_limit(limits: QueueLimits, address: u64) -> usize {
     let before_end = limits.dma_boundary_mask - (address & limits.dma_boundary_mask);
     (before_end.min(u64::from(limits.max_segment_bytes) - 1) + 1) as usize
 }
 
-/// 将父原地址写入已预留 SG，最终向下对齐并裁掉尾段，不建立任何 payload bounce。
+/// 在不超过 `budget` 字节与硬件段数上限的前提下，将父 `Bio` 从 `cursor` 起的物理段追加（或与尾段合并）到散聚表 `sg` 中，
+/// 最后按设备 `logical_block_size` 向下取整裁剪尾部并推进 `cursor`，返回实际纳入的对齐字节数。
 fn append_prefix(
     bio: &BioInner,
     cursor: &mut SegmentCursor,
@@ -984,6 +1121,7 @@ fn append_prefix(
     budget: usize,
 ) -> Result<usize, BlockError> {
     debug_assert!(limits.max_segments <= sg.capacity());
+    // Step 1: 沿局部游标扫描父 Bio 的物理段，物理地址紧邻且未跨 DMA 边界时直接原地扩展尾段，否则压入新散聚段。
     let mut scan = *cursor;
     let mut bytes = 0;
     while bytes < budget {
@@ -1029,6 +1167,7 @@ fn append_prefix(
         bytes += length;
     }
 
+    // Step 2: 将累计字节数向下对齐到设备逻辑块大小，裁掉散聚表末尾不足一个逻辑块的零头，并正式推进父游标。
     let logical = limits.logical_block_size as usize;
     let prefix = bytes / logical * logical;
     trim_tail(sg, bytes - prefix);
@@ -1036,7 +1175,7 @@ fn append_prefix(
     Ok(prefix)
 }
 
-/// 裁掉本轮追加范围的尾部，包括与旧尾段合并的部分，保留既有 parts 的完整字节。
+/// 从散聚表 `sg` 末尾反向回退并截断指定的 `bytes` 字节（包含刚才合并到既有尾段上的部分），确保先前已纳入分片的字节范围保持完整。
 fn trim_tail(sg: &mut Vec<PayloadRange>, mut bytes: usize) {
     while 0 < bytes {
         let last = sg.last_mut().expect("SG prefix tail is absent");

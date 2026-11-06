@@ -1,4 +1,40 @@
-//! 固定 N_TTY 输入、回显与输出算法；本文件只操作调用者传入的短锁状态。
+//! `N_TTY` 行规程（Line Discipline）核心状态机与输入、回显、输出缓冲算法。
+//!
+//! # 模块职责与架构定位
+//! 本模块实现标准 `N_TTY` 行规程的数据结构与纯内存处理算法：
+//! - **上游调用者**：`crate::fs::tty` 在持有端点自旋锁（`Endpoint::state`）的临界区内调用本模块方法。
+//! - **核心职责**：
+//!   1. **输入处理**：处理 UART 采样状态（BREAK、奇偶校验错误、帧错误、硬件溢出）、`ISTRIP`、`INLCR`/`IGNCR`/`ICRNL`、软件流控（`IXON`/`IXANY`）、信号字符（`VINTR`/`VQUIT`/`VSUSP`）、规范模式行编辑（`VERASE`/`VKILL`/`VWERASE`/`VLNEXT`/`VREPRINT`）及行结束符（`\n`/`VEOF`/`VEOL`/`VEOL2`）。
+//!   2. **回显生成与展开**：在编辑输入时将回显指令推入 `EchoQueue`，并在工作队列或读取路径中将其展开为实际输出字节（含 `^X` 控制字符展示、制表符退格对齐、整行擦除与重印快照分批展开）。
+//!   3. **输出后处理（`OPOST`）**：维护终端当前列号（`column`）与规范行起始列号（`canon_column`），执行 `\n` 转 `\r\n`（`ONLCR`）、`\r` 转 `\n`（`OCRNL`）、第 0 列抑制 `\r`（`ONOCR`）以及制表符转空格（`TAB3`）。
+//!
+//! # 核心环形队列与状态布局
+//!
+//! ## 1. 输入环形队列（`InputQueue`，容量 4096 字节）
+//! ```text
+//!   0                 tail                committed_index          head            4095
+//! ┌───────────────────┬──────────────────────────┬──────────────────┬─────────────────┐
+//! │     空闲区域       │   已提交可读区域          │  未提交行编辑尾   │    空闲区域      │
+//! │                   │ (committed 字节，含 eol)  │ (edit_len 字节)  │                 │
+//! └───────────────────┴──────────────────────────┴──────────────────┴─────────────────┘
+//!                      ◄────────────────────── len ────────────────►
+//! ```
+//! - **非规范模式（`!ICANON`）**：所有入队字节立即提交，`committed == len`，`edit_len() == 0`。
+//! - **规范模式（`ICANON`）**：普通字符先进入未提交编辑尾（`committed < len`），支持退格、删词、删行；收到 `\n`、`VEOL`、`VEOL2` 或 `VEOF` 时将 `committed` 推进到 `len`，并在对应下标设置 `eol[idx] = true`（若为空 `VEOF` 则同时设置 `eof[idx] = true`）。
+//!
+//! ## 2. 三队列协同数据流
+//! ```text
+//! UART RX 采样 ──► receive_sample() ──► InputQueue (4096 B) ──► peek/consume (用户 read)
+//!                       │
+//!                       └──► EchoQueue (4104 项)
+//!                                  │
+//!                                  ▼ process_echo()
+//! 用户 write   ───────────► output_byte() ──► OutputQueue (4096 B) ──► UART TX 发送
+//! ```
+//!
+//! # 锁与并发契约
+//! - 本模块所有类型（`NttyState`、`InputQueue`、`EchoQueue`、`OutputQueue`）均不包含内部锁，完全由外部调用方持有的 `SpinLock<NttyState>` 保护。
+//! - 本模块方法严禁睡眠、严禁直接访问 UART 硬件寄存器或向进程组发送信号（待发送信号通过 [`ReceiveOutcome::signal`] 返回给调用方在锁外投递）。
 
 use super::termios::{
     Termios, BRKINT, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IEXTEN, IGNBRK,
@@ -11,82 +47,89 @@ use crate::console::{
 };
 use crate::task::signal::{SIGINT, SIGQUIT, SIGTSTP};
 
-/// 输入队列固定 4096 字节。
+/// 输入字节环形缓冲区的固定容量（单位：字节）。
 pub const INPUT_CAPACITY: usize = 4096;
-/// 输出队列固定 4096 字节。
+/// 输出字节环形缓冲区的固定容量（单位：字节）。
 pub const OUTPUT_CAPACITY: usize = 4096;
-/// 回显操作队列固定 4104 项。
+/// 回显操作环形队列的固定容量（单位：操作项数）。
 pub const ECHO_CAPACITY: usize = 4104;
-/// 读写 uaccess 片段固定 512 字节。
+/// 用户态读写缓冲区单次分段拷贝的字节上限（单位：字节）。
 pub const SEGMENT_BYTES: usize = 512;
 
-/// 回车字节。
+/// 回车符 ASCII 码（`\r`，`0x0d`）。
 const CARRIAGE_RETURN: u8 = b'\r';
-/// 换行字节。
+/// 换行符 ASCII 码（`\n`，`0x0a`）。
 const LINE_FEED: u8 = b'\n';
-/// 退格字节。
+/// 退格符 ASCII 码（`BS`，`0x08`）。
 const BACKSPACE: u8 = 0x08;
-/// 响铃字节。
+/// 响铃符 ASCII 码（`BEL`，`0x07`）。
 const BELL: u8 = 0x07;
-/// 禁用控制字符。
+/// 禁用控制字符的特殊标记值（`_POSIX_VDISABLE`，`0x00`）。
 const DISABLED_CHAR: u8 = 0;
 
+/// 标准水平制表符（Tab）的列对齐宽度（8 列）。
 const TAB_WIDTH: usize = 8;
+/// 计算制表符列内偏移的位掩码（`TAB_WIDTH - 1 = 0b111`）。
 const TAB_COLUMN_MASK: usize = TAB_WIDTH - 1;
 
+/// `ECHO_ERASE_TAB` 操作数高位标志：指示被擦除的制表符前方仍存在另一个制表符（无需叠加 `canon_column`）。
 const ECHO_TAB_AFTER_TAB: u8 = 0x80;
+/// 单次 `process_echo` 展开长耗时操作（整行擦除或重印快照）的最大步数预算，防止单次持锁时间过长。
 const ECHO_EXPANSION_BUDGET: usize = 64;
 
-/// 回显操作：输出一个原始字节。
+/// 回显操作码：按输出模式输出单个普通字节。
 const ECHO_BYTE: u8 = 0;
-/// 回显操作：输出控制字符的 ^X 形式。
+/// 回显操作码：将控制字符展开为 `^X` 两字节形式输出。
 const ECHO_CONTROL: u8 = 1;
-/// 回显操作：记录当前规范列。
+/// 回显操作码：将当前输出列号 `column` 记录为规范行起始列 `canon_column`。
 const ECHO_SET_CANON: u8 = 2;
-/// 回显操作：列回退一格。
+/// 回显操作码：将输出列号回退一列（不额外输出字节）。
 const ECHO_MOVE_BACK: u8 = 3;
-/// 回显操作：按记录擦除一个制表符。
+/// 回显操作码：根据编码的列偏移输出相应数量的退格符以擦除一个制表符。
 const ECHO_ERASE_TAB: u8 = 4;
-/// 回显操作：擦到规范起列，按当前列差增量生成退格。
+/// 回显操作码：输出“退格-空格-退格”序列直至当前列退回到 `canon_column`（对应 `ECHOKE` 整行擦除）。
 const ECHO_ERASE_LINE: u8 = 5;
-/// 回显操作：展开挂起重显快照，未完留头。
+/// 回显操作码：逐步展开 `pending_reprint` 中保存的未提交行快照（对应 `VREPRINT`）。
 const ECHO_REPRINT: u8 = 6;
 
-/// 回显项保存显式操作码与数据，不借 0 或 FF 表达空项。
+/// 回显操作队列中的单个指令项。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EchoItem {
-    /// 操作码。
+    /// 回显操作码（`ECHO_BYTE`、`ECHO_CONTROL` 等常量之一）。
     op: u8,
-    /// 数据字节。
+    /// 与操作码关联的数据字节或打包列宽参数。
     value: u8,
 }
 
-/// 固定容量的输入字节环，canonical 记录与 EOF 标记独立于字节值。
-/// 环表达：tail 读出、head 写入、len 已存字节、committed 已提交字节。
-/// 满队列 head==tail 时仍由 len 区分，不靠指针相等推断空满。
+/// 固定容量的终端输入字节环形队列。
+///
+/// 同时支持规范模式（按行提交与行内编辑）与非规范模式（按字节即时提交）：
+/// - `tail` 指向下一个待用户读取的字节下标，`head` 指向下一个新字节写入下标；
+/// - `len` 记录队列中的总字节数，用于区分空队列与满队列（`head == tail` 时既可能空也可能满）；
+/// - `eol` 与 `eof` 数组按环下标记录每个位置是否为行结束符或零长度 `VEOF` 占位符，从而不占用特殊字节值。
 pub struct InputQueue {
-    /// 环形字节存储。
+    /// 存放输入字节的环形数组（容量 `INPUT_CAPACITY` 字节）。
     pub(crate) bytes: [u8; INPUT_CAPACITY],
-    /// 记录分隔标记，与字节下标一一对应。
+    /// 与 `bytes` 下标一一对应的行结束标记数组；为 `true` 表示规范模式的一条记录在此处结束。
     eol: [bool; INPUT_CAPACITY],
-    /// EOF 提交标记，与字节下标一一对应。
+    /// 与 `bytes` 下标一一对应的 `VEOF` 零长度占位标记数组；读取到该位置时不向用户拷贝该占位字节，直接结束当前行。
     eof: [bool; INPUT_CAPACITY],
-    /// 读出下标。
+    /// 队首读出下标（`0..INPUT_CAPACITY`）。
     pub(crate) tail: usize,
-    /// 写入下标。
+    /// 队尾写入下标（`0..INPUT_CAPACITY`）。
     pub(crate) head: usize,
-    /// 已保存字节数。
+    /// 当前队列中已保存的总字节数（含已提交部分与未提交编辑尾，`0..=INPUT_CAPACITY`）。
     pub(crate) len: usize,
-    /// 已提交记录字节数，不超过 len。
+    /// 当前已提交可供用户 `read` 消费的字节数（恒满足 `committed <= len`）。
     pub(crate) committed: usize,
-    /// LNEXT 转义状态。
+    /// 是否处于 `VLNEXT`（`^V`）字面量转义状态（为 `true` 时下一个输入字符跳过特殊控制符解释）。
     pub(crate) lnext: bool,
-    /// 挂起 EOF：旧记录读完后产生一次零返回。
+    /// 当输入队列已满且编辑尾为空时收到 `VEOF` 所设置的挂起标志；待消费腾出空间后自动补入一个 `EOF` 占位项。
     pub(crate) pending_eof: bool,
 }
 
 impl InputQueue {
-    /// 建立空输入队列。
+    /// 创建空的输入环形队列。
     pub const fn new() -> Self {
         Self {
             bytes: [0; INPUT_CAPACITY],
@@ -101,33 +144,33 @@ impl InputQueue {
         }
     }
 
-    /// 返回已保存字节数。
+    /// 返回队列中当前保存的总字节数（含未提交编辑尾）。
     #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 返回队列是否为空。
+    /// 判断输入队列是否完全为空。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 返回已提交记录字节数。
+    /// 返回已提交可供用户读取的字节数。
     pub fn committed_len(&self) -> usize {
         self.committed
     }
 
-    /// 返回未提交编辑尾长度。
+    /// 返回规范模式下尚未提交的当前编辑行字节数（`len - committed`）。
     pub fn edit_len(&self) -> usize {
         self.len - self.committed
     }
 
-    /// 返回已提交记录边界的环下标。
+    /// 返回已提交区域末尾（即未提交编辑行起点）在环形数组中的下标。
     pub(crate) fn committed_index(&self) -> usize {
         (self.tail + self.committed) % INPUT_CAPACITY
     }
 
-    /// 清空全部输入与编辑状态。
+    /// 清空所有输入字节、行标记、转义状态与挂起 `EOF` 状态。
     pub fn clear(&mut self) {
         self.tail = 0;
         self.head = 0;
@@ -139,7 +182,7 @@ impl InputQueue {
         self.eof = [false; INPUT_CAPACITY];
     }
 
-    /// 在队尾追加一个字节，满或挂起 EOF 未发表时返回假。
+    /// 在队尾追加一个字节；若队列已满或存在尚未落地的 `pending_eof` 则拒绝入队并返回 `false`。
     fn push_byte(&mut self, byte: u8) -> bool {
         if self.pending_eof || self.len == INPUT_CAPACITY {
             return false;
@@ -152,7 +195,7 @@ impl InputQueue {
         true
     }
 
-    /// canonical 普通数据入队，总环留一格结束符，满则拒存。
+    /// 在规范模式下追加一个普通数据字节，固定预留最后一个槽位给行结束符（`\n` / `VEOL` / `VEOF`）。
     fn push_canon_data(&mut self, byte: u8) -> bool {
         if self.pending_eof || INPUT_CAPACITY - 1 <= self.len {
             return false;
@@ -160,27 +203,27 @@ impl InputQueue {
         self.push_byte(byte)
     }
 
-    /// 返回 canonical 普通数据能否容下完整扩展字节数。
+    /// 检查规范模式下是否还能容纳 `count` 个普通数据字节（同时保留 1 个行结束符槽位）。
     fn canon_data_fits(&self, count: usize) -> bool {
         !self.pending_eof && self.len + count < INPUT_CAPACITY
     }
 
-    /// 查看距读出端指定偏移的字节。
+    /// 读取距离队首 `tail` 偏移 `offset` 处的字节值（不消费）。
     fn at(&self, offset: usize) -> u8 {
         self.bytes[(self.tail + offset) % INPUT_CAPACITY]
     }
 
-    /// 返回距读出端指定偏移的字节是否为记录分隔。
+    /// 判断距离队首 `tail` 偏移 `offset` 处的字节是否带有行结束标记（`eol`）。
     fn is_eol(&self, offset: usize) -> bool {
         self.eol[(self.tail + offset) % INPUT_CAPACITY]
     }
 
-    /// 返回距读出端指定偏移的字节是否为 EOF 占位。
+    /// 判断距离队首 `tail` 偏移 `offset` 处的字节是否为 `VEOF` 零长度占位项。
     fn is_eof(&self, offset: usize) -> bool {
         self.eof[(self.tail + offset) % INPUT_CAPACITY]
     }
 
-    /// 消费读出端指定数量的字节；腾出首格立即发表挂起 EOF。
+    /// 从队首消费 `count` 个字节；若此前因队列满而挂起了 `pending_eof`，则在腾出空间后立即将其补入队尾。
     fn consume(&mut self, count: usize) {
         for _ in 0..count {
             self.eol[self.tail] = false;
@@ -203,15 +246,18 @@ impl InputQueue {
         }
     }
 
-    /// 提交当前编辑尾为一条记录；调用者保证编辑尾非空。
+    /// 将当前非空的编辑尾提交为一条完整记录（在最后一个入队字节上标记 `eol = true` 并更新 `committed`）。
     fn commit_record(&mut self) {
         let index = (self.head + INPUT_CAPACITY - 1) % INPUT_CAPACITY;
         self.eol[index] = true;
         self.committed = self.len;
     }
 
-    /// 提交一个空 EOF 占位；满时挂起一次边界，后继数据阻塞计 overrun。
-    /// 第二个额外 EOF 超额度返回假，调用者计真实 overrun。
+    /// 提交一个空行的 `VEOF` 占位符，使下一次读完前序记录后的 `read` 返回 0（EOF）。
+    ///
+    /// - 若队列未满，直接推入一个同时标记 `eol` 与 `eof` 的占位槽位；
+    /// - 若队列已满且尚未挂起过 `pending_eof`，则设置 `pending_eof = true`，待后续消费腾出空间时补入；
+    /// - 若 `pending_eof` 已经为 `true`，说明已有挂起的 `EOF` 尚未被消费，返回 `false` 由调用方计入输入溢出（Overrun）。
     fn commit_eof(&mut self) -> bool {
         if self.pending_eof {
             return false;
@@ -223,12 +269,12 @@ impl InputQueue {
             self.committed = self.len;
             return true;
         }
-        // 环满且编辑尾为空时挂起；编辑尾非空不应到此（应 commit_record）。
+        // 环形缓冲区已满且当前编辑尾为空，挂起一次 EOF 边界。
         self.pending_eof = true;
         true
     }
 
-    /// 丢弃未提交编辑尾的最后一个字符，返回被删字节与列宽。
+    /// 从未提交编辑尾擦除最后一个字符（若开启 `utf8` 则回退完整的 UTF-8 多字节序列），返回被删首字节与字节长度。
     fn erase_char(&mut self, utf8: bool) -> Option<(u8, usize)> {
         if self.edit_len() == 0 {
             return None;
@@ -236,6 +282,7 @@ impl InputQueue {
         let boundary = self.committed_index();
         let mut start = (self.head + INPUT_CAPACITY - 1) % INPUT_CAPACITY;
         let mut count = 1;
+        // 若开启 IUTF8，跳过所有形如 10xxxxxx 的 UTF-8 延续字节，定位到该字符的首字节。
         if utf8 {
             while start != boundary {
                 let byte = self.bytes[start];
@@ -261,7 +308,7 @@ impl InputQueue {
         Some((byte, count))
     }
 
-    /// 观察未提交编辑尾的最后一个字节。
+    /// 查看未提交编辑尾的最后一个字节（不移除）。
     fn edit_last(&self) -> Option<u8> {
         if self.edit_len() == 0 {
             return None;
@@ -269,7 +316,7 @@ impl InputQueue {
         Some(self.bytes[(self.head + INPUT_CAPACITY - 1) % INPUT_CAPACITY])
     }
 
-    /// 丢弃整个未提交编辑尾。
+    /// 清空整个未提交编辑尾（保留已提交的记录不变）。
     fn erase_line(&mut self) {
         let edit = self.edit_len();
         for _ in 0..edit {
@@ -281,20 +328,23 @@ impl InputQueue {
     }
 }
 
-/// 固定容量的回显操作环。
+/// 固定容量的回显操作环形队列。
+///
+/// 输入路径在接收或编辑字符时先将高层回显指令（如普通字节、控制字符、擦除制表符、擦除整行）推入此队列，
+/// 随后由 `NttyState::process_echo` 按当前输出列号将其展开为具体的输出字节并送入 `OutputQueue`。
 pub struct EchoQueue {
-    /// 环形操作存储。
+    /// 环形操作项存储数组（容量 `ECHO_CAPACITY` 项）。
     items: [EchoItem; ECHO_CAPACITY],
-    /// 读出下标。
+    /// 队首读出下标（`0..ECHO_CAPACITY`）。
     tail: usize,
-    /// 写入下标。
+    /// 队尾写入下标（`0..ECHO_CAPACITY`）。
     head: usize,
-    /// 已保存项数。
+    /// 当前队列中待展开的回显操作项数量（`0..=ECHO_CAPACITY`）。
     len: usize,
 }
 
 impl EchoQueue {
-    /// 建立空回显队列。
+    /// 创建空的回显操作队列。
     pub const fn new() -> Self {
         Self {
             items: [EchoItem {
@@ -307,25 +357,26 @@ impl EchoQueue {
         }
     }
 
-    /// 返回已保存项数。
+    /// 返回队列中待处理的回显操作项数量。
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 返回队列是否为空。
+    /// 判断回显操作队列是否为空。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 清空全部回显操作。
+    /// 清空所有待处理的回显操作项。
     pub fn clear(&mut self) {
         self.tail = 0;
         self.head = 0;
         self.len = 0;
     }
 
-    /// 追加一个回显项，满时返回假。
-    /// 调用者先按本次编辑最大展开量 reserve，失败回压输入不丢尾。
+    /// 向队尾推入一个回显操作项；队列已满时返回 `false`。
+    ///
+    /// 调用方在修改输入队列前会先通过 `echo_reserve` 预留本次操作所需的最大槽位数，保证回显与输入状态严格同步。
     fn push(&mut self, op: u8, value: u8) -> bool {
         if self.len == ECHO_CAPACITY {
             return false;
@@ -336,7 +387,7 @@ impl EchoQueue {
         true
     }
 
-    /// 取出读出端一项。
+    /// 弹出并返回队首的回显操作项。
     fn pop(&mut self) -> Option<EchoItem> {
         if self.len == 0 {
             return None;
@@ -347,7 +398,7 @@ impl EchoQueue {
         Some(item)
     }
 
-    /// 查看读出端一项。
+    /// 查看队首的回显操作项（不弹出）。
     fn peek(&self) -> Option<EchoItem> {
         if self.len == 0 {
             return None;
@@ -356,20 +407,22 @@ impl EchoQueue {
     }
 }
 
-/// 固定容量的输出字节环。
+/// 固定容量的终端输出字节环形队列。
+///
+/// 保存已完成 `OPOST` 输出后处理及回显展开、等待写入底层 UART 发送寄存器的字节流。
 pub struct OutputQueue {
-    /// 环形字节存储。
+    /// 存放待发送字节的环形数组（容量 `OUTPUT_CAPACITY` 字节）。
     bytes: [u8; OUTPUT_CAPACITY],
-    /// 读出下标。
+    /// 队首读出下标（`0..OUTPUT_CAPACITY`）。
     tail: usize,
-    /// 写入下标。
+    /// 队尾写入下标（`0..OUTPUT_CAPACITY`）。
     head: usize,
-    /// 已保存字节数。
+    /// 当前队列中待发送的字节数（`0..=OUTPUT_CAPACITY`）。
     len: usize,
 }
 
 impl OutputQueue {
-    /// 建立空输出队列。
+    /// 创建空的输出字节环形队列。
     pub const fn new() -> Self {
         Self {
             bytes: [0; OUTPUT_CAPACITY],
@@ -379,29 +432,29 @@ impl OutputQueue {
         }
     }
 
-    /// 返回已保存字节数。
+    /// 返回队列中当前待发送的字节数。
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 返回队列是否为空。
+    /// 判断输出队列是否为空。
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 返回剩余可写入字节数。
+    /// 返回输出队列剩余可写入的空闲字节数（`OUTPUT_CAPACITY - len`）。
     pub fn space(&self) -> usize {
         OUTPUT_CAPACITY - self.len
     }
 
-    /// 清空全部输出字节。
+    /// 清空全部待发送的输出字节。
     pub fn clear(&mut self) {
         self.tail = 0;
         self.head = 0;
         self.len = 0;
     }
 
-    /// 追加一个字节，满时返回假。
+    /// 在队尾追加一个待发送字节；队列已满时返回 `false`。
     pub fn push(&mut self, byte: u8) -> bool {
         if self.len == OUTPUT_CAPACITY {
             return false;
@@ -412,7 +465,7 @@ impl OutputQueue {
         true
     }
 
-    /// 取出读出端一个字节。
+    /// 弹出并返回队首的一个待发送字节。
     pub fn pop(&mut self) -> Option<u8> {
         if self.len == 0 {
             return None;
@@ -423,7 +476,7 @@ impl OutputQueue {
         Some(byte)
     }
 
-    /// 查看读出端一个字节。
+    /// 查看队首的一个待发送字节（不弹出）。
     pub fn peek(&self) -> Option<u8> {
         if self.len == 0 {
             return None;
@@ -432,16 +485,22 @@ impl OutputQueue {
     }
 }
 
-/// 一次采样产生的真实就绪变化与待锁外递送的前台信号。
+/// 处理单个输入采样后产生的就绪状态变化与待投递信号汇总。
+///
+/// 由于 `NttyState` 运行在自旋锁临界区内，不能直接获取任务图锁发送信号或通知唤醒队列，
+/// 因此通过本结构体将副作用返回给外层调用者在释放自旋锁后执行。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReceiveOutcome {
+    /// 输入队列的已提交可读状态是否发生变化（需唤醒读等待者 / `POLLIN`）。
     pub read_changed: bool,
+    /// 回显、流控或输出状态是否发生变化（需唤醒写等待者 / `POLLOUT` 或触发发送泵）。
     pub write_changed: bool,
+    /// 识别到信号控制字符或 `BRKINT` 时需向控制终端前台进程组发送的信号编号（如 `SIGINT`、`SIGQUIT`、`SIGTSTP`）。
     pub signal: Option<u8>,
 }
 
 impl ReceiveOutcome {
-    /// 将纯队列变化转换为没有信号的输入效果。
+    /// 根据 `(read_changed, write_changed)` 元组构造不含前台信号的 `ReceiveOutcome`。
     fn changes((read_changed, write_changed): (bool, bool)) -> Self {
         Self {
             read_changed,
@@ -451,53 +510,55 @@ impl ReceiveOutcome {
     }
 }
 
-/// 行规程短锁保护的全部状态。
+/// `N_TTY` 行规程的完整运行时状态（由端点自旋锁 `Endpoint::state` 保护）。
 pub struct NttyState {
-    /// 当前 termios 配置。
+    /// 当前生效的 `termios` 终端配置。
     pub termios: Termios,
-    /// 输入字节与记录队列。
+    /// 终端输入字节与规范行记录环形队列。
     pub input: InputQueue,
-    /// 回显操作队列。
+    /// 待展开为输出字节的回显操作环形队列。
     pub echo: EchoQueue,
-    /// 输出字节队列。
+    /// 已完成输出后处理、等待写入串口硬件的输出字节队列。
     pub output: OutputQueue,
-    /// 当前输出列。
+    /// 当前终端光标所在的逻辑列号（从 0 开始，用于制表符展开与退格计算）。
     pub column: usize,
-    /// 规范行首列。
+    /// 当前规范模式输入行开始时的光标列号（用于退格边界保护与 `ECHOKE` 整行擦除）。
     pub canon_column: usize,
-    /// 软件流控停止状态。
+    /// 输出是否因软件流控（收到 `VSTOP`）或 `TCXONC(TCOOFF)` 而处于暂停状态。
     pub stopped: bool,
-    /// TCXONC 停止状态。
+    /// 输出是否由 `ioctl(TCXONC, TCOOFF)` 显式暂停（为 `true` 时收到 `IXANY` 任意字符不会自动恢复输出）。
     pub tco_stopped: bool,
-    /// 优先输出字符。
+    /// 高优先级待发送单字节（由 `TCIOFF`/`TCION` 设置的 `VSTOP`/`VSTART`，优先于普通输出队列发送且不受流控暂停阻塞）。
     pub xchar: Option<u8>,
-    /// 真实输入溢出计数。
+    /// 硬件 FIFO 溢出或软件输入/回显队列满导致的累计丢包计数。
     pub overrun: usize,
-    /// 独立打开计数。
+    /// 当前处于活跃未挂断状态的打开文件描述（OFD）引用计数。
     pub opens: usize,
-    /// DTR 线状态。
+    /// 串口调制解调器控制线 DTR（Data Terminal Ready）当前逻辑状态。
     pub dtr: bool,
-    /// RTS 线状态。
+    /// 串口调制解调器控制线 RTS（Request To Send）当前逻辑状态。
     pub rts: bool,
-    /// 当前硬件分频。
+    /// 最近一次配置到 8250 硬件的 16 位波特率分频系数（单位：时钟周期数）。
     pub divisor: u16,
-    /// 挂起重显快照：echo 满时保存旧行拥有字节。
+    /// `VREPRINT`（`^R`）触发的未提交行重印快照状态（当输出队列空间不足时分多轮增量展开）。
     pub pending_reprint: Option<PendingReprint>,
 }
 
-/// 挂起重显的拥有快照与进度，不保存可变环指针。
+/// `VREPRINT` 触发的当前编辑行重印快照。
+///
+/// 将触发重印时刻的未提交行字节拷贝为独立快照，避免在分批展开回显期间受后续输入编辑指针移动的影响。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingReprint {
-    /// 旧行字节快照。
+    /// 未提交编辑行的字节副本数组。
     pub bytes: [u8; INPUT_CAPACITY],
-    /// 快照有效长度。
+    /// 快照中的有效字节总数（`0..=INPUT_CAPACITY`）。
     pub len: usize,
-    /// 已生成字节数。
+    /// 已经成功展开并推入输出队列的字节数（`0..=len`）。
     pub done: usize,
 }
 
 impl NttyState {
-    /// 用默认 termios 建立行规程状态。
+    /// 使用默认 `termios` 配置初始化空的 `N_TTY` 行规程状态。
     pub const fn new() -> Self {
         Self {
             termios: Termios {
@@ -525,30 +586,36 @@ impl NttyState {
         }
     }
 
-    /// 返回输出丢弃状态，与 termios 快照同一位。
+    /// 判断当前是否处于 `FLUSHO` 输出丢弃状态（开启时用户写入和回显直接丢弃而不进入硬件发送）。
     pub fn flusho(&self) -> bool {
         self.termios.lflag & super::termios::FLUSHO != 0
     }
 
-    /// 处理一个采样，只记录输入效果；实际组信号必须在全部业务锁外发送。
+    /// 处理来自 UART 接收环的单个硬件采样（含状态位与数据字节）。
+    ///
+    /// 在端点自旋锁 `state` 临界区内调用；仅更新行规程内部队列与状态，若触发了前台信号则通过返回值交由调用方在锁外发送。
     pub fn receive_sample(&mut self, sample: RxSample) -> ReceiveOutcome {
         let termios = self.termios;
+        // Step 1: 优先处理线路 BREAK 状态。
         if sample.status & UART_LSR_BREAK != 0 {
             return self.receive_break(termios);
         }
+        // Step 2: 处理奇偶校验错误或帧错误。
         if sample.status & (UART_LSR_PARITY | UART_LSR_FRAME) != 0 {
             return ReceiveOutcome::changes(self.receive_parity_error(termios, sample.byte));
         }
+        // Step 3: 累计硬件接收 FIFO 溢出（Overrun）计数。
         if sample.status & UART_LSR_OVERRUN != 0 {
             self.overrun += 1;
         }
+        // Step 4: 若该采样包含有效数据字节，则进入常规字节解释流程。
         if sample.status & DATA_READY == 0 {
             return ReceiveOutcome::default();
         }
         self.receive_byte(termios, sample.byte)
     }
 
-    /// BRKINT 产生 INT；忽略与错误标记保持原输入顺序和完整容量边界。
+    /// 按 `IGNBRK`、`BRKINT`、`PARMRK` 标志处理接收到的线路 BREAK 事件。
     fn receive_break(&mut self, termios: Termios) -> ReceiveOutcome {
         if termios.iflag & IGNBRK != 0 {
             return ReceiveOutcome::default();
@@ -571,7 +638,7 @@ impl NttyState {
         ReceiveOutcome::changes(changed)
     }
 
-    /// 处理真实校验或帧错误，返回读写变化；PARMRK 按 FF 00 c 原序提交。
+    /// 按 `INPCK`、`IGNPAR`、`PARMRK` 标志处理带有奇偶校验错误或帧错误的输入字节。
     fn receive_parity_error(&mut self, termios: Termios, byte: u8) -> (bool, bool) {
         if termios.iflag & INPCK == 0 {
             return self.queue_input_byte(termios, byte);
@@ -585,7 +652,9 @@ impl NttyState {
         self.queue_input_byte(termios, 0)
     }
 
-    /// 原子提交错误标记字节组，容量/回显先完整 reserve，失败整组丢弃。
+    /// 原子地向输入队列提交 `PARMRK` 错误标记字节序列（如 `[0xff, 0x00, byte]`）。
+    ///
+    /// 入队前先完整检查回显队列与输入队列是否能容纳整组字节；若空间不足则整组丢弃并计入 `overrun`，绝不写入半截标记。
     fn store_marked_bytes(&mut self, termios: Termios, marked: &[u8]) -> (bool, bool) {
         let canonical = termios.lflag & ICANON != 0;
         let need = if termios.lflag & ECHO != 0 {
@@ -631,7 +700,8 @@ impl NttyState {
         (true, true)
     }
 
-    /// 按 strip、literal-next、流控和信号顺序解释输入，不触任务图。
+    /// 按标准 `N_TTY` 优先级依次解释单个正常输入字节：
+    /// `lnext` 转义 ➔ `ISTRIP` 7 位截断 ➔ `IXON` 流控 ➔ `ISIG` 信号 ➔ `IXANY` 恢复 ➔ `VDISCARD` ➔ 回车换行转换 ➔ `ICANON` 规范编辑 ➔ 普通数据入队。
     fn receive_byte(&mut self, termios: Termios, mut byte: u8) -> ReceiveOutcome {
         if self.input.lnext {
             self.input.lnext = false;
@@ -706,7 +776,7 @@ impl NttyState {
         ReceiveOutcome::changes(self.store_data_byte(termios, byte))
     }
 
-    /// 处理软件流控字符，返回是否消费。
+    /// 识别并处理 `IXON` 软件流控字符（`VSTART` 恢复输出、`VSTOP` 暂停输出），返回该字节是否已被流控消费。
     fn receive_flow_control(&mut self, termios: Termios, byte: u8) -> bool {
         if byte == termios.cc[VSTART] && byte != DISABLED_CHAR {
             self.stopped = false;
@@ -719,7 +789,7 @@ impl NttyState {
         false
     }
 
-    /// 处理信号控制字符的本地解释与回显，不递送前台组。
+    /// 处理信号控制字符（`VINTR`、`VQUIT`、`VSUSP`）的本地队列清空（未设置 `NOFLSH` 时）与字符回显。
     fn receive_signal(&mut self, termios: Termios, byte: u8) -> bool {
         if termios.lflag & super::termios::NOFLSH == 0 {
             self.local_flush();
@@ -737,20 +807,24 @@ impl NttyState {
         true
     }
 
-    /// 信号 flush 只退休已解释输入和未发送输出，不丢接收 batch 后继采样。
+    /// 清空行规程内已接收的输入队列与待发送的输出/回显队列（用于信号触发的本地刷新，不丢弃底层串口尚未读取的后续硬件采样）。
     fn local_flush(&mut self) {
         self.input.clear();
         self.flush_output();
     }
 
-    /// 处理规范模式的编辑与记录字符，返回是否已消费；回显满回压输入。
+    /// 处理规范模式（`ICANON`）下的行编辑控制字符（`VERASE`/`VKILL`/`VWERASE`/`VLNEXT`/`VREPRINT`）与行提交字符（`\n`/`VEOF`/`VEOL`/`VEOL2`）。
+    ///
+    /// 返回 `true` 表示该字符已作为规范模式控制或分界字符处理完毕；返回 `false` 表示应作为普通数据字符入队。
     fn receive_canonical(&mut self, termios: Termios, byte: u8) -> bool {
+        // Step 1: 识别单字符擦除（VERASE）、整行擦除（VKILL）与单词擦除（VWERASE）。
         if (byte == termios.cc[VERASE] || byte == termios.cc[VKILL]) && byte != DISABLED_CHAR
             || (termios.lflag & IEXTEN != 0 && byte == termios.cc[VWERASE] && byte != DISABLED_CHAR)
         {
             self.erase_input(termios, byte);
             return true;
         }
+        // Step 2: 识别字面量转义（VLNEXT, ^V），开启 lnext 状态并回显 "^\b" 提示符。
         if termios.lflag & IEXTEN != 0 && byte == termios.cc[VLNEXT] && byte != DISABLED_CHAR {
             if termios.lflag & ECHO != 0 && termios.lflag & ECHOCTL != 0 && !self.echo_reserve(2) {
                 self.overrun += 1;
@@ -763,17 +837,18 @@ impl NttyState {
             }
             return true;
         }
+        // Step 3: 识别重印当前编辑行（VREPRINT, ^R）。
         if termios.lflag & IEXTEN != 0
             && termios.lflag & ECHO != 0
             && byte == termios.cc[VREPRINT]
             && byte != DISABLED_CHAR
         {
-            // 已有挂起重显时第二动作明确 overrun，不覆盖快照。
+            // 若上一次重印快照尚未展开完毕，不再覆盖旧快照，直接计入溢出。
             if self.pending_reprint.is_some() {
                 self.overrun += 1;
                 return true;
             }
-            // 前缀 2 项 + 重显操作 1 项。
+            // 预留 3 个回显槽位：VREPRINT 字符本身 + 换行符 + ECHO_REPRINT 指令。
             if !self.echo_reserve(3) {
                 self.overrun += 1;
                 return true;
@@ -782,6 +857,7 @@ impl NttyState {
             return true;
         }
 
+        // Step 4: 识别换行符（\n），回显换行并将当前编辑尾提交为可读记录。
         if byte == LINE_FEED {
             if termios.lflag & (ECHO | ECHONL) != 0 && !self.echo_reserve(1) {
                 self.overrun += 1;
@@ -797,6 +873,7 @@ impl NttyState {
             }
             return true;
         }
+        // Step 5: 识别文件结束符（VEOF, ^D）；编辑尾非空时提交当前行，为空时提交零长度 EOF 占位。
         if byte == termios.cc[VEOF] && byte != DISABLED_CHAR {
             if 0 < self.input.edit_len() {
                 self.input.commit_record();
@@ -805,6 +882,7 @@ impl NttyState {
             }
             return true;
         }
+        // Step 6: 识别附加行结束符（VEOL / VEOL2），入队并提交当前行。
         if (byte == termios.cc[VEOL] && byte != DISABLED_CHAR)
             || (termios.lflag & IEXTEN != 0 && byte == termios.cc[VEOL2] && byte != DISABLED_CHAR)
         {
@@ -832,7 +910,7 @@ impl NttyState {
             } else {
                 1
             };
-            // 结束符扩展自身占用终止槽，完整预留后无需再给下一字符留格。
+            // 行结束符本身即占用预留的终止槽位，只需确认总长度不超过 INPUT_CAPACITY。
             if self.input.pending_eof || INPUT_CAPACITY < self.input.len + count {
                 self.overrun += 1;
                 return true;
@@ -847,7 +925,9 @@ impl NttyState {
         false
     }
 
-    /// 把数据字节存入输入队列并回显，返回读写变化；回显满回压输入。
+    /// 将普通数据字节存入输入队列并生成对应回显，返回 `(read_changed, write_changed)`。
+    ///
+    /// 若回显队列空间不足，则拒绝接收该字节并计入 `overrun`（以回显背压输入，防止吃掉回显）。
     fn store_data_byte(&mut self, termios: Termios, byte: u8) -> (bool, bool) {
         let need = if termios.lflag & ECHO != 0 {
             if self.input.edit_len() == 0 {
@@ -865,7 +945,7 @@ impl NttyState {
             return (false, true);
         }
 
-        // 先落回显后存输入，保证输入满时回显已可见且不丢尾。
+        // 先写入回显指令再尝试推入输入队列，确保当输入队列满触发 IMAXBEL 时字符回显顺序一致。
         if termios.lflag & ECHO != 0 {
             if self.input.edit_len() == 0 {
                 let _ = self.echo_set_canon();
@@ -880,7 +960,7 @@ impl NttyState {
         }
 
         let canonical = termios.lflag & ICANON != 0;
-        // 0xFF 加倍需完整两格，先 reserve，失败不交残片。
+        // 开启 PARMRK 时，字面量 0xff 需双写为 [0xff, 0xff]；必须预先确认两格空间完整可用。
         if byte == 0xff && termios.iflag & PARMRK != 0 {
             let fits = if canonical {
                 self.input.canon_data_fits(2)
@@ -916,12 +996,12 @@ impl NttyState {
         (true, true)
     }
 
-    /// 把数据字节直接存入队列，不执行规范解释。
+    /// 将错误替换字节直接作为数据字节存入输入队列（跳过控制字符与规范编辑解释）。
     fn queue_input_byte(&mut self, termios: Termios, byte: u8) -> (bool, bool) {
         self.store_data_byte(termios, byte)
     }
 
-    /// 输入满时按 IMAXBEL 响铃或丢弃；输出满不伪成功。
+    /// 当输入队列已满无法接纳新字节时累加 `overrun`；若设置了 `IMAXBEL` 则尝试向输出队列推入响铃符（`BEL`）。
     fn bell_or_drop(&mut self, termios: Termios) {
         self.overrun += 1;
         if termios.iflag & IMAXBEL != 0 && !self.output.push(BELL) {
@@ -929,7 +1009,7 @@ impl NttyState {
         }
     }
 
-    /// 处理擦除、删词与删行；ECHOKE 用擦行操作保序增量生成。
+    /// 执行规范模式下的单字符擦除（`VERASE`）、单词擦除（`VWERASE`）或整行擦除（`VKILL`）。
     fn erase_input(&mut self, termios: Termios, byte: u8) {
         if self.input.edit_len() == 0 {
             return;
@@ -955,7 +1035,7 @@ impl NttyState {
                 }
                 return;
             }
-            // ECHOKE：删整行后入一个擦行操作，按列差增量生成，不预铺退格。
+            // 开启 ECHOKE 时：清空当前编辑尾，并推入一条 ECHO_ERASE_LINE 指令由 process_echo 按列差逐步生成退格擦除。
             if !self.echo_reserve(1) {
                 self.overrun += 1;
                 return;
@@ -995,10 +1075,12 @@ impl NttyState {
         }
     }
 
-    /// 擦除一个字符并回显；调用者已 reserve，失败不删输入。
+    /// 从未提交编辑尾擦除单个字符并推入对应的退格擦除回显指令。
+    ///
+    /// 在真正从 `input` 移除字符前先预留最多 6 个回显槽位（擦除 `^X` 控制字符需 6 个字节：2 次 `BS SPACE BS`），确保回显不会因队列满而丢失。
     fn erase_one(&mut self, termios: Termios) -> bool {
         let utf8 = termios.iflag & IUTF8 != 0;
-        // 先按最大 6 项退格 reserve，再删输入，保证不丢回显尾。
+        // 预留单字符擦除所需的最大 6 个回显操作槽位。
         if termios.lflag & ECHO != 0 && !self.echo_reserve(6) {
             self.overrun += 1;
             return false;
@@ -1052,7 +1134,7 @@ impl NttyState {
         true
     }
 
-    /// 重显当前未提交行；前缀与重显操作入 FIFO，快照保序展开。
+    /// 处理 `VREPRINT`（`^R`）：先回显 `^R\n`，再将当前未提交编辑行保存为 `pending_reprint` 快照并推入 `ECHO_REPRINT` 指令。
     fn reprint_line(&mut self, termios: Termios) {
         let _ = self.echo_char(termios, termios.cc[VREPRINT]);
         let _ = self.echo_raw(LINE_FEED);
@@ -1076,12 +1158,12 @@ impl NttyState {
         let _ = self.echo.push(ECHO_REPRINT, 0);
     }
 
-    /// 回显一个原始字节，满时返回假，调用者回压输入。
+    /// 向回显队列推入单个原始字节输出指令（`ECHO_BYTE`）。
     fn echo_raw(&mut self, byte: u8) -> bool {
         self.echo.push(ECHO_BYTE, byte)
     }
 
-    /// 回显一个字符，控制字符按 ECHOCTL 加标记，满时返回假。
+    /// 向回显队列推入单个字符回显指令；若开启 `ECHOCTL` 且为非制表符的 ASCII 控制字符，则推入 `ECHO_CONTROL`（展开为 `^X`）。
     fn echo_char(&mut self, termios: Termios, byte: u8) -> bool {
         if termios.lflag & ECHOCTL != 0 && byte.is_ascii_control() && byte != b'\t' {
             self.echo.push(ECHO_CONTROL, byte)
@@ -1090,17 +1172,19 @@ impl NttyState {
         }
     }
 
-    /// 记录规范行首列，满时返回假。
+    /// 向回显队列推入记录规范行起始列的指令（`ECHO_SET_CANON`）。
     fn echo_set_canon(&mut self) -> bool {
         self.echo.push(ECHO_SET_CANON, 0)
     }
 
-    /// 按本次编辑最大展开量预留回显空间，不足返回假。
+    /// 检查回显队列剩余空间是否足以容纳 `count` 个回显操作项。
     fn echo_reserve(&self, count: usize) -> bool {
         self.echo.len() + count <= ECHO_CAPACITY
     }
 
-    /// 把回显操作展开为输出字节，返回是否仍有未处理尾。
+    /// 将回显队列中的指令逐项展开为输出字节并推入 `OutputQueue`。
+    ///
+    /// 返回 `true` 表示仍有未展开完毕的回显指令（因输出队列空间不足或达到单轮步数预算 `ECHO_EXPANSION_BUDGET` 而暂停）。
     pub fn process_echo(&mut self) -> bool {
         let termios = self.termios;
         while let Some(item) = self.echo.peek() {
@@ -1217,7 +1301,7 @@ impl NttyState {
         false
     }
 
-    /// 返回按当前 termios/列加工一个字节所需的完整输出槽数。
+    /// 计算在当前 `termios` 与光标列号 `column` 下，经过 `OPOST` 输出一个字节最多需要占用的输出队列字节数。
     pub fn output_required_space(&self, termios: Termios, byte: u8) -> usize {
         if termios.oflag & OPOST == 0 {
             return 1;
@@ -1230,7 +1314,7 @@ impl NttyState {
         }
     }
 
-    /// 返回输出队列能否接受一个字节的完整展开；丢弃态直接可接受。
+    /// 判断输出队列当前剩余空间是否足以完整接纳单个字节 `byte` 展开后的输出（若处于 `FLUSHO` 丢弃态则恒返回 `true`）。
     pub fn output_can_accept(&self, termios: Termios, byte: u8) -> bool {
         if self.flusho() {
             return true;
@@ -1238,14 +1322,16 @@ impl NttyState {
         self.output_required_space(termios, byte) <= self.output.space()
     }
 
-    /// 按输出模式加工一个字节，空间不足返回假且不消费输入。
+    /// 按当前 `termios` 输出模式（`OPOST`、`ONLCR`、`OCRNL`、`ONOCR`、`ONLRET`、`TAB3`）处理单个字节并推入输出队列，同时更新光标列号。
+    ///
+    /// 若输出队列剩余空间不足以容纳该字节展开后的全部字节，则不修改任何状态并返回 `false`。
     pub fn output_byte(&mut self, termios: Termios, byte: u8) -> bool {
         if self.output.space() < self.output_required_space(termios, byte) {
             return false;
         }
         if termios.oflag & OPOST == 0 {
             if !byte.is_ascii_control() && termios.iflag & IUTF8 != 0 && byte & 0xc0 == 0x80 {
-                // UTF-8 后续字节不推进列。
+                // UTF-8 多字节字符的后续延续字节不增加列宽。
             } else if !byte.is_ascii_control() {
                 self.column += 1;
             } else if byte == BACKSPACE && 0 < self.column {
@@ -1311,7 +1397,10 @@ impl NttyState {
         }
     }
 
-    /// 切换 ICANON 时建立明确边界，不重解释已有字节。
+    /// 切换规范模式（`ICANON`）与非规范模式时重整输入队列的提交边界。
+    ///
+    /// - 从非规范模式切换到规范模式时，将队列中已有的字节整体标记为一条已提交记录；
+    /// - 从规范模式切换到非规范模式时，移除队列中所有的零长度 `VEOF` 占位符，并将全部剩余数据标记为已提交可读。
     pub fn set_canonical(&mut self, canonical: bool) {
         let was = self.termios.lflag & ICANON != 0;
         if was == canonical {
@@ -1335,7 +1424,7 @@ impl NttyState {
         self.input.lnext = false;
     }
 
-    /// 退休环内全部 EOF 占位 token，原环向前 compact 保数据与 eol 顺序。
+    /// 移除输入环形队列中所有的零长度 `VEOF` 占位槽位，并将有效数据字节与 `eol` 标记向前紧凑压缩。
     fn retire_eof_tokens(&mut self) {
         if self.input.is_empty() {
             self.input.pending_eof = false;
@@ -1362,7 +1451,7 @@ impl NttyState {
             write += 1;
         }
 
-        // 清尾部残留标记，读指针仍在写指针前。
+        // 清除压缩后尾部空闲槽位上残留的 eol 与 eof 标记。
         let mut i = write;
         while i < len {
             let at = (self.input.tail + i) % INPUT_CAPACITY;
@@ -1377,7 +1466,7 @@ impl NttyState {
         self.input.pending_eof = false;
     }
 
-    /// 规范读专用：返回已提交记录在本次请求内的可交付长度与是否含 EOF。
+    /// 计算规范模式下单次读取请求（上限 `max` 字节）可从队首获取的字节数，以及是否在末尾遇到了 `VEOF` 占位符。
     pub fn canonical_available(&self, max: usize) -> (usize, bool) {
         let committed = self.input.committed_len();
         if max == 0 {
@@ -1400,7 +1489,7 @@ impl NttyState {
         (length, false)
     }
 
-    /// 规范读专用：查看已提交记录，不消费。
+    /// 规范模式读取预览：将当前首条已提交记录的前缀拷贝到 `out`（不从队列移除），返回 `(拷贝字节数, 是否遇到 EOF)`。
     pub fn peek_canonical(&self, out: &mut [u8]) -> (usize, bool) {
         let (length, eof) = self.canonical_available(out.len());
         for (slot, offset) in out.iter_mut().zip(0..length) {
@@ -1409,7 +1498,7 @@ impl NttyState {
         (length, eof)
     }
 
-    /// 规范读专用：消费已交付前缀，EOF 占位随零长度前缀一起消费。
+    /// 规范模式读取消费：从输入队列移除已成功拷贝到用户空间的 `delivered` 个字节（若因队首 `VEOF` 返回 0 字节，则消费该 1 字节的 `VEOF` 占位符）。
     pub fn consume_canonical(&mut self, delivered: usize, eof: bool) {
         if eof && delivered == 0 {
             if 0 < self.input.committed_len() && self.input.is_eof(0) {
@@ -1420,7 +1509,7 @@ impl NttyState {
         self.input.consume(delivered);
     }
 
-    /// 非规范读专用：查看已提交字节，不消费。
+    /// 非规范模式读取预览：将队首最多 `out.len()` 个已提交字节拷贝到 `out`（不从队列移除），返回拷贝的字节数。
     pub fn peek_raw(&self, out: &mut [u8]) -> usize {
         let available = self.input.committed_len().min(out.len());
         for (slot, offset) in out.iter_mut().zip(0..available) {
@@ -1429,12 +1518,15 @@ impl NttyState {
         available
     }
 
-    /// 非规范读专用：消费已交付前缀。
+    /// 非规范模式读取消费：从输入队列移除已成功交付给用户的 `delivered` 个字节。
     pub fn consume_raw(&mut self, delivered: usize) {
         self.input.consume(delivered);
     }
 
-    /// 返回 poll 读就绪谓词。
+    /// 判断当前终端对于 `poll` / `epoll` 是否处于可读就绪状态（`POLLIN`）。
+    ///
+    /// - 规范模式下：存在已提交记录（`committed_len() > 0`）即就绪；
+    /// - 非规范模式下：当 `VTIME == 0 && VMIN > 0` 时需已提交字节数达到 `VMIN`，否则只要有任意字节（`> 0`）即就绪。
     pub fn poll_readable(&self) -> bool {
         if self.termios.lflag & ICANON != 0 {
             0 < self.input.committed_len()
@@ -1449,17 +1541,17 @@ impl NttyState {
         }
     }
 
-    /// 返回 poll 写就绪谓词。
+    /// 判断当前终端对于 `poll` / `epoll` 是否处于可写就绪状态（`POLLOUT`：输出队列有剩余空间）。
     pub fn poll_writable(&self) -> bool {
         0 < self.output.space()
     }
 
-    /// 丢弃未读输入。
+    /// 丢弃输入队列中所有未读字节与未提交编辑状态（对应 `TCIFLUSH`）。
     pub fn flush_input(&mut self) {
         self.input.clear();
     }
 
-    /// 丢弃未发送输出与回显，取消挂起重显。
+    /// 丢弃输出队列、回显队列、高优先级流控字符 `xchar` 以及未完成的重印快照（对应 `TCOFLUSH`）。
     pub fn flush_output(&mut self) {
         self.output.clear();
         self.echo.clear();
@@ -1467,7 +1559,7 @@ impl NttyState {
         self.pending_reprint = None;
     }
 
-    /// 返回软件队列、优先字符与挂起重显是否全部为空。
+    /// 判断软件层面的所有待发送数据（输出队列、回显队列、高优先级字符 `xchar`、挂起重印快照）是否已全部排空。
     pub fn output_empty(&self) -> bool {
         self.output.is_empty()
             && self.echo.is_empty()

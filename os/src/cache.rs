@@ -1,4 +1,67 @@
-//! 元数据视图共用 Disk 的物理页；文件页使用同一稀疏索引和原页状态。
+//! 页缓存子系统（Page Cache）：统一管理磁盘元数据缓存（`MetadataCache`）与文件页缓存（`FileMapping`）。
+//!
+//! ## 模块职责与架构定位
+//! 本模块位于虚拟文件系统（`crate::fs`）、内存管理（`crate::mm`）与块设备层（`crate::block`）之间：
+//! - **向上（VFS / Ext4 / 进程地址空间）**：为文件读写、`mmap` 内存映射提供以 4KiB 物理页（`FolioRef`）
+//!   为单位的稀疏文件缓存（`FileMapping`）；为文件系统超级块、块组描述符、Inode 表和目录/Extent 树
+//!   提供支持 1KiB / 2KiB / 4KiB 块粒度的元数据窗口视图（`MetadataCache` 与 `BufferRef`）。
+//! - **向下（块设备层与物理内存回收）**：通过 `FsClaim` 提交块设备读写 I/O，协调回写错误序列
+//!   （`WritebackError`），并配合 `crate::mm::reclaim` 扫描全局文件页 LRU、卸载用户态页表映射及回收干净页。
+//!
+//! ## 核心设计与关键布局
+//!
+//! ### 1. 物理盘共享元数据页域与分区视图（`MetadataPages` vs `MetadataCache`）
+//! 同一块物理磁盘（`Disk`）仅维护唯一的一套 `MetadataPages`（含容量受限的 `FolioIndex` 和
+//! 预留内存池 `BioReserve`）。磁盘上的不同分区或卷各自持有独立的 `MetadataCache` 门面（Facade）：
+//!
+//! ```text
+//!   MetadataCache (Partition A)          MetadataCache (Partition B)
+//!   - claim: FsClaim (Range A)           - claim: FsClaim (Range B)
+//!   - selected: SpinLock<Vec<u64>>       - selected: SpinLock<Vec<u64>>
+//!   - wb_error: WritebackError           - wb_error: WritebackError
+//!                 \                                 /
+//!                  +---------------+---------------+
+//!                                  | Arc<MetadataPages>
+//!                                  v
+//!                     MetadataPages (Per Physical Disk)
+//!                     - index: FolioIndex (key = disk byte offset)
+//!                     - reserve: Option<Arc<BioReserve>>
+//! ```
+//! 当分区起止扇区未按 4KiB 页对齐时，相邻两个分区的边界可能共享同一个 4KiB 物理页的
+//! 不同扇区（通过 `MetadataCache::page_mask` 计算 8 位扇区掩码隔离各自的有效/脏/回写扇区），
+//! 且跨页的元数据块通过 `BufferRef { folio, tail: Some(...) }` 透明拼接。
+//!
+//! ### 2. 回写错误状态字（`WritebackError`，参考经典的 `errseq_t` 32 位位图算法）
+//! 为了在无需动态分配错误队列的前提下向多个独立的文件描述符（OFD）或同步调用者准确报告后台回写错误，
+//! `WritebackError::value` 将错误码、观察标记与发生计数器编码在同一个 `u32` 中：
+//!
+//! ```text
+//!  31                                   13    12 11               0
+//! +---------------------------------------+-----+------------------+
+//! |         Error Counter (19 bits)       |SEEN |  Errno (12 bits) |
+//! +---------------------------------------+-----+------------------+
+//!                                            ^
+//!                                   ERRSEQ_SHIFT = 12
+//! ```
+//! - **Bits `[11:0]`（`ERRSEQ_ERRNO`）**：最近一次回写失败对应的 POSIX `Errno` 值。
+//! - **Bit `12`（`ERRSEQ_SEEN`）**：标记当前记录的错误是否已被至少一个观察者读取过。
+//!   - 若新观察者打开文件时 `SEEN == 0`（存在尚未被任何人观测到的历史错误），`sample()` 返回 `0`，
+//!     确保后续首次 `fsync` 仍能捕获该错误；
+//!   - 仅当 `SEEN == 1` 时，新写入的错误才会将高 19 位计数器加 1（`+ ERRSEQ_INCREMENT`），
+//!     避免未被观测的连续错误冲掉游标差值。
+//!
+//! ## 锁获取顺序与并发契约
+//! 1. **文件截断与回收锁顺序**：
+//!    `Inode` 写互斥锁 ➔ `Inode` 失效睡眠锁（`invalidate`） ➔ `FileMapping::writeback`（睡眠锁）
+//!    ➔ `Folio::lock_content`（页内容睡眠锁） ➔ `FileMapping::ranges`（反向映射自旋锁）
+//!    ➔ `PteDomain` 页表锁。
+//! 2. **索引与 LRU 锁顺序**：
+//!    `FolioIndex::entries`（自旋锁） ➔ `index::FILE_LRU`（全局 LRU 自旋锁） ➔ `Folio` 内部状态自旋锁。
+//! 3. **元数据预留池初始化锁顺序**：
+//!    `MetadataPages::reserve_init`（睡眠读写锁） ➔ `FolioIndex::entries`（自旋锁） / `MetadataPages::reserve`（自旋锁）。
+//! 4. **跨页元数据块内容锁顺序**：
+//!    `BufferRef` 访问跨越两个相邻物理页的块时，严格按照磁盘字节偏移升序依次获取首页（`self.folio`）
+//!    与尾页（`tail`）的 `lock_content()`，杜绝 AB-BA 死锁。
 
 mod index;
 
@@ -24,32 +87,43 @@ use crate::syscall::Errno;
 use crate::task::{ReclaimMode, ReclaimScope};
 use index::{FileRole, IndexAllocator, Node, NodeRef, RetiredNode, Tree};
 
-/// 内容状态从节点自己的 folio 读取；ToWrite 只标记本轮选中的原节点。
+/// 页缓存范围扫描时用于筛选节点的标记条件。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FolioMark {
+    /// 筛选包含脏扇区（`dirty_sectors() != 0`）的物理页。
     Dirty,
+    /// 筛选正在进行块设备回写（`writeback_sectors() != 0`）的物理页。
     Writeback,
+    /// 筛选在当前同步批次中已被 `mark_to_write_range` 标记为待写回的节点。
     ToWrite,
 }
 
+/// `WritebackError` 状态字中低位 `Errno` 字段的位宽（12 位）。
 const ERRSEQ_SHIFT: u32 = 12;
+/// 提取 `WritebackError` 低 12 位 `Errno` 的掩码（`0xfff`）。
 const ERRSEQ_ERRNO: u32 = (1 << ERRSEQ_SHIFT) - 1;
+/// 标记当前错误已被至少一个调用方观测过的标志位（第 12 位，`0x1000`）。
 const ERRSEQ_SEEN: u32 = 1 << ERRSEQ_SHIFT;
+/// 当已被观测过的错误之后再次发生新错误时，向高 19 位计数器累加的步进值（第 13 位，`0x2000`）。
 const ERRSEQ_INCREMENT: u32 = 1 << (ERRSEQ_SHIFT + 1);
 
-/// 当前文件缓存支持的固定块规格，独立于设备扇区与内存页大小。
+/// 文件系统与元数据缓存支持的 1KiB 逻辑块大小（字节）。
 pub(crate) const FILE_BLOCK_BYTES_1K: usize = 1024;
+/// 文件系统与元数据缓存支持的 2KiB 逻辑块大小（字节）。
 pub(crate) const FILE_BLOCK_BYTES_2K: usize = 2 * FILE_BLOCK_BYTES_1K;
+/// 文件系统与元数据缓存支持的 4KiB 逻辑块大小（字节）。
 pub(crate) const FILE_BLOCK_BYTES_4K: usize = 4 * FILE_BLOCK_BYTES_1K;
 
-/// 固定宽度错误序列保留最后具体错误，不建立逐次错误链。
+/// 采用 32 位 `errseq_t` 位图算法记录异步回写错误的状态机，同时保留最后一次具体的 `FsError`。
 struct WritebackError {
+    /// 编码了低 12 位 `Errno`、第 12 位 `SEEN` 标志及高 19 位错误计数器的状态字（0 表示从未出错）。
     value: u32,
+    /// 最近一次记录的具体文件系统错误枚举，供 `check_and_advance` 精确返回。
     error: Option<FsError>,
 }
 
 impl WritebackError {
-    /// 零值表示从未发生错误，构造不分配存储。
+    /// 创建一个初始无错误记录的 `WritebackError` 状态机。
     const fn new() -> Self {
         Self {
             value: 0,
@@ -57,7 +131,10 @@ impl WritebackError {
         }
     }
 
-    /// 未观察错误从零采样，使新观察者仍能消费既有未见错误。
+    /// 为新创建的观察者（如新打开的文件描述符）采样初始游标值。
+    ///
+    /// 若当前存在尚未被任何观察者读取过的错误（`ERRSEQ_SEEN == 0`），则返回 `0`，
+    /// 使该新观察者在首次调用 `check_and_advance` 时也能观测到这次未见错误。
     fn sample(&self) -> u32 {
         if self.value & ERRSEQ_SEEN == 0 {
             0
@@ -66,7 +143,8 @@ impl WritebackError {
         }
     }
 
-    /// 仅在已有错误被观察后推进有限计数，保留低十二位真实 errno。
+    /// 记录一次新的回写错误：更新低 12 位 `Errno` 并保存具体 `error`；
+    /// 仅当上一次错误已被观察过（`ERRSEQ_SEEN != 0`）时才递增高位错误计数器并清除 `SEEN` 位。
     fn record(&mut self, error: FsError) {
         let mut next = (self.value & !(ERRSEQ_ERRNO | ERRSEQ_SEEN)) | writeback_errno(error);
         if self.value & ERRSEQ_SEEN != 0 {
@@ -76,7 +154,8 @@ impl WritebackError {
         self.error = Some(error);
     }
 
-    /// 调用者串行自己的游标，短锁内标 SEEN 并只报告相对游标的新错误。
+    /// 检查自观察者上次游标 `*since` 以来是否发生了新的回写错误：
+    /// 若状态字发生变化，则置位 `ERRSEQ_SEEN`、将 `*since` 推进到最新状态字并返回最近一次的 `FsError`。
     fn check_and_advance(&mut self, since: &mut u32) -> Result<(), FsError> {
         if self.value == *since {
             return Ok(());
@@ -87,7 +166,7 @@ impl WritebackError {
     }
 }
 
-/// 内部错误保留具体类型，序列低位只编码对应的 Linux errno。
+/// 将内核内部文件系统错误 `FsError` 映射为 12 位以内的标准 POSIX `Errno` 数值。
 fn writeback_errno(error: FsError) -> u32 {
     match error {
         FsError::NoMemory | FsError::Io(BlockError::NoMemory) => Errno::NoMemory as u32,
@@ -144,14 +223,16 @@ fn writeback_errno(error: FsError) -> u32 {
     }
 }
 
-/// 验收同一生产算法的未见采样、独立游标、具体错误和有限计数回绕，不产生 IO。
+/// 测试目标：验证 `WritebackError` 的未观测错误采样、多观察者独立游标推进、错误覆盖以及 19 位计数器回绕逻辑。
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_wb_error_protocol() -> bool {
+    // Step 1: 初始无错误时采样游标为 0，检查推进应返回 Ok(())。
     let mut error = WritebackError::new();
     let mut first = error.sample();
     if error.check_and_advance(&mut first) != Ok(()) {
         return false;
     }
+    // Step 2: 连续发生两次未观测错误时，后一次覆盖前一次的 Errno，且新观察者采样仍从 0 开始以捕获未见错误。
     error.record(FsError::NoMemory);
     error.record(FsError::NoSpace);
     if error.value != 28 || error.sample() != 0 {
@@ -166,6 +247,7 @@ pub(crate) fn ktest_wb_error_protocol() -> bool {
     {
         return false;
     }
+    // Step 3: 已被观察过的错误之后再次发生新错误时，高 19 位计数器加 1（ERRSEQ_INCREMENT）。
     error.record(FsError::Io(BlockError::ShortIo));
     if error.value != ERRSEQ_INCREMENT | 5
         || error.sample() != 0
@@ -173,7 +255,7 @@ pub(crate) fn ktest_wb_error_protocol() -> bool {
     {
         return false;
     }
-    // 直接准备最大有限计数，回绕仍调用正式 record，不循环制造设备错误。
+    // Step 4: 将高 19 位计数器直接设置为全 1 最大值且置位 SEEN，验证再次调用 `record` 时计数器回绕至 0 仍能正确报告新错误。
     error.value = !(ERRSEQ_ERRNO | ERRSEQ_SEEN) | ERRSEQ_SEEN | 5;
     error.record(FsError::NoMemory);
     error.value == 12
@@ -182,14 +264,21 @@ pub(crate) fn ktest_wb_error_protocol() -> bool {
         && error.check_and_advance(&mut second) == Ok(())
 }
 
+/// 管理单个文件或物理磁盘元数据页的稀疏索引封装。
 pub(crate) struct FolioIndex {
+    /// 受自旋锁保护的底层 AVL 平衡二叉搜索树。
     entries: SpinLock<Tree>,
+    /// 索引允许驻留的最大物理页数上限（文件索引为 `None` 表示不设固定上限；元数据索引为 `Some(capacity)`）。
     capacity: Option<usize>,
+    /// 标记该索引是否用于管理磁盘元数据页（决定页分配方式与是否在未命中时立即启动整页读取）。
     metadata: bool,
 }
 
 impl FolioIndex {
-    /// 文件索引不预留固定槽；元数据预算限制的是实际物理页数量。
+    /// 创建一个新的稀疏页索引。
+    ///
+    /// - `capacity`：可选的驻留节点数量上限（元数据缓存传入固定预算，文件缓存传入 `None`）。
+    /// - `metadata`：为 `true` 表示元数据索引，为 `false` 表示文件或裸设备页索引。
     pub(crate) const fn new(capacity: Option<usize>, metadata: bool) -> Self {
         Self {
             entries: SpinLock::new(Tree::new()),
@@ -198,7 +287,9 @@ impl FolioIndex {
         }
     }
 
-    /// 元数据满预算只摘实际索引及可选源基准以外无拥有的静止页，锁外结束原节点。
+    /// 当索引节点数量达到 `capacity` 上限时，按升序查找并摘除一个无外部引用、无脏数据和回写任务的干净节点。
+    ///
+    /// 返回被摘除的 `RetiredNode`，由调用方在释放 `entries` 自旋锁之后释放底层物理页。
     fn evict_if_full(
         &self,
         entries: &mut Tree,
@@ -222,12 +313,17 @@ impl FolioIndex {
         Err(BlockError::NoMemory)
     }
 
-    /// raw/RO 从原 NOWAIT 来源准备；RW metadata 只从同 cache 原页及控制槽准备。
+    /// 查找键为 `key` 的缓存页；若未命中则在锁外分配新页与 `Node` 并插入索引。
+    ///
+    /// - 对于已就绪的可读写元数据缓存（`reserve` 为 `Some`），从 `BioReserve` 预留池租借固定槽位与物理页；
+    /// - 对于只读元数据或普通文件缓存（`reserve` 为 `None`），从内核堆与伙伴系统分配；
+    /// - 返回 `(FolioRef, Option<FolioRead>)`：若本次调用新建了非元数据页，则同时返回整页读取凭证 `Some(FolioRead)`。
     pub(crate) fn get_or_prepare(
         &self,
         key: u64,
         reserve: Option<&Arc<BioReserve>>,
     ) -> Result<(FolioRef, Option<FolioRead>), BlockError> {
+        // Step 1: 持锁检查目标键是否已命中；若未命中且容量已满，先摘除一个可驱逐的空闲节点并在锁外释放。
         let victim = {
             let mut entries = self.entries.lock();
             if entries.closed {
@@ -242,6 +338,7 @@ impl FolioIndex {
             victim.release();
         }
 
+        // Step 2: 在自旋锁外准备候选物理页（`candidate`）与索引节点（`Node`）。
         let (candidate, allocator, lease) = if let Some(reserve) = reserve {
             assert!(self.metadata, "file/raw index received a metadata source");
             let lease = reserve.try_metadata_slot()?;
@@ -269,6 +366,7 @@ impl FolioIndex {
         let mut prepared = Some(Node::prepare(key, candidate.clone(), None, allocator)?);
         drop(lease);
 
+        // Step 3: 再次获取索引锁复查目标键（防止并发插入竞争），若仍未命中则正式插入新节点。
         let (existing, victim) = {
             let mut entries = self.entries.lock();
             if entries.closed {
@@ -294,7 +392,7 @@ impl FolioIndex {
         Ok((candidate, read))
     }
 
-    /// 每次只移一个节点，源基准通过真实库存身份计入，原页和控制均在短锁外结束。
+    /// 扫描索引并摘除所有当前无外部引用、无脏扇区且无在途回写的空闲节点，返回成功清理的节点数量。
     pub(crate) fn prune_unused(&self, reserve: Option<&Arc<BioReserve>>) -> usize {
         let budget = self.len();
         let mut cursor = 0;
@@ -328,13 +426,14 @@ impl FolioIndex {
         removed
     }
 
-    /// 读取当前真实节点数，读入中与失败节点仍占元数据预算。
+    /// 返回当前索引树中驻留的节点总数。
     pub(crate) fn len(&self) -> usize {
         self.entries.lock().len
     }
 
-    /// 单向标记入口有限节点中的限量 Dirty/WB，返回选页数和下一轮起点。
-    /// 扫到范围末尾时续点归零，本轮不回绕；零预算保持原起点。
+    /// 在半开键区间 `[start, end)` 内按升序扫描，将最多 `max_pages` 个存在脏数据或在途回写的节点标记为 `to_write`。
+    ///
+    /// 返回 `(本轮标记的节点数, 下一轮续扫的起始键)`；若已扫描至区间末尾，则下一轮起始键归零。
     fn mark_to_write_range(&self, start: u64, end: u64, max_pages: usize) -> (usize, u64) {
         if max_pages == 0 {
             return (0, start);
@@ -366,7 +465,7 @@ impl FolioIndex {
         (selected, 0)
     }
 
-    /// 直接核原页的成对状态，索引锁下不复制脏页名单或等待内容锁。
+    /// 检查索引中是否仍存在任何包含脏扇区或正在回写的物理页。
     fn has_dirty_or_writeback(&self) -> bool {
         let entries = self.entries.lock();
         let mut cursor = 0;
@@ -383,7 +482,9 @@ impl FolioIndex {
         false
     }
 
-    /// 按半开范围有界选择；ToWrite填满输出片段，检查节点数不超过锁内现存有限数量。
+    /// 在半开键区间 `[start, end)` 内按序筛选匹配 `mark` 状态的节点，将其 `(key, FolioRef)` 填入 `output` 切片。
+    ///
+    /// 若在填满 `output` 或耗尽扫描预算时仍未到达 `end`，则返回 `Some(next_cursor)` 供调用方继续分段扫描。
     pub(crate) fn select_range(
         &self,
         start: u64,
@@ -426,28 +527,41 @@ impl FolioIndex {
     }
 }
 
-/// 元数据槽已发表且范围读尚未认领时的锁外观察点，仅验收镜像保存回调。
+/// 元数据页槽位在索引中发布后、启动扇区读取前触发的测试观察回调类型。
 #[cfg(feature = "ktest")]
 pub(crate) type MetadataLoadHook = Arc<dyn Fn(&Arc<MetadataCache>, u64, usize) + Send + Sync>;
 
-/// 物理盘只保留一份索引、页预算和有限 IO 来源；弱视图不反持各卷占用。
+/// 单个物理块设备（`Disk`）全局共享的元数据物理页域。
 pub struct MetadataPages {
+    /// 以磁盘绝对字节偏移（4KiB 页对齐）为键的稀疏物理页索引。
     index: FolioIndex,
+    /// 保护 `reserve` 预留池首次初始化及热节点迁移过程的睡眠读写锁。
     reserve_init: SleepRwLock<()>,
+    /// 可读写挂载时初始化的块层元数据预留池（包含固定数量的物理页与 `Node` 控制块槽位）。
     reserve: SpinLock<Option<Arc<BioReserve>>>,
+    /// 当前磁盘上已创建的各分区/卷 `MetadataCache` 门面的弱引用列表。
     facades: SleepMutex<Vec<Weak<MetadataCache>>>,
+    /// 底层物理块设备的强引用。
     disk: DiskRef,
 }
 
-/// 每个实际范围保留独立卷、占用、扫描和错误序列，原页仍属于物理盘索引。
+/// 绑定到具体磁盘分区或卷范围（`FsClaim`）的元数据缓存视图门面。
 pub struct MetadataCache {
+    /// 指向所属物理磁盘共享的 `MetadataPages` 页域。
     pages: Arc<MetadataPages>,
+    /// 关联的 `Ext4Volume` 弱引用，用于在元数据被修改变脏时通知对应卷的回写域。
     pub(crate) filesystem: SleepMutex<Weak<Ext4Volume>>,
+    /// 当前视图在块设备上的分区范围与读写权限声明。
     claim: FsClaim,
+    /// 串行化当前视图的元数据回写扫描与同步完成，并保存后台增量回写的续扫游标（磁盘字节偏移）。
     writeback: SleepMutex<u64>,
+    /// 当前视图在本轮同步/回写中被标记为 `ToWrite` 的物理页键（字节偏移）列表。
     selected: SpinLock<Vec<u64>>,
+    /// 记录当前视图元数据异步回写错误的 `errseq_t` 状态机。
     wb_error: SpinLock<WritebackError>,
+    /// 标记当前元数据缓存视图是否已关闭（关闭后拒绝新的块获取请求）。
     closed: AtomicBool,
+    /// 内核测试专用的元数据加载阶段观察钩子。
     #[cfg(feature = "ktest")]
     load_hook: SpinLock<Option<MetadataLoadHook>>,
 }
@@ -455,18 +569,19 @@ pub struct MetadataCache {
 impl Deref for MetadataCache {
     type Target = MetadataPages;
 
-    /// 缓存视图只借物理页域，不能以另一范围的占用提交 IO。
+    /// 解引用到所属物理磁盘共享的 `MetadataPages`。
     fn deref(&self) -> &Self::Target {
         &self.pages
     }
 }
 
 impl MetadataPages {
-    /// 失效已结束占用的半开 sector 段；只借有限索引节点，不分配、摘页或等待内容锁。
+    /// 在分区或卷卸载释放 `FsClaim` 时，使半开扇区区间 `[start, end)` 内已无任何活跃占用的元数据扇区状态失效。
     ///
     /// # Safety
-    /// 调用者持同盘 queue 锁且尚未摘离最后 claim，已扣除所有其他活 claim 的范围；
-    /// 该段的 Buffer、读入、Dirty 和 WB 均已结束，重新准入只可发生在本操作返回后。
+    /// 1. 调用方必须持有所属磁盘的队列锁，且待卸载的最后一个 `FsClaim` 尚未从队列摘除（阻止新访问重新准入该区间）。
+    /// 2. 传入的 `[start, end)` 扇区区间必须已剔除同一磁盘上其他仍存活 `FsClaim` 的重叠范围。
+    /// 3. 该区间内所有的 `BufferRef` 借用、在途读取、脏扇区与回写 I/O 必须已全部完成。
     pub(crate) unsafe fn retire_range(&self, start: u64, end: u64) {
         let Some(byte) = start.checked_mul(SECTOR_BYTES) else {
             return;
@@ -482,8 +597,10 @@ impl MetadataPages {
             let last = end.min(page + PAGE_SIZE as u64 / SECTOR_BYTES);
             let offset = ((first - page) * SECTOR_BYTES) as usize;
             let len = ((last - first) * SECTOR_BYTES) as usize;
-            // SAFETY: queue 锁仍阻止本段新准入，调用者已排除全部活范围责任；
-            // 索引锁保活原 folio，仅撤本页与退休段的交集，不接触相邻窗口的字节。
+            // SAFETY:
+            // 1. 调用方持有磁盘队列锁并已核验 `[start, end)` 内无任何活跃 `BufferRef`、读取或回写任务。
+            // 2. 当前持有 `entries` 自旋锁保证 `node.folio` 存活，且 `[offset, offset + len)` 严格限制在
+            //    当前物理页与待退休扇区区间的交集内，不会影响同一物理页内属于相邻分区的其他扇区。
             unsafe { node.folio.retire_metadata(offset, len) };
             cursor = node.key + 1;
         }
@@ -491,12 +608,13 @@ impl MetadataPages {
 }
 
 impl MetadataCache {
-    /// 串行共同元数据范围选择及完成，并保护后台续扫位置，不覆盖文件数据 IO。
+    /// 获取当前元数据缓存视图的回写睡眠互斥锁，用于串行化显式同步与后台回写扫描，并返回后台续扫游标守卫。
     pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, u64> {
         self.writeback.lock()
     }
 
-    /// RW 卷发表前准备有限原页及控制，热节点在同一次索引锁内替换，原 PFN 与范围状态连续可见。
+    /// 在可读写文件系统挂载发布前，初始化块层元数据预留池（`BioReserve`），并将引导阶段已驻留的热元数据节点
+    /// 平滑替换为由预留池固定槽位分配的 `Node`，确保运行期元数据读写与回写不再依赖动态堆分配。
     pub(crate) fn prepare_reserve(self: &Arc<Self>) -> Result<Arc<BioReserve>, BlockError> {
         let _scope = ReclaimScope::noio();
         let _init = self.reserve_init.write();
@@ -504,6 +622,7 @@ impl MetadataCache {
             return Ok(reserve);
         }
 
+        // Step 1: 扫描索引收集引导期已加载的所有热元数据页 `(key, FolioRef)`。
         let mut hot = Vec::new();
         hot.try_reserve_exact(self.capacity())
             .map_err(|_| BlockError::NoMemory)?;
@@ -527,14 +646,15 @@ impl MetadataCache {
             };
             cursor = next;
         }
+        // Step 2: 用热页集合创建固定容量的 `BioReserve`，并预先触发所有槽位的 `Node::prime` 锁定 `Arc` 控制块布局。
         let reserve =
             BioReserve::try_new(self.capacity(), hot.iter().map(|(_, folio)| folio.clone()))?;
         for slot in 0..self.capacity() {
             Node::prime(&reserve, slot)?;
         }
 
-        // 所有可失败申请已完成，prime 后的构造只消费真实预备控制块。
-        // hot 和源基准保活原 folio，旧节点在替换控制准备期间始终留在索引中。
+        // Step 3: 将引导期由 `Heap` 分配的旧索引节点逐一原子替换为由 `BioReserve` 槽位分配的新节点。
+        // 在单次 `entries` 自旋锁内完成同物理页（PFN）节点的摘除与插入，避免并发扫描观察到节点空窗。
         for (slot, (key, folio)) in hot.into_iter().enumerate() {
             let replacement = Node::prepare(
                 key,
@@ -556,27 +676,27 @@ impl MetadataCache {
                     replacement.folio.phys_addr(),
                     "bootstrap metadata identity changed"
                 );
-                // 范围退休也持此索引锁；它只能看到旧节点或指向同一 folio 的新节点，
-                // 不能在摘离空窗漏过原页。缺失或身份变化均不允许插回旧快照。
+                // 在同一次索引自旋锁临界区内用新节点替换旧节点，保持物理页与扇区状态连续可见。
                 let old = entries.remove(key).unwrap();
                 entries.insert(replacement);
                 old
             };
-            // 原 Heap 控制及其页引用在索引锁外结束，不能由最后 put 反取队列锁。
+            // 在索引自旋锁外释放旧 `Heap` 节点的强引用。
             old.release();
         }
 
+        // Step 4: 标记预留池就绪并发布到 `self.reserve`。
         reserve.mark_ready();
         *self.reserve.lock() = Some(Arc::clone(&reserve));
         Ok(reserve)
     }
 
-    /// 只取得同缓存真实来源快照，IRQ 最后 put 不取得睡眠初始化锁。
+    /// 获取当前元数据页域已就绪的 `BioReserve` 预留池强引用（若处于只读模式或尚未初始化则返回 `None`）。
     pub(crate) fn reserve(&self) -> Option<Arc<BioReserve>> {
         self.reserve.lock().clone()
     }
 
-    /// Buffer/Read/WB 最后 put 已退出 PageUse 锁后通知原库存，通知不授予复用资格。
+    /// 当某个元数据页上的 `BufferRef`、读取或回写任务释放最后一个引用后，唤醒在 `BioReserve` 上等待空闲槽位的任务。
     pub(crate) fn notify_metadata_available(&self) {
         let reserve = self.reserve();
         if let Some(reserve) = reserve {
@@ -584,26 +704,30 @@ impl MetadataCache {
         }
     }
 
-    /// 为新观察者采样共同元数据的有限错误序列。
+    /// 为新的同步观察者采样当前元数据回写错误的初始 `errseq_t` 游标值。
     pub(crate) fn sample_wb_error(&self) -> u32 {
         self.wb_error.lock().sample()
     }
 
-    /// 推进同一观察者的元数据游标，保留原具体错误。
+    /// 检查自 `*since` 游标以来当前视图是否发生过新的元数据回写错误，并推进游标。
     pub(crate) fn check_and_advance_wb_error(&self, since: &mut u32) -> Result<(), FsError> {
         self.wb_error.lock().check_and_advance(since)
     }
 
-    /// 在元数据 WB 退役或同步返回之前发布最后真实错误。
+    /// 在元数据回写 I/O 失败时记录具体的 `FsError` 并更新 `errseq_t` 状态字。
     pub(crate) fn record_wb_error(&self, error: FsError) {
         self.wb_error.lock().record(error);
     }
 
-    /// 同盘共享唯一物理预算，同范围复用同一 facade，权限切换须等旧占用全部结束。
+    /// 获取或创建与给定磁盘占用范围（`claim`）和物理页容量预算（`capacity`）对应的 `MetadataCache` 门面。
+    ///
+    /// - 同一块物理磁盘共享唯一的底层 `MetadataPages` 及总页数预算；
+    /// - 若相同扇区范围与访问模式的门面已存在且未关闭，则直接复用该 `Arc<MetadataCache>`。
     pub fn shared(claim: &FsClaim, capacity: usize) -> Result<Arc<Self>, BlockError> {
         if capacity == 0 {
             return Err(BlockError::InvalidRange);
         }
+        // Step 1: 获取或初始化所属物理磁盘唯一的 `MetadataPages` 页域，并校验容量预算一致。
         let pages = match claim.disk().metadata_cache() {
             Some(pages) => pages,
             None => {
@@ -625,6 +749,7 @@ impl MetadataCache {
             return Ok(existing);
         }
 
+        // Step 2: 分配新的 `MetadataCache` 门面候选实例，并在 `facades` 互斥锁下执行二次检查与弱引用注册。
         let mut selected = Vec::new();
         selected
             .try_reserve_exact(capacity)
@@ -654,7 +779,8 @@ impl MetadataCache {
         Ok(candidate)
     }
 
-    /// 同范围候选在发表短锁内双查，权限冲突和已关闭的旧 facade 不被默默替换。
+    /// 在已注册的门面弱引用列表中查找与 `claim` 具有相同扇区范围的存活 `MetadataCache`：
+    /// 若已关闭则返回 `QueueStopped`，若读写模式冲突则返回 `Busy`。
     fn existing_facade(
         facades: &[Weak<Self>],
         claim: &FsClaim,
@@ -675,14 +801,16 @@ impl MetadataCache {
         Ok(None)
     }
 
-    /// 更换槽发表后的观察者，旧回调在短锁外析构，回调不得遗留未结束的读入责任。
+    /// 设置或清除元数据页槽位发布后的测试观察钩子，旧钩子在自旋锁外释放。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_load_hook(&self, hook: Option<MetadataLoadHook>) {
         let retired = core::mem::replace(&mut *self.load_hook.lock(), hook);
         drop(retired);
     }
 
-    /// 取得准确 1/2/4KiB 窗口；先发表全部页槽，再认领缺失段，已有有效或脏字节不被覆盖。
+    /// 读取并锁定逻辑块号为 `block`、块大小为 `block_size`（1KiB / 2KiB / 4KiB）的元数据块，返回其 `BufferRef` 视图。
+    ///
+    /// 若目标块的扇区尚未加载到物理页中，则自动发起块设备读取并等待就绪；已有效或已变脏的扇区不会被磁盘旧数据覆盖。
     pub(crate) fn get(
         self: &Arc<Self>,
         block: u64,
@@ -692,6 +820,7 @@ impl MetadataCache {
         if self.closed.load(Ordering::Acquire) {
             return Err(BlockError::QueueStopped);
         }
+        // Step 1: 校验块几何参数，计算磁盘绝对字节偏移及是否跨越两个相邻 4KiB 物理页。
         let (byte, offset) = self.block_range(block, block_size)?;
         let first_len = block_size.min(PAGE_SIZE - offset);
         let page = byte - offset as u64;
@@ -704,6 +833,7 @@ impl MetadataCache {
             context.check()?;
         }
 
+        // Step 2: 在 `reserve_init` 读锁保护下，在索引中获取或插入首页（及跨页时的尾页）槽位，并绑定当前 `MetadataCache` 属主。
         let (folio, tail, reserve) = {
             let _init = self.reserve_init.read();
             let reserve = self.reserve();
@@ -733,7 +863,7 @@ impl MetadataCache {
             None => reserve.as_ref().map(BioReserve::metadata_io_context),
         };
         #[cfg(feature = "ktest")]
-        // 完整窗口的页槽均已发表；回调只收到一次调用者的 FS 块参数，且不持初始化或钩子锁。
+        // Step 3 (ktest): 在所有页槽位均已发布到索引后、发起扇区读取前，在锁外调用测试钩子。
         {
             let hook = self.load_hook.lock().clone();
             if let Some(hook) = hook {
@@ -741,8 +871,8 @@ impl MetadataCache {
             }
         }
 
-        // 首次 ready 与旧 Heap IO 由同一读写 gate 排斥；读侧不串行不同页的普通 RO IO。
-        // hook 已在 gate 外结束，完成/凭证归还均不反取 gate；已捕 Some 的旧边界不重采。
+        // Step 4: 对首页（及可选的尾页）补齐尚未就绪的扇区数据。
+        // 若此前未捕获到 `reserve`（只读或引导阶段），则持 `reserve_init` 读锁防止与并发的 `prepare_reserve` 冲突。
         let _legacy_scope = reserve.is_none().then(ReclaimScope::noio);
         let transition = reserve.is_none().then(|| self.reserve_init.read());
         let published = if transition.is_some() {
@@ -779,7 +909,9 @@ impl MetadataCache {
         })
     }
 
-    /// 填充已发表的单页片段；调用者保活实际来源与旧 Heap IO 的初始化读侧。
+    /// 确保单个物理页 `folio` 内 `[byte % PAGE_SIZE, byte % PAGE_SIZE + len)` 字节区间的元数据扇区已加载就绪。
+    ///
+    /// 若部分扇区尚未就绪，则通过单飞（Singleflight）机制调用 `begin_metadata_read` 认领缺失区间并从磁盘读取。
     fn get_segment(
         self: &Arc<Self>,
         folio: &FolioRef,
@@ -822,7 +954,7 @@ impl MetadataCache {
         Ok(())
     }
 
-    /// 只取得已经存在的准确物理窗口，不填充、读盘或申请节点；有效性由使用者另行检查。
+    /// 仅当目标元数据块涉及的所有物理页均已驻留在索引中时，直接返回对应的 `BufferRef`（不分配新节点，也不发起磁盘读取）。
     pub(crate) fn cached_buffer(
         self: &Arc<Self>,
         block: u64,
@@ -857,7 +989,7 @@ impl MetadataCache {
         }))
     }
 
-    /// 在发表候选前解释块几何、设备容量和准确页内范围。
+    /// 校验逻辑块号 `block` 与块大小 `block_size` 是否合法且满足设备扇区对齐，返回 `(磁盘绝对字节偏移, 页内字节偏移)`。
     fn block_range(&self, block: u64, block_size: usize) -> Result<(u64, usize), BlockError> {
         if !matches!(
             block_size,
@@ -877,7 +1009,7 @@ impl MetadataCache {
         Ok((byte, offset))
     }
 
-    /// 只摘本视图相交且没有外部拥有、Dirty 或 WB 的原节点，物理页预算仍全盘共用。
+    /// 扫描当前分区视图覆盖的物理页区间，摘除并释放所有无外部引用、无脏扇区且无在途回写的空闲节点，返回清理的节点数。
     pub fn prune_unused(&self) -> usize {
         let reserve = self.reserve();
         let (mut cursor, end) = self.page_bounds();
@@ -908,7 +1040,7 @@ impl MetadataCache {
         removed
     }
 
-    /// 返回本范围相交的实际物理页数，相邻视图共享的边界页只占一个物理预算。
+    /// 统计当前分区视图范围在共享元数据索引中实际驻留的物理页数量。
     #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         let (mut cursor, end) = self.page_bounds();
@@ -928,7 +1060,7 @@ impl MetadataCache {
         count
     }
 
-    /// 检查物理页索引是否为空。
+    /// 判断当前分区视图范围在元数据索引中是否没有任何驻留物理页。
     #[cfg(feature = "ktest")]
     #[expect(
         dead_code,
@@ -938,7 +1070,7 @@ impl MetadataCache {
         self.len() == 0
     }
 
-    /// 本轮选择只属于当前 facade，同物理边界页的另一卷选择不被覆盖。
+    /// 在当前分区视图的 `selected` 列表中设置或取消指定物理页键（`byte_offset`）的本轮回写选中标记。
     pub(crate) fn set_to_write(&self, byte_offset: u64, selected: bool) {
         let mut keys = self.selected.lock();
         if selected {
@@ -954,12 +1086,13 @@ impl MetadataCache {
         }
     }
 
-    /// 持本缓存扫描互斥时选定入口的有限元数据集合，完整同步不限制页数。
+    /// 在半开字节区间 `[start, end)` 内将所有属于当前视图的脏页或正在回写的页标记为 `ToWrite`，返回选中的页数。
     pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
         self.mark_to_write_budget(start, end, usize::MAX).0
     }
 
-    /// 后台只为最多 max_pages 个原节点建立 ToWrite，并返回下轮单向续扫位置。
+    /// 在半开字节区间 `[start, end)` 内将最多 `max_pages` 个属于当前视图的脏页或回写页标记为 `ToWrite`，
+    /// 返回 `(本轮选中的页数, 下一轮续扫的起始字节偏移)`。
     pub(crate) fn mark_to_write_budget(
         &self,
         start: u64,
@@ -993,7 +1126,7 @@ impl MetadataCache {
         (count, 0)
     }
 
-    /// 检查共同元数据原页是否仍有实际 Dirty 或 WB 义务。
+    /// 检查当前分区视图范围内是否仍存在包含脏扇区或正在回写的元数据页。
     pub(crate) fn has_dirty_or_writeback(&self) -> bool {
         let mut selected = [None];
         self.select_range(0, u64::MAX, FolioMark::Dirty, &mut selected);
@@ -1004,8 +1137,7 @@ impl MetadataCache {
         selected[0].is_some()
     }
 
-    /// 按物理 byte key 有界取得真实元数据页，调用者保持本缓存到全部消费结束。
-    /// 移交 IO 的外部页须附原缓存 anchor，索引内部的引用不反持缓存。
+    /// 在半开字节区间 `[start, end)` 内按序筛选当前视图中匹配 `mark` 状态的元数据页，填入 `output` 切片并返回下一轮续扫游标。
     pub(crate) fn select_range(
         &self,
         start: u64,
@@ -1045,14 +1177,14 @@ impl MetadataCache {
         (cursor < end).then_some(cursor)
     }
 
-    /// 物理页边界用于查索引，非页对齐首尾由 sector mask 单独限制。
+    /// 计算当前分区视图在物理磁盘上的字节范围：返回 `(向下按 4KiB 页对齐的起始字节偏移, 结束字节偏移)`。
     fn page_bounds(&self) -> (u64, u64) {
         let start = self.claim.view().start_sector() * SECTOR_BYTES;
         let end = start + self.claim.view().sectors() * SECTOR_BYTES;
         (start / PAGE_SIZE as u64 * PAGE_SIZE as u64, end)
     }
 
-    /// 返回本卷在指定物理页中实际占有的 sector，供 Dirty、WB 和扫描共用。
+    /// 计算在起始磁盘字节偏移为 `page` 的 4KiB 物理页中，属于当前分区视图的 512B 扇区 8 位掩码（Bit `i` 对应页内第 `i` 个扇区）。
     pub(crate) fn page_mask(&self, page: u64) -> u8 {
         let start = self.claim.view().start_sector() * SECTOR_BYTES;
         let end = start + self.claim.view().sectors() * SECTOR_BYTES;
@@ -1066,12 +1198,12 @@ impl MetadataCache {
         (((1u16 << sectors) - 1) << offset) as u8
     }
 
-    /// 返回此 Disk 活元数据域的明确页预算。
+    /// 返回所属物理磁盘元数据缓存的总物理页容量预算。
     pub fn capacity(&self) -> usize {
         self.index.capacity.unwrap()
     }
 
-    /// RW 源 ready 后按绝对物理页 key 观察原 Arc 控制，范围外的节点不向此视图导出。
+    /// 在预留池已就绪的前提下，获取当前视图范围内指定物理页键对应的 `Node` 弱引用（仅用于内核测试）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_node(&self, byte_offset: u64) -> Option<Weak<Node, IndexAllocator>> {
         let _init = self.reserve_init.read();
@@ -1082,15 +1214,17 @@ impl MetadataCache {
         self.index.entries.lock().weak_node(byte_offset)
     }
 
-    /// 只丢弃本范围的私有字节，不关闭另一卷仍在使用的物理索引。
+    /// 关闭当前元数据缓存视图，并丢弃本分区范围内所有未落盘的私有元数据扇区，同时保留共享边界页上属于相邻分区的扇区数据。
     ///
     /// # Safety
-    /// 调用者已停止本范围全部生产者、IO、WB 和外部视图；其中没有已接受的真实 FS 修改。
+    /// 1. 调用方必须已停止针对当前分区视图的一切并发写入、读取、回写任务以及外部 `BufferRef` 借用。
+    /// 2. 当前视图中被丢弃的脏扇区仅包含测试或未提交的私有修改，不得包含已向文件系统承诺持久化的元数据变更。
     #[cfg(feature = "ktest")]
     pub unsafe fn discard_private(self: &Arc<Self>) -> Result<usize, BlockError> {
         let reserve = self.reserve();
         let (first, end) = self.page_bounds();
         let mut cursor = first;
+        // Step 1: 预检查当前视图覆盖的所有独占物理页均已无外部引用或活跃 I/O。
         loop {
             let next = {
                 let entries = self.index.entries.lock();
@@ -1115,6 +1249,7 @@ impl MetadataCache {
             cursor = key + 1;
         }
 
+        // Step 2: 标记当前视图已关闭，并逐页清除属于当前视图扇区掩码范围内的有效位与脏位。
         self.closed.store(true, Ordering::Release);
         cursor = first;
         loop {
@@ -1130,8 +1265,10 @@ impl MetadataCache {
             let offset = mask.trailing_zeros() as usize * SECTOR_BYTES as usize;
             let len = mask.count_ones() as usize * SECTOR_BYTES as usize;
             let mut content = folio.lock_content();
-            // SAFETY: 调用者终结本范围访问；整页另核外部引用，边界页可保另一卷的外部拥有；
-            // 只失效当前 view 的准确 sector，另一卷字节及其脏义务保持。
+            // SAFETY:
+            // 1. 调用方保证当前视图已无任何并发生产者或外部 `BufferRef` 访问，且上方 Step 1 已核验无在途 I/O。
+            // 2. 当前持有 `folio.lock_content()` 睡眠锁，且 `[offset, offset + len)` 严格由 `self.page_mask(key)` 算出，
+            //    仅作废当前分区占有的扇区，不会篡改同一物理页内属于相邻分区的扇区内容与脏标记。
             unsafe { content.forget_metadata(offset, len)? };
             cursor = key + 1;
         }
@@ -1141,7 +1278,7 @@ impl MetadataCache {
 }
 
 impl Drop for MetadataPages {
-    /// 最后物理域拥有结束时摘弱登记，所有外部读入和回写已释放各自 facade。
+    /// 当物理磁盘的 `MetadataPages` 最后一个强引用释放时，从所属 `Disk` 注销弱引用登记。
     fn drop(&mut self) {
         let identity = self as *const Self;
         let retired = self.disk.unregister_metadata_cache(identity);
@@ -1149,17 +1286,23 @@ impl Drop for MetadataPages {
     }
 }
 
-/// 同一元数据页中的准确范围，保活缓存及其 Disk 占用，不复制字节。
+/// 指向元数据缓存中一个 1KiB / 2KiB / 4KiB 逻辑块窗口的引用句柄（支持跨相邻两个 4KiB 物理页）。
 #[derive(Clone)]
 pub struct BufferRef {
+    /// 逻辑块起始位置所在的第一个 4KiB 物理页（附带所属 `MetadataCache` 强引用）。
     folio: FolioRef,
+    /// 当非页对齐分区的逻辑块跨越 4KiB 页边界时，指向紧邻的下一个 4KiB 物理页。
     tail: Option<FolioRef>,
+    /// 逻辑块起始字节在 `folio`（首页）内的字节偏移量（`0..PAGE_SIZE`）。
     offset: usize,
+    /// 逻辑块的字节长度（1024、2048 或 4096）。
     len: usize,
 }
 
 impl BufferRef {
-    /// 内容锁内短借用本视图；闭包不得分配、等待 IO 或进行可能 fault 的用户复制。
+    /// 在持有底层物理页内容锁（`lock_content`）的保护下，以只读字节切片 `&[u8]` 的形式访问该元数据块内容。
+    ///
+    /// 注意：`consume` 闭包在页内容锁内执行，不得阻塞等待新 I/O 或执行可能触发缺页异常的用户态内存拷贝。
     pub fn with_read<T>(&self, consume: impl FnOnce(&[u8]) -> T) -> Result<T, BlockError> {
         if let Some(tail) = &self.tail {
             return self.read_split(tail, consume);
@@ -1168,7 +1311,7 @@ impl BufferRef {
         Ok(consume(content.metadata_bytes(self.offset, self.len)?))
     }
 
-    /// 非页对齐分区的跨页块按物理地址顺序持锁，有限栈窗口只在闭包期间存在。
+    /// 处理跨越两个物理页的元数据块只读访问：按物理页偏移升序依次锁定首页与尾页，将两段字节拼入栈缓冲区后交给 `consume`。
     #[inline(never)]
     fn read_split<T>(
         &self,
@@ -1184,9 +1327,9 @@ impl BufferRef {
         Ok(consume(&bytes[..self.len]))
     }
 
-    /// 同 view 的 RW 授权只修改准确窗口，Dirty 在字节修改之前记录。
-    /// 闭包不得等待或用户复制；相邻 inode 记录与校验和在同一真实内容锁内保持一致。
-    /// 普通 Task 在内容锁释放后通知所属卷，通知期间不保留卷弱关联锁。
+    /// 在验证 `claim` 具备当前分区视图的读写权限后，锁定底层物理页内容并以可变切片 `&mut [u8]` 执行原地修改闭包 `update`。
+    ///
+    /// 修改前会自动将对应扇区标记为脏（Dirty），并在释放页内容锁之后通知关联的 `Ext4Volume` 回写域。
     pub fn update<T>(
         &self,
         claim: &FsClaim,
@@ -1217,7 +1360,7 @@ impl BufferRef {
         Ok(result)
     }
 
-    /// 两页 guard 同时保持到新字节提交，避免把另一窗口的并发修改拷回旧快照。
+    /// 处理跨越两个物理页的元数据块原地修改：同时持有首页与尾页的内容锁，在栈缓冲区中执行 `update` 后写回两页，防止并发修改丢失。
     #[inline(never)]
     fn update_split<T>(
         &self,
@@ -1238,7 +1381,7 @@ impl BufferRef {
         Ok(result)
     }
 
-    /// 等待本块全部物理片段的旧 WB，不能仅以第一片段代替跨页块的完成。
+    /// 等待该元数据块所覆盖的全部物理页（含跨页时的尾页）上正在进行的回写 I/O 完成。
     pub(crate) fn wait_writeback(&self) {
         self.folio.wait_writeback();
         if let Some(tail) = &self.tail {
@@ -1246,12 +1389,11 @@ impl BufferRef {
         }
     }
 
-    /// 实际块树摘离节点后失效本窗口，等待原页 WB 收权而不影响同页其他元数据块。
+    /// 当文件系统释放某个元数据块（如缩减目录或释放 Extent 树节点）且调用方已等待其在途回写完成后，直接清除该块窗口的脏标记与有效标记。
     ///
     /// # Safety
-    /// 调用者已持真实块映射写保护摘离该节点并阻止旧根新取得，旧消费与 IO 已结束；
-    /// 其他视图不得再消费本窗口旧内容，块尚未归还位图，本窗口确实无需落盘。
-    /// 同 view RW 占用仅证明权限，不能代替上述删除与生命周期条件。
+    /// 1. 调用方必须已持有文件系统的块映射写锁并将该元数据块从树/目录结构中摘除，确保不会有新的读取者获取该块。
+    /// 2. 针对该块的所有旧读取、修改和 I/O 请求必须已结束，且该磁盘块尚未归还给空闲块位图（防止与新分配复用产生冲突）。
     pub(crate) unsafe fn forget(&self, claim: &FsClaim) -> Result<(), BlockError> {
         if claim.mode() != AccessMode::ReadWrite {
             return Err(BlockError::ReadOnly);
@@ -1266,24 +1408,25 @@ impl BufferRef {
 
         let mut content = self.folio.lock_content();
         let count = self.len.min(PAGE_SIZE - self.offset);
-        // SAFETY: 调用者终结本窗口旧消费且块尚未归还；guard 排斥并发 CPU 访问，
-        // 两次失效分别覆盖同一块的准确物理片段，不改相邻卷的字节。
+        // SAFETY:
+        // 1. 调用方已将该元数据块从文件系统结构中摘除且尚未归还位图，当前无其他读取或修改者使用该窗口。
+        // 2. 已持有 `self.folio.lock_content()` 独占锁，且 `[self.offset, self.offset + count)` 仅覆盖该块在首页中的片段，不影响同页其他块。
         unsafe { content.forget_metadata(self.offset, count)? };
         if let Some(tail) = &self.tail {
             let mut content = tail.lock_content();
-            // SAFETY: 同一删除协议覆盖此块尾段，尾页 guard 排斥新访问且仅清本窗口。
+            // SAFETY: 同上，已持有尾页 `tail.lock_content()` 独占锁，且 `[0, self.len - count)` 仅覆盖该跨页块在尾页中的剩余片段。
             unsafe { content.forget_metadata(0, self.len - count)? };
         }
         Ok(())
     }
 
-    /// 返回视图自己的字节长度。
+    /// 返回该元数据块视图的字节长度。
     #[cfg(feature = "ktest")]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 元数据块视图不接受零长度请求。
+    /// 判断该元数据块视图的字节长度是否为 0。
     #[cfg(feature = "ktest")]
     #[expect(
         dead_code,
@@ -1293,42 +1436,48 @@ impl BufferRef {
         self.len == 0
     }
 
-    /// 返回视图在真实 4KiB 页中的起点。
+    /// 返回该元数据块起始位置在首个 4KiB 物理页内的字节偏移。
     #[cfg(feature = "ktest")]
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// 借用首物理页身份供原页诊断；跨页块的内容和等待必须使用 Buffer 接口。
+    /// 返回首个 4KiB 物理页的引用（仅用于内核测试诊断物理页状态）。
     #[cfg(feature = "ktest")]
     pub fn folio(&self) -> &FolioRef {
         &self.folio
     }
 }
 
-/// 每份文件 VMA 的固定来源；驻留页仅弱持来源，私有 COW 后仍保文件范围事实。
+/// 描述单个文件映射虚拟内存区域（VMA）与后端 `Inode` 关联关系的不可变元数据，用于反向映射（rmap）遍历。
 pub(crate) struct FileRangeData {
+    /// 被映射的目标文件 `Inode` 强引用。
     pub(crate) inode: InodeRef,
+    /// 该 VMA 所属进程地址空间的页表域（`PteDomain`），用于在截断或回收时定位并卸载用户态页表项。
     pub(crate) domain: Arc<PteDomain>,
+    /// 该 VMA 在用户地址空间中的虚拟地址半开区间 `[start_va, end_va)`（字节）。
     pub(crate) range: Range<usize>,
+    /// `range.start` 对应于文件内部的起始字节偏移量（按 4KiB 页对齐）。
     pub(crate) offset: u64,
+    /// 标记该映射是否为私有写时复制映射（`MAP_PRIVATE` 为 `true`，`MAP_SHARED` 为 `false`）。
     pub(crate) private: bool,
 }
 
 impl FileRangeData {
-    /// 有序键的分配地址由遍历 cursor 的 Arc 保活，防止迭代期间地址复用。
+    /// 生成用于在 `FileMapping::ranges` 有序数组中唯一定位该映射条目的复合排序键 `(文件起始字节偏移, Arc 实例内存地址)`。
     fn key(this: &Arc<Self>) -> (u64, usize) {
         (this.offset, Arc::as_ptr(this) as usize)
     }
 }
 
-/// VMA 独占登记责任；先从 inode 的弱索引摘离，再释放固定来源及 PTE 域拥有。
+/// 由文件映射 VMA 独占持有的反向映射注册守卫（Drop 时自动从 `FileMapping::ranges` 注销）。
 pub(crate) struct FileRangeRegistration {
+    /// 当前 VMA 对应的文件映射范围描述数据。
     data: Arc<FileRangeData>,
 }
 
 impl FileRangeRegistration {
-    /// 在候选 VMA 可见前登记；候选无可写叶，失败不会改变现有映射。
+    /// 分配 `FileRangeData` 并将其注册到目标文件 `inode.mapping()` 的反向映射有序表中。
     pub(crate) fn try_new(
         inode: InodeRef,
         domain: Arc<PteDomain>,
@@ -1348,14 +1497,14 @@ impl FileRangeRegistration {
         Ok(Self { data })
     }
 
-    /// 借用不可变来源，不允许取得 Arc 可变权限或改变登记键。
+    /// 获取底层的 `Arc<FileRangeData>` 只读引用。
     pub(crate) fn data(&self) -> &Arc<FileRangeData> {
         &self.data
     }
 }
 
 impl Drop for FileRangeRegistration {
-    /// 摘离 Weak 在范围锁外析构；字段的最后强拥有也在索引摘离之后释放。
+    /// 在 VMA 销毁时，先持 `ranges` 自旋锁将自身的 `Weak` 条目从反向映射表中移除，再在锁外释放 `data`。
     fn drop(&mut self) {
         let detached = {
             let mut ranges = self.data.inode.mapping().ranges.lock();
@@ -1369,65 +1518,73 @@ impl Drop for FileRangeRegistration {
     }
 }
 
-/// 文件范围失效的真实同步边界；两处观察均仍保有原退休页及表页。
+/// 文件映射范围卸载（unmap）过程中全 CPU 硬件 TLB 同步前后的测试观察阶段枚举。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileUnmapPhase {
+    /// 页表叶子项已清除、但尚未执行全核 TLB 刷新（`sync_all`）之前的阶段。
     BeforeSync,
+    /// 全核 TLB 刷新（`sync_all`）已完成、但尚未释放退休物理页与页表页之前的阶段。
     AfterSync,
 }
 
-/// invalidate 外准备的真实命中引用或未发表页/Node/读入责任，失败与输家锁外结束。
+/// 在 `Inode` 失效锁（`invalidate`）之外预先查找或分配的文件页候选结果。
 pub(crate) enum PreparedFile {
+    /// 索引中已命中的现有物理页引用（已附带所属 `InodeRef`）。
     Cached(FolioRef),
+    /// 索引未命中而在锁外新分配的索引节点与整页读取凭证（`node` 为预分配并初始化的索引树节点，`read` 为覆盖整页 `[0, PAGE_SIZE)` 的单飞读取凭证）。
     New { node: NodeRef, read: FolioRead },
 }
 
-/// 同一文件来源按偏移和稳定 Arc 地址排序，弱引用不延长 VMA 寿命。
+/// 按 `(文件起始偏移, Arc 地址)` 升序排列的文件反向映射弱引用集合。
 type FileRanges = Vec<((u64, usize), Weak<FileRangeData>)>;
 
-/// 同一撤叶观察回调仅借同步边界的标量，不取得页或表的拥有。
+/// 文件页表卸载与全核 TLB 同步边界的测试观察回调类型。
 #[cfg(feature = "ktest")]
 type FileUnmapHook = Arc<dyn Fn(FileUnmapPhase, usize, usize) + Send + Sync>;
 
-/// canonical inode 的稀疏页与弱文件范围索引；来源独立于当前驻留 backing。
+/// 单个文件 `Inode` 的页缓存映射与反向映射（rmap）管理器。
 pub struct FileMapping {
+    /// 以文件内 4KiB 页序号（`index = byte_offset / PAGE_SIZE`）为键的稀疏物理页索引。
     index: FolioIndex,
+    /// 映射了该文件的所有用户态 VMA 范围描述表（按文件内起始偏移升序排列）。
     ranges: SpinLock<FileRanges>,
-    // 锁内保存下轮后台扫描的文件页号，显式同步不改变它。
+    /// 串行化同一文件的数据回写扫描与同步完成，并保存后台增量回写的续扫文件页序号。
     writeback: SleepMutex<u64>,
+    /// 记录该文件数据页异步回写错误的 `errseq_t` 状态机。
     wb_error: SpinLock<WritebackError>,
+    /// 内核测试专用的页表卸载与 TLB 同步边界观察钩子。
     #[cfg(feature = "ktest")]
     unmap_hook: SpinLock<Option<FileUnmapHook>>,
 }
 
 impl FileMapping {
-    /// 串行同一 inode 的同步扫描与完成，并保护后台续扫位置，不排斥其他 inode IO。
+    /// 获取当前文件的回写睡眠互斥锁，用于串行化该文件的 `fsync` 与后台回写扫描，并返回后台续扫页号守卫。
     pub(crate) fn lock_writeback(&self) -> SleepMutexGuard<'_, u64> {
         self.writeback.lock()
     }
 
-    /// 新 OFD 保留尚未被任何观察者见到的旧错误。
+    /// 为新打开的文件描述符（OFD）采样当前文件数据回写错误的初始 `errseq_t` 游标。
     pub(crate) fn sample_wb_error(&self) -> u32 {
         self.wb_error.lock().sample()
     }
 
-    /// 在调用者自己的 OFD 游标互斥下推进有限错误观察。
+    /// 在调用方持有自身 OFD 游标锁的前提下，检查并推进该文件的数据回写错误游标。
     pub(crate) fn check_and_advance_wb_error(&self, since: &mut u32) -> Result<(), FsError> {
         self.wb_error.lock().check_and_advance(since)
     }
 
-    /// 完成者在撤销本轮 WB 前记录原文件的数据错误。
+    /// 在文件数据页回写 I/O 失败时记录具体的 `FsError` 并更新 `errseq_t` 状态字。
     pub(crate) fn record_wb_error(&self, error: FsError) {
         self.wb_error.lock().record(error);
     }
 
-    /// 在原索引短锁下检查实际页义务，不复制状态或等待内容锁。
+    /// 检查当前文件索引中是否仍存在包含脏扇区或正在回写的数据页。
     pub(crate) fn has_dirty_or_writeback(&self) -> bool {
         self.index.has_dirty_or_writeback()
     }
 
-    /// 建立无预留节点的唯一文件页索引，miss 的真实内存不足由节点和页申请返回。
+    /// 创建一个空的 `FileMapping` 实例。
     pub const fn new() -> Self {
         Self {
             index: FolioIndex::new(None, false),
@@ -1439,7 +1596,9 @@ impl FileMapping {
         }
     }
 
-    /// 在真实 owner 的 invalidate/root/content 之外准备原页及唯一 Node，有限 OOM 共用请求。
+    /// 在不持有 `Inode` 失效锁（`invalidate`）或页内容锁的上下文中，查找第 `index` 页或预先分配新页与 `Node`。
+    ///
+    /// 若为内存文件系统（tmpfs/ramfs）且未命中，还会预先向所属 Inode 申请内存页配额并绑定到新物理页上。
     pub(crate) fn prepare_file(
         &self,
         owner: &InodeRef,
@@ -1485,7 +1644,10 @@ impl FileMapping {
             .map_err(Into::into)
     }
 
-    /// caller 重核 EOF 后二查 canonical；None 只表示旧命中已退休，私有输家仍由 caller 锁外结束。
+    /// 在调用方已持有所属 `Inode` 锁并核验文件大小（EOF）之后，将 `prepare_file` 准备的候选结果发布到索引树中。
+    ///
+    /// - 若目标页已存在于索引中，则直接返回索引中的物理页（若此前准备了 `PreparedFile::New`，则留在 `prepared` 中由调用方在锁外释放）；
+    /// - 若目标页不在索引中且 `prepared` 为 `Cached`（说明原命中页在并发截断/回收中已被移除），则返回 `Ok(None)` 通知调用方重新调用 `prepare_file`。
     pub(crate) fn publish_file(
         &self,
         owner: &InodeRef,
@@ -1535,8 +1697,7 @@ impl FileMapping {
         Ok(Some((result.0.with_file_owner(owner.clone()), result.1)))
     }
 
-    /// 只取得原索引已有页，不填充、读盘或申请节点；调用者保原 inode 到内容检查结束。
-    /// 返回引用不附 inode，不能脱离该来源保护交给外部使用者或设备。
+    /// 若第 `index` 页当前驻留在文件索引中，则返回其 `FolioRef` 克隆（不分配新页、不发起读取，也不绑定 `InodeRef` 属主）。
     pub(crate) fn cached_folio(&self, index: u64) -> Option<FolioRef> {
         self.index
             .entries
@@ -1545,7 +1706,7 @@ impl FileMapping {
             .map(|node| node.folio.clone())
     }
 
-    /// 短索引锁只核现有节点的原页身份，不增加 folio 引用或建立第二页缓存。
+    /// 检查文件索引中第 `index` 页是否仍然指向与 `folio` 相同的物理页（相同物理地址 PFN）。
     pub(crate) fn is_canonical(&self, index: u64, folio: &FolioRef) -> bool {
         self.index
             .entries
@@ -1554,13 +1715,15 @@ impl FileMapping {
             .is_some_and(|node| node.folio.phys_addr() == folio.phys_addr())
     }
 
-    /// 与全范围失效串行来源换身份及 fork 叶提交；持此 guard 时只允许原 PTE 短锁操作。
+    /// 获取反向映射范围表（`ranges`）的自旋锁守卫，用于串行化页表项安装、写时复制（COW）以及 `fork` 页表复制。
     pub(crate) fn lock_ranges(&self) -> SpinLockGuard<'_, FileRanges> {
         self.ranges.lock()
     }
 
-    /// 撤销文件字节半开范围所覆盖的当前叶，私有匿名 COW 由原文件来源定位。
-    /// 不改变 VMA，不取得 mmap；原页和表页统一在范围/PTE 锁外真实 CSD 后释放。
+    /// 卸载所有用户态进程地址空间中映射了该文件字节区间 `range` 的页表叶子项，并在锁外完成全核 TLB 刷新后释放退休页。
+    ///
+    /// - 当 `even_cows == true`（如文件截断收缩）时，连同基于该文件区间派生的私有写时复制（COW）匿名页映射一并卸载；
+    /// - 当 `even_cows == false`（如页面回收或整页失效）时，仅卸载直接指向文件缓存页的页表项，保留私有匿名副本。
     pub fn unmap_range(&self, range: Range<u64>, even_cows: bool) -> usize {
         if range.end <= range.start {
             return 0;
@@ -1570,18 +1733,21 @@ impl FileMapping {
         let mut tables = RetiredTables::default();
         let mut unmapped = 0;
         {
-            // ponytail: 同 inode 的短锁覆盖全范围撤叶；实际大映射延迟成为瓶颈时再调整范围锁协议。
+            // ponytail: 同一 Inode 的 ranges 自旋锁覆盖全范围卸载；若未来超大映射卸载延迟成为瓶颈，可拆分为分段持锁。
             let ranges = self.ranges.lock();
             for ((offset, _), weak) in ranges.iter() {
                 if range.end <= *offset {
                     break;
                 }
-                // SAFETY: 已登记的 Weak 由 FileRangeRegistration 的强 data 拥有支持；
-                // registration 必须先持本范围锁摘登记才析构 data，当前锁使其保持存活。
-                // 这里只借不可变来源，不增加或析构 Arc，域锁内只移动原退休拥有。
+                // SAFETY:
+                // 1. `ranges` 中的每个 `Weak<FileRangeData>` 都对应一个存活的 `FileRangeRegistration`；
+                //    `FileRangeRegistration::drop` 必须先获取当前持有的 `self.ranges` 自旋锁才能移除条目并析构 `data`，
+                //    因此在持有 `self.ranges` 锁期间，`weak.as_ptr()` 指向的 `FileRangeData` 保证有效且不会被释放。
                 let data = unsafe { &*weak.as_ptr() };
-                // SAFETY: 同一范围锁保来源登记和 fork/换身份互斥；原退休页及表链在此处只接收拥有，
-                // 下方在全部范围/PTE 锁外完成真实 CSD 后才析构，不提前归还数据页或目录页。
+                // SAFETY:
+                // 1. 当前持有 `self.ranges` 自旋锁，与并发的缺页填表、COW 换页及 `fork` 保持互斥。
+                // 2. 被卸载页表项所转移出的物理页引用与空页表页均收集在 `pages` 和 `tables` 中，
+                //    直到下方释放所有自旋锁并执行 `sync_retired`（全核 TLB 同步）之后才会真正释放。
                 unmapped += unsafe {
                     data.domain
                         .unmap_range(data, &range, even_cows, &mut pages, &mut tables)
@@ -1595,7 +1761,7 @@ impl FileMapping {
         unmapped
     }
 
-    /// 原退休拥有始终覆盖真实全 CPU 同步及既有观察点，调用者随后才析构。
+    /// 对刚刚从页表中卸下的物理页集合 `pages` 与退休页表页 `tables` 执行全核 TLB 刷新（`sync_all`），并在同步前后触发测试观察钩子。
     fn sync_retired(&self, pages: &ResidentPages, tables: &RetiredTables) {
         #[cfg(feature = "ktest")]
         let hook = self.unmap_hook.lock().clone();
@@ -1620,8 +1786,9 @@ impl FileMapping {
         let _ = (pages, tables);
     }
 
-    /// 普通清洁回收只查有限原来源，先 mkclean/CSD，再按同来源、File 与 PFN 撤叶。
-    /// 私有匿名 COW 保留；任何预算拒尾仍结束已撤叶的 CSD 和真实拥有，不归还原 file 页。
+    /// 在常规内存回收（`ReclaimMode::Normal`）路径中，尝试清理并卸载指向指定干净文件页 `folio` 的所有用户态页表映射。
+    ///
+    /// 若遍历过程中发现共享映射（`MAP_SHARED`）的页表项带有硬件脏位，则将其转为页缓存脏扇区并中止对该页的回收（返回 `false`）。
     fn reclaim_mappings(
         &self,
         inode: &InodeRef,
@@ -1640,6 +1807,7 @@ impl FileMapping {
             .expect("file reclaim end overflow");
         let mut sources: [Option<Arc<FileRangeData>>; SOURCES] = [const { None }; SOURCES];
         let mut count = 0;
+        // Step 1: 在 `ranges` 自旋锁下收集覆盖当前文件页偏移 `[start, end)` 的前 `SOURCES`（最多 32）个 VMA 反向映射描述。
         {
             let ranges = self.ranges.lock();
             for ((offset, _), weak) in ranges.iter() {
@@ -1667,6 +1835,7 @@ impl FileMapping {
             }
         }
 
+        // Step 2: 遍历所有共享映射（`!data.private`），清除页表项写权限并汇总硬件脏位；若发现被写脏则标记页缓存扇区为 Dirty。
         for data in sources[..count].iter().flatten() {
             if !data.private {
                 let (observed, _) = data.domain.mkclean_range(data, start, folio.phys_addr());
@@ -1691,6 +1860,7 @@ impl FileMapping {
             return false;
         }
 
+        // Step 3: 若全核 TLB 同步后该页仍保持干净且无回写，则再次持 `ranges` 锁卸载所有指向该文件页的页表叶子项。
         let mut pages = ResidentPages::default();
         let mut tables = RetiredTables::default();
         let mut unmapped = 0;
@@ -1702,9 +1872,10 @@ impl FileMapping {
                     complete = false;
                     break;
                 }
-                // SAFETY: 原来源 Arc 保活，其登记/换身份/fork 与本范围锁串行；
-                // 只撤实际 File 后备、同来源及同 PFN，旧原页/表拥有移入退休链，
-                // 下方锁外无条件全 CPU CSD 完成以后才释放；匿名 COW 不匹配。
+                // SAFETY:
+                // 1. `data` 由 `sources` 数组中的 `Arc<FileRangeData>` 强引用保活，且当前持有 `self.ranges` 自旋锁。
+                // 2. `unmap_file_folio` 仅卸载仍指向 `folio.phys_addr()` 的文件后备页表项（不影响私有匿名 COW 页），
+                //    且卸下的引用存入 `pages` 和 `tables`，在下方锁外完成 `sync_retired` 全核 TLB 同步后才释放。
                 unmapped += unsafe {
                     data.domain.unmap_file_folio(
                         data,
@@ -1728,21 +1899,20 @@ impl FileMapping {
         complete
     }
 
-    /// 观察真实撤叶与 CSD 边界，callback 不改变叶或替代硬件同步；旧 callback 锁外释放。
+    /// 设置或清除文件页表卸载与 TLB 同步边界的测试观察钩子，旧钩子在自旋锁外释放。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_unmap_hook(&self, hook: Option<FileUnmapHook>) {
         let previous = core::mem::replace(&mut *self.unmap_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 在正式截断协议下附实际 inode 后清理原页，删除义务与本卷页账在同次状态转换中退出。
+    /// 在文件截断收缩（将文件长度减小至 `new_size`）时，清理并移除所有完全超出 `new_size` 的缓存页，
+    /// 并作废跨 `new_size` 边界页内超出新文件末尾的完整文件系统逻辑块。
     ///
     /// # Safety
-    /// 调用者须持同 inode 写序列化、invalidate 独占及本 mapping 的 WB 互斥，
-    /// 已发表 new_size 且完成第一次完整尾范围 even_cows 撤叶/CSD，阻止新填充和 WB。
-    /// 原索引页属于本 inode；旧填充和真实 WB 的完成不得依赖调用者持有的锁。
-    /// 返回后仍须第二次 even_cows 撤叶/CSD，再结束旧块别名及设备使用并归还磁盘块；
-    /// 部分保留 FS 块的盘上尾零由文件系统负责，删除义务不能当作回写成功。
+    /// 1. 调用方必须同时持有该 `Inode` 的写互斥锁、失效独占锁（`invalidate`）以及当前 `FileMapping` 的 `writeback` 睡眠锁。
+    /// 2. 调用方必须已更新 `Inode` 的 `new_size`，且已对被截断区间执行过第一轮 `even_cows = true` 的 `unmap_range` 与 TLB 同步。
+    /// 3. 本函数返回后，调用方仍需在释放底层磁盘块之前执行第二轮 `unmap_range(..., true)`，并负责将跨边界逻辑块的尾部字节清零。
     pub(crate) unsafe fn truncate_pages(
         &self,
         inode: &InodeRef,
@@ -1759,6 +1929,7 @@ impl FileMapping {
         ) {
             return Err(FsError::InvalidOperation);
         }
+        // Step 1: 逐个摘除并作废页起始偏移完全位于 `new_size` 之后的整页节点。
         let first = new_size.div_ceil(PAGE_SIZE as u64);
         loop {
             let next = {
@@ -1785,15 +1956,17 @@ impl FileMapping {
                 );
                 entries.remove(index).unwrap()
             };
-            // SAFETY: 调用者阻止新填充/WB；内容锁已等唯一填充，真实 WB 已结束。
-            // 本原节点已摘索引，仍指本 folio 的文件叶已撤且 CSD 完成；
-            // 迟到候选同内容锁重核 canonical，私有匿名副本不再访问该原页。
+            // SAFETY:
+            // 1. 调用方持有 `Inode` 写锁、`invalidate` 锁与 `writeback` 锁，阻止了新的缺页加载与回写启动。
+            // 2. 上方已获取 `folio.lock_content()`、等待在途回写完成、卸载了所有关联页表项并将节点从索引树摘除，
+            //    因此可安全调用 `content.discard()` 直接清除该页的脏状态并回收内存配额。
             unsafe { content.discard() };
             drop(content);
             drop(detached);
             drop(folio);
         }
 
+        // Step 2: 若 `new_size` 落在某个 4KiB 页内部，则清理该尾部半页内完全超出 `new_size` 的文件系统逻辑块脏/有效状态。
         let valid = (new_size % PAGE_SIZE as u64) as usize;
         if valid == 0 {
             return Ok(());
@@ -1808,16 +1981,16 @@ impl FileMapping {
             let mut content = folio.lock_content();
             folio.wait_writeback();
             self.mkclean(index, &folio, &mut content);
-            // SAFETY: 同 inode 写/invalidate/WB 保护来自调用者；原内容 guard 已等填充，
-            // 真实 WB 已结束，mkclean 在短锁外完成全部 CPU 写许可失效。
-            // 仅作废删除的整 FS 块，有效前缀及私有匿名页保持原内容。
+            // SAFETY:
+            // 1. 调用方持有截断所需的三把互斥锁，上方已获取 `folio.lock_content()`、等待回写完成并调用 `mkclean` 收回所有用户态写权限。
+            // 2. `truncate_file_tail(valid, block_size)` 仅作废偏移 `valid` 之后完整被删的文件系统逻辑块，保留有效前缀数据。
             unsafe { content.truncate_file_tail(valid, block_size) }?;
             self.set_to_write(index, false);
         }
         Ok(())
     }
 
-    /// 在 canonical 准入短锁内辨别纯缓存拥有，允许脏义务留给后续真实同步。
+    /// 检查当前文件索引中的所有驻留页是否均仅由页缓存自身持有（无用户态页表映射、无在途 I/O 或外部借用）。
     pub(crate) fn is_cache_only(&self) -> bool {
         let entries = self.index.entries.lock();
         let mut cursor = 0;
@@ -1833,7 +2006,7 @@ impl FileMapping {
         true
     }
 
-    /// 容量不足时在锁外准备替代存储；短锁内重查并仅转移原 Weak，不分配或析构。
+    /// 将新的文件映射范围 `data` 按键序插入 `self.ranges`；若底层 `Vec` 容量不足，则在自旋锁外扩容后再交换插入。
     fn register_range(&self, data: &Arc<FileRangeData>) -> Result<(), BlockError> {
         let key = FileRangeData::key(data);
         let mut spare = Vec::new();
@@ -1861,8 +2034,10 @@ impl FileMapping {
         }
     }
 
-    /// 持真实 folio 内容锁逐个枚举 shared 文件范围，降权后在全部短锁外同步全 CPU。
-    /// 新写授权也取此内容锁，故候选登记及并发移除无需全局代次或整表快照。
+    /// 在持有 `folio` 页内容锁（`content`）的前提下，遍历所有覆盖第 `index` 页的共享文件映射（`MAP_SHARED`），
+    /// 将用户态页表项降权为只读、汇总硬件脏位到 `content` 的脏扇区掩码中，并在最后执行一次全核 TLB 同步（`sync_all`）。
+    ///
+    /// 返回本次操作实际清除可写权限的用户态页表项数量。
     pub(crate) fn mkclean(
         &self,
         index: u64,
@@ -1913,37 +2088,38 @@ impl FileMapping {
             }
             cursor = Some(data);
         }
-        // 范围换身份可已撤 W、尚未结束自己的 CSD；零命中也须结束旧远核翻译。
+        // 即使本轮未扫到可写页表项，此前并发的 COW 换页也可能刚清除了写权限但尚未完成全核刷新，因此统一执行 `sync_all()`。
         sync_all();
         cleaned
     }
 
-    /// 仅摘除无内容锁、Dirty、WB 和外部使用者的静止页。
+    /// 扫描当前文件索引，摘除并释放所有无外部引用、无脏数据且无在途回写的干净空闲页，返回清理的页数。
     pub fn prune_unused(&self) -> usize {
         self.index.prune_unused(None)
     }
 
-    /// 返回已发表的稀疏节点数。
+    /// 返回当前文件索引中驻留的物理页节点数量。
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    /// 检查是否仍保有任何页身份。
+    /// 判断当前文件索引是否为空（没有任何驻留的缓存页）。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 在同一原节点标记或取消本轮待写选择，不创建第二份页拥有。
+    /// 设置或清除文件第 `index` 页的 `to_write` 本轮回写选中标记。
     pub fn set_to_write(&self, index: u64, selected: bool) {
         self.index.entries.lock().set_to_write(index, selected);
     }
 
-    /// 持同 inode 扫描互斥时选定入口完整集合，显式同步保留原半开范围。
+    /// 在半开页号区间 `[start, end)` 内将所有脏页或正在回写的页标记为 `ToWrite`，返回选中的页数。
     pub(crate) fn mark_to_write_range(&self, start: u64, end: u64) -> usize {
         self.index.mark_to_write_range(start, end, usize::MAX).0
     }
 
-    /// 后台最多标记 max_pages 个原节点，并返回下轮单向续扫位置。
+    /// 在半开页号区间 `[start, end)` 内将最多 `max_pages` 个脏页或正在回写的页标记为 `ToWrite`，
+    /// 返回 `(本轮选中的页数, 下一轮续扫的起始页号)`。
     pub(crate) fn mark_to_write_budget(
         &self,
         start: u64,
@@ -1953,8 +2129,7 @@ impl FileMapping {
         self.index.mark_to_write_range(start, end, max_pages)
     }
 
-    /// 锁内只选有界范围和增加原引用；返回值是下一次有界扫描起点。
-    /// 文件扫描者保原 InodeRef 到所有选中页和 IO 使用结束，跨拥有交付须附原 anchor。
+    /// 在半开页号区间 `[start, end)` 内按序筛选匹配 `mark` 状态的文件页填入 `output`，并返回下一轮续扫的起始页号。
     pub(crate) fn select_range(
         &self,
         start: u64,
@@ -1967,7 +2142,7 @@ impl FileMapping {
 }
 
 impl Default for FileMapping {
-    /// 默认文件映射同样没有预先申请或固定页预算。
+    /// 创建一个默认的空 `FileMapping` 实例。
     fn default() -> Self {
         Self::new()
     }
@@ -1976,7 +2151,11 @@ impl Default for FileMapping {
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest;
 
-/// 单一申请先收当前清洁原页，只有没有实际归页时才请求一次原卷有限 WB 值进度。
+/// 执行一轮针对全局磁盘文件页 LRU 的物理内存回收尝试。
+///
+/// 先执行一轮干净页扫描与回收（`reclaim_pass`）；若首轮未能释放任何文件页或页表页，
+/// 且扫描过程中遇到了可读写卷上的脏页，并在当前回收上下文允许等待回写（`attempt.wait_writeback()`）时，
+/// 则触发对应 `Ext4Volume` 的一次定量回写推进，待回写完成后再执行第二轮干净页回收。
 pub(crate) fn reclaim_file(attempt: &mut ReclaimAttempt) {
     let before = attempt.stats();
     let mut writeback = None;
@@ -2007,7 +2186,7 @@ pub(crate) fn reclaim_file(attempt: &mut ReclaimAttempt) {
     reclaim_pass(attempt, &mut None);
 }
 
-/// 本轮只走入口队列前缀；老化后的 active 页不在同轮再次隔离，访问及弱失败也耗预算。
+/// 执行单轮全局文件页 LRU 扫描：从 `inactive` 队列隔离候选页并尝试回收，随后对 `active` 队列头部执行定量老化扫描。
 fn reclaim_pass(attempt: &mut ReclaimAttempt, writeback: &mut Option<Arc<Ext4Volume>>) {
     const ACTIVE_AGING_BATCH: usize = 16;
     let (inactive, active) = index::lru_lengths();
@@ -2024,12 +2203,18 @@ fn reclaim_pass(attempt: &mut ReclaimAttempt, writeback: &mut Option<Arc<Ext4Vol
     index::age_active(attempt, aging);
 }
 
-/// 隔离同票锁外升级真实 canonical owner；所有 guard 结束后才 putback 或实际最后释放。
+/// 尝试回收单个已从 `inactive` 队列隔离出的文件页节点 `node`：
+///
+/// - 若所属 `Inode` 正在析构（弱引用升级失败），则直接通过 `putback` 归还或释放节点；
+/// - 在常规回收模式（`ReclaimMode::Normal`）下，先卸载指向该页的用户态页表项并确认页面干净，
+///   随后在 `entries` 与 `FILE_LRU` 双锁保护下调用 `retire_clean` 原子核验无外部引用后从索引摘除；
+/// - 若页面变脏或仍被外部引用而无法回收，则记录待回写卷并通过 `putback` 将节点放回 `inactive` 队尾。
 fn reclaim_node(
     node: NodeRef,
     attempt: &mut ReclaimAttempt,
     writeback: &mut Option<Arc<Ext4Volume>>,
 ) {
+    // Step 1: 尝试将节点的弱 Inode 引用升级为强引用；若 Inode 已在销毁中则直接归还或释放节点。
     let Some(inode) = node.role.as_ref().and_then(|role| role.owner().upgrade()) else {
         let freed_file = index::putback(node);
         attempt.account(ReclaimStats {
@@ -2042,6 +2227,7 @@ fn reclaim_node(
     let normal = attempt.mode() == ReclaimMode::Normal;
     let mut scanner = None;
     let mut needs_writeback = false;
+    // Step 2: 根据回收模式（常规卸载映射 vs 仅限无映射缓存页）检查脏状态、清理页表映射并从索引树原子摘除。
     let retired = if normal {
         (|| {
             let _scope = ReclaimScope::nofs();
@@ -2097,6 +2283,7 @@ fn reclaim_node(
         }
     };
 
+    // Step 3: 若因页面变脏而未能回收，记录所属可读写卷以便后续触发定量回写；最后在锁外释放已摘除节点或将节点放回 LRU。
     if needs_writeback && writeback.is_none() {
         if let Ok(volume) = inode.disk_volume() {
             if volume.mode() == AccessMode::ReadWrite {
@@ -2119,7 +2306,7 @@ fn reclaim_node(
     });
 }
 
-/// 返回本架构实际 Node payload 布局，不猜 Arc 控制头或额外预留控制对象。
+/// 返回当前目标架构下 `Node` 结构体的字节大小（仅用于内核测试校验元数据预留槽位大小）。
 #[cfg(feature = "ktest")]
 pub(crate) const fn ktest_node_bytes() -> usize {
     core::mem::size_of::<Node>()

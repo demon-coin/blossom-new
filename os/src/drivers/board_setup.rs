@@ -1,14 +1,57 @@
-//! 所选 MMC/GMAC 的 JH7110 时钟、复位和引脚动作；不建立设备注册表。
+//! StarFive JH7110 板级外设（SDIO / GMAC）的时钟树、复位控制与引脚复用（IOMUX）配置模块。
 //!
-//! 归档身份见 `build/stage11/linux-reference-exports.json`；以下是实际 7.3.0-rc4
-//! 归档中 `linux/` 下的成员，不要求它们已全部导出到普通源码目录：
-//! `drivers/clk/starfive/clk-starfive-jh7110-{sys,aon,pll}.c`、
-//! `clk-starfive-jh71x0.{c,h}`、`drivers/reset/starfive/reset-starfive-jh71x0.c`、
-//! `reset-starfive-jh7110.c`、`drivers/pinctrl/starfive/pinctrl-starfive-jh7110{,-sys}.c`，
-//! 以及 `arch/riscv/boot/dts/starfive/jh7110{,-common}.dtsi` 的 MMC/GMAC 绑定。
-//! 门控交叉依据为固定 `ref/stage11/moss-ba14c9c06eea/` 中的
-//! `vendor/axdriver/src/jh7110.rs:20-29,65-95`；其它同级板资料不提供可复用的时钟状态机。
-//! 只改叶设备需要的门、分频、父源和复位；共享 PLL、CPU/总线根的配置保留。
+//! ## 模块职责与架构定位
+//! 本模块位于具体板级外设驱动（`sdmmc`、`dwmac`）与底层 SoC 系统控制寄存器之间，
+//! 负责在设备初始化阶段根据 [`boot::DeviceSetup`] 中解析出的设备树（FDT）绑定信息，
+//! 对 JH7110 的系统时钟复位控制器（`SYS_CRG` / `AON_CRG`）、锁相环状态（`PLL_SYSCON`）
+//! 以及引脚复用控制器（`SYS_PIN` / `AON_PIN`）执行寄存器级的读-改-写配置。
+//!
+//! ## 核心设计与硬件寄存器布局
+//! 本模块仅按需修改目标外设叶子节点所需的时钟门控（Gate）、分频系数（Divider）、
+//! 多路复用父源（Mux）与复位线（Reset），保持共享 PLL 与 CPU/总线根时钟的固件配置不变。
+//!
+//! 1. **CRG 时钟与复位寄存器布局**：
+//!    - 每个时钟节点对应一个独立的 32 位寄存器（偏移 = `clock_id * 4`）：
+//!
+//! ```text
+//!  31      28 27      24 23                                      0
+//! +----------+----------+-----------------------------------------+
+//! |  ENABLE  |   MUX    |                 DIVIDER                 |
+//! | (Bit 31) | [27:24]  |                 [23:0]                  |
+//! +----------+----------+-----------------------------------------+
+//! ```
+//!
+//!    - 复位控制器按每 32 个复位源共享一个 32 位控制字（`ASSERT`）与一个状态字（`STATUS`）；
+//!      写入 `ASSERT` 置 1 触发复位（此时 `STATUS` 对应位变为 0），清 0 解除复位（等待 `STATUS` 变为 1）。
+//!
+//! 2. **SYS_PIN 引脚复用与电气配置布局**：
+//!    - 64 个通用 GPIO 引脚在 `SYS_DOEN`（输出使能）、`SYS_DOUT`（输出信号路由）和 `SYS_GPI`（输入信号路由）
+//!      中按每字 4 个字节槽（8 bit/slot）排列；
+//!    - `PinResource::mux` 的 32 位编码格式如下：
+//!
+//! ```text
+//!  31          24 23          16 15        10 9      8 7          0
+//! +--------------+--------------+------------+--------+------------+
+//! |  DIN (GPI)   | DOUT (GPOUT) | DOEN(GPOEN)|  FUNC  | PIN NUMBER |
+//! |   [31:24]    |   [23:16]    |  [15:10]   | [9:8]  |   [7:0]    |
+//! +--------------+--------------+------------+--------+------------+
+//! ```
+//!
+//! 3. **设备初始化时序（[`apply_setup`]）**：
+//!
+//! ```text
+//! validate_setup (在首次写寄存器前校验所有 Clock/Reset/Pin 范围)
+//!    ├─► 1. 配置并使能 assigned-clocks 与设备 clocks (自顶向下开启父门控)
+//!    ├─► 2. 解除 IOMUX 控制器自身的时钟门控与复位 (prepare_pins)
+//!    ├─► 3. 拉低目标外设的所有复位线 (assert resets)
+//!    ├─► 4. 配置引脚复用路由与 Pad 电气属性，并保持复位至少 reset_hold 时长
+//!    └─► 5. 释放目标外设的所有复位线并等待硬件状态就绪 (deassert resets)
+//! ```
+//!
+//! ## 锁顺序与并发契约
+//! - 全局睡眠互斥锁 [`SETUP_LOCK`] 串行化所有对共享 CRG 与 IOMUX 寄存器的读-改-写操作。
+//! - 本模块所有公开入口均必须在时钟源已就绪、允许调度的普通任务上下文中调用；
+//!   中断处理路径或早期启动阶段严禁并发访问这些共享控制器寄存器。
 
 use crate::arch::{dma_barrier, mmio_address};
 use crate::boot::{
@@ -29,7 +72,7 @@ pub(crate) const DIV_MASK: u32 = 0x00ff_ffff;
 pub(crate) const MUX_MASK: u32 = 0x0f00_0000;
 const TRANSITION_TIMEOUT: Duration = Duration::from_millis(1);
 
-// CRG 的每个时钟占一字，reset 另按32个源共用一字。
+// CRG 中每个时钟占用一个 32 位字；复位控制器则按每 32 个复位源共享一个 32 位字。
 const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
 pub(crate) const CLOCK_MUX_SHIFT: u32 = 24;
 const MAX_CLOCK_DEPTH: usize = 16;
@@ -40,7 +83,7 @@ pub(crate) const AON_RESET_STATUS: usize = 0x3c;
 const SYS_CRG_MIN_BYTES: usize = SYS_RESET_STATUS + 3 * REGISTER_BYTES;
 const AON_CRG_MIN_BYTES: usize = AON_RESET_STATUS + REGISTER_BYTES;
 
-// ID 属于各自 provider，不能跨 SYS/AON 解释。
+// 时钟与复位 ID 均归属于各自的控制器（SYS_CRG 或 AON_CRG），不可跨控制器混用。
 const SYSCLK_BUS_ROOT: u32 = 5;
 const SYSCLK_AXI_CFG0: u32 = 7;
 const SYSCLK_STG_AXIAHB: u32 = 8;
@@ -158,20 +201,20 @@ const GPI_SDIO0_WP: u32 = 13;
 const GPI_SDIO1_CD: u32 = 41;
 const GPI_SDIO1_STRB: u32 = 53;
 
-// 可睡锁串行共享寄存器的 RMW；IRQ/早期 RTC 不得与这些初始化动作并发。
+// 使用可睡眠互斥锁串行化共享 CRG/IOMUX 寄存器的读-改-写操作；中断上下文不得并发调用本模块。
 static SETUP_LOCK: SleepMutex<()> = SleepMutex::new(());
 
-/// 对一次规范化请求执行实际板设备动作；空请求不取锁、不读取启动快照。
+/// 根据规范化的板级设备配置请求，依次完成目标外设的时钟配置、引脚复用及复位释放。
 ///
-/// 只能在时间源已建立、可切换的普通任务中调用。所选复位全部 assert 后，
-/// 至少保持 reset_hold 的单调时间；失败前已完成的动作保留，不回滚共享时钟。
+/// 若请求中不包含任何时钟、复位或引脚条目，则直接返回而不获取锁。
+/// 必须在系统单调时钟已建立、允许调度的普通任务上下文中调用。所有目标复位线拉低（assert）后，
+/// 会至少维持 `reset_hold` 指定的单调时间长度再释放（deassert）；若中途出错，此前已生效的共享时钟配置保持现状。
 ///
 /// # Safety
-/// 所有 provider、父时钟和启动快照中的 PLL/syscrg 必须来自当前实际板资源，
-/// 其完整范围必须已有永久设备 MMIO 映射；调用者须独占目标外设且已阻止其 DMA。
-/// 全部 CRG/pinctrl 使用者须通过本锁串行，或在外部保证不并发修改同一寄存器；
-/// 调用者还须保证被改变的父时钟没有本请求以外的活动使用者。此处不取得资源拥有权。
-/// 叶驱动必须先检验自己必需的 clock/reset/pin，不能把缺资源传成空请求。
+/// 1. `setup` 中引用的所有控制器区间（Provider）、父时钟以及 [`boot::info`] 中的 PLL/CRG 资源必须对应真实板级硬件，
+///    且其完整寄存器范围已在内核虚拟地址空间中建立永久强序 MMIO 映射；
+/// 2. 调用方必须独占目标外设，且在调用期间已停止该外设的一切 DMA 活动；
+/// 3. 系统中所有对 CRG 与 pinctrl 寄存器的修改必须通过 [`SETUP_LOCK`] 串行化，且被修改频率或父源的时钟节点不得有其他并发活动外设正在使用。
 pub(crate) unsafe fn apply_setup(
     setup: &DeviceSetup,
     reset_hold: Duration,
@@ -185,6 +228,7 @@ pub(crate) unsafe fn apply_setup(
         return Ok(());
     }
 
+    // Step 1: 获取全局板级配置锁，配置并使能设备所需的时钟与指定时钟（assigned-clocks）。
     let _guard = SETUP_LOCK.lock();
     for clock in &setup.clocks.assigned[..setup.clocks.assigned_count] {
         configure_clock(clock)?;
@@ -193,11 +237,12 @@ pub(crate) unsafe fn apply_setup(
         configure_clock(clock)?;
         enable_clock(clock.reference, 0)?;
     }
-    // assigned-clocks 也可能不在 clocks 中；它自己的父源和门同样必须生效。
+    // assigned-clocks 中的时钟节点未必重复出现在 clocks 列表中，同样需要递归开启其父源与自身门控。
     for clock in &setup.clocks.assigned[..setup.clocks.assigned_count] {
         enable_clock(clock.reference, 0)?;
     }
 
+    // Step 2: 预先使能 IOMUX 控制器时钟并解除其复位，随后将目标外设的所有复位线置为有效（assert）。
     prepare_pins(setup)?;
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, true)?;
@@ -212,6 +257,7 @@ pub(crate) unsafe fn apply_setup(
         )
     };
 
+    // Step 3: 在外设处于复位保持状态期间配置引脚复用与电气参数，并等待复位保持时间到期。
     for pin in &setup.pins[..setup.pin_count] {
         apply_pin(pin)?;
     }
@@ -221,17 +267,21 @@ pub(crate) unsafe fn apply_setup(
         }
     }
 
+    // Step 4: 解除目标外设的所有复位线（deassert），等待硬件复位状态位确认释放完成。
     for reset in &setup.resets[..setup.reset_count] {
         set_reset(*reset, false)?;
     }
     Ok(())
 }
 
-/// 读取所选实际时钟树的当前输出率；请求中的 rate 不代替硬件读数。
+/// 从硬件时钟树寄存器实时计算并返回指定时钟节点的当前输出频率（单位：Hz）。
+///
+/// 对于外部固定频率时钟（`fixed-clock`），直接返回设备树给定的频率；对于 CRG 内部时钟，
+/// 沿硬件实际选中的多路复用父源与分频寄存器逐级向上回溯计算。
 ///
 /// # Safety
-/// 与 apply_setup 相同的永久映射和共享寄存器串行义务适用；只能在可切换任务中调用。
-/// JH7110 的晶振频率、PLL 寄存器资源必须已经由唯一启动发现发布，不能由调用者猜测。
+/// 1. 调用方必须满足与 [`apply_setup`] 相同的永久强序 MMIO 映射与 [`SETUP_LOCK`] 串行化要求；
+/// 2. 只能在普通可睡眠任务上下文中调用，且 [`boot::info`] 中的晶振频率与 PLL 寄存器区间必须已由启动阶段正确初始化。
 pub(crate) unsafe fn clock_rate(clock: &ClockResource) -> Result<u64, &'static str> {
     validate_clock(clock)?;
     if fixed(clock.reference) {
@@ -241,16 +291,19 @@ pub(crate) unsafe fn clock_rate(clock: &ClockResource) -> Result<u64, &'static s
     rate(clock.reference, 0)
 }
 
-/// 在普通可睡任务中配置独立 SYS GPIO 输入并读取原始电平，不解释卡检测极性。
+/// 在普通可睡眠任务中将指定的 `SYS_PIN` 通用引脚配置为施密特触发输入模式，并读取其原始引脚电平。
+///
+/// 本函数仅返回 GPIO 输入寄存器的原始比特状态（`true` 为高电平，`false` 为低电平），不反转卡检测（CD）等信号的低有效极性。
 ///
 /// # Safety
-/// GPIO provider 与所选设备的 SYS CRG 必须来自唯一启动快照，并已有完整永久 MMIO
-/// 映射；调用者独占该 pin 的功能选择，全部共享 CRG/pinctrl 更新遵守 SETUP_LOCK。
+/// 1. `input.provider` 与系统 `SYS_CRG` 必须来自全局启动信息快照，且已完成完整的永久强序 MMIO 映射；
+/// 2. 调用方必须独占 `input.pin` 对应引脚的复用配置权，所有共享 CRG 与 IOMUX 寄存器访问均受 [`SETUP_LOCK`] 保护。
 pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, &'static str> {
     check_region(input.provider, SYS_PIN, SYS_PIN_MIN_BYTES)?;
     if SYS_GPIO_COUNT <= input.pin {
         return Err("JH7110 SYS GPIO input pin is outside the supported range");
     }
+    // Step 1: 获取全局配置锁，确保 SYS_PIN 依赖的 IOMUX APB 时钟已开启且复位已解除。
     let _guard = SETUP_LOCK.lock();
     let provider = crg(SYS_CRG)?;
     enable_clock(
@@ -268,6 +321,7 @@ pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, 
         false,
     )?;
 
+    // Step 2: 计算引脚在每字 4 槽寄存器中的字节偏移与位偏移，启用输入与施密特触发并关闭输出驱动。
     let pin = input.pin;
     let offset = pin as usize / GPIO_SLOTS_PER_WORD as usize * REGISTER_BYTES;
     let shift = pin % GPIO_SLOTS_PER_WORD * GPIO_SLOT_BITS;
@@ -293,6 +347,7 @@ pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, 
         update(input.provider, offset, PINMUX_FUNCTION_MASK << shift, 0)?;
     }
 
+    // Step 3: 从 SYS_GPIOIN 寄存器读取该引脚对应的原始输入电平位。
     Ok(read(
         input.provider,
         SYS_GPIOIN + pin as usize / u32::BITS as usize * REGISTER_BYTES,
@@ -300,7 +355,7 @@ pub(crate) unsafe fn read_gpio_input(input: &GpioInputResource) -> Result<bool, 
         != 0)
 }
 
-/// 检查完整寄存器范围，防止偏移或地址加法溢出后再进行 MMIO。
+/// 校验控制器物理地址区间 `region` 是否精确起始于 `base` 且长度至少包含 `bytes` 字节。
 fn check_region(region: Region, base: usize, bytes: usize) -> Result<(), &'static str> {
     if region.start != base || region.end < region.start || region.end - region.start < bytes {
         return Err("JH7110 provider address or register range is unsupported");
@@ -308,26 +363,30 @@ fn check_region(region: Region, base: usize, bytes: usize) -> Result<(), &'stati
     Ok(())
 }
 
-/// 私有 MMIO 读取只由已验证资源和外层 unsafe 调用合同覆盖。
+/// 从已验证的设备寄存器区间读取 `offset` 处的 32 位寄存器值，并在前后插入 DMA 内存屏障。
 fn read(region: Region, offset: usize) -> u32 {
     assert!(offset % 4 == 0 && offset + 4 <= region.end - region.start);
     dma_barrier();
-    // SAFETY: 对外入口要求 provider 永久映射，所有调用前已校验该硬件范围；偏移覆盖完整 u32。
+    // SAFETY:
+    // 1. 外层公开 `unsafe` 入口契约保证 `region` 具有永久有效的强序 MMIO 映射，且调用方已通过 `check_region` 验证基址与最小长度；
+    // 2. 上方 `assert!` 已确认 `offset` 按 4 字节对齐且 `[offset, offset + 4)` 完全落在 `region` 范围内。
     let value = unsafe { ((mmio_address(region.start) + offset) as *const u32).read_volatile() };
     dma_barrier();
     value
 }
 
-/// 写入实际设备寄存器并以架构设备屏障发布，不以编译器屏障替代设备顺序。
+/// 向已验证的设备寄存器区间 `offset` 处写入 32 位值，并在前后插入架构设备屏障以保证硬件可见顺序。
 fn write(region: Region, offset: usize, value: u32) {
     assert!(offset % 4 == 0 && offset + 4 <= region.end - region.start);
     dma_barrier();
-    // SAFETY: 外层调用者提供永久映射和独占，SETUP_LOCK 串行 RMW；本访问在已验证的四字节范围内。
+    // SAFETY:
+    // 1. 外层公开 `unsafe` 入口保证 `region` 已建立永久强序 MMIO 映射，且所有调用路径均持有 `SETUP_LOCK` 串行化寄存器修改；
+    // 2. 上方 `assert!` 已确认 `offset` 按 4 字节对齐且目标 32 位字完全处于已校验的 `region` 边界内。
     unsafe { ((mmio_address(region.start) + offset) as *mut u32).write_volatile(value) };
     dma_barrier();
 }
 
-/// 等待真实寄存器字段达到期望值，期限属于原单调时间域。
+/// 轮询等待寄存器 `offset` 在掩码 `mask` 下的位域变为 `value`，超时上限为 [`TRANSITION_TIMEOUT`]（1 毫秒）。
 fn wait_bits(region: Region, offset: usize, mask: u32, value: u32) -> Result<(), &'static str> {
     let deadline = time::now()
         .checked_add(TRANSITION_TIMEOUT)
@@ -343,18 +402,18 @@ fn wait_bits(region: Region, offset: usize, mask: u32, value: u32) -> Result<(),
     }
 }
 
-/// 只更新请求字段，保留同一字内其它设备状态，并确认实际回读。
+/// 对寄存器 `offset` 执行掩码读-改-写（清除 `mask` 位并填入 `value`），并轮询确认硬件回读值已生效。
 fn update(region: Region, offset: usize, mask: u32, value: u32) -> Result<(), &'static str> {
     write(region, offset, (read(region, offset) & !mask) | value);
     wait_bits(region, offset, mask, value)
 }
 
-/// 零范围只代表规范化的 fixed-clock，非零但空的 provider 不作固定输入处理。
+/// 判断资源引用是否表示无 MMIO 寄存器的外部固定频率时钟（`provider` 起止地址与 `id` 全为 0）。
 fn fixed(reference: ResourceReference) -> bool {
     reference.provider.start == 0 && reference.provider.end == 0 && reference.id == 0
 }
 
-/// 校验计数和所有请求的绑定形状，在第一次 MMIO 写前拒绝不支持的输入。
+/// 在执行任何硬件寄存器写入前，全面校验 `setup` 中所有时钟、复位及引脚资源的计数与硬件绑定合法性。
 fn validate_setup(setup: &DeviceSetup) -> Result<(), &'static str> {
     if setup.clocks.entries.len() < setup.clocks.count
         || setup.clocks.assigned.len() < setup.clocks.assigned_count
@@ -378,7 +437,7 @@ fn validate_setup(setup: &DeviceSetup) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 只接受本轮 SDIO、GMAC 以及其所需 IOMUX 的实际 provider/id。
+/// 校验单个时钟资源是否属于 JH7110 支持的 SDIO、GMAC 或 IOMUX 时钟绑定范围。
 fn validate_clock(clock: &ClockResource) -> Result<(), &'static str> {
     if fixed(clock.reference) {
         if clock.parent.is_some() || clock.rate.is_none() || clock.rate == Some(0) {
@@ -411,7 +470,7 @@ fn validate_clock(clock: &ClockResource) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 从所选两个设备的真实 provider 引用取得 CRG，缺映射时不从板地址制造资源。
+/// 从启动阶段选定的 MMC 或 GMAC 设备资源中查找并返回基址为 `base` 的 CRG 控制器物理区间。
 fn crg(base: usize) -> Result<Region, &'static str> {
     let board = &boot::info().board;
     for setup in [
@@ -445,7 +504,7 @@ fn crg(base: usize) -> Result<Region, &'static str> {
     Err("required JH7110 CRG provider is missing from selected device resources")
 }
 
-/// 只把实际硬件支持的 GMAC mux 父引用转换成选择位；固定输入 phandle 丢失身份时拒绝猜测。
+/// 将设备树指定的时钟父节点引用 `parent` 转换为目标多路复用时钟 `clock` 硬件寄存器的选择索引（Mux Index）。
 fn parent_index(clock: ResourceReference, parent: ResourceReference) -> Result<u32, &'static str> {
     if clock.provider.start == AON_CRG
         && clock.id == AONCLK_GMAC0_TX
@@ -464,7 +523,7 @@ fn parent_index(clock: ResourceReference, parent: ResourceReference) -> Result<u
         }
         (SYS_CRG, SYSCLK_GMAC1_TX) => [SYSCLK_GMAC1_GTXCLK, SYSCLK_GMAC1_RMII_RTX],
         (AON_CRG, AONCLK_GMAC0_TX) => {
-            // AON 的 GTX 父源来自 SYS；本轮实际 DT 只指定同 AON 的 RMII_RTX。
+            // AON GMAC0_TX 的 0 号父源位于 SYS_CRG（已在函数开头处理），1 号父源为同属 AON_CRG 的 RMII_RTX。
             if parent.id == AONCLK_GMAC0_RMII_RTX {
                 return Ok(1);
             }
@@ -482,7 +541,7 @@ fn parent_index(clock: ResourceReference, parent: ResourceReference) -> Result<u
         .ok_or("assigned clock parent id is not connected to this mux")
 }
 
-/// 父源和输出率分别落实到硬件，不因已有 gate 或请求重复而跳过配置。
+/// 将单个时钟资源的父源选择（Mux）与目标输出频率（Rate）写入硬件寄存器。
 fn configure_clock(clock: &ClockResource) -> Result<(), &'static str> {
     if fixed(clock.reference) {
         return Ok(());
@@ -502,17 +561,24 @@ fn configure_clock(clock: &ClockResource) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 有限的所选硬件树边；根输入没有独立 CRG 门寄存器。
+/// JH7110 局部时钟树中某个时钟节点的直接上游父节点类型。
+///
+/// 根时钟输入（晶振、PLL 或外部引脚时钟）没有独立的 CRG 门控寄存器。
 #[derive(Clone, Copy)]
 enum Parent {
+    /// 位于 `SYS_CRG` 或 `AON_CRG` 内的上游内部时钟节点。
     Clock(ResourceReference),
+    /// 板载外部主晶振输入（通常为 24 MHz，由设备树提供）。
     Oscillator,
+    /// `PLL_SYSCON` 中的硬件锁相环输出（参数为 PLL 编号，如 `0` 表示 PLL0、`2` 表示 PLL2）。
     Pll(u32),
+    /// GMAC 外部 RMII 参考时钟引脚输入。
     Rmii,
+    /// GMAC 外部 RGMII 接收时钟引脚输入。
     Rgmii,
 }
 
-/// 在同一已验证 CRG 内构造硬件父节点，不生成新物理资源。
+/// 在与 `reference` 相同的 CRG 控制器内构造时钟 ID 为 `id` 的上游父节点 [`Parent::Clock`]。
 fn local(reference: ResourceReference, id: u32) -> Parent {
     Parent::Clock(ResourceReference {
         provider: reference.provider,
@@ -520,7 +586,7 @@ fn local(reference: ResourceReference, id: u32) -> Parent {
     })
 }
 
-/// 读取所选 mux 的实际值，保留不合法硬件选择的错误。
+/// 从硬件时钟寄存器读取多路复用选择位（`MUX_MASK`），并校验其处于双父源索引范围（`0..=1`）内。
 fn selection(reference: ResourceReference) -> Result<u32, &'static str> {
     let selection = (read(reference.provider, reference.id as usize * REGISTER_BYTES) & MUX_MASK)
         >> CLOCK_MUX_SHIFT;
@@ -530,7 +596,7 @@ fn selection(reference: ResourceReference) -> Result<u32, &'static str> {
     Ok(selection)
 }
 
-/// 描述实际 SDIO/GMAC 到已有总线根的窄树，不支持其它外设的任意时钟遍历。
+/// 查询指定 SDIO、GMAC 或 IOMUX 时钟节点在硬件时钟树中的直接上游父节点。
 fn parent(reference: ResourceReference) -> Result<Parent, &'static str> {
     let result = match (reference.provider.start, reference.id) {
         (SYS_CRG, SYSCLK_BUS_ROOT) => {
@@ -605,7 +671,7 @@ fn parent(reference: ResourceReference) -> Result<Parent, &'static str> {
     Ok(result)
 }
 
-/// 返回真实整数分频的范围；零表示本节点不含分频字段。
+/// 返回指定时钟节点硬件分频寄存器的最大允许整数分频值；返回 `0` 表示该节点不包含分频字段。
 fn divider_max(reference: ResourceReference) -> u32 {
     match (reference.provider.start, reference.id) {
         (SYS_CRG, SYSCLK_AXI_CFG0) => 3,
@@ -622,14 +688,14 @@ fn divider_max(reference: ResourceReference) -> u32 {
     }
 }
 
-/// 只对有 gate 的节点写 bit31；反相节点递归到真实 gated parent，绝不伪造门位。
+/// 判断指定时钟节点的硬件寄存器是否包含独立的门控使能位（Bit 31 `ENABLE`）。
 fn gated(reference: ResourceReference) -> bool {
     matches!((reference.provider.start, reference.id),
         (SYS_CRG, SYSCLK_AHB0 | SYSCLK_AHB1 | SYSCLK_APB0 | SYSCLK_SDIO0_AHB..=SYSCLK_SDIO1_SDCARD | SYSCLK_GMAC1_AHB | SYSCLK_GMAC1_AXI | SYSCLK_GMAC1_PTP | SYSCLK_GMAC1_TX | SYSCLK_GMAC1_GTXC..=SYSCLK_IOMUX_APB)
         | (AON_CRG, AONCLK_GMAC0_AHB | AONCLK_GMAC0_AXI | AONCLK_GMAC0_TX))
 }
 
-/// 检查实际分频不为零且位于该寄存器的硬件范围内。
+/// 读取并校验指定时钟节点的当前硬件整数分频系数（无分频器的节点固定返回 `1`）。
 fn divisor(reference: ResourceReference) -> Result<u64, &'static str> {
     let maximum = divider_max(reference);
     if maximum == 0 {
@@ -642,7 +708,7 @@ fn divisor(reference: ResourceReference) -> Result<u64, &'static str> {
     Ok(u64::from(divisor))
 }
 
-/// 先启用实际父门再启用叶门；不重编程 PLL 或未请求的根频率。
+/// 按时钟树拓扑自顶向下递归开启上游父时钟门控，再置位当前时钟节点的使能位。
 fn enable_clock(reference: ResourceReference, depth: usize) -> Result<(), &'static str> {
     if fixed(reference) {
         return Ok(());
@@ -665,7 +731,7 @@ fn enable_clock(reference: ResourceReference, depth: usize) -> Result<(), &'stat
     Ok(())
 }
 
-/// 读取启动快照发布的真实晶振频率，缺失时不能把参考板频率当作输入。
+/// 从全局启动快照中读取板载主晶振频率（单位：Hz），若缺失或为 0 则返回错误。
 fn oscillator_rate() -> Result<u64, &'static str> {
     boot::info()
         .board
@@ -675,7 +741,7 @@ fn oscillator_rate() -> Result<u64, &'static str> {
         .ok_or("JH7110 oscillator clock-frequency is missing from normalized board inputs")
 }
 
-/// 读取实际 PLL 的整数或小数配置，计算原有 PLL 输出；不修改共享 PLL。
+/// 读取 `PLL_SYSCON` 中指定锁相环（PLL0 或 PLL2）的整数/小数倍频与预分频/后分频寄存器，计算其实时输出频率（单位：Hz）。
 fn pll_rate(id: u32) -> Result<u64, &'static str> {
     let registers = boot::info().board.clock_inputs.pll_registers;
     check_region(registers, PLL_SYSCON, PLL_MIN_BYTES)?;
@@ -721,7 +787,7 @@ fn pll_rate(id: u32) -> Result<u64, &'static str> {
         .ok_or("JH7110 PLL output rate is invalid")
 }
 
-/// 区分板内部可计算输入与尚未规范化身份的外部 GMAC 引脚时钟。
+/// 计算上游父节点 `upstream` 的输出频率（单位：Hz）；未在启动信息中提供频率的外部 RMII/RGMII 引脚时钟返回错误。
 fn parent_rate(upstream: Parent, depth: usize) -> Result<u64, &'static str> {
     match upstream {
         Parent::Clock(reference) => rate(reference, depth),
@@ -732,7 +798,7 @@ fn parent_rate(upstream: Parent, depth: usize) -> Result<u64, &'static str> {
     }
 }
 
-/// 沿已选择的真实父边计算频率，gate 关闭不改变源频率但零分频保留错误。
+/// 沿硬件当前选中的父节点路径递归计算 `reference` 时钟节点的输出频率（单位：Hz）。
 fn rate(reference: ResourceReference, depth: usize) -> Result<u64, &'static str> {
     if MAX_CLOCK_DEPTH <= depth {
         return Err("JH7110 selected clock path exceeds its bounded depth");
@@ -744,7 +810,7 @@ fn rate(reference: ResourceReference, depth: usize) -> Result<u64, &'static str>
     Ok(output)
 }
 
-/// SDIO 请求允许整数分频量化，向上取整保证输出不超过上限；叶须读取实际输出率。
+/// 计算 SDIO 卡时钟的整数分频系数：采用向上取整（`ceil(parent / requested)`）以保证实际输出频率不超过卡协议上限。
 fn sd_divider(parent: u64, requested: u64, maximum: u32) -> Result<u32, &'static str> {
     if requested == 0 {
         return Err("requested SDIO clock rate is zero");
@@ -756,7 +822,7 @@ fn sd_divider(parent: u64, requested: u64, maximum: u32) -> Result<u32, &'static
     Ok(divider as u32)
 }
 
-/// GMAC 链路时钟必须精确表达请求，不能量化后继续按原协商速率驱动 PHY。
+/// 计算 GMAC 等严格链路时钟的精确整数分频系数：要求父时钟频率必须能被目标频率整除。
 fn exact_divider(parent: u64, requested: u64, maximum: u32) -> Result<u32, &'static str> {
     if requested == 0 || parent % requested != 0 {
         return Err("requested clock rate has no exact integer divider");
@@ -768,7 +834,7 @@ fn exact_divider(parent: u64, requested: u64, maximum: u32) -> Result<u32, &'sta
     Ok(divider as u32)
 }
 
-/// 频率请求只改所选 SDIO/GMAC 叶分频，gate/反相节点沿同一真实父源传播。
+/// 设置目标时钟节点的输出频率：对含分频器的 SDIO/GMAC 节点直接更新分频字段，对门控/反相派生节点则向上游父节点传播。
 fn set_rate(
     reference: ResourceReference,
     requested: u64,
@@ -818,7 +884,7 @@ fn set_rate(
     }
 }
 
-/// 取得真实复位字和状态字；JH7110 asserted 为零、deasserted 为一。
+/// 计算指定复位源在对应 CRG 中的控制字偏移（`ASSERT`）、状态字偏移（`STATUS`）与单比特掩码。
 fn reset_registers(reference: ResourceReference) -> Result<(usize, usize, u32), &'static str> {
     let (assert, status) = match (reference.provider.start, reference.id) {
         (SYS_CRG, SYSRST_IOMUX_APB | SYSRST_SDIO0_AHB..=SYSRST_GMAC1_AHB) => {
@@ -839,7 +905,7 @@ fn reset_registers(reference: ResourceReference) -> Result<(usize, usize, u32), 
     ))
 }
 
-/// 更新 assert 位后等待独立 status 位，不把写入完成当作复位完成。
+/// 置位或清除指定复位源的控制位，并轮询独立的状态寄存器直至硬件复位状态切换完成（JH7110 状态位：`0` 为复位有效，`1` 为复位解除）。
 fn set_reset(reference: ResourceReference, asserted: bool) -> Result<(), &'static str> {
     let (control, status, mask) = reset_registers(reference)?;
     write(
@@ -855,7 +921,7 @@ fn set_reset(reference: ResourceReference, asserted: bool) -> Result<(), &'stati
     )
 }
 
-/// 计算每个规范化电气字段的真实 pad 位；未请求的电气位保持原值。
+/// 将规范化的引脚电气配置（上下拉、驱动电流 mA、输入使能、施密特触发、摆率）编码为 `SYS_PADCFG` 寄存器的掩码与目标位值。
 fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
     let mut mask = 0;
     let mut value = 0;
@@ -900,7 +966,7 @@ fn pad_config(pin: &PinResource) -> Result<(u32, u32), &'static str> {
     Ok((mask, value))
 }
 
-/// GPIO function0 的选择位来自实际 SYS func_sel；专用 SD/GMAC pad 不制造虚构 mux 字段。
+/// 查询需要显式写入 `SYS_FUNC_SEL` 寄存器以切换至 Function 0 的引脚对应的寄存器字节偏移与位偏移。
 fn function_field(pin: u32) -> Option<(usize, u32)> {
     match pin {
         6 => Some((SYS_FUNC_SEL + 5 * REGISTER_BYTES, 0)),
@@ -917,7 +983,7 @@ fn function_field(pin: u32) -> Option<(usize, u32)> {
     }
 }
 
-/// 只接受 SDIO GPIO 信号及 SD/GMAC 固定功能；电气无寄存器的 GMAC pad 明确拒绝配置。
+/// 校验单个引脚复用资源是否属于受支持的 `SYS_PIN`/`AON_PIN` 控制器及合法的 SDIO/GMAC 信号路由。
 fn validate_pin(pin: &PinResource) -> Result<(), &'static str> {
     let number = pin.mux & PINMUX_PIN_MASK;
     let function = (pin.mux >> PINMUX_FUNCTION_SHIFT) & PINMUX_FUNCTION_MASK;
@@ -964,7 +1030,7 @@ fn validate_pin(pin: &PinResource) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// IOMUX 的共享复位只解除、不重新 assert，避免破坏此前已初始化设备的引脚状态。
+/// 在访问引脚复用寄存器前，按需开启 `SYS_PIN`/`AON_PIN` 依赖的 IOMUX 时钟并解除其复位（仅解除不重新拉低复位，以免破坏已初始化外设的引脚状态）。
 fn prepare_pins(setup: &DeviceSetup) -> Result<(), &'static str> {
     if setup.pins[..setup.pin_count]
         .iter()
@@ -1001,7 +1067,7 @@ fn prepare_pins(setup: &DeviceSetup) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 按一个 pin 的字节槽修改 DOUT/DOEN/GPI；专用 pad 仅有已验证的固定功能。
+/// 将单个引脚的输出信号路由（`DOUT`）、输出使能路由（`DOEN`）、输入信号路由（`GPI`）、功能选择（`FUNC_SEL`）与电气配置（`PADCFG`）写入硬件寄存器。
 fn apply_pin(pin: &PinResource) -> Result<(), &'static str> {
     let number = pin.mux & PINMUX_PIN_MASK;
     if pin.provider.start == SYS_PIN {
@@ -1057,7 +1123,9 @@ fn apply_pin(pin: &PinResource) -> Result<(), &'static str> {
 mod checks {
     use super::*;
 
-    /// 纯转换检验覆盖整数分频、pinmux 位域和所有电气开关，不访问任何板寄存器。
+    /// 测试目标：验证纯软件计算函数（分频系数、功能选择位偏移、Pad 电气位掩码及复位寄存器定位）的编码准确性与非法参数拒绝行为。
+    /// 场景步骤：依次传入合法与越界的 GMAC/SDIO 分频请求、引脚编号、上下拉冲突配置、非法驱动电流及复位 ID。
+    /// 预期结果：合法输入返回精确匹配的寄存器偏移/掩码/分频值，越界或冲突输入均返回 `Err`。
     #[test]
     fn clock_and_pin_encoding() {
         assert_eq!(exact_divider(200_000_000, 50_000_000, 15), Ok(4));

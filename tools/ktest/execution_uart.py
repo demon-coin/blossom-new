@@ -1,4 +1,9 @@
-"""执行日志的具体宿主业务 fixture；KTAP 层不解释记录、缺口或正文。"""
+"""内核执行日志（`klog`）专项测试的宿主机串口观测与背压核验夹具。
+
+本模块专门配合三个内核执行服务日志用例（无分配记录标识、UART 打印机背压阻塞、多核定时器与工作队列混合汇聚）：
+通用 KTAP 解析器只负责协议状态流转，而本模块的 `ExecutionUART` 负责从原始串口字节流中提取 `KLOG` 业务行与
+`# diagnostic: execution-*` 环形缓冲区快照诊断行，并在用例结束时逐字节比对序号连续性、丢包计数及完整报文。
+"""
 
 import re
 
@@ -20,7 +25,7 @@ FILL = re.compile(rb"  # diagnostic: execution-backpressure fill-bytes=" + NUMBE
 
 
 def record_line(row):
-    """由独立环快照字段和固定业务正文生成生产 printer 的完整线字节。"""
+    """根据诊断行采集到的环形缓冲区记录元数据与期望消息体，拼装预期的 `KLOG ...\\n` 完整字节行。"""
     task = str(row["task"]) if row["task"] else "none"
     header = (f"KLOG seq={row['seq']} level={row['level']} ns={row['ns']} "
               f"cpu={row['cpu']} task={task} truncated={row['truncated']} "
@@ -29,10 +34,10 @@ def record_line(row):
 
 
 class ExecutionUART:
-    """仅承接三个具体日志场景；每个 case 独立保存完整正文和真实元数据。"""
+    """针对三个 `execution_services` 内核日志测试用例的宿主机侧串口观测器。"""
 
     def __init__(self, cpus, directory):
-        """固定本 VM 的真实核数和证据目录，不读取源码建立目录。"""
+        """初始化观测器，保存当前虚拟机的 CPU 核心数与原始证据落盘目录。"""
         self.cpus = cpus
         self.directory = directory
         self.kind = None
@@ -45,7 +50,7 @@ class ExecutionUART:
         self.captured = False
 
     def begin(self, case):
-        """具体 fixture 绑定实际自动目录全名，不参与通用注册或选择。"""
+        """在每个测试用例开始时重置观测状态，并根据用例全名判断是否激活对应的日志观测模式。"""
         kinds = {
             "os::ktest::execution_services::klog::records::allocation_free_record_identity": "records",
             "os::ktest::execution_services::klog::uart::socket_printer_backpressure": "backpressure",
@@ -61,10 +66,11 @@ class ExecutionUART:
         self.captured = False
 
     def observe(self, raw):
-        """保留原换行字节；业务元数据绝不作为 KTAP 控制事件。"""
+        """在用例 `body` 阶段逐行旁路观测原始串口字节，收集 `KLOG` 输出行与 `# diagnostic:` 元数据。"""
         if self.kind is None or not self.body:
             return
         limit = 5 if self.kind == "records" else (65 if self.kind == "backpressure" else 16 * self.cpus)
+        # 收集非背压场景下直接打印到串口的 KLOG 行（背压场景走独立的 capture 原始采集流程）
         if raw.startswith(b"KLOG "):
             require(self.kind != "backpressure", "backpressure bytes outside its opaque fixture")
             require(len(self.lines) < limit and len(raw) <= 769, "unexpected execution log record")
@@ -72,6 +78,7 @@ class ExecutionUART:
         pattern = RECORD if self.kind == "records" else (PRESSURE if self.kind == "backpressure" else MIXED)
         match = pattern.fullmatch(raw)
         if match:
+            # 解析内核测试在独立诊断行中导出的环形缓冲区记录元数据，用于事后与实际串口 KLOG 输出逐字节对账
             if self.kind == "mixed":
                 seq, ns, cpu, task, source, slot, round_number = match.groups()
                 slot, round_number = int(slot), int(round_number)
@@ -124,7 +131,11 @@ class ExecutionUART:
             self.fill_bytes = int(fill[1])
 
     def capture(self, channel, declaration, deadline):
-        """H 后保原首次拒写和停点；直接消费通道字节，以固定65条业务记录结束。"""
+        """处理背压（`backpressure`）用例的串口暂停与恢复采集。
+
+        先向内核发送 `H` 触发写端填充串口 FIFO 直至首次出现背压阻塞，按声明等待指定时长让内核完成丢包与恢复逻辑，
+        随后直接从底层通道读取空白填充换行符及全部 65 条 `KLOG` 记录并写入 `.raw` 证据文件，最后回发 `KTEST IO OK` 确认。
+        """
         require(self.kind == "backpressure" and not self.captured and self.body,
                 "opaque UART capture outside backpressure fixture")
         require(declaration["direction"] == "pause" and declaration["length"] == 0
@@ -133,8 +144,10 @@ class ExecutionUART:
         require(declaration["case"] == self.case, "backpressure case mismatch")
         acknowledgement = f"KTEST IO OK {self.case}\n".encode("ascii")
         require(len(acknowledgement) <= 16, "backpressure ACK exceeds FIFO bound")
+        # 发送 'H' 通知客体开始向受阻的串口写入，宿主机暂停读取以制造真实的 UART 发送缓冲区满（背压）条件
         channel.send(b"H", deadline)
         channel.delay(declaration["delay_ms"] / 1000, deadline)
+        # 暂停结束后放开读取，消费前导填充换行符并收齐 65 条业务日志记录
         with (self.directory / f"execution-uart-{self.case}.raw").open("xb") as output:
             while len(self.lines) < 65:
                 channel.check(deadline)
@@ -157,7 +170,7 @@ class ExecutionUART:
         channel.send(acknowledgement, deadline)
 
     def finish(self, status):
-        """客体 Pass 还须完整外部正文、所有生产者及原填充字节一致。"""
+        """在客体报告用例 `Pass` 后，核对采集到的日志条数、序号连续性、背压空白填充字节数及完整输出内容。"""
         if self.kind is None:
             return
         self.body = False
@@ -181,6 +194,7 @@ class ExecutionUART:
         if self.kind == "backpressure":
             require(self.captured and self.fill_bytes == self.blank_bytes and 0 < self.blank_bytes < 1024 * 1024,
                     "UART fill does not match its actual opaque prefix")
+        # 生成期望的完整 KLOG 字节序列落盘留存，并与串口实际收到的字节流做精确比对
         expected = b"".join(record_line(row) for row in rows)
         (self.directory / f"execution-uart-{self.case}.expected").write_bytes(expected)
         require(b"".join(self.lines) == expected, "execution UART full payload mismatch")

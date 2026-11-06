@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""唯一 ktest list/run 入口：固定 ELF、发现目录、选择、执行与同次报告。"""
+"""内核测试（ktest）统一命令行入口脚本。
+
+本脚本负责在宿主机上驱动 `riscv64` 与 `loongarch64` 架构的 QEMU 内核测试，支持 `list`（列举用例）
+和 `run`（执行用例）两个子命令。核心工作流程包括：
+1. 解析命令行过滤条件、硬件配置、磁盘挂载与各阶段超时预算；
+2. 在本次运行的专属报告目录中构建或复制独立的只读测试内核 `kernel.elf`，并校验其 ELF 段布局；
+3. 启动 QEMU 完成测试目录（catalog）发现，并按过滤条件、分片、重复次数与随机种子筛选排列用例；
+4. 按隔离级别（`suite` 或 `case`）分批启动 QEMU 执行测试、解析串口协议结果，并生成 `results.json` 与 JUnit `results.xml` 报告。
+"""
 
 import argparse
 import json
@@ -24,7 +32,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def positive_seconds(value):
-    """CLI 的秒数预算必须有限且为正数。"""
+    """解析并校验命令行超时秒数参数，要求必须为有限正浮点数。"""
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
@@ -32,7 +40,7 @@ def positive_seconds(value):
 
 
 def natural(value):
-    """计数不能是零或负数。"""
+    """解析并校验正整数参数（如 CPU 核数、重复次数、并发任务数）。"""
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("must be positive")
@@ -40,7 +48,7 @@ def natural(value):
 
 
 def seed_value(value):
-    """种子严格匹配 UART u64 范围。"""
+    """解析并校验随机种子参数，要求在无符号 64 位整数（`u64`）范围内。"""
     number = int(value, 0)
     if not 0 <= number < 1 << 64:
         raise argparse.ArgumentTypeError("seed must be u64")
@@ -48,7 +56,7 @@ def seed_value(value):
 
 
 def shard_value(value):
-    """分片索引从零开始，并且小于总片数。"""
+    """解析形如 `INDEX/COUNT` 的分片参数，要求 `0 <= INDEX < COUNT`。"""
     try:
         index, count = map(int, value.split("/"))
         if not 0 <= index < count:
@@ -59,7 +67,13 @@ def shard_value(value):
 
 
 def arguments(argv=None):
-    """只为两种架构的 QEMU 定义测试、资源与报告参数，不接受缩写。"""
+    """定义并解析内核测试命令行的全部参数，完成跨选项约束检查与默认值填充。
+
+    参数：
+    - `argv`：可选的参数字符串列表；为 `None` 时解析 `sys.argv[1:]`。
+
+    返回：填充了默认内存大小、64 位随机种子与规范化磁盘路径字典 `disks` 的 `argparse.Namespace`。
+    """
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("command", choices=("list", "run"))
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
@@ -103,6 +117,8 @@ def arguments(argv=None):
     parser.add_argument("--report-dir", type=Path, default=REPOSITORY_ROOT / "build" / "ktest")
     parser.add_argument("--uart-expect", type=Path, help="expected full tx/pause/slow payload")
     args = parser.parse_args(argv)
+
+    # 校验跨选项约束并填充架构默认内存、随机种子和磁盘映射。
     if 1 << 32 <= args.repeat:
         parser.error("repeat must be u32")
     if args.modern and args.arch != "riscv64":
@@ -121,7 +137,7 @@ def arguments(argv=None):
 
 
 def terminate_group(process):
-    """构建子命令的后代也必须退出，超时不能遗留 rustc 或链接进程。"""
+    """向子进程所属的独立进程组发送终止信号并等待其完全退出，防止构建超时后遗留后台编译或链接进程。"""
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -138,14 +154,24 @@ def terminate_group(process):
 
 
 def fixed_kernel(args, directory):
-    """按测试 profile 构建或复制独占 ELF，目录与装载始终消费同一 QEMU 副本。"""
+    """在运行目录中准备独立的只读测试内核 `kernel.elf`，确保测试目录发现与各批次 QEMU 执行使用同一份二进制文件。
+
+    参数：
+    - `args`：已解析的命令行参数（若指定了 `--kernel` 则直接复制，否则调用 `make build-kernel-test-elf` 构建）。
+    - `directory`：本次运行的报告目录。
+
+    返回：`(kernel_path, sha256_hex_digest)` 二元组。
+    异常：构建失败、文件非独立普通文件或 ELF 布局校验不通过时抛出 `HostError` / `OSError` / ` subprocess.TimeoutExpired`。
+    """
     kernel = directory / "kernel.elf"
     if args.kernel is not None:
+        # 使用外部指定的内核镜像时，将其完整复制为报告目录内的独立文件。
         source = args.kernel.resolve()
         regular_file(source)
         with source.open("rb") as input_file, kernel.open("xb") as output:
             shutil.copyfileobj(input_file, output, 1024 * 1024)
     else:
+        # 未指定现有内核时，在独立会话中调用 Makefile 构建测试 ELF，并记录构建命令与日志。
         command = ["make", "build-kernel-test-elf", f"ARCH={args.arch}",
                    "TARGET_PLATFORM=qemu-virt", f"KERNEL_BUILD_PROFILE={args.mode}",
                    f"KTEST_PANIC_STRATEGY={args.panic}", f"KERNEL_ELF_OUTPUT={kernel}"]
@@ -158,6 +184,8 @@ def fixed_kernel(args, directory):
             finally:
                 terminate_group(process)
         require(status == 0, f"build-kernel-test-elf failed: {status}")
+
+    # 校验生成的内核文件为无硬链接的独立普通文件，检查 ELF 段布局并设为只读权限。
     regular_file(kernel)
     require(not kernel.is_symlink() and kernel.stat().st_nlink == 1, "fixed ELF must be an independent file")
     layout = validate_test_kernel_layout(kernel, args.arch)
@@ -167,7 +195,14 @@ def fixed_kernel(args, directory):
 
 
 def exit_status(results, infrastructure=None):
-    """基础设施错误优先，其次真实失败；全 Skip 单独返回四。"""
+    """根据所有用例的执行结果汇总进程退出码。
+
+    退出码约定：
+    - `2`：发生宿主机或协议层基础设施错误，或结果集为空；
+    - `1`：存在用例失败（`Fail`、`Crash`、`Timeout`、`NotRun`）；
+    - `4`：所有已选中的用例状态均为跳过（`Skip`）；
+    - `0`：全部通过（或部分通过、部分跳过，且无失败与错误）。
+    """
     if infrastructure or any(r["status"] == "Error" or r.get("infrastructure_error") for r in results):
         return 2
     if any(r["status"] in ("Fail", "Crash", "Timeout", "NotRun") for r in results):
@@ -178,7 +213,7 @@ def exit_status(results, infrastructure=None):
 
 
 def export_reports(directory, report):
-    """JSON 和 JUnit 使用同一结果对象，不再次解析日志猜测成功。"""
+    """将内存中的结构化测试结果同时写出为 `results.json` 和 JUnit 格式的 `results.xml`。"""
     (directory / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     results = report["results"]
     suite = ET.Element("testsuite", name="ktest", tests=str(len(results) + bool(report.get("error"))),
@@ -208,7 +243,7 @@ def export_reports(directory, report):
 
 
 def main(argv=None):
-    """同次目录和运行拥有独立 VM；只释放宿主资源与固定 ELF 副本。"""
+    """执行一次完整的 `ktest` 列表查询或测试运行，并在退出前清理临时内核副本并导出报告。"""
     args = arguments(argv)
     CANCELLED.clear()
     try:
@@ -222,6 +257,7 @@ def main(argv=None):
                   **config(args), results=[], report_dir=str(directory))
     kernel = directory / "kernel.elf"
     try:
+        # 阶段 1：准备只读测试内核 ELF，并启动 QEMU 发现全部内建测试目录（catalog）。
         kernel, digest = fixed_kernel(args, directory)
         report["elf_sha256"] = digest
         report["kernel"] = str(kernel)
@@ -230,6 +266,8 @@ def main(argv=None):
         catalog = discover(args, kernel, catalog_dir)
         selected = select(catalog, args, execution=args.command == "run")
         report["selected"] = [case["name"] for case in selected]
+
+        # 阶段 2：按子命令输出测试目录 JSON 行，或分批校验资源并启动 QEMU 执行测试。
         if args.command == "list":
             print(json.dumps(catalog.header))
             for sid in dict.fromkeys(case["suite"] for case in selected):
@@ -252,7 +290,7 @@ def main(argv=None):
         report["error"] = str(error) or "host run interrupted"
         report["exit_code"] = 2
     finally:
-        # discover/execute 已释放其宿主资源；只删本次独占输入。
+        # discover 与 execute 已负责回收各自的 QEMU 子进程与临时盘；此处仅删除体积较大的临时内核副本。
         try:
             kernel.unlink(missing_ok=True)
         except OSError as error:
@@ -265,7 +303,7 @@ def main(argv=None):
 
 
 def interrupted(signum, frame):
-    """将终止信号交给统一异常回收路径，不遗留 VM 子进程。"""
+    """捕获 `SIGTERM` 信号：置位全局取消标志并抛出 `KeyboardInterrupt`，交由主流程的 `finally` 统一回收 QEMU 子进程。"""
     CANCELLED.set()
     raise KeyboardInterrupt()
 

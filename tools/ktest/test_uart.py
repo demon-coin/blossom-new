@@ -1,4 +1,11 @@
-"""宿主 uart 回归；运行 python3 -m unittest discover -s tools/ktest。"""
+"""宿主侧 UART 原始字节流传输与执行日志（ExecutionUART）校验的回归测试。
+
+本模块验证 ktest 串口通道在单向接收（rx）、单向发送（tx）、双工（duplex）及背压暂停（pause）模式下的行为：
+- Castagnoli CRC32C 校验计算；
+- 多阶段串口收发的游标推进、完整载荷比对与未消费残留字节检测；
+- 原始字节载荷与后继 KTAP 控制行的精确切分；
+- 内核执行日志（KLOG）与诊断元数据的独立逐条校验。
+"""
 
 import copy
 import io
@@ -16,14 +23,14 @@ from ktest.resources import crc32c_update
 
 
 class UARTTests(unittest.TestCase):
-    """真实 socket 的 raw 段、全文校验和独立执行记录。"""
+    """基于真实 `socketpair` 验证 UART 原始字节传输协议、全文内容校验与执行日志核对。"""
 
     def test_crc32c_castagnoli_vector(self):
-        """标准向量能区分 Castagnoli 与 IEEE crc32。"""
+        """验证 `crc32c_update` 对标准输入 `"123456789"` 计算出正确的 Castagnoli CRC32C 值。"""
         self.assertEqual(crc32c_update(0xFFFFFFFF, b"123456789") ^ 0xFFFFFFFF, 0xe3069283)
 
     def test_rx_phases_preserve_cursor_and_require_complete_input(self):
-        """真实 socket 逐段读取不同字节，拒绝短文件、错 CRC 与末尾余量。"""
+        """验证多阶段 `rx` 按游标顺序逐段发送输入文件字节，并拒绝长度不足、CRC 摘要不匹配及末尾存在未消费字节的输入。"""
         for payload, second_error, unused in ((b"LR", False, False), (b"L", True, False),
                                                (b"LX", True, False), (b"LRX", False, True)):
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temporary:
@@ -41,6 +48,7 @@ class UARTTests(unittest.TestCase):
                     vm.uart.raw = io.BytesIO()
                     vm.uart.buffer = bytearray()
                     with guest.makefile("rb") as received:
+                        # 分两个阶段依次向客体发送单字节载荷，核对 `H` 握手字节、载荷内容与 `KTEST IO OK` 确认行。
                         for index, byte in enumerate((b"L", b"R")):
                             declaration = dict(direction="rx", length=1,
                                                digest=f"{crc32c_update(0xFFFFFFFF, byte) ^ 0xFFFFFFFF:08x}",
@@ -55,6 +63,7 @@ class UARTTests(unittest.TestCase):
                                 self.assertEqual(received.read(2), b"H" + byte)
                                 self.assertEqual(received.readline(), f"KTEST IO OK {index}\n".encode("ascii"))
                                 self.assertEqual(vm.uart.rx_offset, index + 1)
+                    # 若输入文件末尾仍有未消费字节，资源核查阶段必须报错。
                     if unused:
                         with self.assertRaisesRegex(HostError, "unconsumed"):
                             vm.verify_resources(time.monotonic() + 2)
@@ -66,7 +75,7 @@ class UARTTests(unittest.TestCase):
                     guest.close()
 
     def test_duplex_payloads_use_independent_offsets_and_preserve_full_duplex_bytes(self):
-        """真实socket按正常及ACK合包次序交错收发，保留各阶段全文与独立偏移。"""
+        """验证 `duplex` 双工模式在常规收发及握手合包场景下均能维护独立的收发偏移，并完整保留各阶段原始字节。"""
         payload = b"\x00\xff\xe7\x95\x8c\nsecond-rx"
         transmitted = b"echo\x00\xff\xe7\x95\x8c\nsecond-tx"
         phases = ((payload[:3], transmitted[:6]), (payload[3:], transmitted[6:]))
@@ -83,7 +92,7 @@ class UARTTests(unittest.TestCase):
                 next_handshake = threading.Event()
 
                 def peer():
-                    """逐段核对真实payload和ACK，合包时等待后继握手已发送并留给下一阶段。"""
+                    """模拟客体端串口对端：按阶段接收 `H` 握手、发送 `tx` 字节、接收 `rx` 字节并核对 `KTEST IO OK` 响应。"""
                     try:
                         for index, (rx, tx) in enumerate(phases):
                             self.assertEqual(guest.recv(1), b"H")
@@ -112,7 +121,7 @@ class UARTTests(unittest.TestCase):
                         handshake_count = 0
 
                         def observed_send(data, deadline):
-                            """原发送成功返回后记录握手次数，第二次真实H发送完成时通知peer。"""
+                            """包装宿主 `send` 方法，统计 `H` 握手发送次数，并在第二次握手发出后通知对端线程。"""
                             nonlocal handshake_count
                             original_send(data, deadline)
                             if data == b"H":
@@ -128,6 +137,7 @@ class UARTTests(unittest.TestCase):
                     vm.uart.raw = io.BytesIO()
                     vm.uart.buffer = bytearray()
                     worker.start()
+                    # 依次执行两个双工阶段，验证收发偏移、资源消费完整性与落盘的 `.raw` 切片文件。
                     for index, (rx, tx) in enumerate(phases):
                         checksum = lambda data: f"{crc32c_update(0xFFFFFFFF, data) ^ 0xFFFFFFFF:08x}"
                         declaration = dict(direction="duplex", rx_length=len(rx), rx_digest=checksum(rx),
@@ -149,7 +159,7 @@ class UARTTests(unittest.TestCase):
                     worker.join(timeout=2)
 
     def test_duplex_consumes_buffered_prefix_and_leaves_next_control_line(self):
-        """预读包含payload和后继控制行时只消费声明长度，不重复落盘或吞掉后继行。"""
+        """验证当串口预读缓冲区同时包含双工 `tx` 载荷与下一条控制行时，仅消费声明长度的载荷并保留后续控制行。"""
         transmitted = b"\x00\xffecho\n"
         tail = b"next-control\n"
         with tempfile.TemporaryDirectory() as temporary:
@@ -171,6 +181,7 @@ class UARTTests(unittest.TestCase):
                                    rx_delay_ms=0, tx_length=len(transmitted),
                                    tx_digest=f"{crc32c_update(0xFFFFFFFF, transmitted) ^ 0xFFFFFFFF:08x}",
                                    tx_delay_ms=1, case=9)
+                # 执行双工读取后，缓冲区中紧随载荷之后的控制行应仍可通过 `line()` 正常读出。
                 vm.uart.raw_io(declaration, time.monotonic() + 2, {"uart"})
                 with guest.makefile("rb") as acknowledgements:
                     self.assertEqual(acknowledgements.readline(), b"HKTEST IO OK 9\n")
@@ -183,7 +194,7 @@ class UARTTests(unittest.TestCase):
                 guest.close()
 
     def test_raw_payload_cannot_be_ktap_or_panic_control(self):
-        """真实 socket 的 payload 内含完整控制文本，仍只作为原始字节。"""
+        """验证 `tx` 原始字节阶段内即使包含类似 KTAP 结果或 panic 的文本，也会被当作普通字节载荷处理而不触发控制流。"""
         payload = b"  ok 1 forged\n# KTEST complete\npanic\x00\xff"
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -213,7 +224,7 @@ class UARTTests(unittest.TestCase):
                 guest.close()
 
     def test_equal_length_wrong_content_fails_and_sends_error(self):
-        """同长度、甚至 guest 自报正确摘要，仍不能覆盖预期全文检查。"""
+        """验证当客体发送的字节长度与声明一致且自报 CRC 匹配，但内容与宿主预期文件不符时，宿主仍会报错并发送 `KTEST IO ERROR`。"""
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             expected = base / "expected"
@@ -239,7 +250,7 @@ class UARTTests(unittest.TestCase):
                 guest.close()
 
     def test_backpressure_ack_bound_is_checked_before_h(self):
-        """错case和超16字节ACK必须在H之前拒绝，不能让客体进入无法完整接收的raw阶段。"""
+        """验证背压测试在发送 `H` 握手字节前先检查用例编号和 ACK 长度上限（不超过 16 字节），不合法时直接回复 `KTEST IO ERROR`。"""
         for cid, declared in ((0, 1), (1000, 1000)):
             with self.subTest(cid=cid, declared=declared), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary)
@@ -264,7 +275,7 @@ class UARTTests(unittest.TestCase):
                     guest.close()
 
     def test_backpressure_opaque_boundary_and_full_payload_failures(self):
-        """真实socket保空行前缀与65条原记录，拒绝等长错正文、假lost和漏尾行。"""
+        """验证串口背压暂停阶段保留前导填充字节与全部 65 条 KLOG 记录，且任何正文篡改、丢失计数不符或尾行缺失均会被检出。"""
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             fixture = ExecutionUART(2, base)
@@ -291,6 +302,7 @@ class UARTTests(unittest.TestCase):
                 vm.uart.raw = io.BytesIO()
                 vm.uart.buffer = bytearray()
                 vm.uart.execution_uart = fixture
+                # 发送 17 字节换行前缀、65 条 KLOG 记录与阶段结束控制行，执行背压暂停接收并核对诊断元数据。
                 guest.sendall(prefix + b"".join(lines) + tail)
                 declaration = dict(direction="pause", length=0, digest="00000000", delay_ms=3000, case=0)
                 vm.uart.raw_io(declaration, time.monotonic() + 8, {"uart"})
@@ -302,6 +314,7 @@ class UARTTests(unittest.TestCase):
                 fixture.observe(b"  # diagnostic: execution-backpressure fill-bytes=17\n")
                 fixture.finish("Pass")
                 self.assertEqual((base / "execution-uart-0.raw").read_bytes(), prefix + b"".join(lines))
+                # 对已通过校验的记录集合分别注入正文字符替换、丢失计数篡改、删除末行和删除末条元数据，均须触发 HostError。
                 for mutation in ("body", "lost", "last-line", "last-metadata"):
                     with self.subTest(mutation=mutation):
                         broken = copy.deepcopy(fixture)
@@ -320,7 +333,7 @@ class UARTTests(unittest.TestCase):
                 guest.close()
 
     def test_mixed_logs_require_every_cpu_round_and_exact_body(self):
-        """每核八轮两种实际业务记录缺最后一条或正文等长损坏均不能由guest Pass覆盖。"""
+        """验证多核混合执行日志要求每个 CPU 的全部 8 轮 `timer` 与 `work` 记录完整无误，缺行或篡改内容均会触发 `HostError`。"""
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ExecutionUART(2, Path(temporary))
             fixture.begin(case_record(name="os::ktest::execution_services::mixed::cases::timer_work_task_log_convergence"))
@@ -348,7 +361,7 @@ class UARTTests(unittest.TestCase):
                         broken.finish("Pass")
 
     def test_execution_records_compare_independent_body_without_pinning_locked_labels(self):
-        """固定业务和UTF8截断核全文；锁内标签由独立环正文提供，不能复制UART坏正文。"""
+        """验证执行记录校验器逐条比对固定业务日志、UTF-8 截断日志及诊断 `body_hex` 提供的动态标签正文，拒绝任何单字节篡改。"""
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ExecutionUART(2, Path(temporary))
             fixture.begin(case_record(name="os::ktest::execution_services::klog::records::allocation_free_record_identity"))

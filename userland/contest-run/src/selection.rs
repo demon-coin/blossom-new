@@ -1,4 +1,41 @@
-//! 只从本次实际 root 读取目录和清单，不执行准备动作。
+//! 测试计划（Config）解析、目录/清单扫描与最终测试用例列表（`ResolvedCase`）展开模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于配置加载器（`config`）与运行执行器（`execute`）之间，负责将声明式的 TOML 测试计划展开为具有确定性顺序、稳定唯一 ID 和完整运行参数的 [`ResolvedCase`] 序列。
+//! - **上游**：接收 `config::load` 解析出的 [`Config`] 与目标硬件架构名称（`"riscv64"` 或 `"loongarch64"`）。
+//! - **下游**：向 `execute` 或 `--list` 模式输出展开后的 [`ResolvedCase`] 列表；文件系统的受限根路径读取委托给 [`crate::runtime::rooted_path`]。
+//!
+//! # 核心机制与选择流水线
+//! ```text
+//! Config (defaults + roots + steps + overrides)
+//!   │
+//!   ├─ 1. 预校验 (validate_overrides)
+//!   │     └─ 检查相同 ID 的多条 override 是否在同一字段/环境变量上存在冲突值
+//!   │
+//!   ├─ 2. 按声明顺序遍历 Step
+//!   │     ├─ 过滤：跳过 enabled == false 或 arch 不匹配的 step
+//!   │     ├─ 直接命令 (Exec / Shell) ──► 构造单个 Entry，合并配置并应用 override
+//!   │     └─ 目录/清单扫描 (Ltp / Basic / Libctest)
+//!   │           │
+//!   │           ├─ 按 step.roots 顺序遍历每个目标根目录
+//!   │           ├─ 扫描可执行目录 (executables) 或解析文本清单 (text_catalog)
+//!   │           ├─ 按 step.include 模式顺序匹配条目，再剔除匹配 step.exclude 的条目
+//!   │           └─ 生成稳定 ID -> 合并 defaults/root/step -> 应用 override -> 去重/冲突检查
+//!   │
+//!   └─ 3. 后置完整性检查
+//!         ├─ 确保每条 override 的目标 ID 都至少命中了一个已选中的测试用例
+//!         └─ 确保最终选中的测试用例集合非空
+//! ```
+//!
+//! ## 配置与环境变量合并优先级（由低到高）
+//! ```text
+//! [defaults]  ──►  [roots.<name>]  ──►  [[step]]  ──►  [[override]] (按 ID 精确匹配)
+//! ```
+//! - 环境变量（`env`）按字典键逐层覆盖合并；
+//! - 命令参数（`args`）、前置/后置步骤（`setup`/`cleanup`）等数组字段采用整字段替换。
+//!
+//! # 锁获取顺序与并发契约
+//! 本模块为纯单线程配置展开与只读文件系统元数据/清单读取逻辑，不涉及任何并发锁或子进程创建。
 
 use crate::model::{
     CaseOverride, CatalogSource, CommandSpec, Config, Protocol, ResolvedCase, RootSpec,
@@ -11,16 +48,30 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+/// 从测试步骤或清单文件中提取出的单个候选测试条目。
 struct Entry {
+    /// 条目在清单或目录中的短名称（用于匹配 `include`/`exclude` 及拼接用例 ID）。
     name: String,
+    /// 待执行的命令规格（直接执行 `Exec` 或通过 Shell 执行 `Shell`）。
     command: CommandSpec,
+    /// 该条目在配置文件及清单文件中的定义位置（用于错误诊断与报告溯源）。
     source: SourceLocation,
+    /// 条目自带的默认工作目录（例如 `basic` 类型默认在其所在目录执行）。
     cwd: Option<PathBuf>,
+    /// 输出解析与结果判定协议（`Plain`、`Ltp`、`Basic` 或 `Pre2025Libctest`）。
     protocol: Protocol,
 }
 
-/// 按文件、step、root、include 的源顺序形成稳定 ID；重复轮次不复制 case。
+/// 根据当前架构将配置展开为按声明顺序排列的测试用例列表。
+///
+/// # 参数
+/// - `config`：已加载并完成语法校验的测试计划配置。
+/// - `arch`：当前目标架构名称（仅支持 `"riscv64"` 或 `"loongarch64"`）。
+///
+/// # 返回值
+/// 成功时返回去重且应用完所有覆盖规则的 [`ResolvedCase`] 列表；若架构未知、模式未命中任何条目、存在未命中的 `override` 或重复 ID 语义冲突，则返回包含具体源文件位置的错误字符串。
 pub fn resolve(config: &Config, arch: &str) -> Result<Vec<ResolvedCase>, String> {
+    // Step 1: 校验目标架构名称与全局 override 规则自身的字段一致性。
     if !matches!(arch, "riscv64" | "loongarch64") {
         return Err(format!(
             "{}: unknown architecture {arch:?}",
@@ -30,6 +81,7 @@ pub fn resolve(config: &Config, arch: &str) -> Result<Vec<ResolvedCase>, String>
     validate_overrides(&config.overrides)?;
     let mut cases = Vec::new();
     let mut selected = BTreeMap::<String, usize>::new();
+    // Step 2: 按配置文件与 step 的声明顺序遍历所有启用的测试步骤。
     for step in &config.steps {
         if !step.enabled || (!step.arch.is_empty() && !step.arch.iter().any(|value| value == arch))
         {
@@ -92,6 +144,7 @@ pub fn resolve(config: &Config, arch: &str) -> Result<Vec<ResolvedCase>, String>
             }
         }
     }
+    // Step 3: 确认所有声明的 override 均命中了实际被选中的用例，且最终用例列表非空。
     for item in &config.overrides {
         if !selected.contains_key(&item.id) {
             return Err(format!(
@@ -110,7 +163,7 @@ pub fn resolve(config: &Config, arch: &str) -> Result<Vec<ResolvedCase>, String>
     Ok(cases)
 }
 
-/// 直接命令的 argv 不经过 Shell，空参数保持不变。
+/// 将 `Exec` 或 `Shell` 类型的直接命令步骤转换为候选 [`Entry`]。
 fn direct_entry(step: &Step) -> Entry {
     let command = match step.kind {
         StepKind::Exec => CommandSpec::Exec {
@@ -132,7 +185,7 @@ fn direct_entry(step: &Step) -> Entry {
     }
 }
 
-/// 固定输入的缺省路径就是实际目录或原脚本，未命中时不改用其他来源。
+/// 返回目录/清单类测试步骤在目标根目录内的清单文件或可执行文件目录路径。
 fn catalog_path(step: &Step) -> PathBuf {
     match step.kind {
         StepKind::Ltp if step.source.unwrap_or_default() == CatalogSource::Executables => {
@@ -150,7 +203,7 @@ fn catalog_path(step: &Step) -> PathBuf {
     }
 }
 
-/// 选择来源完全由 kind/source 决定，runtest 打不开直接报告原错误。
+/// 根据步骤类型（`Basic`、`Ltp`、`Libctest`）和数据源模式读取目标根目录下的候选条目列表。
 fn catalog(step: &Step, root: &RootSpec) -> Result<Vec<Entry>, String> {
     let path = catalog_path(step);
     match step.kind {
@@ -163,7 +216,7 @@ fn catalog(step: &Step, root: &RootSpec) -> Result<Vec<Entry>, String> {
     }
 }
 
-/// 在指定 root 内跟随目录和条目链接，按原别名排序并保留执行路径。
+/// 扫描目标根目录下指定路径中的所有普通可执行文件，并按文件名升序排列返回候选条目。
 fn executables(step: &Step, root: &RootSpec, path: &Path) -> Result<Vec<Entry>, String> {
     let at = step.location.as_ref().unwrap();
     let directory = rooted_path(&root.path, Path::new("/"), path)
@@ -231,7 +284,7 @@ fn executables(step: &Step, root: &RootSpec, path: &Path) -> Result<Vec<Entry>, 
     Ok(entries)
 }
 
-/// 从指定 root 解析清单链接，保留原行顺序与命令正文及固定 libctest argv。
+/// 读取并解析目标根目录下的文本格式测试清单（LTP `runtest` 文件或 `libctest` 启动脚本）。
 fn text_catalog(step: &Step, root: &RootSpec, path: &Path) -> Result<Vec<Entry>, String> {
     let at = step.location.as_ref().unwrap();
     let text = rooted_path(&root.path, Path::new("/"), path)
@@ -280,7 +333,7 @@ fn text_catalog(step: &Step, root: &RootSpec, path: &Path) -> Result<Vec<Entry>,
     Ok(entries)
 }
 
-/// 固定 pre-2025 的 runtest argv，工作目录留给 root、step 和精确覆盖决定。
+/// 解析单行 `libctest` 启动命令（固定格式为 `./runtest.exe -w entry-<variant>.exe <SELECTOR>`）。
 fn libctest_entry(variant: &str, line: &str, source: SourceLocation) -> Result<Entry, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let entry = format!("entry-{variant}.exe");
@@ -306,7 +359,7 @@ fn libctest_entry(variant: &str, line: &str, source: SourceLocation) -> Result<E
     })
 }
 
-/// 名称用于稳定 ID 和 Hook 消息，冒号留给明确的 ID 分段。
+/// 校验目录或清单中的测试条目名称是否合法（非空、不含空白字符、不含 `:` 与 NUL 字节）。
 fn catalog_name(name: &str, at: &SourceLocation) -> Result<(), String> {
     if name.is_empty() || name.contains([':', '\0']) || name.chars().any(char::is_whitespace) {
         return Err(format!("{at}: invalid catalog name {name:?}"));
@@ -314,7 +367,7 @@ fn catalog_name(name: &str, at: &SourceLocation) -> Result<(), String> {
     Ok(())
 }
 
-/// ID 与具体选择来源绑定，重复轮次和 include 的拼写不影响名称。
+/// 根据测试类型、根目录名、套件/变体名及条目名拼接全局稳定的测试用例 ID。
 fn case_id(step: &Step, root: &str, name: &str) -> String {
     match step.kind {
         StepKind::Ltp => format!("ltp:{root}:{}:{name}", step.suite.as_ref().unwrap()),
@@ -324,7 +377,7 @@ fn case_id(step: &Step, root: &str, name: &str) -> String {
     }
 }
 
-/// defaults、root 环境与 step 依次合并，命令数组整字段替换。
+/// 合并全局默认配置（`defaults`）、目标根目录配置（`root`）与当前步骤配置（`step`），构造初始 [`ResolvedCase`]。
 fn resolved(
     config: &Config,
     step: &Step,
@@ -366,7 +419,7 @@ fn resolved(
     }
 }
 
-/// 覆盖先作用于每次命中；相同最终语义保首项，冲突保留两处来源。
+/// 对测试用例应用匹配的 `override` 规则并插入结果集；若 ID 已存在则校验两次命中的运行语义是否完全一致。
 fn insert(
     mut case: ResolvedCase,
     config: &Config,
@@ -390,7 +443,7 @@ fn insert(
     Ok(())
 }
 
-/// 来源位置不属于运行语义，重复引用同一项只保留最早的来源。
+/// 判断两个同 ID 的 [`ResolvedCase`] 除定义来源位置（`source`）外的所有执行语义是否完全相同。
 fn same_semantics(left: &ResolvedCase, right: &ResolvedCase) -> bool {
     left.root == right.root
         && left.cwd == right.cwd
@@ -404,7 +457,7 @@ fn same_semantics(left: &ResolvedCase, right: &ResolvedCase) -> bool {
         && left.protocol == right.protocol
 }
 
-/// 相同 ID 的多份覆盖可补充不同字段，同字段冲突必须显式修正输入。
+/// 校验针对同一个用例 ID 的多条 `override` 规则之间是否存在同一字段或同一环境变量键的不同赋值冲突。
 fn validate_overrides(items: &[CaseOverride]) -> Result<(), String> {
     let mut seen: BTreeMap<&str, Vec<&CaseOverride>> = BTreeMap::new();
     for item in items {
@@ -445,7 +498,7 @@ fn validate_overrides(items: &[CaseOverride]) -> Result<(), String> {
     Ok(())
 }
 
-/// 精确覆盖不改变选择 ID；root 的环境和 cwd 已在形成 case 时选定。
+/// 将单条 [`CaseOverride`] 规则合并到目标 [`ResolvedCase`] 上，并拒绝跨命令类型（`Exec` 与 `Shell` 互改）的非法覆盖。
 fn apply_override(case: &mut ResolvedCase, item: &CaseOverride) -> Result<(), String> {
     let at = item.location.as_ref().unwrap();
     match &mut case.command {

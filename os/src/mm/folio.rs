@@ -1,4 +1,58 @@
-//! 固定原页引用、范围初始化和内容修改；内容锁与等待源随活 folio 保持原地址。
+//! 页缓存物理页帧状态（Folio）管理、字节/扇区范围状态跟踪、内容锁与读写 I/O 凭证模块。
+//!
+//! ## 模块职责与架构定位
+//! 本模块将单张 4KiB 物理页（order-0 `OwnedPages`）封装为引用计数的页缓存单元（`FolioRef`），
+//! 为上层文件页缓存（File Page Cache）和块设备元数据缓存（Metadata Cache）提供统一的页面生命周期、
+//! 有效范围追踪、脏扇区（Dirty）与在途回写（Writeback）位图管理，以及 CPU/DMA 并发访问同步。
+//! - **上游调用者**：文件系统缓存层（`crate::cache`）、Inode 映射与后台回写（`crate::fs`）、
+//!   缺页异常处理与用户地址空间映射（`crate::mm`）以及块设备 DMA 提交/完成层（`crate::block`）。
+//! - **下游依赖**：物理页描述符表（`crate::mm::page::PageDesc`）、伙伴物理页分配器（`alloc_pages`）、
+//!   任务等待队列（`crate::wait::WaitQueue`）与后台脏页统计域（`crate::fs::background`）。
+//!
+//! ## 核心设计与关键状态布局
+//!
+//! ### 1. 页描述符内联固定状态（Pinned `FolioState`）
+//! 每张被用作 Folio 的物理页，其状态 `FolioState` 直接内联存储在全局静态 `PageDesc` 的用途槽（`PageUse`）中。
+//! 只要引用计数 `references > 0`，`FolioState` 在内存中的地址就永久固定（Pin），从而保证内嵌的
+//! `WaitQueue` 链表头和原子标志位在等待者睡眠期间绝不会移动或提前析构。
+//!
+//! ### 2. 4KiB 页面内的扇区（512B）位图与原子标志编码
+//! 单张 4KiB 页面划分为 8 个 512 字节扇区（`SECTORS_PER_PAGE = 8`），`dirty`、`writeback`、
+//! `file_prepared` 及元数据 `valid` 均使用 `u8` 位图按扇区粒度精确追踪：
+//!
+//! ```text
+//!   4KiB 物理页扇区位图 (u8: dirty / writeback / file_prepared / Metadata::valid)
+//!  ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐
+//!  │ Bit 7  │ Bit 6  │ Bit 5  │ Bit 4  │ Bit 3  │ Bit 2  │ Bit 1  │ Bit 0  │
+//!  ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+//!  │3584..  │3072..  │2560..  │2048..  │1536..  │1024..  │ 512..  │   0..  │
+//!  │  4096B │  3584B │  3072B │  2560B │  2048B │  1536B │  1024B │   512B │
+//!  └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
+//!
+//!   FolioState::flags 原子状态字 (AtomicU8)
+//!  ┌─────────────────────────┬───────────────┬───────────────┬────────────────┐
+//!  │        Bits 7..3        │   Bit 2 (4)   │   Bit 1 (2)   │   Bit 0 (1)    │
+//!  ├─────────────────────────┼───────────────┼───────────────┼────────────────┤
+//!  │       保留 (0)          │   ACTIVATE    │  REFERENCED   │ CONTENT_LOCKED │
+//!  │                         │ 二次访问晋升  │ 首次访问标记  │ 页内容独占锁位 │
+//!  └─────────────────────────┴───────────────┴───────────────┴────────────────┘
+//! ```
+//!
+//! ### 3. 角色分离与读写凭证状态机
+//! - **文件页（`FolioContents::File`）**：允许通过页表映射给用户态共享读写。内核仅通过 `copy_user_bytes`
+//!   对其执行原始字节拷贝，绝不构造 `&[u8]` / `&mut [u8]` Rust 切片，从根本上避免用户态并发写造成 Rust 别名未定义行为。
+//! - **元数据页（`FolioContents::Metadata`）**：终身禁止映射给用户态，且在 `writeback != 0` 期间排斥获取内容锁，
+//!   因此持有 `FolioContent` 时可安全借用 `&[u8]` / `&mut [u8]` 切片。
+//! - **读入凭证（`FolioRead`）与回写凭证（`FolioWriteback`）**：采用 RAII 线性所有权模型。当物理页移交块设备执行
+//!   DMA 期间，凭证对象持有一份 `FolioRef` 强引用（连同所属 `InodeRef` 或 `Arc<MetadataCache>`）；
+//!   必须在设备中断/队列重置彻底结束并收回物理页 DMA 访问权后，才能调用 `complete` 发布结果或释放凭证。
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **高层缓存/文件系统锁**（如 `Inode` 截断/失效锁、缓存索引锁 `index`、LRU 队列锁）
+//! 2. **页内容睡眠锁（`CONTENT_LOCKED` / `FolioContent`）**：仅限可睡眠任务获取；等待期间不持有 `PageDesc` 自旋锁。
+//! 3. **页描述符用途自旋锁（`PageDesc::usage` -> `PageUseGuard`）**：保护 `FolioShared` 的短临界区自旋锁，
+//!    持锁期间严禁睡眠、严禁执行大块内存拷贝或直接唤醒调度器（唤醒等待队列或释放 `OwnedPages`/`FolioOwner`
+//!    必须在释放 `PageUseGuard` 之后执行）。
 
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
@@ -19,118 +73,183 @@ use crate::mm::{alloc_pages, pages, OwnedPages, PAGE_SIZE};
 use crate::sched;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
+/// 块设备标准扇区字节数（512 字节）。
 const SECTOR_SIZE: usize = SECTOR_BYTES as usize;
+/// 单张 4KiB 物理页包含的 512 字节扇区数量（8 个扇区）。
 const SECTORS_PER_PAGE: usize = PAGE_SIZE / SECTOR_SIZE;
 
+/// `FolioState::flags` 位掩码：页内容锁（置 1 表示当前有任务持有 `FolioContent` 或有在途 `FolioRead` 正在填充）。
 const CONTENT_LOCKED: u8 = 1;
+/// `FolioState::flags` 位掩码：页面近期被访问过一次（用于 LRU 二次机会老化算法）。
 const REFERENCED: u8 = 2;
+/// `FolioState::flags` 位掩码：页面在已处于 `REFERENCED` 状态下再次被访问，提示 LRU 将其晋升到活跃队列。
 const ACTIVATE: u8 = 4;
 
-/// 固定 4KiB 基本页内的 byte 窗口，验证后的起点和长度均可无损保存为 u16。
+/// 4KiB 物理页内已成功初始化的连续字节区间 `[offset, offset + len)`。
+///
+/// 由于页大小为 4096 字节，经过边界校验后的页内偏移量与长度均可无损表示为 `u16`。
 #[derive(Clone, Copy)]
 struct InitializedRange {
+    /// 已初始化区间在页内的起始字节偏移（单位：字节，范围 `0..4096`）。
     offset: u16,
+    /// 已初始化区间的字节长度（单位：字节，范围 `1..=4096`）。
     len: u16,
 }
 
-/// 文件页只初始化一次任意合法范围；RAM 文件额度随内容槽持有到最后原页引用。
+/// Folio 承载的具体内容角色及其初始化状态。
+///
+/// 页面在安装为 Folio 时即确定为文件页（`File`）或元数据页（`Metadata`），生命周期内角色永不改变。
 enum FolioContents {
+    /// 文件数据缓存页（只允许初始化一次有效字节范围；若是内存文件系统页则附带配额凭证）。
     File {
+        /// 首次填充读入的结果：`None` 表示尚未开始或尚未完成初始化，`Some(Ok(range))` 表示已就绪区间，
+        /// `Some(Err(err))` 表示读入失败。
         initialized: Option<Result<InitializedRange, BlockError>>,
+        /// 若该页属于内存文件系统（memfs），则持有对应的内存页配额凭证，随最后一个 `FolioRef` 释放时归还。
         memory_charge: Option<MemoryPageCharge>,
     },
+    /// 块设备元数据缓存页（按 512 字节扇区粒度独立追踪有效性与 I/O 错误）。
     Metadata {
+        /// 8 位扇区有效位图：第 `i` 位为 1 表示页内第 `i` 个 512B 扇区已完成初始化且数据有效。
         valid: u8,
+        /// 页内各 512B 扇区最近一次读入失败的具体块设备错误记录。
         errors: [Option<BlockError>; SECTORS_PER_PAGE],
     },
 }
 
-/// 共享头只经所属 PageUse 锁访问；Dirty 与 WB 各自描述实际 512 字节范围。
+/// 受所属页描述符自旋锁（`PageUseGuard`）保护的 Folio 可变元数据头。
 struct FolioShared {
+    /// 当前存活的强引用（`FolioRef`）计数；归零时析构 `FolioState` 并归还底层物理页。
     references: usize,
+    /// 页面内容角色与初始化状态（文件页或元数据页）。
     contents: FolioContents,
+    /// 8 位脏扇区位图：第 `i` 位为 1 表示第 `i` 个 512B 扇区已被修改且尚未提交回写。
     dirty: u8,
+    /// 8 位在途回写扇区位图：第 `i` 位为 1 表示第 `i` 个 512B 扇区正处于块设备回写（Writeback）过程中。
     writeback: u8,
-    /// 已发表且完成初始化的文件 FS 块；只记准备事实，不保存第二份物理块根。
+    /// 文件页中已完成底层文件系统块分配与零初始化准备的 512B 扇区位图。
     file_prepared: u8,
 }
 
-/// 页用途内保存原拥有者、独立内容锁和等待源；活引用期间禁止移动整个用途。
+/// 内联存储在全局 `PageDesc` 用途槽中的 Folio 核心状态。
+///
+/// 在 `references > 0` 期间，该结构体在全局页描述符数组中保持地址固定（Pinned），
+/// 确保并发任务在 `waiters` 上睡眠或操作 `flags` 原子位时内存地址稳定有效。
 pub(crate) struct FolioState {
+    /// 底层 order-0 物理页的所有权凭证；仅在最后一个引用释放或显式摘除时取走归还给伙伴系统。
     backing: Option<OwnedPages>,
+    /// 受所属 `PageDesc::usage()` 自旋锁保护的共享元数据。
     shared: UnsafeCell<FolioShared>,
+    /// 原子状态位（含 `CONTENT_LOCKED`、`REFERENCED`、`ACTIVATE`），支持与自旋锁配合的无锁快路操作。
     flags: AtomicU8,
+    /// 等待该页内容锁释放或在途回写完成的任务等待队列。
     waiters: WaitQueue,
+    /// 标记该结构体不可移动（`!Unpin`），保障侵入式等待队列节点的内存安全。
     _pinned: PhantomPinned,
 }
 
-// SAFETY: backing 在活引用期间不可变；shared 仅通过所属 PageUse guard 访问，
-// 内容锁用原子协议转交，等待源内部短锁保护节点。活用途只做内部可变访问，
-// refs 归零且读入者、等待者和内容借用均结束后才取走原页，固定状态原地析构。
+// SAFETY:
+// 1. `backing` 在 Folio 存活期间（`references > 0`）仅被只读读取物理地址，直到最后一个引用归零并在独占状态下才被取走；
+// 2. `shared` 仅在持有所属 `PageDesc` 的 `PageUseGuard` 自旋锁时通过 `shared()` / `shared_mut()` 访问，互斥性由自旋锁保证；
+// 3. `flags` 为原子类型 `AtomicU8`，`waiters` 内部自带自旋锁保护等待链表，且整个 `FolioState` 在存活期间固定于静态 `PageDesc` 中不发生移动。
 unsafe impl Sync for FolioState {}
 
-/// 外部页句柄保活实际 canonical 内容域；内部索引和初始读入引用不附此拥有者。
+/// 外部句柄附带的缓存域强引用锚点，用于在页面存活或 I/O 在途期间保活所属 Inode 或元数据缓存。
+///
+/// 缓存索引树（Index）内部持有的基准 `FolioRef` 不携带此字段（保持为 `None`），从而打破“Inode/Cache -> 索引 -> FolioRef -> Inode/Cache”的循环引用。
 #[derive(Clone)]
 enum FolioOwner {
+    /// 文件缓存页所属的 VFS Inode 强引用。
     File(InodeRef),
+    /// 元数据缓存页所属的块设备元数据缓存强引用。
     Metadata(Arc<MetadataCache>),
 }
 
-/// 永久描述符上的一份原页引用；外部取得还保活实际 inode 或元数据缓存。
-/// 索引内部的引用不附拥有者，避免 index 到自身内容域的强拥有环。
+/// 指向单张 4KiB 页缓存物理页的引用计数句柄。
+///
+/// 外部调用者拿到的 `FolioRef` 会通过 `owner` 同时保活所属 `InodeRef` 或 `Arc<MetadataCache>`；
+/// 缓存索引内部保存的 `FolioRef` 则令 `owner = None` 以避免循环引用。
 pub struct FolioRef {
+    /// 指向全局静态页描述符表中对应 `PageDesc` 的固定引用。
     descriptor: Pin<&'static PageDesc>,
+    /// 可选的所属缓存域拥有者（外部句柄与在途 I/O 凭证持有，内部索引不持有）。
     owner: Option<FolioOwner>,
 }
 
-/// 唯一内容锁责任及一份保页引用；未完成时析构以 QueueStopped 结束填充。
-/// DMA 层交设备后必须保护整个拥有者，直到实际收权才能完成或析构。
+/// 页面初始读入（填充）操作的独占凭证，同时持有一份 `FolioRef` 强引用与该页的 `CONTENT_LOCKED` 锁责任。
+///
+/// - 若在调用 `complete` 前被丢弃（Drop），会自动以 `BlockError::QueueStopped` 发布失败状态并解锁唤醒等待者。
+/// - 当页面交由块设备 DMA 读取时，DMA 层必须托管整个 `FolioRead` 直到硬件完成传输并交还物理页访问权，随后才能调用 `complete` 或析构。
 pub struct FolioRead {
+    /// 被填充的目标 Folio 引用（若已交设备，还附带 `FolioOwner` 保活所属 Inode 或元数据缓存）。
     folio: FolioRef,
+    /// 本次读入负责填充的页内起始偏移（单位：字节）。
     offset: usize,
+    /// 本次读入负责填充的字节长度（单位：字节）。
     len: usize,
+    /// 标记本次读入是否已通过 `publish` 发布最终结果并释放了 `CONTENT_LOCKED`。
     completed: bool,
 }
 
-/// 一次真实回写范围及原内容域的拥有；设备全尾结束前不得结束本轮 WB。
-/// 未交设备的准备者退出时恢复 Dirty，不把取消或失败视为持久化成功。
+/// 页面脏扇区回写（Writeback）操作的独占凭证，持有一份 `FolioRef` 强引用并追踪本轮回写的扇区范围。
+///
+/// - 在块设备 DMA 传输彻底完成并收回物理页访问权之前，严禁提前结束本轮回写。
+/// - 若在提交设备前因准备失败而析构（`completed == false`），`Drop` 实现会将 `original_dirty` 恢复回页面的 `dirty` 位图，确保脏数据不会静默丢失。
 pub struct FolioWriteback {
+    /// 正在回写的目标 Folio 引用（保活底层物理页及所属 Inode/元数据缓存）。
     folio: FolioRef,
+    /// 本轮回写在页内的起始字节偏移（单位：字节，按 512B 扇区对齐）。
     offset: u16,
+    /// 本轮回写的字节长度（单位：字节，按 512B 扇区对齐）。
     len: u16,
+    /// 标记本轮回写是否已调用 `finish` 清除 `writeback` 位图并完成结算。
     completed: bool,
+    /// 启动本轮回写时从页面 `dirty` 位图中摘除的原始脏扇区掩码，用于在回写取消或部分未受理时恢复脏位。
     original_dirty: u8,
-    /// 实际提交者附卷统计拥有，元数据完成无需在 IRQ 升级卷的弱引用。
+    /// 所属块设备卷的回写统计域强引用，使中断完成路径无需升级弱引用即可直接更新卷级回写账目。
     writeback_domain: Option<Arc<WritebackDomain>>,
+    /// 标记本轮回写是否由后台回写线程发起（用于区分后台轮次 I/O 流量统计）。
     background: bool,
 }
 
-/// 普通 Task 借用的内容锁；文件页仅可原始复制，元数据页才可借用初始化范围。
-/// 锁不排斥用户共享 store；不得持本 guard 做可能 fault 的用户复制。
+/// 普通可睡眠任务持有的页内容独占锁守卫（Guard）。
+///
+/// - 对于**文件页**，持有此守卫仅串行化内核态的填充、清零与 `copy_to`/`copy_from` 操作，不排斥用户态通过共享可写页表直接执行内存写入，因此文件页只允许通过汇编拷贝访问，不提供 Rust 切片。
+/// - 对于**元数据页**，由于不存在用户态映射且排斥在途回写，持有此守卫可安全借用 `&[u8]` 或 `&mut [u8]`。
+/// - 持有此守卫期间严禁执行可能触发缺页异常（Page Fault）的用户空间内存拷贝，以免发生递归加锁死锁。
 pub struct FolioContent<'a> {
+    /// 被锁定的目标 `FolioRef` 借用。
     folio: &'a FolioRef,
+    /// 标记当前守卫是否仍持有 `CONTENT_LOCKED` 解锁责任（在 `begin_metadata_read` 中会将锁责任转移给 `FolioRead` 并置为 `false`）。
     locked: bool,
+    /// 限制 `FolioContent` 为 `!Send` 且 `!Sync`，确保仅在获取锁的当前任务上下文中使用和释放。
     _task_local: PhantomData<*mut ()>,
 }
 
 impl FolioState {
-    /// 借用所属用途锁保护的共享头，借用不能超出 guard 的存活期。
+    /// 在持有所属 `PageUseGuard` 的前提下，获取 `FolioShared` 的共享不可变引用。
     fn shared<'a>(usage: &'a PageUseGuard<'_>) -> &'a FolioShared {
         let state = usage.folio();
-        // SAFETY: usage 是本状态唯一所属用途锁的活 guard；所有 shared 写者
-        // 都持同锁，返回借用绑定 guard，期间没有可变 shared 借用。
+        // SAFETY:
+        // 1. `usage` 是当前 `PageDesc` 用途自旋锁的存活守卫，所有对 `shared` 的写入都必须持有同一把自旋锁；
+        // 2. 返回引用的生命周期 `'a` 绑定到 `&'a PageUseGuard`，在此期间不可能存在对 `shared` 的可变借用。
         unsafe { &*state.shared.get() }
     }
 
-    /// 仅修改固定用途内部的共享头，不创建会排斥其他 Pin 借用的 &mut FolioState。
+    /// 在持有所属 `PageUseGuard` 可变借用的前提下，获取 `FolioShared` 的独占可变引用。
+    ///
+    /// 仅对 `UnsafeCell<FolioShared>` 进行内部可变投影，不创建 `&mut FolioState`，从而不违反 `Pin<&FolioState>` 的共享别名约束。
     fn shared_mut<'a>(usage: &'a mut PageUseGuard<'_>) -> &'a mut FolioShared {
         let state = usage.folio();
-        // SAFETY: 可变借用 guard 串行本状态全部 shared 访问；只从 UnsafeCell
-        // 创建内部可变借用，不改变固定状态、原拥有者、内容锁或等待源的地址。
+        // SAFETY:
+        // 1. `&'a mut PageUseGuard` 保证了当前线程独占持有该 `PageDesc` 的用途自旋锁，没有任何其他并发读写者访问 `shared`；
+        // 2. 仅通过 `UnsafeCell::get` 构造内部 `FolioShared` 的可变引用，不会移动外层 `FolioState` 或其中的 `WaitQueue`。
         unsafe { &mut *state.shared.get() }
     }
 
-    /// 只检查当前范围事实；调用者负责持内容锁或拒绝仍被锁定的状态。
+    /// 检查页内指定字节区间 `[offset, offset + len)` 的数据是否已完成初始化且无 I/O 错误。
+    ///
+    /// 调用方负责在调用前持有内容锁（`CONTENT_LOCKED`）或预先排除 `CONTENT_LOCKED` 置位状态。
     fn range_ready(shared: &FolioShared, offset: usize, len: usize) -> Result<(), BlockError> {
         match &shared.contents {
             FolioContents::File { initialized, .. } => {
@@ -156,7 +275,7 @@ impl FolioState {
         Ok(())
     }
 
-    /// 最后引用结束后取走原页归还权，固定等待源仍由用途槽原地析构。
+    /// 当所有 `FolioRef` 引用计数归零且无内容锁、无脏数据、无在途回写时，从状态槽中取出底层物理页所有权。
     pub(crate) fn take_backing(&mut self) -> OwnedPages {
         assert_eq!(
             self.shared.get_mut().references,
@@ -175,14 +294,16 @@ impl FolioState {
 }
 
 impl FolioRef {
-    /// 为外部文件页句柄附上实际 inode 引用，内部索引不得保存此句柄。
-    /// 重复附同一对象保留原拥有者，不同对象或内容角色暴露为协议错误。
+    /// 为外部使用的文件页句柄绑定所属的 `InodeRef` 强引用，消费并返回绑定后的 `FolioRef`。
+    ///
+    /// 仅用于缓存索引向外部返回句柄或构造 I/O 凭证时保活 Inode；若重复绑定同一 Inode 则保持幂等，
+    /// 若尝试绑定不同 Inode 或绑定到元数据页则直接 panic。
     pub(crate) fn with_file_owner(mut self, owner: InodeRef) -> Self {
         self.attach_file_owner(owner);
         self
     }
 
-    /// 为原引用就地附来源，文件页句柄和读入凭证共用同一角色与身份检查。
+    /// 就地为当前 `FolioRef` 绑定所属 `InodeRef`，并校验页面角色与 Inode 身份一致性。
     fn attach_file_owner(&mut self, owner: InodeRef) {
         {
             let usage = self.descriptor.usage();
@@ -203,14 +324,15 @@ impl FolioRef {
         }
     }
 
-    /// 为外部元数据页句柄附上真实 Arc 缓存，内部索引不得保存此句柄。
-    /// 拥有凭证由 caller 直接移交，不从缓存 payload 地址恢复 Arc。
+    /// 为外部使用的元数据页句柄绑定所属的 `Arc<MetadataCache>` 强引用，消费并返回绑定后的 `FolioRef`。
+    ///
+    /// 仅用于向缓存外部或 I/O 凭证交付句柄时保活 `MetadataCache`，内部索引不持有该强引用以避免循环引用。
     pub(crate) fn with_metadata_owner(mut self, owner: Arc<MetadataCache>) -> Self {
         self.attach_metadata_owner(owner);
         self
     }
 
-    /// 原页视图和唯一读入凭证共用真实元数据域身份，内部索引仍无 anchor。
+    /// 就地为当前 `FolioRef` 绑定所属 `Arc<MetadataCache>`，并校验页面角色与缓存实例指针一致性。
     fn attach_metadata_owner(&mut self, owner: Arc<MetadataCache>) {
         {
             let usage = self.descriptor.usage();
@@ -234,7 +356,7 @@ impl FolioRef {
         }
     }
 
-    /// 借用本外部句柄已有的元数据缓存拥有者，视图无需再保存一份等价 Arc。
+    /// 若当前句柄绑定了元数据缓存拥有者，则返回其 `&Arc<MetadataCache>` 借用。
     pub(crate) fn metadata_owner(&self) -> Option<&Arc<MetadataCache>> {
         match &self.owner {
             Some(FolioOwner::Metadata(owner)) => Some(owner),
@@ -242,7 +364,9 @@ impl FolioRef {
         }
     }
 
-    /// 消耗真实 order0 拥有者作为文件页；高阶完整返回，不拆分或改变其阶数。
+    /// 将单张 order-0 物理页（`OwnedPages`）封装为文件缓存页 `FolioRef`。
+    ///
+    /// 若传入的 `backing` 阶数不为 0，则原样通过 `Err(backing)` 退回给调用者。
     pub fn from_pages(backing: OwnedPages) -> Result<Self, OwnedPages> {
         Self::install(
             backing,
@@ -253,7 +377,9 @@ impl FolioRef {
         )
     }
 
-    /// 消耗独占 order0 页作为元数据页；此角色终身禁止交给用户可写映射。
+    /// 将单张 order-0 物理页（`OwnedPages`）封装为块设备元数据缓存页 `FolioRef`。
+    ///
+    /// 元数据页按 512B 扇区独立追踪有效位与错误，且终身禁止映射到用户地址空间。
     pub fn from_metadata_pages(backing: OwnedPages) -> Result<Self, OwnedPages> {
         Self::install(
             backing,
@@ -264,7 +390,9 @@ impl FolioRef {
         )
     }
 
-    /// 将预留的 RAM 文件页额度移入原页内容槽；节点发表前必须完成此转移。
+    /// 将预先申请的内存文件系统（memfs）页面配额凭证绑定到当前文件页中，并撤销磁盘文件缓存页计数。
+    ///
+    /// 必须在该页面被发布到文件索引树之前完成调用。
     pub(crate) fn attach_memory_charge(&mut self, charge: MemoryPageCharge) {
         let mut usage = self.descriptor.usage();
         let shared = FolioState::shared_mut(&mut usage);
@@ -279,7 +407,7 @@ impl FolioRef {
         background::account_file_page(false);
     }
 
-    /// 在未发表的空用途槽安装原拥有者和终身内容角色。
+    /// 在物理页对应的全局 `PageDesc` 空闲用途槽中安装 `FolioState`，并构造首个 `FolioRef`。
     fn install(backing: OwnedPages, contents: FolioContents) -> Result<Self, OwnedPages> {
         if backing.order() != 0 {
             return Err(backing);
@@ -315,8 +443,9 @@ impl FolioRef {
             }
         }
 
-        // SAFETY: 生产 PageMap 在独占元数据 RAM 中一次发布，描述符永久有效
-        // 且不再移动；此 Pin 只借用描述符，活 folio 用途的固定由私有投影协议保证。
+        // SAFETY:
+        // 1. 全局 `pages()` 描述符数组在内核启动时一次性初始化于静态内存区域，所有 `PageDesc` 具有 `'static` 生命周期且物理/虚拟地址永不改变；
+        // 2. 将 `descriptor` 包装为 `Pin<&'static PageDesc>` 满足固定地址要求，内嵌 `FolioState` 的固定性由引用计数与 `PageUse` 协议共同维护。
         let descriptor = unsafe { Pin::new_unchecked(descriptor) };
         Ok(Self {
             descriptor,
@@ -324,7 +453,7 @@ impl FolioRef {
         })
     }
 
-    /// 从唯一生产页入口取得未清零 order0 页，不申请额外控制对象。
+    /// 从伙伴分配器申请一页未清零的 order-0 物理页，并将其初始化为文件缓存页 `FolioRef`。
     pub fn allocate() -> Option<Self> {
         let backing = alloc_pages(0, false)?;
         Some(
@@ -333,7 +462,7 @@ impl FolioRef {
         )
     }
 
-    /// 从唯一页入口准备未清零元数据页，不建立第二份缓存或额外控制对象。
+    /// 从伙伴分配器申请一页未清零的 order-0 物理页，并将其初始化为元数据缓存页 `FolioRef`。
     pub fn allocate_metadata() -> Option<Self> {
         let backing = alloc_pages(0, false)?;
         Some(
@@ -342,7 +471,7 @@ impl FolioRef {
         )
     }
 
-    /// 返回同一原页地址，仅用于身份与 DMA 映射，不授予内容访问权。
+    /// 返回底层 4KiB 物理页的起始物理地址（字节），用于页表映射、身份比对或块设备 DMA 映射。
     pub fn phys_addr(&self) -> usize {
         self.state()
             .backing
@@ -351,13 +480,13 @@ impl FolioRef {
             .phys_addr()
     }
 
-    /// 读取用途锁内的真实引用数；并发快照不授予独占访问权。
+    /// 读取当前 Folio 的强引用计数快照（仅用于内核测试断言）。
     #[cfg(feature = "ktest")]
     pub fn ref_count(&self) -> usize {
         FolioState::shared(&self.descriptor.usage()).references
     }
 
-    /// 只识别由 MemoryPageCharge 标记的 RAM 文件原页，不凭文件打开对象猜后端。
+    /// 判断当前 Folio 是否为绑定了 `MemoryPageCharge` 的内存文件系统（memfs）文件页。
     pub(crate) fn is_memory(&self) -> bool {
         let usage = self.descriptor.usage();
         matches!(
@@ -369,8 +498,10 @@ impl FolioRef {
         )
     }
 
-    /// 文件的一次填充结束后为真（包括失败）；元数据须整页全部 sector 已终结。
-    /// 检查特定视图的可读性必须使用 range_ready，不能据此忽略失败或部分有效范围。
+    /// 检查页面初始读入流程是否已结束（仅用于内核测试）。
+    ///
+    /// 对于文件页，只要发布过一次读入结果（含成功或失败）且未持有内容锁即返回 `true`；
+    /// 对于元数据页，要求全部 8 个扇区均已有效或已记录具体错误且未持有内容锁。
     #[cfg(feature = "ktest")]
     pub fn is_ready(&self) -> bool {
         let usage = self.descriptor.usage();
@@ -384,8 +515,10 @@ impl FolioRef {
         }
     }
 
-    /// 文件页只认领一次任意非空页内范围；已完成或已在途时返回 Busy。
-    /// 在候选发表前调用，内容锁责任可整体移交 DMA 完成域，不携带 Task 睡眠锁。
+    /// 认领文件缓存页的首次读入填充权，锁定页面内容并返回 `FolioRead` 凭证。
+    ///
+    /// 文件页在整个生命周期内只允许初始化一次非空字节区间 `[offset, offset + len)`；
+    /// 若该页已完成初始化或当前已有其他任务持有 `CONTENT_LOCKED`，则返回 `Err(BlockError::Busy)`。
     pub fn begin_read(&self, offset: usize, len: usize) -> Result<FolioRead, BlockError> {
         validate_range(offset, len)?;
         let state = self.state();
@@ -419,9 +552,12 @@ impl FolioRef {
         })
     }
 
-    /// 等待同页内容锁后重查请求，仅认领其中首段连续未初始化的 sector。
-    /// 请求须按 512 字节对齐；已有效返回 None，失败保留所属 sector 的首次具体错误。
-    /// owner 的 offset/len 是实际传输范围，不能用原请求覆盖已有效或 Dirty 字节。
+    /// 在元数据页中锁定内容并认领区间 `[offset, offset + len)` 内首段连续尚未初始化的扇区。
+    ///
+    /// - `offset` 与 `len` 必须按 512 字节扇区对齐。
+    /// - 若扫描过程中遇到某扇区曾记录过读入错误，则立即返回该具体错误。
+    /// - 若请求区间内的所有扇区均已有效（`valid`），则释放内容锁并返回 `Ok(None)`。
+    /// - 若存在未初始化扇区，则截取首段连续未初始化且无错误的子区间构造 `FolioRead`，并将内容锁责任直接移交给该凭证。
     pub fn begin_metadata_read(
         &self,
         offset: usize,
@@ -439,6 +575,7 @@ impl FolioRef {
             let FolioContents::Metadata { valid, errors } = &shared.contents else {
                 return Err(BlockError::InvalidRange);
             };
+            // Step 1: 跳过区间前端已经有效（valid）的扇区；若遇到历史 I/O 错误则立即中止并返回错误。
             let end = (offset + len) / SECTOR_SIZE;
             let mut first = offset / SECTOR_SIZE;
             while first < end {
@@ -453,6 +590,7 @@ impl FolioRef {
             if first == end {
                 return Ok(None);
             }
+            // Step 2: 从首个未就绪扇区开始，向后合并连续未初始化且无错误的扇区，避免覆盖后续已有效的扇区数据。
             let mut last = first + 1;
             while last < end && valid & (1 << last) == 0 && errors[last].is_none() {
                 last += 1;
@@ -463,7 +601,8 @@ impl FolioRef {
                 .expect("folio reference count overflow");
             (first * SECTOR_SIZE, (last - first) * SECTOR_SIZE)
         };
-        // guard 的锁责任原样交给唯一 owner，不解锁、不携带非 Send 的 Task guard。
+        // Step 3: 将 `FolioContent` 持有的 `CONTENT_LOCKED` 锁责任直接移交给 `FolioRead` 凭证，
+        // 使读入操作可以跨任务或交给异步 DMA 中断完成，而无需在 `FolioContent::drop` 中提前解锁。
         content.locked = false;
         Ok(Some(FolioRead {
             folio: Self {
@@ -476,8 +615,9 @@ impl FolioRef {
         }))
     }
 
-    /// 等待当前内容锁结束；文件保留一次范围结果，元数据只认可整页真实有效范围。
-    /// 元数据缺失但无 owner 时返回 NotReady，填充精确窗口须使用 begin_metadata_read。
+    /// 阻塞等待当前页面的内容锁释放，并检查页面初始数据是否已就绪。
+    ///
+    /// 对于文件页，检查首次初始化是否成功；对于元数据页，检查整页（`0..PAGE_SIZE`）全部扇区是否均有效。
     pub fn wait_ready(&self) -> Result<(), BlockError> {
         let _content = self.lock_content();
         let usage = self.descriptor.usage();
@@ -490,7 +630,7 @@ impl FolioRef {
         }
     }
 
-    /// 非阻塞检查本次 byte 窗口；持内容锁、缺失或失败均不授予读取权。
+    /// 非阻塞检查页内字节区间 `[offset, offset + len)` 是否已初始化就绪且当前未被锁定。
     pub fn range_ready(&self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
         let usage = self.descriptor.usage();
@@ -500,8 +640,9 @@ impl FolioRef {
         FolioState::range_ready(FolioState::shared(&usage), offset, len)
     }
 
-    /// 在普通 Task 中原始复制已初始化内容到独占内核片段，不形成文件页切片。
-    /// 等待内容锁但不排斥用户共享 store，因此结果不承诺一致快照；空目标不访问页。
+    /// 在可睡眠任务中获取页面内容锁，并将页内 `[offset, offset + dst.len())` 的已初始化数据拷贝到内核缓冲区 `dst`。
+    ///
+    /// 若 `dst` 为空切片，仅校验偏移量合法性而不加锁访问页面。
     pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), BlockError> {
         validate_copy_range(offset, dst.len())?;
         if dst.is_empty() {
@@ -510,8 +651,10 @@ impl FolioRef {
         self.lock_content().copy_to(offset, dst)
     }
 
-    /// 普通 Task 取得页内容锁；沿固定 WaitQueue 先登记再重查，不持用途锁 park。
-    /// 内容锁串行内核修改及读入，不排斥用户共享字节访问或替代 DMA 收权证明。
+    /// 在可睡眠任务中阻塞获取页面内容独占锁，返回 `FolioContent` 守卫。
+    ///
+    /// 采用“先尝试加锁 -> 失败则将栈上固定节点登记到 `WaitQueue` -> 二次检查锁状态 -> 睡眠等待”的标准协议，
+    /// 确保不会因唤醒信号与睡眠操作交错而发生丢唤醒（Lost Wakeup）。
     pub fn lock_content(&self) -> FolioContent<'_> {
         sched::assert_switchable();
         let state = self.state();
@@ -521,8 +664,9 @@ impl FolioRef {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 保活固定用途内的源，pin! 固定栈节点；
-            // 所有退出均先撤 registration，再析构节点和 waiter，不遗忘登记。
+            // SAFETY:
+            // 1. `self` 持有一份存活的 `FolioRef` 强引用，保证静态 `PageDesc` 内的 `state.waiters` 在整个等待期间地址固定且不被析构；
+            // 2. `node` 通过 `pin!` 宏固定在当前任务栈帧上，`_registration` 守卫在循环每次迭代结束或提前 `return` 时都会先从链表摘除节点，随后才析构 `node` 与 `waiter`。
             let _registration = unsafe { state.waiters.register(node.as_mut()) };
             if let Some(content) = self.try_lock_content() {
                 return content;
@@ -531,8 +675,10 @@ impl FolioRef {
         }
     }
 
-    /// 尝试在用途短锁下取得内容 guard，失败不等待；调用者可先提交已准备前缀。
-    /// 元数据的全页 WB 仍排斥内容借用，文件 WB 不阻止 coherent 原始写。
+    /// 尝试非阻塞地获取页面内容锁（`CONTENT_LOCKED`）。
+    ///
+    /// 若当前已有其他任务持有 `CONTENT_LOCKED`，或者当前页面为正在执行块设备回写（`writeback != 0`）的元数据页，
+    /// 则立即返回 `None` 而不睡眠等待。
     pub(crate) fn try_lock_content(&self) -> Option<FolioContent<'_>> {
         let usage = self.descriptor.usage();
         let state = usage.folio();
@@ -550,7 +696,7 @@ impl FolioRef {
         })
     }
 
-    /// canonical 索引准入只接受没有外部页引用、填充或 WB 的原页，Dirty 由后续同步处理。
+    /// 检查页面当前是否仅由单一持有者引用（`references == 1`），且无在途回写、无内容锁占用。
     pub(crate) fn is_cache_only(&self) -> bool {
         let usage = self.descriptor.usage();
         let shared = FolioState::shared(&usage);
@@ -559,7 +705,8 @@ impl FolioRef {
             && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
     }
 
-    /// 真实读入消费、文件 fault 或 uaccess 标记访问；准备、预读及 WB 不调用。
+    /// 标记页面被访问过一次，驱动二次机会（Second-Chance）LRU 老化状态机：
+    /// 首次访问置 `REFERENCED`，若 `REFERENCED` 已置位则同时置 `ACTIVATE`。
     pub(crate) fn mark_accessed(&self) {
         let _ = self
             .state()
@@ -574,7 +721,7 @@ impl FolioRef {
             });
     }
 
-    /// 老化只消费访问位，内容锁以及并发新访问均保留原原子协议。
+    /// 原子读取并清除页面的 `REFERENCED` 与 `ACTIVATE` 访问标志位，返回 `(是否曾被引用, 是否应晋升活跃队列)`。
     pub(crate) fn take_accessed(&self) -> (bool, bool) {
         let previous = self
             .state()
@@ -583,7 +730,9 @@ impl FolioRef {
         (previous & REFERENCED != 0, previous & ACTIVATE != 0)
     }
 
-    /// 消费一份真实引用并在实际归还 file 原页后返回一；拥有者在页用途锁外结束。
+    /// 显式消费当前 `FolioRef` 强引用；若此次释放使引用计数归零并实际回收了一页磁盘文件缓存页，则返回 `1`，否则返回 `0`。
+    ///
+    /// 所属 `owner`（`InodeRef` 或 `Arc<MetadataCache>`）会在释放 `PageDesc` 自旋锁之后再析构，避免锁序反转。
     pub(crate) fn release(self) -> usize {
         let mut this = ManuallyDrop::new(self);
         let freed = this.put();
@@ -591,7 +740,7 @@ impl FolioRef {
         freed
     }
 
-    /// Drop 与显式回收共用最后 put，归页返回以后才记录 file 页账。
+    /// 递减一次 `FolioRef` 引用计数；当最后一个强引用被释放（`references == 0`）时，摘除 `FolioState` 并归还物理页。
     fn put(&mut self) -> usize {
         let discarded = {
             let mut usage = self.descriptor.usage();
@@ -625,8 +774,11 @@ impl FolioRef {
                     0,
                     "last folio reference retains a content owner"
                 );
-                // SAFETY: 引用归零且无内容锁、Dirty、WB；读入和等待者均自持活引用，
-                // 全部固定投影已结束，take 只原地析构用途，页在退出用途锁后归还。
+                // SAFETY:
+                // 1. 前置检查已确认 `references == 0`、`dirty == 0`、`writeback == 0` 且 `CONTENT_LOCKED == 0`；
+                // 2. 所有在途读入（`FolioRead`）、回写（`FolioWriteback`）及等待队列上的任务都各自持有 `FolioRef` 强引用，
+                //    因此 `references == 0` 证明已不存在任何并发访问者或 `Pin<&FolioState>` 借用；
+                // 3. 在 `PageUseGuard` 保护下调用 `take_folio()` 原地析构 `FolioState` 并抽出 `OwnedPages`，随后在锁外释放物理页。
                 Some((unsafe { usage.take_folio() }, file, charge))
             } else {
                 None
@@ -648,7 +800,7 @@ impl FolioRef {
         }
     }
 
-    /// 元数据控制和旧外部凭证已结束后，只有实际源基准才允许重用原页。
+    /// 检查元数据缓存页是否处于可被空闲池复用的干净静止状态（仅剩库存基准引用 `references == 1`、无脏扇区、无回写、无内容锁且未绑定外部 owner）。
     pub(crate) fn metadata_inventory_available(&self) -> bool {
         let usage = self.descriptor.usage();
         let shared = FolioState::shared(&usage);
@@ -660,7 +812,7 @@ impl FolioRef {
             && self.owner.is_none()
     }
 
-    /// 原索引基准及可选真实源基准以外没有 Buffer/Read/WB，才准许静止节点摘离。
+    /// 检查缓存索引中的页面是否处于无外部使用的静止状态（引用数等于索引基准引用加上可选的元数据库存基准引用，且无在途回写与内容锁）。
     pub(crate) fn index_unused(&self, metadata_baseline: bool, allow_dirty: bool) -> bool {
         let usage = self.descriptor.usage();
         let shared = FolioState::shared(&usage);
@@ -670,8 +822,10 @@ impl FolioRef {
             && usage.folio().flags.load(Ordering::Acquire) & CONTENT_LOCKED == 0
     }
 
-    /// 在 index→LRU→PageUse 同一最终锁域先核外部拥有，再检查真实 File 清洁状态。
-    /// retire 只摘拥有，不可分配、睡眠或析构；内容 guard 必须属于传入的扫描原引用。
+    /// 在持有缓存索引锁与 LRU 锁的最终临界区内，校验干净文件页是否仍无外部引用，并在满足条件时执行 `retire` 摘除闭包。
+    ///
+    /// `scanner` 为回收扫描器额外持有的同一页引用（若存在则允许总引用数为 2，否则为 1）；
+    /// `content` 为调用方可能已持有的本页内容锁守卫。`retire` 闭包在 `PageDesc` 自旋锁内执行，因此严禁在闭包内执行内存分配、睡眠或析构物理页。
     pub(crate) fn retire_clean<T>(
         &self,
         scanner: Option<&Self>,
@@ -708,7 +862,7 @@ impl FolioRef {
         Some(retire())
     }
 
-    /// 源只有基准和本次私有准备者，全部旧责任结束后重设元数据有效与失败范围。
+    /// 重置空闲元数据缓存页的所有扇区有效位（`valid = 0`）与错误记录，准备将其重新分配给新的元数据块使用。
     pub(crate) fn reset_metadata_inventory(&self) {
         let content = self
             .try_lock_content()
@@ -732,12 +886,14 @@ impl FolioRef {
         drop(content);
     }
 
-    /// 最后范围占用结束时仅撤有效与失败状态，可在 IRQ 中持用途锁执行，不借用页字节。
+    /// 当元数据页内指定扇区窗口 `[offset, offset + len)` 的最后一个块缓冲区引用结束时，清除该窗口的有效位与历史错误记录。
+    ///
+    /// 此函数仅修改 `FolioShared` 元数据位图而不访问物理页字节，支持在中断上下文中调用。
     ///
     /// # Safety
-    /// 调用者仍持物理盘的范围准入锁，已证明本窗口没有其他活 claim；
-    /// Buffer、读入和 WB 的真实 claim 均已结束，且解除本次 claim 前不会重新准入。
-    /// 同页其他窗口可以仍持内容锁或设备拥有，本操作不得修改其状态或原页字节。
+    /// 1. 调用方必须持有对应元数据块的地址准入锁，确保 `[offset, offset + len)` 窗口当前没有任何存活的缓冲区借用、在途读入（`FolioRead`）或在途回写（`FolioWriteback`）；
+    /// 2. 在当前回收流程释放准入锁之前，不得允许新的任务重新认领该扇区窗口；
+    /// 3. 同页内的其他扇区窗口可能正处于并发读写或 DMA 传输中，本操作仅通过位掩码修改目标扇区的状态位。
     pub(crate) unsafe fn retire_metadata(&self, offset: usize, len: usize) {
         assert!(validate_range(offset, len).is_ok());
         assert_eq!(offset % SECTOR_SIZE, 0);
@@ -762,24 +918,24 @@ impl FolioRef {
         errors[offset / SECTOR_SIZE..(offset + len) / SECTOR_SIZE].fill(None);
     }
 
-    /// 返回实际 512 字节脏范围位图；该快照不代表已经提交或持久化。
+    /// 返回当前页面 8 个 512B 扇区的脏位图快照（`dirty`）。
     pub fn dirty_sectors(&self) -> u8 {
         FolioState::shared(&self.descriptor.usage()).dirty
     }
 
-    /// 返回真实回写范围位图；本接口不建立回写、清脏或完成成功的责任。
+    /// 返回当前页面 8 个 512B 扇区的在途回写位图快照（`writeback`）。
     pub fn writeback_sectors(&self) -> u8 {
         FolioState::shared(&self.descriptor.usage()).writeback
     }
 
-    /// 在同一次用途锁内取得 Dirty 与 WB，清脏转 WB 不会从两个快照之间漏失。
+    /// 在同一次 `PageDesc` 自旋锁临界区内原子读取 `(dirty, writeback)` 位图快照，防止在将脏位转为回写位的交界处出现观测漏失。
     pub(crate) fn writeback_state(&self) -> (u8, u8) {
         let usage = self.descriptor.usage();
         let shared = FolioState::shared(&usage);
         (shared.dirty, shared.writeback)
     }
 
-    /// 普通 Task 等待当前页的全部真实 WB 结束；Dirty 为零不能替代这个条件。
+    /// 在可睡眠任务中阻塞等待当前页面的所有在途块设备回写（`writeback`）全部完成。
     pub fn wait_writeback(&self) {
         sched::assert_switchable();
         let state = self.state();
@@ -789,8 +945,9 @@ impl FolioRef {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: 本引用保活固定等待源，栈节点在全部登记期间固定；
-            // 每条返回路径先撤登记，再释放节点和 waiter，真实完成在状态发布后唤醒。
+            // SAFETY:
+            // 1. `self` 持有的 `FolioRef` 强引用确保 `state.waiters` 在静态 `PageDesc` 内地址固定且存活；
+            // 2. `node` 通过 `pin!` 固定在当前任务栈上，且所有退出分支都会先析构 `_registration` 将节点从等待队列移除，再析构栈上的 `node` 与 `waiter`。
             let _registration = unsafe { state.waiters.register(node.as_mut()) };
             if self.writeback_sectors() == 0 {
                 return;
@@ -799,7 +956,7 @@ impl FolioRef {
         }
     }
 
-    /// 用途锁内只作原子转移，本卷账取真实外部 File owner，不取得调度锁。
+    /// 在持有 `PageDesc` 自旋锁期间，根据 `dirty` 与 `writeback` 位图的前后变化更新全局及所属磁盘卷的回写统计计数。
     fn account_state(&self, old_dirty: u8, old_wb: u8, shared: &FolioShared) {
         if matches!(
             &shared.contents,
@@ -820,7 +977,7 @@ impl FolioRef {
         }
     }
 
-    /// 用途锁外重报可见脏义务；只有可能减轻压力时唤醒 writer，新 Dirty 不制造空唤醒。
+    /// 在释放 `PageDesc` 自旋锁之后，向所属磁盘卷的回写域通知脏页状态变化；若 `relieved` 为 `true`（脏页/回写压力减轻），则唤醒因脏页限流而阻塞的写入任务。
     fn notify_dirty_state(&self, relieved: bool) {
         if self.is_memory() {
             return;
@@ -837,22 +994,25 @@ impl FolioRef {
         }
     }
 
-    /// 在用途短锁内定位状态，再投影绑定本活引用的共享 Pin，不将锁带入 IO 或等待。
+    /// 获取指向当前 Folio 内部状态 `Pin<&FolioState>` 的固定借用。
+    ///
+    /// 先在短暂的 `PageUseGuard` 自旋锁下获取 `FolioState` 地址，随后释放自旋锁并返回绑定到 `&self` 生命周期的 `Pin` 引用，
+    /// 从而允许调用者在自旋锁外安全地操作原子标志 `flags` 或在 `waiters` 等待队列上睡眠。
     fn state(&self) -> Pin<&FolioState> {
         let pointer = {
             let usage = self.descriptor.usage();
             usage.folio() as *const FolioState
         };
-        // SAFETY: from_pages 先完成用途写入再发表首引用；此后活引用只通过
-        // UnsafeCell 修改共享头，从不创建 &mut FolioState 或替换用途。
-        // self 保证 references 至少为一，本借用终止前无法执行最后引用移出；
-        // 永久 descriptor 固定该用途槽地址，内容锁、等待源和 backing 均不移动。
+        // SAFETY:
+        // 1. `FolioRef::install` 在发布首个 `FolioRef` 之前已完成 `FolioState` 的初始化写入，且存活期间仅通过 `UnsafeCell` 修改 `FolioShared`，绝不创建 `&mut FolioState` 或移动状态；
+        // 2. `&self` 保证当前至少存在一份强引用（`references >= 1`），因此在返回借用的生命周期内不可能触发最后一个引用释放（`take_folio`）；
+        // 3. `PageDesc` 永久固定于静态内存中，故 `pointer` 指向的 `FolioState` 在 `&self` 存活期间始终有效且地址固定。
         unsafe { Pin::new_unchecked(&*pointer) }
     }
 }
 
 impl Clone for FolioRef {
-    /// 克隆真实内容域拥有者和原页计数，不复制内容；内部无 anchor 的引用仍保持无 anchor。
+    /// 克隆 `FolioRef` 句柄：递增底层 `FolioShared::references` 引用计数，并同步克隆可选的 `FolioOwner`（不复制物理页数据）。
     fn clone(&self) -> Self {
         let owner = self.owner.clone();
         let mut usage = self.descriptor.usage();
@@ -869,30 +1029,31 @@ impl Clone for FolioRef {
 }
 
 impl Drop for FolioRef {
-    /// 最后 put 原页后再结束内容域拥有者；脏、内容锁和 WB 仍须由真实责任者结束。
+    /// 释放 `FolioRef` 句柄：递减引用计数；若为最后一个强引用则归还底层物理页，随后由编译器自动析构 `owner`。
     fn drop(&mut self) {
         self.put();
     }
 }
 
 impl FolioContent<'_> {
-    /// 借用当前 guard 实际锁住的原页，用于最终授权与回写的身份核对。
+    /// 返回当前内容锁守卫所锁定的 `&FolioRef` 借用。
     pub(crate) fn folio(&self) -> &FolioRef {
         self.folio
     }
 
-    /// 在内容锁内读取真实 WB 范围；检查为零之后仍须保持授权与清脏互斥。
+    /// 在持有内容锁期间读取当前页面的在途回写扇区位图（`writeback`）。
     pub(crate) fn writeback_sectors(&self) -> u8 {
         self.folio.writeback_sectors()
     }
 
-    /// 读取本页已发表 FS 块的准备事实，最终授权核对时不取得 inode 块根。
+    /// 读取文件页内已完成底层文件系统块分配与零初始化准备的 512B 扇区位图（`file_prepared`）。
     pub(crate) fn file_prepared_sectors(&self) -> u8 {
         FolioState::shared(&self.folio.descriptor.usage()).file_prepared
     }
 
-    /// 保存已经发表并初始化的整 FS 块事实，调用者持 inode invalidate 和本内容锁。
-    /// 块根修改必须先真实提交；此位图不承担分配或块地址查询责任。
+    /// 将文件页内已完成底层磁盘块分配和初始化的区间 `[offset, offset + len)` 标记到 `file_prepared` 位图中。
+    ///
+    /// 调用方必须同时持有所属 Inode 的截断/失效锁与本页内容锁，且 `offset` 与 `len` 必须按 512 字节扇区对齐。
     pub(crate) fn mark_file_prepared(
         &mut self,
         offset: usize,
@@ -913,10 +1074,10 @@ impl FolioContent<'_> {
         Ok(())
     }
 
-    /// 只重标当前 EOF 内已真实准备的整 FS 块；hole 与 EOF 外块不产生脏义务。
-    /// 调用者须保留同一 canonical inode，并按其 invalidate 协议持有本页内容锁；
-    /// block_size 必须来自该 inode 所属文件系统的几何。索引内部引用可以没有外部 inode，
-    /// 因此文件与元数据角色由固定原页状态区分。
+    /// 将文件页内位于当前文件有效长度（`0..valid_bytes`，按文件系统块大小向上取整）范围内、且已在 `file_prepared` 中准备好的块标记为脏（`dirty`）。
+    ///
+    /// 未映射的文件空洞（Hole）或超出文件末尾（EOF）的块不在 `file_prepared` 中，因此不会被标记为脏扇区。
+    /// 若该页为内存文件系统（memfs）页面，则直接返回 `Ok(())`。
     pub(crate) fn mark_prepared_dirty(
         &mut self,
         valid_bytes: usize,
@@ -954,8 +1115,9 @@ impl FolioContent<'_> {
         Ok(())
     }
 
-    /// 初始化已有效的文件缓存 byte 范围，不把未映射 hole 的零内容当作盘块 Dirty。
-    /// 调用者先撤该页共享写许可并完成 TLB 同步，再按真实块映射标脏。
+    /// 将文件页内已初始化的字节区间 `[offset, offset + len)` 清零（不修改脏位图）。
+    ///
+    /// 调用方在截断或空洞清零时应先撤销用户态共享可写映射并完成 TLB 刷新，再调用本方法。
     pub(crate) fn zero_file_range(&mut self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_copy_range(offset, len)?;
         if len == 0 {
@@ -974,19 +1136,23 @@ impl FolioContent<'_> {
         let zeros = [0u8; SECTOR_SIZE];
         for part in (0..len).step_by(zeros.len()) {
             let count = (len - part).min(zeros.len());
-            // SAFETY: 内容 guard 保活并串行内核修改，完整窗口已初始化且在原页内；
-            // 独占零片段不与目标重叠，文件内容仅作原始访问，不建立共享 RAM 引用。
+            // SAFETY:
+            // 1. 当前任务持有 `FolioContent` 守卫，保证底层物理页存活且串行化内核态内容修改，前文 `range_ready` 已验证 `[offset, offset + len)` 位于单页已初始化范围内；
+            // 2. `zeros` 是栈上独立的 512B 数组，与目标物理页的直接映射虚拟地址绝不重叠；
+            // 3. 使用 `arch::copy_user_bytes` 执行原始字节写入，避免对可能存在用户态映射的文件页构造 `&mut [u8]` 切片。
             unsafe { arch::copy_user_bytes((address + part) as *mut u8, zeros.as_ptr(), count) };
         }
         Ok(())
     }
 
-    /// 缩小后的原文件尾页保留有效前缀，只清已删除整 FS 块的准备和脏义务。
+    /// 在文件缩小（Truncate）时处理新的文件尾页：将页内偏移 `valid` 之后的尾部字节清零，并清除已超出新文件大小的文件系统块的 `dirty` 与 `file_prepared` 位。
+    ///
+    /// 若 `valid` 落在一个文件系统块的中间，则保留该部分块（`0..retained`）的准备状态，并在该块已准备的前提下将其标记为脏，以便后续将该块的尾零状态持久化到磁盘。
     ///
     /// # Safety
-    /// 调用者持同 inode 写序列化、invalidate 独占和 mapping WB 互斥；新 size 已发表。
-    /// 本页的共享写许可已撤且全部 CPU 失效完成，唯一填充和真实 WB 已结束；
-    /// 删除范围无需落盘，保留的部分 FS 块仍由真实块树负责尾零持久化。
+    /// 1. 调用方必须持有所属 Inode 的写互斥锁、失效（invalidate）独占锁及映射回写互斥锁，且新的文件大小已发布；
+    /// 2. 该页的所有用户态共享可写页表映射必须已撤销并完成跨核 TLB 同步，且页上不存在任何在途回写（`writeback == 0`）；
+    /// 3. 被截断丢弃的尾部整块确定不再需要落盘持久化。
     pub(crate) unsafe fn truncate_file_tail(
         &mut self,
         valid: usize,
@@ -1006,7 +1172,9 @@ impl FolioContent<'_> {
             0,
             "file truncate retains writeback"
         );
+        // Step 1: 将新文件末尾 `valid` 到页尾 `PAGE_SIZE` 的字节全部清零。
         self.zero_file_range(valid, PAGE_SIZE - valid)?;
+        // Step 2: 计算按文件系统块大小向上取整后仍需保留的字节边界，清除已删除尾块的 dirty 与 file_prepared 位。
         let retained = valid.div_ceil(block_size) * block_size;
         let keep = sector_mask(0, retained);
         let mut usage = self.folio.descriptor.usage();
@@ -1014,6 +1182,7 @@ impl FolioContent<'_> {
         let old_dirty = shared.dirty;
         shared.dirty &= keep;
         shared.file_prepared &= keep;
+        // Step 3: 若新 EOF 落在某个已准备好的文件系统块内部，将该块标记为脏以确保尾部清零能回写落盘。
         if valid % block_size != 0 {
             let start = valid / block_size * block_size;
             shared.dirty |= shared.file_prepared & sector_mask(start, block_size);
@@ -1026,14 +1195,14 @@ impl FolioContent<'_> {
         Ok(())
     }
 
-    /// 在持内容锁期间检查真实 byte 窗口，不把同页其他 sector 的成功借给本范围。
+    /// 在持有内容锁期间检查页内字节区间 `[offset, offset + len)` 是否已初始化就绪且无 I/O 错误。
     pub fn range_ready(&self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
         let usage = self.folio.descriptor.usage();
         FolioState::range_ready(FolioState::shared(&usage), offset, len)
     }
 
-    /// 持锁原始复制到独占片段，不建立共享文件内容的 Rust 引用或一致快照。
+    /// 在持有内容锁期间，将页内已初始化区间 `[offset, offset + dst.len())` 的字节原始拷贝到调用方独占缓冲区 `dst`。
     pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), BlockError> {
         validate_copy_range(offset, dst.len())?;
         if dst.is_empty() {
@@ -1041,15 +1210,15 @@ impl FolioContent<'_> {
         }
         self.range_ready(offset, dst.len())?;
         let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
-        // SAFETY: guard 保活原页且已验证完整初始化范围，原始源不创建共享 RAM 引用；
-        // dst 是调用者独占的普通内核片段，不与本页有效内容重叠。
-        // metadata 锁排斥写者，file 用户共享 store 可并发，汇编只作有界字节访问。
+        // SAFETY:
+        // 1. `self` 守卫保活底层物理页，且 `self.range_ready` 已确认 `[offset, offset + dst.len())` 在页内已初始化；
+        // 2. `dst` 为调用方独占的可变字节切片，位于普通内核栈或堆内存中，与页缓存物理页不重叠；
+        // 3. 通过 `arch::copy_user_bytes` 进行原始指针拷贝，不构造文件页的 `&[u8]` 引用，即使并发存在用户态共享页表写入也不会触发 Rust 别名未定义行为。
         unsafe { arch::copy_user_bytes(dst.as_mut_ptr(), address as *const u8, dst.len()) };
         Ok(())
     }
 
-    /// 从普通内核片段原始修改已有效范围，修改前标记覆盖到的实际 sector 为 Dirty。
-    /// 不清除已有 WB，不承诺用户共享 store 与此次复制之间的快照或顺序。
+    /// 在持有内容锁期间，先将页内 `[offset, offset + src.len())` 覆盖的扇区标记为脏（`dirty`），再从内核切片 `src` 将字节原始拷贝到页内。
     pub fn copy_from(&mut self, offset: usize, src: &[u8]) -> Result<(), BlockError> {
         validate_copy_range(offset, src.len())?;
         if src.is_empty() {
@@ -1057,25 +1226,30 @@ impl FolioContent<'_> {
         }
         self.mark_dirty(offset, src.len())?;
         let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
-        // SAFETY: guard 保活原页并串行内核修改，mark_dirty 已验证已初始化范围；
-        // src 是已初始化内核片段，其借用期间不能并发修改，不与目标原页重叠。
-        // 目标没有 Rust 内容引用，用户共享 store 仅经原始访问；汇编不越界。
+        // SAFETY:
+        // 1. `self` 可变守卫保活底层物理页并串行化内核态写入，`self.mark_dirty` 已验证 `[offset, offset + src.len())` 位于页内已初始化范围内；
+        // 2. `src` 为有效的只读内核切片，与目标物理页内存不重叠；
+        // 3. 通过 `arch::copy_user_bytes` 执行有界原始字节写入，不构造文件页的 `&mut [u8]` 引用。
         unsafe { arch::copy_user_bytes(address as *mut u8, src.as_ptr(), src.len()) };
         Ok(())
     }
 
-    /// 仅对终身元数据角色借用已初始化窗口；返回借用不能超出本内容 guard。
-    /// 持该借用时不得做可能 fault 的用户访问，也不得通过物理地址交用户或设备写。
+    /// 借用元数据页内已初始化区间 `[offset, offset + len)` 的只读字节切片 `&[u8]`。
+    ///
+    /// 仅限 `FolioContents::Metadata` 角色调用；若页面为文件页或目标扇区存在在途回写，则返回错误。
+    /// 持有返回切片期间严禁执行可能触发缺页异常的用户空间访问。
     pub fn metadata_bytes(&self, offset: usize, len: usize) -> Result<&[u8], BlockError> {
         self.metadata_range(offset, len)?;
         let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
-        // SAFETY: 终身 Metadata 角色从未交用户共享写，guard 排斥 CPU 修改和初始化 DMA；
-        // 完整窗口已经初始化，folio 引用保活固定原页，切片绑定 guard 且不越界。
+        // SAFETY:
+        // 1. `self.metadata_range` 已确认该页为终身 `Metadata` 角色（绝无用户态映射）、无在途回写，且 `[offset, offset + len)` 全部扇区已初始化有效；
+        // 2. `self` 内容锁守卫排斥任何其他内核态 CPU 修改或读入 DMA，返回的不可变切片生命周期绑定到 `&self`。
         Ok(unsafe { slice::from_raw_parts(address as *const u8, len) })
     }
 
-    /// 在同一元数据锁下借用可修改窗口，并在借用前标记对应 sector 为 Dirty。
-    /// 邻记录和校验和应在此真实窗口内同步修改，不得拷回旧整块快照。
+    /// 借用元数据页内已初始化区间 `[offset, offset + len)` 的可变字节切片 `&mut [u8]`，并在返回前将对应扇区标记为脏（`dirty`）。
+    ///
+    /// 仅限 `FolioContents::Metadata` 角色调用；若目标扇区存在在途回写则返回 `Err(BlockError::Busy)`。
     pub fn metadata_bytes_mut(
         &mut self,
         offset: usize,
@@ -1084,19 +1258,17 @@ impl FolioContent<'_> {
         self.metadata_range(offset, len)?;
         self.mark_dirty(offset, len)?;
         let address = arch::phys_to_virt(self.folio.phys_addr()) + offset;
-        // SAFETY: Metadata 角色无用户共享写，内容 guard 排斥其他内核访问；
-        // mark_dirty 已拒绝与在途 WB 重叠的窗口，guard 保持该条件；
-        // &mut self 结束此前借用，窗口已初始化且保活，唯一可变切片绑定本 guard。
+        // SAFETY:
+        // 1. `self.metadata_range` 与 `self.mark_dirty` 已确认该页为 `Metadata` 角色、目标区间已初始化且无在途回写；
+        // 2. `&mut self` 确保独占持有当前页面的 `CONTENT_LOCKED` 内容锁，排斥任何其他 CPU 读写或块设备 DMA 访问，故构造绑定到 `&mut self` 的 `&mut [u8]` 满足独占别名要求。
         Ok(unsafe { slice::from_raw_parts_mut(address as *mut u8, len) })
     }
 
-    /// 在真实删除或失效协议下作废整页有效、失败和 Dirty 状态，不代表回写成功。
+    /// 在文件截断删除或缓存失效流程中，作废整页的初始化状态、错误记录、`dirty` 位图与 `file_prepared` 位图。
     ///
     /// # Safety
-    /// 调用者须已从真实索引摘离本页并阻止新取得，结束全部 IO/WB 和用户映射访问，
-    /// 完成必要失效及 TLB 同步；其他持页者不得再按旧内容使用或交设备。
-    /// 内容须属于未发表候选或实际删除/失效协议，且确实无需落盘；
-    /// 独占引用计数不能代替上述证明，已接受的文件系统修改不得仅为归页而丢弃。
+    /// 1. 调用方必须已将该页从缓存索引中摘除并阻止新任务获取，且已彻底结束该页的所有块设备 I/O、回写（`writeback == 0`）及用户态页表映射（含跨核 TLB 同步）；
+    /// 2. 该页承载的数据必须属于未发布的临时候选页或已被文件系统协议正式删除的数据，确实不再需要落盘持久化。
     pub unsafe fn discard(&mut self) {
         assert!(self.locked, "discard without a content guard");
         let mut usage = self.folio.descriptor.usage();
@@ -1107,8 +1279,8 @@ impl FolioContent<'_> {
         let shared = FolioState::shared_mut(&mut usage);
         assert_eq!(shared.writeback, 0, "discard retains writeback");
         let old_dirty = shared.dirty;
-        // 本 guard 独占内容锁，初始化 owner 无法同时存在；设备尾部与外部
-        // 映射失效仍由 caller 证明，状态清除不能取消任何已接受的访问责任。
+        // 当前守卫独占持有 `CONTENT_LOCKED`，保证不存在并发的 `FolioRead` 初始化操作；
+        // 重置页面初始化状态并清空脏扇区与已准备块位图。
         match &mut shared.contents {
             FolioContents::File { initialized, .. } => *initialized = None,
             FolioContents::Metadata { valid, errors } => {
@@ -1125,12 +1297,11 @@ impl FolioContent<'_> {
         self.folio.notify_dirty_state(true);
     }
 
-    /// 在真实元数据删除协议下失效准确窗口，保留同页其他块的内容与义务。
+    /// 在文件系统释放元数据磁盘块时，精确作废元数据页内 `[offset, offset + len)` 扇区窗口的有效位、错误记录与脏位，同时保留同页其余扇区的状态。
     ///
     /// # Safety
-    /// 原块已从真实块树摘离并禁止旧映射新取得，全部旧内容消费与 IO/WB 已结束；
-    /// 其他持页者不得再按该窗口旧内容使用，窗口确实无需落盘。
-    /// 必须先执行本失效，再把物理块归还位图，不能用于取消已接受修改。
+    /// 1. 对应磁盘块必须已从文件系统块树中正式解除引用并禁止新任务通过旧映射获取，且该窗口上的所有缓冲区借用与在途回写（`writeback & mask == 0`）均已结束；
+    /// 2. 必须在将物理块号归还给磁盘空闲位图之前调用本函数清除脏位，且不得用于丢弃已向用户承诺持久化的有效元数据修改。
     pub(crate) unsafe fn forget_metadata(
         &mut self,
         offset: usize,
@@ -1160,7 +1331,7 @@ impl FolioContent<'_> {
         Ok(())
     }
 
-    /// 确认终身元数据角色和完整范围，普通文件页不能借用任何内容切片。
+    /// 校验当前页面为 `Metadata` 角色，且区间 `[offset, offset + len)` 已初始化就绪且未处于回写状态。
     fn metadata_range(&self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
         let usage = self.folio.descriptor.usage();
@@ -1174,12 +1345,14 @@ impl FolioContent<'_> {
         FolioState::range_ready(shared, offset, len)
     }
 
-    /// 持内容锁把本次已初始化范围的 Dirty 移入 WB，后续标脏保留为新义务。
+    /// 在持有内容锁期间，将页内已初始化区间 `[offset, offset + len)` 的脏扇区（`dirty`）原子转移到在途回写位图（`writeback`），并生成 `FolioWriteback` 凭证。
+    ///
+    /// - 若目标区间内没有任何脏扇区（`dirty & mask == 0`），则返回 `Ok(None)`。
+    /// - 若目标区间与已有在途回写重叠（`writeback & mask != 0`），则返回 `Err(BlockError::Busy)`。
     ///
     /// # Safety
-    /// 文件来源的全部共享可写映射须先撤销写许可并完成真实 TLB 同步；
-    /// 本 guard 仍保持对应许可提交与清脏的互斥。元数据来源不得映射给用户。
-    /// 返回拥有者只能在其全部设备访问实际结束后完成；准备失败须保留脏义务。
+    /// 1. 若为文件页，调用方在调用前必须已撤销该页所有用户态共享可写页表映射的写权限（mkclean）并完成跨核 TLB 同步，防止回写期间用户态静默改写正在 DMA 的内存却不置脏位；
+    /// 2. 返回的 `FolioWriteback` 凭证一旦提交给块设备，必须在硬件 DMA 传输彻底结束后才能调用 `complete`。
     pub(crate) unsafe fn begin_writeback(
         &mut self,
         offset: usize,
@@ -1233,7 +1406,7 @@ impl FolioContent<'_> {
         }))
     }
 
-    /// 只在有效 byte 窗口上增加 Dirty；WB 独立保留，失败不会污染其他范围。
+    /// 在持有内容锁期间，将页内已初始化区间 `[offset, offset + len)` 覆盖的扇区标记为脏（`dirty`），并更新回写域统计。
     pub(crate) fn mark_dirty(&mut self, offset: usize, len: usize) -> Result<(), BlockError> {
         validate_range(offset, len)?;
         let mut usage = self.folio.descriptor.usage();
@@ -1266,7 +1439,7 @@ impl FolioContent<'_> {
 }
 
 impl Drop for FolioContent<'_> {
-    /// 归还实际内容锁并在用途锁外通知等待者；已交读入 owner 的责任不二次解锁。
+    /// 释放 `FolioContent` 守卫：若当前守卫仍持有 `CONTENT_LOCKED` 锁责任，则清除锁标志位并在自旋锁外唤醒等待队列上的所有任务。
     fn drop(&mut self) {
         if !self.locked {
             return;
@@ -1286,7 +1459,7 @@ impl Drop for FolioContent<'_> {
 }
 
 impl FolioWriteback {
-    /// 为卷提交的凭证附真实统计域，后台标志只区分当前有限轮次的完成账。
+    /// 为回写凭证绑定所属磁盘卷的 `Arc<WritebackDomain>` 统计域，并标记是否为后台回写任务发起的I/O。
     pub(crate) fn with_writeback_domain(
         mut self,
         domain: &Arc<WritebackDomain>,
@@ -1300,22 +1473,22 @@ impl FolioWriteback {
         self
     }
 
-    /// 借用本轮仍保活的原页地址，只用于有界设备映射。
+    /// 返回正在回写的底层 4KiB 物理页起始物理地址（仅用于构建块设备 DMA 映射）。
     pub(crate) fn phys_addr(&self) -> usize {
         self.folio.phys_addr()
     }
 
-    /// 返回本轮原页内起点，不授予共享内容的切片访问。
+    /// 返回本轮回写区间在页内的起始字节偏移（单位：字节）。
     pub(crate) fn offset(&self) -> usize {
         usize::from(self.offset)
     }
 
-    /// 返回本轮交设备的完整 byte 范围。
+    /// 返回本轮回写区间的字节长度（单位：字节）。
     pub(crate) fn len(&self) -> usize {
         usize::from(self.len)
     }
 
-    /// 只分类原页终身角色，不借用任何仍在途的内容。
+    /// 检查当前回写凭证对应的页面是否为元数据页（仅用于内核测试）。
     #[cfg(feature = "ktest")]
     pub(crate) fn is_metadata(&self) -> bool {
         matches!(
@@ -1324,17 +1497,17 @@ impl FolioWriteback {
         )
     }
 
-    /// 完成后的凭证不能再次开始设备访问。
+    /// 检查当前回写凭证是否已完成结算。
     pub(crate) fn is_completed(&self) -> bool {
         self.completed
     }
 
-    /// 真实收权后只结束本轮 WB；未接受原脏范围恢复，已接受失败先记错且不重放。
+    /// 在块设备回写 DMA 彻底结束后结算本轮回写：记录可能发生的写回错误、清除 `writeback` 位、恢复未受理尾部的脏位并更新卷级统计。
     ///
     /// # Safety
-    /// 整个凭证范围的全部设备访问已由真实 used 或确认 reset 结束；
-    /// accepted 是真实提交成功的连续前缀，result 只属于该前缀的设备完成。
-    /// 软件取消、超时或其他请求完成不得用来证明收权。
+    /// 1. 块设备对本凭证范围内物理页的全部 DMA 读取必须已通过硬件完成中断（used ring）或确认的控制器重置彻底结束；
+    /// 2. `accepted` 必须为块设备层实际受理提交的连续前缀字节数（按 512B 扇区对齐），`result` 为该前缀的实际传输结果；
+    /// 3. 严禁仅凭软件层面的超时或取消而未确认硬件停止访问时调用此函数。
     pub(crate) unsafe fn complete(&mut self, accepted: usize, result: IoResult) {
         assert!(accepted <= self.len() && result.completed <= accepted);
         assert_eq!(accepted % SECTOR_SIZE, 0, "unaligned writeback acceptance");
@@ -1375,7 +1548,7 @@ impl FolioWriteback {
         }
     }
 
-    /// 错误已经发布；用途锁内退役本轮并恢复未接受原义务，锁外才唤醒。
+    /// 在 `PageDesc` 自旋锁内清除本轮回写的 `writeback` 位图，并将未被设备受理的尾部区间（`unaccepted`）恢复原始脏位，随后在锁外唤醒等待者。
     fn finish(&mut self, accepted: usize) {
         let mask = sector_mask(self.offset(), self.len());
         let unaccepted = if accepted < self.len() {
@@ -1402,7 +1575,7 @@ impl FolioWriteback {
 }
 
 impl Drop for FolioWriteback {
-    /// 未提交准备者恢复真实脏义务；设备拥有期由 DMA 外壳禁止提前析构。
+    /// 若 `FolioWriteback` 在提交设备前被丢弃（`!self.completed`），自动将全部原始脏扇区恢复到页面的 `dirty` 位图中并清除 `writeback` 位。
     fn drop(&mut self) {
         if !self.completed {
             self.finish(0);
@@ -1411,41 +1584,40 @@ impl Drop for FolioWriteback {
 }
 
 impl FolioRead {
-    /// 交设备前为唯一文件读入凭证附原 inode，真实设备及隔离拥有保该来源到全尾结束。
-    /// 仅修改本凭证中的原 FolioRef，索引内部引用仍不反持 inode。
+    /// 在提交块设备 DMA 前，为文件读入凭证绑定所属 `InodeRef` 强引用，确保整个 DMA 读入及中断完成期间 Inode 保持存活。
     pub(crate) fn with_file_owner(mut self, owner: InodeRef) -> Self {
         self.folio.attach_file_owner(owner);
         self
     }
 
-    /// aux 交设备前附原缓存，等待和设备尾部都保活同一 MetadataCache。
+    /// 在提交块设备 DMA 前，为元数据读入凭证绑定所属 `Arc<MetadataCache>` 强引用，确保整个 DMA 读入期间元数据缓存保持存活。
     pub(crate) fn with_metadata_owner(mut self, owner: Arc<MetadataCache>) -> Self {
         self.folio.attach_metadata_owner(owner);
         self
     }
 
-    /// 返回仍由本读入者保活的原页地址，DMA 层须维护其自身交权与收权协议。
+    /// 返回当前读入凭证锁定的底层 4KiB 物理页起始物理地址（用于构建块设备 DMA 映射）。
     pub fn phys_addr(&self) -> usize {
         self.folio.phys_addr()
     }
 
-    /// 返回本次页内读入起点。
+    /// 返回本次读入负责填充的页内起始偏移（单位：字节）。
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// 返回本次非空读入长度。
+    /// 返回本次读入负责填充的非零字节长度（单位：字节）。
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// DMA 层拒绝将已经完成其初始化责任的拥有者再次交给设备。
+    /// 检查本次读入凭证是否已发布结果并释放了内容锁。
     pub(crate) fn is_completed(&self) -> bool {
         self.completed
     }
 
-    /// 只观察读入原页的终身文件角色，不借用内容或改变初始化责任。
+    /// 检查当前读入凭证对应的页面是否为文件页（仅用于内核测试）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_is_file(&self) -> bool {
         matches!(
@@ -1454,25 +1626,29 @@ impl FolioRead {
         )
     }
 
-    /// 完成前只借用本 owner 的缺失初始化范围；交设备后 DMA 层不得调用此入口。
+    /// 在通过 CPU 同步填充页面时，获取本次读入区间 `[offset, offset + len)` 的未初始化可变字节切片 `&mut [MaybeUninit<u8>]`。
+    ///
+    /// 当 `FolioRead` 移交给块设备执行异步 DMA 期间，禁止调用此方法创建 CPU 端可变切片，以免与设备 DMA 写入产生数据竞争。
     pub fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         assert!(
             !self.completed,
             "completed folio read cannot write contents"
         );
         let address = arch::phys_to_virt(self.phys_addr()) + self.offset;
-        // SAFETY: 本对象唯一持有内容锁，范围尚未有效且不能交用户共享写；
-        // metadata 的已有有效范围不在本 owner 内，guard 被内容锁排斥。
-        // MaybeUninit 允许未初始化字节，借用绑定 &mut self；DMA 期间整体保护 owner。
+        // SAFETY:
+        // 1. `self` 独占持有页面的 `CONTENT_LOCKED` 锁且 `!self.completed`，该区间尚未对外发布为有效，因此不存在用户态映射或并发的 `FolioContent` 访问；
+        // 2. 对于元数据页，`begin_metadata_read` 仅认领未初始化的连续扇区，与同页其他已有效扇区不重叠；
+        // 3. 使用 `MaybeUninit<u8>` 表达未初始化内存，返回切片的生命周期受 `&mut self` 约束且不越出 4KiB 页边界。
         unsafe { slice::from_raw_parts_mut(address as *mut MaybeUninit<u8>, self.len) }
     }
 
-    /// 在真实 DMA 全尾后发表唯一结果、解锁并锁外唤醒；重复完成不改变首次结果。
+    /// 在块设备 DMA 读入或 CPU 填充彻底完成后，发布初始化结果、释放 `CONTENT_LOCKED` 并唤醒等待队列上的所有任务。
+    ///
+    /// 若重复调用则直接忽略，保持首次发布的终态不变。
     ///
     /// # Safety
-    /// 本 owner 范围的全部设备、CPU 初始化访问必须已经结束；成功要求其全部字节初始化。
-    /// 部分成功与失败不授予本范围内容访问权，完成后原初始化地址不能再被写入。
-    /// 元数据其他有效或失败范围保留；完成不约束后续合法 guard 修改或用户共享 store。
+    /// 1. 针对本凭证区间 `[offset, offset + len)` 的全部块设备 DMA 写入或 CPU 填充写入必须已彻底完成，且此后不再向该初始化区间写入；
+    /// 2. 当 `result.error.is_none()` 且 `result.completed == self.len` 时，调用方必须保证区间内的全部 `self.len` 个字节均已完成有效初始化。
     pub unsafe fn complete(&mut self, result: IoResult) {
         if self.completed {
             return;
@@ -1488,7 +1664,7 @@ impl FolioRead {
         self.publish(initialized);
     }
 
-    /// 持短用途锁发表终态并结束独立内容锁责任，释放锁后通知实际等待者。
+    /// 在 `PageDesc` 自旋锁内写入文件页或元数据扇区的初始化结果，释放 `CONTENT_LOCKED` 标志，并在自旋锁外唤醒等待队列。
     fn publish(&mut self, initialized: Result<InitializedRange, BlockError>) {
         let state = self.folio.state();
         {
@@ -1538,7 +1714,7 @@ impl FolioRead {
 }
 
 impl Drop for FolioRead {
-    /// 未提交读入者结束自身填充责任并唤醒，已完成者只释放所保原页引用。
+    /// 若 `FolioRead` 在完成前被提前丢弃（`!self.completed`），自动以 `Err(BlockError::QueueStopped)` 发布失败结果并释放内容锁唤醒等待者。
     fn drop(&mut self) {
         if !self.completed {
             self.publish(Err(BlockError::QueueStopped));
@@ -1546,7 +1722,7 @@ impl Drop for FolioRead {
     }
 }
 
-/// 拒绝空范围、溢出和跨页访问，所有内容入口共用同一几何边界。
+/// 校验页内非空字节区间 `[offset, offset + len)` 是否合法（要求 `len > 0` 且不发生算术溢出、不超出 `PAGE_SIZE`）。
 fn validate_range(offset: usize, len: usize) -> Result<(), BlockError> {
     if len == 0 || offset.checked_add(len).is_none_or(|end| PAGE_SIZE < end) {
         return Err(BlockError::InvalidRange);
@@ -1554,7 +1730,7 @@ fn validate_range(offset: usize, len: usize) -> Result<(), BlockError> {
     Ok(())
 }
 
-/// 原始复制允许页尾零长请求，非零请求仍须满足同一 byte 几何边界。
+/// 校验拷贝操作的页内字节区间 `[offset, offset + len)`：允许 `len == 0` 且 `offset <= PAGE_SIZE` 的零长边界请求，非空请求同 `validate_range`。
 fn validate_copy_range(offset: usize, len: usize) -> Result<(), BlockError> {
     if len == 0 {
         return if offset <= PAGE_SIZE {
@@ -1566,7 +1742,7 @@ fn validate_copy_range(offset: usize, len: usize) -> Result<(), BlockError> {
     validate_range(offset, len)
 }
 
-/// 将已验证非空 byte 窗口投影到实际覆盖的 512 字节 sector，不扩大到整页。
+/// 将经过合法性校验的非空页内字节区间 `[offset, offset + len)` 转换为覆盖的 512 字节扇区 8 位掩码。
 fn sector_mask(offset: usize, len: usize) -> u8 {
     let first = offset / SECTOR_SIZE;
     let last = (offset + len - 1) / SECTOR_SIZE;

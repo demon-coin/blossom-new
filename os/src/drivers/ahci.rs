@@ -1,4 +1,74 @@
-//! 单端口、非 NCQ AHCI；原块层拥有请求、八个软件槽及可睡 progress Work。
+//! AHCI（Advanced Host Controller Interface）单端口、非 NCQ SATA 块设备驱动。
+//!
+//! # 模块职责与架构定位
+//! 本模块（`drivers::ahci`）是 SATA 磁盘控制器的底层硬件驱动，负责：
+//! - **上游调用者**：通用块设备层（`crate::block`）通过可睡眠的 `progress` 工作队列任务（Work）
+//!   调用 [`Ahci::execute`] 提交直接 DMA 读写或刷新请求，并在中断顶半部调用 [`Ahci::acknowledge`]
+//!   应答硬件中断、在错误恢复/卸载路径调用 [`Ahci::request_reset`] 与 [`Ahci::reset_complete`]。
+//! - **下游依赖**：
+//!   - 子模块 [`ata`]：负责 `IDENTIFY DEVICE` 参数解析与 20 字节 Register H2D FIS 命令编码；
+//!   - 子模块 [`registers`]：负责 HBA 全局与端口 MMIO 强序寄存器访问及链路 COMRESET 序列；
+//!   - DMA 子系统（`crate::mm::dma`）：管理控制结构的一致性/同步 DMA 内存与请求负载物理段映射；
+//!   - 同步与等待基础设施（`SleepMutex`、`SpinLock`、`WaitQueue`、`Timer`）：实现中断驱动的睡眠等待与超时控制。
+//!
+//! # 核心设计与关键状态机 / 内存布局
+//!
+//! ## 1. DMA 控制页布局（[`Controls`]）
+//! 为避免在非缓存一致性（Non-coherent DMA）平台上发生 CPU 与设备共享同一条 Cache Line 导致的写回覆盖（Cache Line 污染），
+//! 驱动为四类控制结构分别分配独立的整页（Page-aligned）[`CoherentDma`] 缓冲区，且仅使用命令槽 0（Slot 0）：
+//!
+//! ```text
+//! +-----------------------+--------------------------------------------------------+
+//! | CoherentDma 独立页    | 内部结构与硬件对齐要求                                 |
+//! +-----------------------+--------------------------------------------------------+
+//! | list (1 KiB, 1K 对齐) | 32 个 Command Header（每个 32B），仅使用 Slot 0：      |
+//! |                       |   DW0: [31:16] PRDTL | [6] W (Write) | [4:0] CFL (5)   |
+//! |                       |   DW1: [31:0]  PRDBC (硬件更新的已传输字节计数)        |
+//! |                       |   DW2: [31:0]  CTBA  (Command Table 物理地址低 32 位)  |
+//! |                       |   DW3: [31:0]  CTBAU (Command Table 物理地址高 32 位)  |
+//! +-----------------------+--------------------------------------------------------+
+//! | fis (256B, 256B 对齐) | Received FIS 接收区（设备回传 D2H / PIO Setup FIS 等） |
+//! +-----------------------+--------------------------------------------------------+
+//! | table (128B 对齐)     | Command Table：                                        |
+//! |                       |   +0x000..0x080 (128B): CFIS (前 20B 为 H2D FIS) 等    |
+//! |                       |   +0x080..0x400 (56 * 16B): PRDT 物理段描述符表：      |
+//! |                       |     DW0: DBA  (数据段物理地址低 32 位，偶地址对齐)     |
+//! |                       |     DW1: DBAU (数据段物理地址高 32 位)                 |
+//! |                       |     DW2: Reserved (0)                                  |
+//! |                       |     DW3: [21:0] DBC (字节数减 1，偶数长度，最大 4 MiB) |
+//! +-----------------------+--------------------------------------------------------+
+//! | identify (512B, 2B齐) | 探测阶段接收 256 Words `IDENTIFY DEVICE` 数据的缓冲区  |
+//! +-----------------------+--------------------------------------------------------+
+//! ```
+//!
+//! ## 2. 端口 DMA 引擎启停状态机（[`StopPhase`]）
+//! AHCI 硬件要求命令引擎（`ST`/`CR`）与 FIS 接收引擎（`FRE`/`FR`）严格按序停止。
+//! 只有在两个引擎彻底停稳（`CR == 0` 且 `FR == 0`）后，硬件才不再通过 DMA 访问控制页或请求数据页：
+//!
+//! ```text
+//!                     issue() 置位 FRE=1, ST=1, CI=1
+//!    +--------------------------------------------------------------+
+//!    |                                                              v
+//! +---------+     reset_complete()      +-----+  begin_stop()   +---------+
+//! | Stopped | <------------------------ | Fis | <-------------- | Running |
+//! +---------+   确认 FR==0 + DMA 读屏障 +-----+    (若已清 FRE) +---------+
+//!                                          ^                        |
+//!                                          | reset_complete()       | begin_stop()
+//!                                          | 确认 CR==0 后清 FRE=0  | 置 IE=0, 清 ST=0
+//!                                       +---------+                 |
+//!                                       | Command | <---------------+
+//!                                       +---------+
+//! ```
+//! - 若停止过程超时（返回 [`BlockError::StopUnconfirmed`]），说明硬件 DMA 引擎可能仍在访问物理内存；
+//!   此时驱动严禁释放 [`Controls`] 控制页或归还上层请求的数据物理页（Folio/Page），以防止 DMA Use-After-Free 踩内存。
+//!
+//! # 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **`control: SleepMutex<()>`（外层可睡眠互斥锁）** ➔ **`state: SpinLock<State>`（内层自旋锁）**
+//!    - 任何同时需要这两把锁的路径（如 [`Ahci::execute`]）必须先获取 `control` 睡眠锁，再短暂获取 `state` 自旋锁。
+//!    - **严禁**在持有 `state` 自旋锁期间尝试获取 `control`、调用睡眠函数（如 `Waiter::park`、`timer::sleep`）或调用 `WaitQueue::wake_all`。
+//! 2. **DMA 控制页所有权契约**：
+//!    - `controls` 中的 DMA 缓冲区仅允许在持有 `control` 睡眠锁（或 `prepare` 单线程初始化阶段）且确认端口处于 `StopPhase::Stopped`（`CR == 0 && FR == 0`）时由 CPU 读写。
+//!    - 中断上下文（[`Ahci::acknowledge`]）仅获取 `state` 自旋锁、读写 MMIO 端口中断寄存器并原子更新 `mailbox`，绝不触碰 `controls` 或请求负载页。
 
 mod ata;
 mod registers;
@@ -24,50 +94,81 @@ use registers::{
     TASK_BUSY, TASK_ERROR, TFD,
 };
 
+/// 单条 ATA 命令从下发门铃到等待中断完成的最大超时时间（5 秒）。
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// 请求停止端口 DMA 引擎后等待 `CR == 0` 与 `FR == 0` 的最大超时时间（2 秒）。
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 完整 ABAR 包含全局窗口和规范允许的全部端口窗口。
+/// 完整 AHCI ABAR MMIO 窗口字节大小（包含全局控制区与规范定义的全部 32 个端口窗口）。
 pub(crate) const MMIO_BYTES: usize =
     registers::PORT_BASE + registers::MAX_PORTS as usize * registers::PORT_BYTES;
+/// AHCI 规范定义每个端口命令列表包含的命令槽（Command Slot）总数（32 个）。
 const COMMAND_SLOTS: usize = 32;
+/// 单个命令头（Command Header）的字节大小（32 字节 / 8 个 DWORD）。
 const COMMAND_HEADER_BYTES: usize = 32;
+/// 整个端口命令列表（Command List）的字节大小（`32 * 32 = 1024` 字节）。
 const COMMAND_LIST_BYTES: usize = COMMAND_SLOTS * COMMAND_HEADER_BYTES;
+/// Received FIS 接收缓冲区的字节大小（256 字节）。
 const RECEIVED_FIS_BYTES: usize = 256;
+/// 命令表（Command Table）头部固定区域（含 CFIS、ACMD 与保留区）的字节大小（128 字节）。
 const COMMAND_TABLE_HEADER_BYTES: usize = 128;
+/// 单个物理区域描述符表项（PRDT Entry）的字节大小（16 字节 / 4 个 DWORD）。
 const PRDT_ENTRY_BYTES: usize = 16;
+/// Command Header DW0 中 `W`（Write，方向标志）位的偏移量（位 6，置 1 表示主机写往设备）。
 const COMMAND_WRITE_SHIFT: u32 = 6;
+/// Command Header DW0 中 `PRDTL`（PRDT 表项数量）字段的位偏移量（位 31:16）。
 const PRDT_LENGTH_SHIFT: u32 = 16;
+/// Command Header 中 `PRDBC`（Physical Region Descriptor Byte Count，DW1）相对于命令头起始的字节偏移（4 字节）。
 const PRDBC_OFFSET: usize = core::mem::size_of::<u32>();
+/// 本驱动固定使用命令槽 0（Slot 0），对应 `PxCI` 寄存器中的位掩码 `1 << 0`。
 const ACTIVE_COMMAND: u32 = 1;
+/// 平台非一致性 DMA 缓存同步所需的 Cache Line 对齐粒度（64 字节）。
 const DMA_CACHE_LINE_BYTES: usize = 64;
 
+/// 端口 DMA 引擎（命令列表引擎 `ST`/`CR` 与 FIS 接收引擎 `FRE`/`FR`）的运行与停止阶段状态机。
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StopPhase {
+    /// 命令列表引擎与 FIS 接收引擎均已确认停止（`CR == 0` 且 `FR == 0`），CPU 可安全访问 DMA 控制页。
     Stopped,
+    /// 端口 DMA 引擎正在运行（`FRE == 1` 且 `ST == 1`），控制页与负载页归硬件 DMA 引擎访问。
     Running,
+    /// 已清除 `CMD.ST`，正在等待硬件将 `CMD.CR`（Command List Running）清零。
     Command,
+    /// 已确认 `CMD.CR == 0` 并清除 `CMD.FRE`，正在等待硬件将 `CMD.FR`（FIS Receive Running）清零。
     Fis,
 }
 
+/// 受 `Ahci::state` 自旋锁保护的端口运行期控制状态。
 struct State {
+    /// 端口 DMA 引擎当前所处的启停阶段。
     phase: StopPhase,
+    /// 控制器是否已通过 [`Ahci::publish`] 向块设备层正式发布并开启 HBA 全局中断。
     published: bool,
+    /// 端口当前是否允许接收新的 I/O 命令（在未发布或触发重置后为 `false`）。
     accepting: bool,
+    /// 上层块核心是否请求开启本端口的硬件中断（对应 `PxIE` 掩码状态）。
     interrupts: bool,
+    /// 当前运行周期内是否已向槽 0 写入 `PxCI` 下发过命令。
     issued: bool,
 }
 
-/// 四个独立整页块避免非一致 cacheline 混合 CPU 与设备拥有。
+/// 端口专用的四块独立整页 DMA 控制缓冲区。
+///
+/// 每个字段均由独立的整页 [`CoherentDma`] 承载，以保证在非缓存一致性架构上不会因共享 Cache Line
+/// 而发生 CPU 脏缓存行写回覆盖设备 DMA 写入的数据。
 struct Controls {
+    /// 命令列表（Command List，1024 字节，硬件要求 1024 字节对齐）。
     list: CoherentDma,
+    /// 接收 FIS 缓冲区（Received FIS，256 字节，硬件要求 256 字节对齐）。
     fis: CoherentDma,
+    /// 命令表（Command Table，含 128B 头部与 56 项 PRDT，硬件要求 128 字节对齐）。
     table: CoherentDma,
+    /// `IDENTIFY DEVICE` 命令专用的 512 字节数据接收缓冲区（要求 2 字节偶地址对齐）。
     identify: CoherentDma,
 }
 
 impl Controls {
-    /// 所有可失败控制存储都在任何地址发表之前从唯一原页体系取得。
+    /// 在向硬件寄存器写入任何 DMA 地址之前，分配全部四块控制缓冲区并校验其硬件地址对齐要求。
     fn allocate(domain: DmaDomain) -> Result<Self, BlockError> {
         let controls = Self {
             list: CoherentDma::allocate(domain, COMMAND_LIST_BYTES)?,
@@ -91,7 +192,9 @@ impl Controls {
         Ok(controls)
     }
 
-    /// 准备期独占或运行期可睡锁保护且端口停止时填真实 PRDT，设备地址保留完整高字。
+    /// 向命令表（Command Table）的第 `index` 个 PRDT 表项写入一段物理内存区域的 DMA 地址与字节长度。
+    ///
+    /// 仅在探测阶段单线程独占或运行期持有 `control` 睡眠锁、且端口 DMA 引擎已停止时调用。
     fn prdt(&self, index: usize, address: u64, bytes: usize) -> Result<(), BlockError> {
         if ata::MAX_PRDT <= index || bytes == 0 || ata::PRDT_BYTES < bytes {
             return Err(BlockError::InvalidRange);
@@ -105,7 +208,10 @@ impl Controls {
             0,
             (bytes - 1) as u32,
         ];
-        // SAFETY: 准备期未发表或调用者持可睡控制锁，CR/FR 已停；index 已核，table owner 保活整块。
+        // SAFETY:
+        // 1. 调用方处于 `prepare` 独占阶段或持有 `self.control` 睡眠锁，且端口 `CR`/`FR` 均已停止，设备不会并发访问 `table`；
+        // 2. 上方边界检查已保证 `index < ata::MAX_PRDT`，因此 `COMMAND_TABLE_HEADER_BYTES + index * PRDT_ENTRY_BYTES`
+        //    加上 16 字节仍在 `self.table` 分配的容量范围内，且起始地址满足 `u32` 对齐。
         unsafe {
             let destination = self
                 .table
@@ -121,7 +227,7 @@ impl Controls {
         Ok(())
     }
 
-    /// 已收权的固定控制页接受新命令，PRDT 数量只覆盖本次实际设备段。
+    /// 在端口停止且 CPU 拥有控制页访问权时，填充 CFIS 命令帧、清空接收 FIS 区、写入槽 0 命令头并执行下发前的 DMA 缓存同步。
     fn command(
         &self,
         fis: &[u8; ata::H2D_FIS_BYTES],
@@ -140,8 +246,10 @@ impl Controls {
             table as u32,
             (table >> 32) as u32,
         ];
-        // SAFETY: 准备期独占或 execute 持可睡锁且引擎已停；三个完整控制 owner 保活。
-        // 设备尚无本轮访问权，CPU 不建立活过交权的切片。
+        // SAFETY:
+        // 1. 调用方处于 `prepare` 独占阶段或 `execute` 持有 `self.control` 睡眠锁阶段，且端口 DMA 引擎已确认停止；
+        // 2. `self.table`（>= 128B）、`self.fis`（256B）与 `self.list`（1024B，满足 u32 对齐）均由 `self` 保活且容量充足；
+        // 3. 写入完成后立即调用 `sync_for_device` 将控制页的访问权移交设备，且不保留任何跨越移交点的 Rust 引用或切片。
         unsafe {
             ptr::copy_nonoverlapping(fis.as_ptr(), self.table.region().cpu.as_ptr(), fis.len());
             ptr::write_bytes(self.fis.region().cpu.as_ptr(), 0, RECEIVED_FIS_BYTES);
@@ -159,9 +267,13 @@ impl Controls {
         Ok(())
     }
 
-    /// 在 CR/FR 均确认归零后收取 PRDBC；错误命令的已传输字节不等于成功写入前缀。
+    /// 在确认端口 `CR == 0` 且 `FR == 0` 停止后，将命令列表与接收 FIS 缓冲区同步回 CPU，并读取槽 0 的 `PRDBC` 已传输字节计数。
+    ///
+    /// 注意：当命令发生硬件或任务文件错误时，`PRDBC` 仅反映 DMA 引擎尝试传输的字节数，不能作为已成功写入介质的数据量依据。
     fn transferred(&self) -> Result<usize, BlockError> {
-        // SAFETY: 仅在 stop 完整确认后调用；原 owner 存活且期间没有 CPU 写入设备控制范围。
+        // SAFETY:
+        // 1. 调用方在调用前已通过 `stop_bounded` 确认 `CR == 0` 且 `FR == 0`，设备已停止对 `list` 与 `fis` 的 DMA 写入；
+        // 2. `self.list` 与 `self.fis` 缓冲区有效且期间无并发 CPU 访问，`PRDBC_OFFSET`（4 字节）在 `list`（1024 字节）内且满足 `u32` 对齐。
         unsafe {
             self.list
                 .sync_for_cpu(0, self.list.byte_len(), DmaDirection::Bidirectional)?;
@@ -179,35 +291,51 @@ impl Controls {
     }
 }
 
-/// IRQ 只访问短锁、寄存器与 mailbox；控制页的 CPU 访问由可睡锁独占。
-/// Root 必须强持本 Arc 到请求、IRQ、Work 全尾且 reset_complete 确认停止。
+/// AHCI 单端口控制器运行时实例。
+///
+/// - 中断处理路径仅访问 `state` 自旋锁、MMIO 寄存器、`mailbox` 原子字与 `waiters` 等待队列；
+/// - `controls` DMA 控制缓冲区的 CPU 访问由 `control` 睡眠锁独占保护；
+/// - 上层块设备持有者必须保持 `Arc<Ahci>` 强引用存活，直到所有在途请求、中断回调及工作队列任务全部执行完毕，
+///   且 [`Ahci::reset_complete`] 确认硬件 DMA 引擎彻底停止（`StopPhase::Stopped`）。
 pub(crate) struct Ahci {
+    /// 当前控制器绑定的活动 SATA 端口 MMIO 句柄。
     port: Port,
+    /// 经中断子系统映射后的外部中断号。
     interrupt: IrqNumber,
+    /// 结合平台 DMA 掩码与控制器 `CAP.S64A` 能力构造的 DMA 地址域。
     domain: DmaDomain,
+    /// 探测阶段通过 `IDENTIFY DEVICE` 解析出的磁盘几何参数与命令集能力。
     identify: Option<ata::Identify>,
+    /// 端口 DMA 控制缓冲区集合；使用 `ManuallyDrop` 包装以确保仅在 `Drop` 断言硬件已停稳后才释放底层物理页。
     controls: ManuallyDrop<Controls>,
+    /// 串行化命令准备、门铃下发、等待完成与引擎停止全过程的睡眠互斥锁。
     control: SleepMutex<()>,
+    /// 保护端口启停阶段（`StopPhase`）与中断/接收标志的自旋锁。
     state: SpinLock<State>,
+    /// 累积中断顶半部已应答的 `PxIS` 端口中断状态位图的原子信箱。
     mailbox: AtomicU32,
+    /// 供命令执行线程睡眠等待中断完成或重置唤醒的等待队列。
     waiters: WaitQueue,
 }
 
 impl Ahci {
-    /// 消费真实 ABAR/IRQ 并识别介质；只有端口扫描确认无介质才返回 None，硬件错误不作缺盘。
-    /// 选端口后先建立 FIS 接收并做一次端口复位再识别。
+    /// 根据平台提供的 AHCI 硬件资源初始化 HBA、扫描端口、执行 COMRESET 链路复位并完成 `IDENTIFY DEVICE` 介质识别。
+    ///
+    /// - 若所有已实现端口经扫描确认均无设备连接（`DET == 0`），则停止各端口并返回 `Ok(None)`；
+    /// - 若存在设备但链路未就绪、签名非 ATA 磁盘或 `IDENTIFY` 失败，则返回对应的 `Err(BlockError)`（不会将硬件错误掩盖为无介质）。
     ///
     /// # Safety
-    /// 资源来自唯一库存，PCI BAR 已解析；ABAR 完整窗口永久强序映射且独占，固件已不再使用。
-    /// 资源的 DMA 总线为已规范化的恒等物理窗口；coherency 和额外平台 mask 必须符合真实设备。
-    /// 返回 Arc 的拥有者须先保活它再注册 IRQ，直到真实停止及全部外部访问尾部。
+    /// 1. `resources.registers` 必须是真实的 AHCI ABAR 物理区域，已在内核中建立永久强序（Device）映射且由本驱动独占，固件不再访问；
+    /// 2. `resources.dma_mask` 与 `resources.dma_coherent` 必须如实反映平台总线对本控制器的 DMA 寻址限制与缓存一致性特征；
+    /// 3. 调用方收到返回的 `Arc<Self>` 后，必须在注册 IRQ 和提交请求期间持续保活该 `Arc`，并在销毁前确保所有外部回调结束且 [`Self::reset_complete`] 返回 `true`。
     pub(crate) unsafe fn prepare(
         resources: &AhciResources,
     ) -> Result<Option<Arc<Self>>, BlockError> {
+        // Step 1: 验证当前处于可睡眠任务上下文，映射中断号并校验平台 DMA 地址掩码。
         crate::sched::assert_switchable();
         let interrupt =
             irq::map_source(resources.interrupt_source).map_err(|_| BlockError::InvalidRange)?;
-        // None 表示平台没有额外收紧；实际硬件上限始终由 CAP.S64A 决定。
+        // `None` 表示平台总线无额外收紧限制；最终 DMA 掩码上限由控制器 `CAP.S64A` 共同决定。
         let device_mask = match resources.dma_mask {
             Some(mask) => mask,
             None => u64::MAX,
@@ -216,7 +344,8 @@ impl Ahci {
             return Err(BlockError::InvalidRange);
         }
 
-        // SAFETY: 调用者保证本次资源为实际 ABAR，完整强序窗口和独占硬件的寿命覆盖控制器。
+        // Step 2: 构造 HBA 寄存器窗口，执行 BIOS/OS 交接与 HBA 复位，并根据 CAP.S64A 建立 DMA 地址域。
+        // SAFETY: `prepare` 的调用方契约保证了 `resources.registers` 是永久强序映射且由本驱动独占的真实 ABAR 窗口。
         let host = unsafe { Host::new(resources.registers) }?;
         let (cap, ports) = host.initialize(resources.ports_implemented)?;
         let mask = device_mask.min(if cap & registers::CAP_64BIT != 0 {
@@ -233,6 +362,7 @@ impl Ahci {
             resources.dma_coherent,
         )?;
 
+        // Step 3: 遍历所有已实现端口，为其上电并探测第一个已建立活动连接的标准 SATA 磁盘端口。
         let mut selected = None;
         for index in 0..registers::MAX_PORTS {
             if ports & (1 << index) == 0 {
@@ -248,8 +378,8 @@ impl Ahci {
             }
         }
         let Some(port) = selected else {
-            // power_up 只设置链路电源位；仍逐端口确认 CR/FR 停止后才能报告无介质。
-            // 此时尚未分配或发表任何本驱动的控制和 IDENTIFY 页。
+            // 所有端口均无介质连接：逐端口确认 DMA 引擎停止并清理中断状态后返回 `Ok(None)`。
+            // 此时尚未分配或向硬件写入任何 DMA 控制页地址。
             for index in 0..registers::MAX_PORTS {
                 if ports & (1 << index) == 0 {
                     continue;
@@ -263,6 +393,7 @@ impl Ahci {
             return Ok(None);
         };
 
+        // Step 4: 分配四块 DMA 控制页，开启端口 FIS 接收引擎，并执行 COMRESET 链路复位与设备签名验证。
         let controls = Controls::allocate(domain)?;
         port.start_fis_rx(
             controls.list.region().device.value(),
@@ -311,8 +442,8 @@ impl Ahci {
             return Err(BlockError::Unsupported);
         }
 
-        // 构造 Arc 前收回设备访问权，保持识别命令准备期间控制页由 CPU 独占。
-        // Arc 分配失败或命令准备提前返回时，控制页也只能在确认停止后释放。
+        // Step 5: 在构造控制器实例并准备 IDENTIFY 命令前，先停止端口 FIS 接收引擎以收回控制页的 CPU 独占访问权。
+        // 若后续 Arc 内存分配失败而提前返回，此时硬件已确认停止，释放 controls 不会引发 DMA 悬垂访问。
         if !port.stop_polled() {
             core::mem::forget(controls);
             panic!("AHCI probe stop unconfirmed; control pages retained");
@@ -336,6 +467,7 @@ impl Ahci {
         })
         .map_err(|_| BlockError::NoMemory)?;
 
+        // Step 6: 通过轮询方式执行 IDENTIFY DEVICE 命令，解析磁盘容量与能力后完成控制器初始化。
         match controller.identify_polled() {
             Ok(identify) => {
                 Arc::get_mut(&mut controller)
@@ -344,7 +476,8 @@ impl Ahci {
                 Ok(Some(controller))
             }
             Err(BlockError::StopUnconfirmed) => {
-                // fail-fast: 已发表的控制/IDENTIFY 页仍可能被访问，强引用不能经 Err 展开析构。
+                // 若 IDENTIFY 后端口未能确认停稳，硬件可能仍在对控制页或 IDENTIFY 页做 DMA，
+                // 必须通过 `Arc::into_raw` 泄露强引用并立即 panic，防止展开析构释放正在被 DMA 访问的物理页。
                 let retained = Arc::into_raw(controller);
                 panic!(
                     "AHCI identify stop unconfirmed; owner retained at {:p}",
@@ -355,22 +488,24 @@ impl Ahci {
         }
     }
 
-    /// 返回 IDENTIFY 得到的正常扇区、容量及独立 FLUSH 能力，不重新读硬件。
+    /// 返回探测阶段由 `IDENTIFY DEVICE` 解析出的队列限额（容量、扇区大小、PRDT 段限制及 FLUSH 支持）。
     pub(crate) fn limits(&self) -> QueueLimits {
         self.identify.expect("AHCI identify missing").limits()
     }
 
-    /// 原 payload 的设备映射和同步必须使用本控制器核对后的同一地址域。
+    /// 返回本控制器核对后的 DMA 地址域，供上层块设备层映射和同步请求数据页使用。
     pub(crate) fn domain(&self) -> DmaDomain {
         self.domain
     }
 
-    /// 返回唯一 IRQ 库存已经验证的外部中断身份。
+    /// 返回本控制器绑定的外部中断号。
     pub(crate) fn interrupt(&self) -> IrqNumber {
         self.interrupt
     }
 
-    /// Core 已保活 Arc 并准备 IRQ action 后发表设备；第一条命令才启动 DMA 引擎。
+    /// 在上层块设备核心已保活 `Arc<Ahci>` 并准备好中断处理程序后，正式发布控制器并开启 HBA 全局中断使能。
+    ///
+    /// 此阶段仅清除残留中断并置位 `GHC.IE`，端口 DMA 引擎要到第一条命令下发（[`Self::issue`]）时才会启动。
     pub(crate) fn publish(&self) -> Result<(), BlockError> {
         let mut state = self.state.lock();
         if state.published || state.phase != StopPhase::Stopped || !self.port.connected() {
@@ -384,7 +519,10 @@ impl Ahci {
         Ok(())
     }
 
-    /// 共享 IRQ 只认领本端口实际原因，W1C 后记录 mailbox 并唤醒，不读取 payload。
+    /// 在共享中断线或等待前检查中认领本端口的中断状态：
+    /// 若 `PxIS` 非零，则通过写 1 清零（W1C）应答端口与 HBA 中断、将状态位或入 `mailbox` 并唤醒等待队列。
+    ///
+    /// 可在关中断的 IRQ 顶半部或普通任务上下文中安全调用，不访问任何 DMA 缓冲区。
     pub(crate) fn acknowledge(&self) -> bool {
         let claimed = {
             let _state = self.state.lock();
@@ -404,7 +542,10 @@ impl Ahci {
         claimed
     }
 
-    /// 只改变本设备的中断屏蔽；控制器命令执行期间 Core 必须保留中断使能。
+    /// 更新本端口的中断屏蔽位（`PxIE`）。
+    ///
+    /// 仅当 `enabled` 为 `true`、端口处于允许接收命令状态（`accepting`）且 DMA 引擎正在运行（`StopPhase::Running`）时，
+    /// 才会向硬件 `PxIE` 写入 [`INTERRUPTS`] 掩码；在命令执行期间，上层块核心需保持中断使能开启。
     pub(crate) fn set_interrupts(&self, enabled: bool) {
         let mut state = self.state.lock();
         state.interrupts = enabled;
@@ -419,14 +560,16 @@ impl Ahci {
         let _ = self.port.read(IE);
     }
 
-    /// 登记源后开放中断并复查一次早到状态，不制造 used 或周期完成轮询。
+    /// 开启端口中断使能并立即执行一次中断状态认领，返回 `mailbox` 中是否已有待处理的硬件中断事件。
     pub(crate) fn arm_and_check(&self) -> bool {
         self.set_interrupts(true);
         self.acknowledge();
         self.mailbox.load(Ordering::Acquire) != 0
     }
 
-    /// 短队列锁内禁止新 doorbell 并请求清 ST；不睡眠，不等待 CR 或 FR。
+    /// 在自旋锁临界区内禁止接收新命令、关闭端口中断并启动端口停止流程的第一步（清除 `CMD.ST`），随后唤醒所有等待者。
+    ///
+    /// 本函数不会阻塞等待硬件 `CR` 或 `FR` 清零，可在任意非睡眠上下文中调用。
     pub(crate) fn request_reset(&self) {
         {
             let mut state = self.state.lock();
@@ -437,7 +580,13 @@ impl Ahci {
         self.waiters.wake_all();
     }
 
-    /// 每次只推进有限 MMIO 阶段；CR=0 之后才清 FRE，FR=0 才允许归还原页。
+    /// 向前推进一次端口 DMA 引擎停止状态机（非阻塞 MMIO 探测），返回引擎是否已彻底停稳（`StopPhase::Stopped`）。
+    ///
+    /// 状态迁移遵循 AHCI 硬件规范：
+    /// - `StopPhase::Command`：确认 `CMD.CR == 0` 后，清除 `CMD.FRE` 并转入 `StopPhase::Fis`；
+    /// - `StopPhase::Fis`：确认 `CMD.FR == 0` 后，执行 DMA 读屏障确保设备写入对 CPU 可见，随后转入 `StopPhase::Stopped` 并返回 `true`。
+    ///
+    /// 只有当本函数返回 `true` 后，上层才可安全收回并释放之前移交给设备的物理页。
     pub(crate) fn reset_complete(&self) -> bool {
         let mut state = self.state.lock();
         match state.phase {
@@ -464,12 +613,15 @@ impl Ahci {
         }
     }
 
-    /// 原 progress Work 锁外提交一个直接 payload 命令，并沿原 Waiter 等待真实 IRQ。
+    /// 在可睡眠的块设备工作队列任务（`progress` Work）中同步提交一条直接 DMA 命令，睡眠等待硬件中断完成并返回传输结果。
     ///
     /// # Safety
-    /// ranges 必须来自 Core 仍完整拥有的 accepted payload，并已按 domain() 交权。
-    /// 交权期间无冲突 CPU 访问；返回 StopUnconfirmed 时 Core 必须继续保留全部 payload、槽和本 Arc，
-    /// 不完成或归页，直到后续真实停止。其它返回均已确认硬件结束这些范围的访问。
+    /// 1. `ranges` 描述的所有物理内存段必须属于上层块核心当前独占持有的已接收请求负载（Payload），
+    ///    且在调用前已通过 [`Self::domain`] 完成 DMA 映射与向设备的缓存同步（移交 DMA 访问权）；
+    /// 2. 在本函数执行期间，CPU 不得并发读写 `ranges` 覆盖的物理页；
+    /// 3. 若返回结果包含 [`BlockError::StopUnconfirmed`]，说明端口 DMA 引擎在超时后仍未确认停稳，
+    ///    硬件可能仍在通过 DMA 访问这些物理页；此时调用方**严禁**完成该请求、释放软件槽位、归还物理页或销毁 `Arc<Ahci>`，
+    ///    必须保留它们直到后续 [`Self::reset_complete`] 返回 `true`。除 `StopUnconfirmed` 外的其他返回结果均保证硬件已彻底停止访问这些范围。
     pub(crate) unsafe fn execute(
         &self,
         operation: BlkOperation,
@@ -477,11 +629,13 @@ impl Ahci {
         bytes: usize,
         ranges: &[PayloadRange],
     ) -> IoResult {
+        // Step 1: 获取可睡眠控制锁，校验请求范围并填充 PRDT 与命令头。
         let _control = self.control.lock();
         if let Err(error) = self.prepare_transfer(operation, sector, bytes, ranges) {
             return failed(error);
         }
 
+        // Step 2: 在自旋锁内检查端口状态与寄存器空闲条件，启动端口引擎并写 `CI` 门铃下发命令。
         {
             let mut state = self.state.lock();
             if !state.published || !state.accepting {
@@ -499,6 +653,7 @@ impl Ahci {
             self.issue(&mut state, true);
         }
 
+        // Step 3: 睡眠等待硬件中断完成或 5 秒超时，随后请求停止端口 DMA 引擎并等待 `CR`/`FR` 归零。
         let deadline = time::now()
             .checked_add(COMMAND_TIMEOUT)
             .expect("AHCI command deadline overflow");
@@ -514,6 +669,7 @@ impl Ahci {
             return failed(BlockError::StopUnconfirmed);
         }
 
+        // Step 4: 引擎已确认停稳，同步控制页并读取 PRDBC 已传输字节数，核对任务文件与中断错误位。
         let transferred = match self.controls.transferred() {
             Ok(transferred) => transferred,
             Err(error) => {
@@ -522,7 +678,7 @@ impl Ahci {
             }
         };
         if let Err(error) = completion {
-            // ATA 错误或超时不证明任何写入成功前缀，绝不重放未知写。
+            // 命令执行出错或超时时，ATA 协议不保证任何前缀扇区已落盘，统一按 0 已完成字节报告失败。
             return failed(error);
         }
         if self.port.read(TFD) & (TASK_ERROR | TASK_BUSY) != 0
@@ -549,7 +705,7 @@ impl Ahci {
         }
     }
 
-    /// 校验原块限额后直接规范化真实设备段，不拷贝 payload 或分配 SG 容器。
+    /// 校验块请求限额，将物理内存段按 4 MiB 上限拆分为 PRDT 表项填入命令表，并编码 H2D FIS 命令头。
     fn prepare_transfer(
         &self,
         operation: BlkOperation,
@@ -557,12 +713,14 @@ impl Ahci {
         bytes: usize,
         ranges: &[PayloadRange],
     ) -> Result<(), BlockError> {
+        // Step 1: 确认端口当前允许接收请求且处于已停止状态。
         {
             let state = self.state.lock();
             if !state.accepting || state.phase != StopPhase::Stopped {
                 return Err(BlockError::QueueStopped);
             }
         }
+        // Step 2: 对照 IDENTIFY 队列限额校验扇区范围与 SG 段约束，并编码 20 字节 ATA FIS。
         let identify = self.identify.expect("AHCI identify missing");
         identify
             .limits()
@@ -572,6 +730,7 @@ impl Ahci {
         }
 
         let command = identify.command(operation, sector, bytes)?;
+        // Step 3: 将每个物理段映射为设备 DMA 地址，按单表项最大 4 MiB 拆分写入 PRDT。
         let mut entries = 0;
         for range in ranges {
             let mut address = self
@@ -590,11 +749,12 @@ impl Ahci {
             }
         }
 
+        // Step 4: 写入命令表 CFIS 与槽 0 命令头，并同步控制页缓存。
         self.controls
             .command(&command, operation == BlkOperation::Write, entries)
     }
 
-    /// 在独占短锁内重装地址、开启 FRE/ST，最后只写新命令的 CI 位。
+    /// 在持有 `state` 自旋锁的临界区内清空残留状态、配置控制页基址、启动 `FRE`/`ST` 引擎，最后写入 `PxCI` 门铃触发槽 0 命令。
     fn issue(&self, state: &mut State, interrupts: bool) {
         self.port.clear_pending();
         self.mailbox.store(0, Ordering::Release);
@@ -616,7 +776,10 @@ impl Ahci {
         let _ = self.port.read(CI);
     }
 
-    /// 命令是否完成只在实际中断原因存在时检查 CI；单独 CI 清零不能补救丢失的 IRQ。
+    /// 检查当前下发的命令是否已收到中断完成通知或发生错误。
+    ///
+    /// 仅当 `mailbox` 记录了实际硬件中断完成标志（`COMPLETION`）且 `PxCI` 槽 0 位已被硬件清零时，
+    /// 才判定命令完成（单纯 `CI == 0` 但缺失中断标志不能视为正常完成）。
     fn completion(&self) -> Option<Result<(), BlockError>> {
         let state = self.state.lock();
         if !state.accepting || state.phase != StopPhase::Running {
@@ -636,12 +799,16 @@ impl Ahci {
         None
     }
 
-    /// 每轮提前通知只重挂原绝对期限；定时器仅产生超时，不读取寄存器或补发完成。
+    /// 在截止时间 `deadline` 前挂起当前线程，等待端口中断唤醒或高精度定时器超时。
+    ///
+    /// 若被伪唤醒或阶段性中断唤醒但命令尚未完成，则沿用原绝对 `deadline` 重新注册等待，直到完成、出错或超时。
     fn wait_irq(&self, deadline: MonotonicInstant) -> Result<(), BlockError> {
         loop {
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 保活源，栈节点固定；局部 registration 在节点和 waiter 退出前真实撤链。
+            // SAFETY:
+            // 1. `self.waiters` 由当前正在执行的 `&self` 保活，`node` 通过 `pin!` 固定在当前栈帧上；
+            // 2. 在本轮循环末尾 `node` 与 `waiter` 离开作用域前，会先显式 `drop(registration)` 将节点从等待队列链表中安全摘除。
             let registration = unsafe { self.waiters.register(node.as_mut()) };
             let waker = pin!(waiter.waker());
             let timeout = pin!(Timer::new(
@@ -650,14 +817,16 @@ impl Ahci {
                 wake_timeout,
                 waker.as_ref().get_ref() as *const Waker as usize,
             ));
-            // SAFETY: timeout/Waker 栈地址固定，退出本轮前同步取消等待真实回调尾部。
+            // SAFETY:
+            // 1. `timeout` 与 `waker` 均通过 `pin!` 固定在当前栈帧上，`wake_timeout` 回调读取的 `*const Waker` 指针在栈帧存活期间始终有效；
+            // 2. 在本轮循环退出、`waker` 与 `timeout` 析构前，必先调用 `timeout.as_ref().cancel_sync()` 同步取消定时器并等待可能正在执行的回调彻底退出。
             unsafe { timeout.as_ref().arm_borrowed(deadline) }.expect("AHCI timeout rejected");
 
             self.acknowledge();
             let mut result = self.completion();
             if result.is_none() && time::now() < deadline {
                 waiter.park();
-                // 到期只报告故障，不以期限唤醒后的寄存器探测制造成功完成。
+                // 若因达到截止时间而被唤醒，直接判定为超时 I/O 错误，不再探测寄存器状态。
                 result = if deadline <= time::now() {
                     Some(Err(BlockError::Io))
                 } else {
@@ -676,7 +845,8 @@ impl Ahci {
         }
     }
 
-    /// 与 request_reset 共用停止第一步；锁内只清 ST，不等待设备推进。
+    /// 在持有 `state` 自旋锁的前提下执行端口停止的第一步：屏蔽端口中断（`IE = 0`），
+    /// 若当前处于 `StopPhase::Running` 则清除 `CMD.ST` 并转入 `StopPhase::Command`。
     fn begin_stop(&self, state: &mut State) {
         self.port.write(IE, 0);
         if state.phase == StopPhase::Running {
@@ -686,7 +856,10 @@ impl Ahci {
         }
     }
 
-    /// 可睡执行者在队列锁外等待停止阶段；准备期使用有限忙等，运行期沿原 timer 睡眠。
+    /// 在自旋锁外循环调用 [`Self::reset_complete`] 推进端口停止状态机，直到停稳或达到 `STOP_TIMEOUT`（2 秒）。
+    ///
+    /// - `sleep == true`（运行期命令执行路径）：每次未停稳时睡眠 1 毫秒让出 CPU；
+    /// - `sleep == false`（探测阶段 `identify_polled` 路径）：使用 `spin_loop` 忙等。
     fn stop_bounded(&self, sleep: bool) -> bool {
         let deadline = time::now()
             .checked_add(STOP_TIMEOUT)
@@ -706,14 +879,17 @@ impl Ahci {
         }
     }
 
-    /// 稳定 Arc 和全部 owner 准备完成后才能发表 IDENTIFY 的控制与数据地址。
+    /// 在探测阶段（未开启中断）通过轮询方式下发 `IDENTIFY DEVICE` 命令，读取并解析 512 字节设备识别信息。
     fn identify_polled(&self) -> Result<ata::Identify, BlockError> {
+        // Step 1: 配置 PRDT 第 0 项指向 `identify` 缓冲区，同步 DMA 缓存并填写 `IDENTIFY` 命令帧。
         self.controls.prdt(
             0,
             self.controls.identify.region().device.value(),
             ata::IDENTIFY_BYTES,
         )?;
-        // SAFETY: IDENTIFY owner 尚无设备访问，完整零页独占 cacheline，Arc 已稳定保活全部存储。
+        // SAFETY:
+        // 1. 此时端口处于 `StopPhase::Stopped`，设备尚未访问 `identify` 缓冲区；
+        // 2. `self.controls.identify` 独占整页且由 `self` 保活，调用 `sync_for_device` 将缓冲区访问权移交设备。
         unsafe {
             self.controls.identify.sync_for_device(
                 0,
@@ -723,6 +899,7 @@ impl Ahci {
         }?;
         self.controls.command(&ata::fis(ata::IDENTIFY), false, 1)?;
 
+        // Step 2: 以屏蔽中断方式（interrupts = false）下发命令，并轮询等待命令完成或报错。
         {
             let mut state = self.state.lock();
             self.issue(&mut state, false);
@@ -733,6 +910,7 @@ impl Ahci {
         let failed_command = !completed
             || self.port.read(PORT_IS) & ERROR != 0
             || self.port.read(TFD) & TASK_ERROR != 0;
+        // Step 3: 停止端口 DMA 引擎，确认 `CR == 0` 且 `FR == 0` 后收回 `identify` 缓冲区的 CPU 访问权。
         {
             let mut state = self.state.lock();
             self.begin_stop(&mut state);
@@ -742,7 +920,9 @@ impl Ahci {
         }
 
         let transferred = self.controls.transferred()?;
-        // SAFETY: ST/CR/FRE/FR 已完整停止，IDENTIFY owner 原页仍存活，期间无 CPU 访问。
+        // SAFETY:
+        // 1. 上方 `stop_bounded(false)` 已确认端口 `CR == 0` 且 `FR == 0`，设备已彻底结束对 `identify` 缓冲区的 DMA 写入；
+        // 2. `self.controls.identify` 物理页存活且期间无并发 CPU 访问，调用 `sync_for_cpu` 刷新 CPU 缓存以读取设备写入的数据。
         unsafe {
             self.controls.identify.sync_for_cpu(
                 0,
@@ -757,8 +937,11 @@ impl Ahci {
             return Err(BlockError::ShortIo);
         }
 
+        // Step 4: 从 `identify` 缓冲区按小端序读取 256 个 16-bit 字并解析设备几何参数。
         let mut words = [0; ata::IDENTIFY_WORDS];
-        // SAFETY: 完成同步且完整停止后独占读取 512B；CPU 不保留越过本作用域的 DMA 切片。
+        // SAFETY:
+        // 1. 已完成 `sync_for_cpu` 且端口 DMA 引擎已停稳，CPU 独占访问 `self.controls.identify`；
+        // 2. `self.controls.identify` 容量为 `IDENTIFY_BYTES`（512 字节）且满足 `u16` 对齐，读取 256 个 `u16` 不会越界。
         unsafe {
             let source = self.controls.identify.region().cpu.as_ptr().cast::<u16>();
             for (index, word) in words.iter_mut().enumerate() {
@@ -770,25 +953,29 @@ impl Ahci {
 }
 
 impl Drop for Ahci {
-    /// 未停稳时 ManuallyDrop 继续保留原控制页；确认停止和全部外部尾部后才消费 owner。
+    /// 析构 AHCI 控制器：断言端口 DMA 引擎已彻底停稳（`StopPhase::Stopped`），随后释放 `controls` DMA 物理页。
     fn drop(&mut self) {
         assert!(
             self.state.lock().phase == StopPhase::Stopped,
             "dropping active AHCI controller"
         );
-        // SAFETY: 最后 Arc 消失前拥有者已确认 IRQ/Work 全尾；状态确认 CR/FR 均停，CPU 无并发访问。
+        // SAFETY:
+        // 1. 当最后一个 `Arc<Ahci>` 强引用被释放并进入 `Drop::drop` 时，调用方契约保证所有 IRQ 与工作队列任务均已退出，且 `&mut self` 保证无并发 CPU 访问；
+        // 2. 上方 `assert!` 已确认端口处于 `StopPhase::Stopped`（`CR == 0` 且 `FR == 0`），硬件不再对 `controls` 进行 DMA 访问，且 `self.controls` 仅在此处 `drop` 一次。
         unsafe { ManuallyDrop::drop(&mut self.controls) };
     }
 }
 
-/// 期限回调只通知原等待身份；同步取消返回前，固定栈 Waker 始终有效。
+/// 命令超时定时器的到期回调函数：从定时器上下文恢复栈上固定的 [`Waker`] 引用并唤醒等待中的命令执行线程。
 fn wake_timeout(timer: Pin<&Timer>) {
-    // SAFETY: wait_irq 固定 Waker 栈地址，cancel_sync 确认真实回调尾部后才退出该轮。
+    // SAFETY:
+    // `wait_irq` 在挂载定时器前将 `Waker` 通过 `pin!` 固定在栈上，并在 `waker` 离开作用域前调用 `cancel_sync()`
+    // 等待本回调执行完毕，因此在回调执行期间 `timer.context()` 保存的 `*const Waker` 指针始终有效且对齐。
     let waker = unsafe { &*(timer.context() as *const Waker) };
     waker.notify();
 }
 
-/// 没有可信成功前缀的命令失败统一保持零完成字节。
+/// 构造已完成字节数为 0 的错误 [`IoResult`]（用于命令下发前校验失败或执行期出错无法确认成功传输字节数的场景）。
 fn failed(error: BlockError) -> IoResult {
     IoResult {
         completed: 0,
@@ -799,13 +986,23 @@ fn failed(error: BlockError) -> IoResult {
 #[cfg(feature = "ktest")]
 #[::ktest::suite(context = "Boot", tags("block", "ahci", "protocol"), timeout_ms = 1000)]
 mod protocol {
-    /// 直接检查正式 ATA 编码的 4Kn、LBA48 高位、独立 FLUSH 和不支持字段，无硬件访问。
+    /// 验证 ATA `IDENTIFY DEVICE` 参数解析与 Register H2D FIS 命令编码协议逻辑。
+    ///
+    /// - **测试目标**：在不依赖真实硬件的前提下，验证 4Kn 扇区换算、LBA48 寻址编码、独立 FLUSH 能力判定及越界/未对齐错误拦截。
+    /// - **场景步骤（Given-When-Then）**：调用 [`super::ata::self_check`] 依次检验 4096B 逻辑扇区、LBA48 读写 FIS 字段、
+    ///   未对齐扇区拒绝、`FLUSH CACHE` / `FLUSH CACHE EXT` 操作码选择以及非法扇区大小报错。
+    /// - **预期结果**：所有断言均通过。
     #[test]
     fn identify_geometry_and_flush() {
         super::ata::self_check();
     }
 
-    /// SATA DET=0 才表示无介质，未完成链路协商、PHY 离线和失效 MMIO 均不能当缺盘。
+    /// 验证 SATA 端口 `PxSSTS` 状态寄存器的缺盘（无介质）判定边界。
+    ///
+    /// - **测试目标**：确保只有 `DET == 0` 被识别为无设备连接，防止将链路协商未完成、PHY 离线或 MMIO 读取全 1 误判为正常缺盘。
+    /// - **场景步骤（Given-When-Then）**：分别向 [`super::registers::media_absent`] 传入 `0`（无设备）、`1`（检测到设备但 PHY 未通信）、
+    ///   `0x103`（Active 且通信建立）、`4`（PHY 离线）与 `u32::MAX`（MMIO 失效）。
+    /// - **预期结果**：仅输入 `0` 时返回 `true`，其余状态均返回 `false`。
     #[test]
     fn media_absence_boundary() {
         assert!(super::registers::media_absent(0));

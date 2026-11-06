@@ -1,4 +1,10 @@
-"""宿主 protocol 回归；运行 python3 -m unittest discover -s tools/ktest。"""
+"""宿主侧 ktest 串口协议与 KTAP 状态机解析回归测试。
+
+本模块验证 `ktest.protocol` 对串口握手行（`KTEST READY`）、KTAP 测试计划与结果行、
+阶段流转控制行（`case-begin` / `phase` / `armed` / `fatal` / `case-abort` / `suite-error`）
+以及 UART 流量声明（`KTEST io`）的语法与状态机约束。
+运行方式：`python3 -m unittest discover -s tools/ktest`。
+"""
 
 import json
 import unittest
@@ -9,16 +15,16 @@ from ktest.protocol import CaseResult, ready
 
 
 class ProtocolTests(unittest.TestCase):
-    """结果身份、阶段和最终确认都是必需证据。"""
+    """验证用例身份匹配、阶段流转顺序与顶层结束标记等协议状态机约束。"""
 
     def test_ready_uses_real_cpu_count(self):
-        """AP 数不符是启动错误，不能变成适用条件 Skip。"""
+        """验证 `KTEST READY` 上报的在线 CPU 数量与请求配置不符时立即抛出启动错误，而非降级为跳过。"""
         with self.assertRaises(HostError):
             ready("KTEST READY 1 arch=riscv64 cpus=1 mode=debug panic=unwind", CONFIG)
 
 
     def test_cpu_arguments_match_ready_without_narrowing(self):
-        """正整数 CPU 原样进入请求配置，少核 READY 必须拒绝而非降核。"""
+        """验证正整数 `--cpus` 参数原样写入请求配置，且客体上报核数不一致时会被握手校验拒绝。"""
         for architecture in ("riscv64", "loongarch64"):
             for count in (1, 2, 3, 4, 5, 8, 16, 32, 33, 64, 65, 128):
                 with self.subTest(architecture=architecture, count=count):
@@ -31,7 +37,7 @@ class ProtocolTests(unittest.TestCase):
                         ready(line.replace(f"cpus={count} ", f"cpus={count + 1} "), config)
 
     def test_cpu_arguments_reject_nonpositive_and_fractional(self):
-        """零、负数、非整数无法到达会话创建边界。"""
+        """验证命令行参数解析阶段直接拒绝零、负数与非整数的 `--cpus` 输入。"""
         from contextlib import redirect_stderr
         import io
 
@@ -41,7 +47,7 @@ class ProtocolTests(unittest.TestCase):
                     CLI.arguments(["run", "--arch", "riscv64", "--cpus", value])
                 self.assertEqual(raised.exception.code, 2)
     def test_complete_pass_with_diagnostics(self):
-        """业务 panic 字样只是诊断，完整生命周期才决定结果。"""
+        """验证普通诊断注释中的 `panic` 或 `PASS` 字样不会干扰状态机，只有走完完整生命周期才判定为通过。"""
         row = case_record()
         parser = parser_for([row])
         parser.feed("  # expected input contains panic and PASS")
@@ -53,18 +59,21 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parser.results[0]["status"], "Pass")
 
     def test_early_pass_missing_result_and_fake_suite_pass_rejected(self):
-        """body 内 PASS、少结果和假总 PASS 各自是错误。"""
+        """验证在清理阶段完成前提前输出 `ok`、遗漏用例结果或有失敗用例却输出顶层 `ok` 时均会报错。"""
         row = case_record()
+        # 场景 1：仅进入 body 阶段、尚未走完清理阶段就提前输出用例 ok
         parser = parser_for([row])
         for line in case_lines(row)[:3]:
             parser.feed(line)
         with self.assertRaises(HostError):
             parser.feed(f"  ok 1 {row['name']}")
+        # 场景 2：计划运行 2 个用例，但只完成了 1 个就提前输出套件总结果
         parser = parser_for([row, case_record(1)])
         for line in case_lines(row):
             parser.feed(line)
         with self.assertRaises(HostError):
             parser.feed("ok 1 os::tests0")
+        # 场景 3：子用例结果为 Fail，但套件顶层汇总行却输出了 ok
         parser = parser_for([row])
         for line in case_lines(row, status="Fail"):
             parser.feed(line)
@@ -72,7 +81,7 @@ class ProtocolTests(unittest.TestCase):
             parser.feed("ok 1 os::tests0")
 
     def test_wrong_name_number_duplicate_and_indent_are_rejected(self):
-        """看似合法结果也必须与目录全名、序号和层级一致。"""
+        """验证 KTAP 结果行的用例名称、序号、缩进层级必须与目录严格一致，且禁止重复输出结果。"""
         row = case_record()
         for invalid in ("  ok 1 wrong", f"  ok 2 {row['name']}", f"    ok 1 {row['name']}"):
             parser = parser_for([row])
@@ -87,7 +96,7 @@ class ProtocolTests(unittest.TestCase):
             parser.feed(case_lines(row)[-1])
 
     def test_missing_complete_cannot_be_success(self):
-        """完整结果列表不能替代顶层终结确认。"""
+        """验证即使所有用例和套件汇总行均已输出，缺少顶层 `# KTEST complete` 或带多余后缀时仍视为未完成或错误。"""
         row = case_record()
         parser = parser_for([row])
         for line in case_lines(row):
@@ -98,7 +107,7 @@ class ProtocolTests(unittest.TestCase):
             parser.feed("# KTEST complete trailing")
 
     def test_actual_fatal_validates_identity_kind_uniqueness_and_noreturn(self):
-        """实际故障与期望分离，但身份、固定类型和 NoReturn 后禁止控制仍严格。"""
+        """验证 `KTEST fatal` 事件必须匹配当前活动用例 ID 与合法故障类型，且触发后禁止再输出任何后续控制行。"""
         row = case_record(expected_fatal="illegal")
         for invalid in ("  # KTEST fatal 1 illegal", "  # KTEST fatal 0 invented"):
             with self.subTest(invalid=invalid):
@@ -119,7 +128,7 @@ class ProtocolTests(unittest.TestCase):
                     parser.feed(late)
 
     def test_skip_retains_reason_and_status(self):
-        """全部 Skip 与 Pass 保持不同结果。"""
+        """验证 `SKIP` 指令能够正确解析为 `Skip` 状态并保留跳过原因，与普通 `Pass` 区分开。"""
         row = case_record()
         parser = parser_for([row])
         for line in case_lines(row, status="Skip"):
@@ -129,7 +138,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parser.results[0], dict(status="Skip", reason="insufficient CPUs"))
 
     def test_complete_result_event_keeps_identity_and_rejects_private_status(self):
-        """唯一普通终态携带清理后的身份；清 active 不影响回执消费者。"""
+        """验证合法的 KTAP 结果行生成携带用例 ID、状态和原因的 `CaseResult` 事件并清空当前活动状态，同时拒绝非法指令或私有状态行。"""
         row = case_record(7)
         samples = (("ok", "", "Pass", ""),
                    ("not ok", "", "Fail", ""),
@@ -159,7 +168,7 @@ class ProtocolTests(unittest.TestCase):
             parser.feed("  # KTEST status 7 Pass")
 
     def test_parameter_directive_text_is_part_of_full_result_identity(self):
-        """参数中的分隔符属于完整名字，只有名字后追加的指令改变终态。"""
+        """验证参数化用例名称方括号内包含 `#`、`# SKIP` 或 `# ERROR` 时，解析器仍将其视为完整名称的一部分。"""
         for label in ("value # comment", "value # SKIP reason", "value # ERROR"):
             row = case_record(7, parameter=label, name=f"os::tests0::case7[{label}]")
             for status in ("Pass", "Fail", "Skip", "Error"):
@@ -178,7 +187,7 @@ class ProtocolTests(unittest.TestCase):
                     self.assertTrue(parser.complete)
 
     def test_result_directive_starts_only_after_exact_full_name(self):
-        """追加指令必须紧邻完整身份，额外名字尾缀或近似名字不能冒充同例。"""
+        """验证 `# SKIP` / `# ERROR` 指令必须紧跟在精确匹配的完整用例名之后，任何名称尾缀或篡改都会被拒绝。"""
         label = "value # comment"
         row = case_record(7, parameter=label, name=f"os::tests0::case7[{label}]")
         for polarity, suffix, status in (("ok", " # SKIP reason # detail", "Skip"),
@@ -210,7 +219,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(parser.active, 7)
 
     def test_fatal_message_only_matches_armed_actual_diagnostics(self):
-        """arm 前的文本和 raw 声明不能冒充实际 panic 诊断。"""
+        """验证预期 panic 的消息子串只能在 `armed` 且 `fatal` 事件发生之后的诊断行中匹配，此前的日志不计入匹配。"""
         row = case_record(expected_fatal="panic", fatal_message="unique actual panic")
         parser = parser_for([row])
         for line in case_lines(row)[:3]:
@@ -224,7 +233,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(parser.fatal_message_seen)
 
     def test_phase_regression_and_outside_fixture_uart_are_errors(self):
-        """阶段不能倒退，UART raw 声明只能出现在真实 fixture 阶段。"""
+        """验证用例执行阶段（phase）不允许倒退，且 `KTEST io` 串口流量声明只能出现在进入有效阶段之后。"""
         row = case_record()
         parser = parser_for([row])
         parser.feed("  # KTEST case-begin 0")
@@ -236,7 +245,7 @@ class ProtocolTests(unittest.TestCase):
             parser.feed("  # KTEST phase 0 setup")
 
     def test_empty_pause_barrier_does_not_allow_empty_transfers(self):
-        """零字节停读屏障保CRC零，tx/rx/slow或伪摘要仍不能声明空载荷。"""
+        """验证仅 `pause` 屏障允许声明 0 字节与全零 CRC，而 `tx`/`rx`/`slow` 传输或超限延迟均会被拒绝。"""
         parser = parser_for([case_record()])
         for line in ("  # KTEST case-begin 0", "  # KTEST phase 0 setup", "  # KTEST phase 0 body"):
             parser.feed(line)
@@ -248,7 +257,7 @@ class ProtocolTests(unittest.TestCase):
                 parser.feed("  # KTEST io 0 " + declaration)
 
     def test_suite_setup_error_has_no_started_case(self):
-        """suite 基础 setup 失败只产生独立错误，不能虚构首例 begin。"""
+        """验证套件级 `setup` 阶段报错时只记录独立的 `suite_error`，不会将任何用例标记为已启动。"""
         parser = parser_for([case_record(0), case_record(1)])
         parser.feed("  # KTEST suite-error setup allocation failed\\nrollback complete")
         parser.feed("not ok 1 os::tests0")
@@ -260,7 +269,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(parser.complete)
 
     def test_suite_cleanup_error_preserves_all_case_passes(self):
-        """真实用例全部通过也不能把 suite cleanup 错误变成 outer PASS。"""
+        """验证即使所有用例均已通过，套件级 `cleanup` 阶段报错后顶层汇总行仍必须为 `not ok`，且结束标记后禁止再出现控制行。"""
         rows = [case_record(0), case_record(1)]
         parser = parser_for(rows)
         for position, row in enumerate(rows, 1):
@@ -281,7 +290,7 @@ class ProtocolTests(unittest.TestCase):
                 parser.feed(late)
 
     def test_missing_cases_need_explicit_valid_suite_error(self):
-        """未开始项只有明确合法 suite-error 才可缺结果，活动项不能缺结果。"""
+        """验证存在未启动用例时必须有合法的 `suite-error execution` 说明原因，且当前正在执行的用例不允许无结果直接报错退出。"""
         rows = [case_record(0), case_record(1)]
         parser = parser_for(rows)
         for line in case_lines(rows[0]):
@@ -305,7 +314,7 @@ class ProtocolTests(unittest.TestCase):
             active.feed("  # KTEST suite-error execution missing active result")
 
     def test_case_abort_requires_current_unfinished_identity_and_actual_cleanup_phase(self):
-        """中止不是普通 final；只能终结当前确定身份的真实清理阶段。"""
+        """验证 `case-abort` 只能终结当前正在执行且处于清理阶段（`quiesce`/`join`/`cleanup`）的用例，且触发后禁止后续用例继续运行。"""
         rows = [case_record(0), case_record(1)]
         ledger = dict(primary="body failed", child=None, cleanup="unsafe to release",
                       expectations=2, reason="cleanup did not converge")
@@ -343,7 +352,7 @@ class ProtocolTests(unittest.TestCase):
                 parser.feed(f"  # KTEST case-abort {identity} {phase} {payload}")
 
     def test_case_abort_rejects_malformed_duplicate_or_wrong_typed_json_fields(self):
-        """JSON 对象必须恰有五个独立字段，不能靠重复键覆盖失败。"""
+        """验证 `case-abort` 携带的 JSON 载荷必须严格包含规定的 5 个独立字段且类型合法，拒绝缺失、多余或重复键。"""
         ledger = dict(primary=None, child=None, cleanup=None, expectations=0, reason="stop")
         invalid = ["{", "null", "[]", json.dumps(list(ledger.items())),
                    json.dumps({key: value for key, value in ledger.items() if key != "child"}),
@@ -364,7 +373,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parser.case_abort, dict(phase="cleanup", **ledger))
 
     def test_duplex_declaration_validates_both_lengths_crc_and_delays(self):
-        """双向协议分别校验RX/TX长度与CRC、每段延迟及非空传输方向。"""
+        """验证 `duplex` 双向串口传输声明会分别校验 RX/TX 的长度上限、非零载荷 CRC 以及每段延迟范围。"""
         invalid = ("duplex 0 00000000 0 0 00000000 0",
                    "duplex 1 01234567 0 0 00000001 0",
                    "duplex 0 00000001 0 1 00000000 0",

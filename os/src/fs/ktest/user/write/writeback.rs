@@ -1,9 +1,53 @@
-//! 原页批次、同步顺序、错误序列及普通同步 ABI 的真实完成窗口。
+//! 页面缓存批量回写、冷挂载持久化校验、并发重脏（Redirty）、错误序列（errseq）与同步系统调用测试。
+//!
+//! ## 模块职责与架构定位
+//! 本模块属于 `fs::ktest::user::write` 测试套件，负责验证页面缓存脏页回写（Writeback）与用户态同步接口
+//! （`fsync`、`fdatasync`、`msync`、`O_SYNC`、`O_DSYNC`）的端到端持久性及并发一致性契约。
+//! 上游由 `ktest` 测试运行器调用，下游覆盖 `writeback::sync_inode_range`、`File::sync_range`、
+//! `Mm::sync_mapping_range`、`InodeCache` 冷卸载与重挂载以及块设备故障注入机制。
+//!
+//! ## 核心机制与状态机流转
+//!
+//! ### 1. 物理页（Folio）扇区级 Dirty / Writeback 位图状态机
+//! ```text
+//! [普通写入 write_at / 共享映射写 copyout]
+//!         │ (置位对应块/扇区的 dirty_sectors，保持 writeback_sectors 不变)
+//!         ▼
+//!   Dirty != 0, WB == 0
+//!         │
+//!         ├─► [启动回写: 清理 dirty_sectors 并转置为 writeback_sectors，提交 Bio 至块设备]
+//!         │         │
+//!         │         ├── (回写 I/O 在途期间未发生新写入)
+//!         │         │         └──► [Bio 完成回调: 清除 writeback_sectors] ──► Dirty == 0, WB == 0 (干净页)
+//!         │         │
+//!         │         └── (回写 I/O 在途期间发生并发覆盖写或共享映射写: Redirty)
+//!         │                   └──► Dirty != 0, WB != 0
+//!         │                             └──► [旧 Bio 完成回调: 仅清除本次提交的 writeback_sectors，保留 dirty_sectors]
+//!         │                                       └──► Dirty != 0, WB == 0 (等待下一轮回写刷盘)
+//!         │
+//!         └─► [fsync 等待契约]: 即使 Dirty == 0，只要 WB != 0（在途回写未完成），
+//!                               后续 fsync 仍必须阻塞等待在途 Bio 彻底完成后才可返回。
+//! ```
+//!
+//! ### 2. 写回错误序列（Writeback Error Sequence / `errseq`）游标推进
+//! ```text
+//! Inode 共享错误状态字: [ 新错误发生 (Data / Metadata / Flush EIO) ──► 递增错误序号 ]
+//!    ├── OpenFileDescription A ──► 首次调用 sync_range 观察到序号落后 ──► 推进游标并返回 EIO (再次调用若无新错则返回 Ok)
+//!    ├── dup(A) 共享同一 OFD   ──► 与 A 共享同一游标，A 消费错误后 dup 句柄再次调用直接返回 Ok
+//!    ├── OpenFileDescription B ──► 独立游标，首次调用 sync_range 同样观察并消费一次该错误返回 EIO
+//!    └── 错误未被任何 OFD 观察 ──► 标记为“未见错误”，后续新 open 的文件句柄首次 sync 仍会捕获并报告该历史错误
+//! ```
+//!
+//! ## 锁获取顺序与并发契约
+//! 1. **同步写入（`O_SYNC` / `O_DSYNC`）锁释放契约**：`write` 将数据拷贝进页面缓存并更新文件偏移游标后，
+//!    必须在进入回写 I/O 阻塞等待之前**释放 Inode 内容锁与文件偏移游标（Cursor）锁**，保证回写等待期间不阻塞并发 `lseek` 或同行无冲突写入。
+//! 2. **冷重开（Cold Reopen）生命周期契约**：验证落盘持久性时，必须先释放全部用户进程图、VFS 挂载视图、目录项与 `InodeCache` 强引用，
+//!    并等待缓存退役监视器（`wait_retired`）与在途磁盘 I/O 归零后，才能在同一块设备上以新 `InodeCache` 只读重挂载。
 
 use super::*;
 
 impl UserOwner {
-    /// 普通写程序同步退出后关闭原缓存域，在同盘只读新生命周期核全文与内嵌链接盘面格式。
+    /// 运行用户态回写测试程序（写入模式）后彻底释放旧文件系统与缓存实例，随后在同一块设备上以只读模式冷挂载并运行校验程序，验证文件内容及内联短符号链接（Fast Symlink）的磁盘格式。
     pub(in crate::fs::ktest::user) fn production_writeback_cold_reopen(
         &mut self,
         context: &mut TestContext<'_>,
@@ -30,7 +74,7 @@ impl UserOwner {
         drop(self.graph.take());
         self.path.release_view();
 
-        // 开放缓存仍持卷绑定；必须关闭最后 cache owner 并等原收据，不能把清槽当作冷重开。
+        // Step 1: 释放目录树、进程图与路径视图后，取出最后一个 InodeCache 强引用并等待其异步退役完成，确保没有任何残留的内存缓存对象。
         let cache = self
             .path
             .owner
@@ -77,6 +121,7 @@ impl UserOwner {
         }
         drop(self.path.owner.cache_watch.take());
 
+        // Step 2: 在确认全部旧强引用与在途磁盘 I/O 归零后，创建全新的 InodeCache 并以只读模式重新挂载同一块设备。
         let reads_before = disk.test_snapshot().submitted;
         self.path.owner.cache = Some(
             Arc::try_new(checked(context, InodeCache::try_new(64))?)
@@ -94,6 +139,7 @@ impl UserOwner {
         context.expect_eq(root.filesystem().device() != old_device, true);
         drop(root);
 
+        // Step 3: 启动用户态校验程序（只读模式）从磁盘冷读验证文件全文，并直接检查内联短符号链接的磁盘元数据标志。
         let event = self.run_named(context, PROGRAM, b"r", false, 0)?;
         context.expect_eq(event.status, 0);
         if event.status != 0 {
@@ -133,8 +179,11 @@ impl UserOwner {
 pub(super) mod cases {
     use super::*;
 
-    /// 目标页确认为空洞后占住首原页的真实物理后继，多个父请求先发表并 kick，随后消费全部原尾。
-    /// 十六页准备共用一份回收预算，完成后的整窗身份检查另用一份预算。
+    /// 测试目标：验证当 16 个页面缓存页对应的磁盘物理块因碎片隔离而不连续时，批量回写（`sync_inode_range`）会拆分为多个父 Bio 请求，并在进入完成等待之前将所有已接受的请求提交并通知块设备队列。
+    /// 场景步骤：
+    /// 1. 校验文件末尾后方 16 页区间全部为磁盘空洞（Hole），写入第 0 页使其分配首个物理块 `first`，随后通过块分配器预占紧随 `first` 之后的连续物理块 `target`，迫使后续写入的第 1 页分配到非连续物理块 `second`。
+    /// 2. 释放预占的未发布隔离块，继续写满剩余 14 页数据，挂起块设备完成通知后在后台线程启动 16 页范围同步。
+    /// 3. 断言在同步线程阻塞等待完成期间，块设备上已有多个在途请求（`inflight > 1`）且已触发队列通知（Kick）；恢复设备完成通知后验证全部 16 页清脏、落盘内容一致且缓存物理页地址未变。
     #[test]
     #[ktest(tags("W10", "fs-sync"), min_cpus = 2)]
     fn original_folio_batch_publishes_prefix_before_wait(
@@ -156,7 +205,7 @@ pub(super) mod cases {
         checked(
             context,
             inode.with_map_read(|metadata, root| {
-                // 本地查询终点只放开 EOF 裁剪，不修改 canonical size 或块树。
+                // Step 1: 临时将本地元数据副本的 size 扩展至 `end` 以绕过 EOF 截断检查（不修改 Inode 正式大小或块树），确认目标逻辑块范围确为空洞。
                 let mut lookup = *metadata;
                 lookup.size = end;
                 for logical in base / block..end / block {
@@ -195,7 +244,7 @@ pub(super) mod cases {
 
             let target = first + PAGE_SIZE as u64 / block;
             let budget = volume.geometry().blocks_count - volume.geometry().first_data_block;
-            // 本例没有并发分配者；second 的首 data 申请先于同次节点摘离，已占用目标此时不可申请。
+            // Step 2: 在分配第 1 页的数据块前，先检查并预占第 0 页末尾紧邻的物理后继块 `target`，强制制造物理块不连续以触发多 Bio 批次拆分。
             let mut target_state = checked(context, block_allocation_bit(&volume, target))?;
             context.diagnostic(format_args!(
                 "W10 fragmentation first-physical={} target-successor={} target-allocation-state={:?} reservation-budget={} second-unprepared=1",
@@ -207,7 +256,7 @@ pub(super) mod cases {
                 if occupied {
                     break;
                 }
-                // 容量准备先于新责任；同组较低空洞的 token 一并保留，直到真实目标位被占住。
+                // 先为预留容器扩容再申请新块；同块组内编号更低的空闲块令牌一并暂存，直到成功占住目标后继块。
                 held.try_reserve(1)
                     .map_err(|_| TestError("W10 physical separator owner OOM"))?;
                 let separator = checked(context, volume.allocate_block(allocation_hint))?;
@@ -226,7 +275,7 @@ pub(super) mod cases {
                     break;
                 }
                 if target_state.is_none() {
-                    // 只在本次真实分配之后重核未知组；不把 BLOCK_UNINIT 的随机位当已拥有。
+                    // 仅在首次实际分配初始化了未知块组位图后重新查询目标块状态，避免将未初始化块组（BLOCK_UNINIT）误判为已占用。
                     target_state = checked(context, block_allocation_bit(&volume, target))?;
                     occupied = target_state == Some(true);
                     context.diagnostic(format_args!(
@@ -245,6 +294,7 @@ pub(super) mod cases {
                 reserved_bounds, held.len()
             ));
 
+            // Step 3: 依次写入第 1 至第 15 页；在第 1 页完成非连续物理块映射后立即归还所有临时占用的隔离块令牌。
             let separators = held.len();
             let mut second = 0;
             for (index, slot) in folios.iter_mut().enumerate().skip(1) {
@@ -284,13 +334,14 @@ pub(super) mod cases {
             Ok((first, target, second, separators))
         })();
 
-        // 任一步失败均先显式归还全部未发表 token；已接受文件内容仍由原 fixture 真实同步。
+        // 若上述准备过程因错误提前中断，在此兜底归还所有尚未释放的临时块令牌。
         for separator in held.drain(..) {
             volume.release_unpublished_block(separator);
         }
         let (first, target, second, separators) = prepared?;
         context.expect_eq(first + PAGE_SIZE as u64 / block != second, true);
 
+        // Step 4: 挂起块设备完成中断并发起 16 页批量回写，验证在等待首个 Bio 完成前已向设备提交并通知了多个非连续物理段请求。
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -353,7 +404,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 正式数据、元数据与 FLUSH 后结束全部 FS 和 VMA 拥有，弱引用到期后重新读盘验证新根、CRC 和内容。
+    /// 测试目标：验证在完成文件数据、元数据与设备 FLUSH 同步后，释放全部 VMA、打开文件、Inode、缓存与卷强引用，从磁盘冷重开能完整还原块映射树、CRC 校验与全部落盘数据。
+    /// 场景步骤：
+    /// 1. 在文件末尾后的 5 个跨度逻辑块偏移处写入特征字节（覆盖传统间接块或 Extent 树的深层节点），调用 `sync_range` 触发数据、元数据写回及设备 FLUSH，并建立一页只读文件映射。
+    /// 2. 调用 `cold_reopen` 销毁地址空间、文件句柄、Inode、元数据缓存与卷实例，确认所有弱引用计数归零后重新挂载该磁盘。
+    /// 3. 校验重新加载的 Inode 统计信息、块映射树结构（深度、Extent 数量、节点与物理块分布）以及各逻辑偏移处读回的字节内容与同步前完全一致。
     #[test]
     #[ktest(tags("W07", "fs-write-cold", "fs-sync"))]
     fn formal_sync_drop_all_owners_and_cold_reload(
@@ -411,6 +466,7 @@ pub(super) mod cases {
             context.expect_eq(0 < mapped.depth, true);
         }
 
+        // Step 1: 执行全范围同步，确认数据写、元数据写与设备 FLUSH 均已下发，并记录同步后的 Inode 元数据与块树根快照。
         let before = disk.test_snapshot();
         checked(context, file.sync_range(0..u64::MAX, false))?;
         let synced = disk.test_snapshot();
@@ -428,11 +484,12 @@ pub(super) mod cases {
         )?;
         mapped_bytes(context, &mm, SOURCE, &[0x41]);
 
+        // Step 2: 释放全部内存所有者并冷重开卷，校验新加载的 Inode 元数据、块映射树及各逻辑块数据与落盘前完全相同。
         let (reopened, reads_before) = fixture.cold_reopen(context, mm, file, inode, volume)?;
         let reloaded_inode = fixture.inodes.last().unwrap().clone();
         let mut reloaded_stat = checked(context, reopened.stat())?;
         context.expect_eq(reloaded_stat.device != stat.device, true);
-        // 新卷实例分配新的内核设备号；盘面属性仍须逐项相同。
+        // 重新挂载的卷实例会分配新的内核虚拟设备号，其余磁盘持久化属性必须逐项相等。
         reloaded_stat.device = stat.device;
         context.expect_eq(reloaded_stat, stat);
         context.expect_eq(
@@ -477,8 +534,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 真正在途的原页允许普通覆盖和映射再脏，旧父完成只撤自己的 WB，下一轮写出新义务。
-    /// 原页由显式有限请求准备，随后持有同一凭证观察再脏与完成。
+    /// 测试目标：验证正处于在途回写（Writeback）状态的物理页允许并发的 `write_at` 覆盖写与 `mmap` 共享映射写将其重新标脏（Redirty），且当旧回写请求完成时仅清除 `writeback` 位而保留新产生的 `dirty` 位，由下一轮同步刷出新数据。
+    /// 场景步骤：
+    /// 1. 写入并同步一页数据后再次写脏该页，建立 `SHARED_ALIAS` 共享可写映射，挂起块设备完成通知并在后台启动第 1 轮范围回写。
+    /// 2. 等待该页进入 `dirty == 0 && writeback != 0` 的在途回写阻塞状态，随后在另一个线程中对该页执行 `write_at` 与 `copyout` 共享映射写入。
+    /// 3. 断言并发写入无需等待旧回写完成即可返回，且物理页变为 `dirty != 0 && writeback != 0`；恢复块设备完成后验证旧回写仅清除 `writeback` 位而保留 `dirty` 位及卷级脏 Inode 登记，最后执行第 2 轮同步将新数据彻底刷盘。
     #[test]
     #[ktest(tags("W09", "fs-sync", "fs-shared"), min_cpus = 2)]
     fn coherent_redirty_during_original_writeback(
@@ -494,7 +554,7 @@ pub(super) mod cases {
         context.expect_eq(file.write_at(offset, &[0x31; 4096]), Ok(4096));
 
         let inode = fixture.inodes.last().unwrap().clone();
-        // 普通增长可能给旧 EOF 尾页留下合法义务，先真实同步它，再只覆盖本例新页。
+        // Step 1: 文件扩展可能会使原先的 EOF 尾页变脏，先将其同步干净，随后单独写脏目标测试页并建立共享映射。
         checked(context, crate::fs::writeback::sync_inode(&inode))?;
         context.expect_eq(file.write_at(offset, &[0x31; 4096]), Ok(4096));
         let volume = fixture.volume();
@@ -513,6 +573,7 @@ pub(super) mod cases {
                 .file_page(offset / PAGE_SIZE as u64, &mut attempt),
         )?;
 
+        // Step 2: 挂起块设备完成通知并发起第 1 轮回写，等待目标页清除 dirty 位并进入 writeback 在途状态。
         let disk = fixture.user.path.owner.disk()?.clone();
         let before = disk.test_snapshot();
         disk.test_suspend_completions();
@@ -527,6 +588,7 @@ pub(super) mod cases {
         })?;
         context.expect_eq(folio.dirty_sectors(), 0);
 
+        // Step 3: 在回写 I/O 在途期间并发执行普通写入（write_at）与共享内存映射写入（copyout），验证缓存页在保持物理地址不变的同时重新置位 dirty 标志。
         let writing = file.clone();
         let mapping = alias.clone();
         let producer = fixture.consume_sync(1, move || {
@@ -555,6 +617,7 @@ pub(super) mod cases {
         );
         bytes_at(context, &file, offset, &[0x31, 0x52, 0x73])?;
 
+        // Step 4: 恢复块设备完成通知使第 1 轮回写结束，验证仅 writeback 位清零而 dirty 位与脏 Inode 队列保留，最后通过第 2 轮回写刷出新修改。
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -588,8 +651,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 两独立 OFD 各观察一次错误，dup 共游标；没有任何观察者的新错误仍由后来 open 报告。
-    /// 错误观察结束后用独立有限请求取得原页检查剩余 Dirty/WB。
+    /// 测试目标：验证独立打开的文件描述（OFD）各自独立消费一次回写错误序号（`errseq`），`dup` 复制的描述符共享同一错误游标，且在错误发生时尚未打开文件的后续 `open` 能否正确按“已见/未见”规则报告错误。
+    /// 场景步骤：
+    /// 1. 对同一文件分别调用两次 `open` 得到独立句柄 `first` 与 `second`，并对 `first` 执行 `dup` 得到共享同一 OFD 的句柄 `duplicated`。
+    /// 2. 写入脏数据并注入一次数据块写 EIO：`first.sync_range` 与 `second.sync_range` 均返回一次 `EIO`，而共享游标的 `duplicated`、重试的 `first` 以及错误已被观察后新打开的 `seen` 句柄调用 `sync_range` 均返回 `Ok(())` 且不触发多余写盘。
+    /// 3. 再次写入脏数据并注入一次数据块写 EIO，通过内核内部 `sync_inode` 触发回写失败（此时没有任何 OFD 消费该错误）；验证随后新打开的 `unseen` 句柄首次 `sync_range` 能捕获该未见错误并返回 `EIO`，且 `first` 与 `second` 也各自观测到这一次新错误。
     #[test]
     #[ktest(tags("W11", "fs-sync", "controlled-ledger"))]
     fn independent_open_dup_and_unseen_old_errseq(
@@ -610,6 +676,7 @@ pub(super) mod cases {
         let duplicated = checked(context, table.lookup(duplicate))?;
         context.expect_eq(Arc::ptr_eq(&first, &duplicated), true);
 
+        // Step 1: 注入第 1 次数据回写 EIO，验证两个独立 OFD 各报告一次错误、dup 句柄共享游标不重复报错，且错误被消费后新 open 的句柄不再报错。
         context.expect_eq(first.write_at(0, &[0x91; 4096]), Ok(4096));
         disk.test_fail_next_data(BlockError::Io);
         let error = Err(FsError::Io(BlockError::Io));
@@ -623,6 +690,7 @@ pub(super) mod cases {
         context.expect_eq(seen.sync_range(0..u64::MAX, false), Ok(()));
         context.expect_eq(disk.test_snapshot().data_submitted, failed.data_submitted);
 
+        // Step 2: 注入第 2 次数据回写 EIO 并由不绑定 OFD 的内部接口触发，验证没有任何观察者消费该错误时，后续新 open 的句柄首次同步仍能捕获该错误。
         context.expect_eq(first.write_at(0, &[0xa2; 4096]), Ok(4096));
         disk.test_fail_next_data(BlockError::Io);
         context.expect_eq(crate::fs::writeback::sync_inode(&inode), error);
@@ -644,8 +712,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 页已清脏但原 WB 未完成时，普通 sys82 必须真实 Blocked，放行真实完成后才返回。
-    /// 在暂停完成前以显式有限请求取得待观察的原页。
+    /// 测试目标：验证当文件页已清除 `dirty` 位但前序回写 I/O 仍在途（`writeback != 0`）时，用户态调用 `fsync`（系统调用号 82）必须阻塞等待该在途回写完成后才能返回。
+    /// 场景步骤：
+    /// 1. 写入 1 页数据并预先获取其 `FolioRef`，启动用户态测试进程进入第一阶段就绪点。
+    /// 2. 挂起块设备完成通知，在后台线程发起 `sync_inode` 使该页进入 `dirty == 0 && writeback != 0` 的在途回写状态。
+    /// 3. 放行用户态进程执行 `fsync`，断言用户态线程进入 `State::Blocked` 阻塞状态且未提前推进阶段号；随后恢复块设备完成通知，验证前序回写与用户态 `fsync` 共同完成且页状态归零。
     #[test]
     #[ktest(tags("W12", "fs-sync", "user-fs"), min_cpus = 2)]
     fn fsync_waits_for_existing_clean_writeback(
@@ -673,6 +744,7 @@ pub(super) mod cases {
             .and_then(|user| user.executor())
             .ok_or(TestError("W12 user executor missing"))?;
 
+        // Step 1: 挂起块设备完成中断并启动后台回写，使目标页处于已清脏（dirty == 0）但回写仍在途（writeback != 0）的状态。
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         let syncing = inode.clone();
@@ -684,6 +756,7 @@ pub(super) mod cases {
                 && first.blocked()
         })?;
 
+        // Step 2: 唤醒用户态进程调用 sys_fsync (82)，确认其不会因为 dirty == 0 而直接跳过等待，而是阻塞在在途的 writeback 上。
         WriteOwner::release(&mm, 1)?;
         until("W12 sys82 did not really block on existing WB", || {
             sched::test_state(&executor) == State::Blocked
@@ -703,6 +776,7 @@ pub(super) mod cases {
             true,
         );
 
+        // Step 3: 恢复块设备完成通知，确认后台回写与用户态 fsync 相继完成返回。
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*first.result.lock(), Some(Ok(())));
@@ -714,8 +788,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 数据真实完成后才消费一次元数据或 FLUSH 错误，显式后次同步和静止窗口都不得自动 replay。
-    /// 错误后原页检查使用独立有限请求，不改变完成错误或重放数据。
+    /// 测试目标：验证当文件数据回写已成功完成、仅后续的元数据写回或设备 FLUSH 发生 I/O 错误时，`sync_range` 准确报告一次 `EIO`，且后台工作队列或后续显式同步均不会重复回写已经落盘的数据或无新修改的元数据。
+    /// 场景步骤：
+    /// 1. 写入 1 页数据，根据用例参数注入下一次元数据写 EIO 或下一次设备 FLUSH EIO，调用 `file.sync_range` 并断言返回 `EIO`。
+    /// 2. 校验此时数据与元数据请求均已提交且页面缓存页的 `dirty` 与 `writeback` 位均已清零；休眠等待 10ms，确认后台不会自动发起任何重放 I/O。
+    /// 3. 再次显式调用 `file.sync_range`，断言返回 `Ok(())`，且期间数据写与元数据写提交计数保持不变（仅重新发出一次 FLUSH），落盘数据完好可读。
     #[test]
     #[case("metadata", false)]
     #[case("flush", true)]
@@ -732,6 +809,7 @@ pub(super) mod cases {
             return Err(TestError("W13 requires negotiated real FLUSH"));
         }
 
+        // Step 1: 写入一页数据并注入受控的元数据或 FLUSH 错误，验证首次同步消费该错误且数据页已完成清脏。
         context.expect_eq(file.write_at(0, &[0xb3; 4096]), Ok(4096));
         let before = disk.test_snapshot();
         if flush {
@@ -757,6 +835,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq((folio.dirty_sectors(), folio.writeback_sectors()), (0, 0));
 
+        // Step 2: 排空完成队列并静置一段时间，确认不会触发后台自动重放，且再次显式同步不会重传已落盘的数据与元数据。
         disk.test_flush_completions();
         timer::sleep(time::Duration::from_millis(10));
         context.expect_eq(disk.test_snapshot().submitted, failed.submitted);
@@ -771,8 +850,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 小块几何核同原页的精确 Dirty 交集；原 OFD 与 VMA 偏移决定写出范围，private COW 和异步不写源页。
-    /// 两页初始准备共享预算，各次同步后的身份检查分别使用独立有限请求。
+    /// 测试目标：验证小于页尺寸的块几何下按字节区间同步仅刷写相交的脏块扇区，并验证 `msync` 对文件偏移映射、私有写时复制（COW）映射、`MS_ASYNC`、`MS_INVALIDATE` 以及系统调用参数边界的处理契约。
+    /// 场景步骤：
+    /// 1. 若文件系统块大小小于页大小（1024B 或 2048B），在同一物理页的第 0 块与第 1 块各写入 3 字节，先仅同步第 0 块区间，断言第 0 块脏扇区位清零而同页相邻的第 1 块脏扇区位保留，再同步第 1 块区间使其彻底清脏。
+    /// 2. 建立文件第 2 页（偏移 4096）的可写共享映射 `SOURCE` 与第 1 页（偏移 0）的可写私有映射 `SHARED_ALIAS`，分别写入 1 字节；验证对共享映射执行 `MS_ASYNC | MS_INVALIDATE` 及对私有 COW 映射执行 `MS_SYNC` 均不产生磁盘 I/O。
+    /// 3. 对横跨已映射页与未映射区的区间调用 `sync_mapping_range(SOURCE..SOURCE + 8192, true, false)`，断言在同步完已映射的前半段脏页后返回 `VmError::Unmapped`；最后运行用户态测试程序验证 `fsync`/`fdatasync`/`msync` 系统调用的参数与标志位校验。
     #[test]
     #[ktest(tags("W14", "fs-sync", "fs-shared", "user-fs"))]
     fn msync_ranges_private_and_ordinary_abi(
@@ -798,6 +880,7 @@ pub(super) mod cases {
                 .file_page(1, &mut prepare_attempt),
         )?;
 
+        // Step 1: 当文件系统块小于 4KiB 页大小时，验证同一物理页内不同文件块的精细脏扇区掩码交集同步。
         let block = inode.block_size() as usize;
         let disk = fixture.user.path.owner.disk()?.clone();
         if block < PAGE_SIZE {
@@ -871,6 +954,7 @@ pub(super) mod cases {
             context.diagnostic(format_args!("W14 small-FS-block-range block-size={} branch-exercised=0 same-folio-neighbor-unavailable=1", block));
         }
 
+        // Step 2: 验证非零文件偏移的共享映射、私有 COW 映射、MS_ASYNC / MS_INVALIDATE 标志以及跨未映射区间的部分同步行为。
         let mm = vm(context, Mm::try_new().map_err(VmError::from))?;
         vm(
             context,
@@ -912,6 +996,7 @@ pub(super) mod cases {
         mapped_bytes(context, &mm, SHARED_ALIAS + 29, &[0x88]);
         drop(mm);
 
+        // Step 3: 启动用户态进程执行 sys_fsync / sys_fdatasync / sys_msync 的 ABI 标志与范围边界检查。
         let image = fixture.shared_image(context, b"y")?;
         let user_mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -928,8 +1013,11 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 同步 write 提交后释放 inode/cursor 锁，受控 EIO 不回滚接受的字节和位置。
-    /// 后续 sync 完成真实 FLUSH，两个独立 OFD 分别消费各自的 errseq 样本。
+    /// 测试目标：验证带有 `O_SYNC` 或 `O_DSYNC` 标志的同步 `write` 在等待底层回写 I/O 完成期间已释放 Inode 锁与文件偏移游标锁，且当底层回写遭遇 `EIO` 时不会回滚已写入页面缓存的数据和已推进的文件偏移游标。
+    /// 场景步骤：
+    /// 1. 初始化 1 页文件并同步，启动用户态测试进程以 `O_SYNC` 或 `O_DSYNC` 打开文件并进入第一阶段就绪点。
+    /// 2. 挂起块设备完成通知并注入一次数据写 `EIO`，放行用户态进程执行 1 字节同步 `write`，等待其阻塞在在途回写 I/O 上。
+    /// 3. 在同步 `write` 阻塞期间，从内核辅助线程对同一打开文件句柄调用 `seek(SeekFrom::Current(0))` 并向同文件偏移 1 处执行 `write_at`，断言两者均不阻塞且成功完成（证明游标锁与 Inode 锁已在等待 I/O 前释放）；随后恢复设备完成通知，验证即使同步写返回 `EIO`，已写入缓存的字节与推进到 1 的文件游标均保留不回滚。
     #[test]
     #[case("O_SYNC", b"d" as &[u8])]
     #[case("O_DSYNC", b"z" as &[u8])]
@@ -973,6 +1061,7 @@ pub(super) mod cases {
             file.mapping_inode().unwrap().file_page(0, &mut attempt),
         )?;
 
+        // Step 1: 挂起块设备完成中断并预设数据写 EIO，放行用户态进程执行 O_SYNC/O_DSYNC write 使其阻塞在回写等待阶段。
         let disk = fixture.user.path.owner.disk()?.clone();
         disk.test_suspend_completions();
         disk.test_fail_next_data(BlockError::Io);
@@ -983,6 +1072,7 @@ pub(super) mod cases {
                 && sched::test_state(&executor) == State::Blocked
         })?;
 
+        // Step 2: 在用户态同步写阻塞等待 I/O 期间，并发探测同一 OFD 的游标位置（seek）并向同一 Inode 写入相邻字节，确认游标锁与 Inode 锁均已释放。
         let cursor = original.clone();
         let writing = file.clone();
         let unlocked = fixture.consume_sync(0, move || {
@@ -1001,6 +1091,7 @@ pub(super) mod cases {
         context.expect_eq(*unlocked.result.lock(), Some(Ok(())));
         context.expect_eq(folio.dirty_sectors() != 0, true);
 
+        // Step 3: 恢复块设备完成中断以触发受控 EIO，确认页面缓存中已接受的新数据与 OFD 游标位置均未被回滚，随后验证后续显式同步的 FLUSH 错误传递。
         disk.test_resume_completions();
         fixture.join_consumers()?;
         fixture.phase(&mm, 0, 2)?;

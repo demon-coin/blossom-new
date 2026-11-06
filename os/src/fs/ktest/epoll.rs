@@ -1,4 +1,32 @@
-//! 正式 control/scan、真实管道、用户页和任务并发的永久事件回归。
+//! `epoll` 事件多路复用子系统的内核集成与并发回归测试。
+//!
+//! ## 模块职责与架构定位
+//! 本模块位于文件系统内核测试层（`fs::ktest::epoll`），作为 `EpollFile` 的直接集成测试入口，
+//! 向上承接 `ktest` 测试运行器，向下驱动 `fs::epoll`（控制与扫描）、`fs::pipe`（匿名管道事件源）、
+//! `fs::poll`（等待表与唤醒通知）、`fs::FileTable`（文件描述符表）以及 `mm::space::Mm`（用户地址空间拷贝）。
+//!
+//! ## 核心测试机制与生命周期模型
+//! 测试围绕 `(OpenFileDescription, fd)` 复合兴趣键（Interest Key）、触发模式状态机与引用计数展开：
+//!
+//! ```text
+//!   [Pipe Writer] --write()--> [Pipe Reader (OFD)]
+//!                                    |
+//!                       PollNotify   v
+//!   [FileTable (fd)] --------> [Epoll Interest (OFD, fd)]
+//!                                    |
+//!                    ready queue     v
+//!                              [EpollFile::scan()] ---> [User Mm / Callback]
+//! ```
+//!
+//! - **触发模式转换**：覆盖水平触发（LT，缓冲区有数据即重入就绪队列）、边缘触发（ET，仅在新通知到达或溢出回退时入队）
+//!   与单次触发（`EPOLLONESHOT`，完整交付一项后进入禁用态，需 `EPOLL_CTL_MOD` 重新激活）。
+//! - **延迟释放（Deferred Drop）**：当 `scan` 回调内部关闭最后一个指向目标文件的描述符时，扫描帧持有的临时强引用
+//!   保证目标文件在 `EpollFile` 控制锁释放后才执行析构与反向注销，避免锁重入死锁。
+//!
+//! ## 锁获取顺序与并发契约
+//! - 测试中的 `TaskObserver` 自旋锁（`SpinLock`）仅在子任务启动和主任务轮询睡眠状态时短暂获取，持锁期间不睡眠、不嵌套其他锁。
+//! - 验证 `EpollFile::scan` 的睡眠互斥锁（`SleepMutex`）与底层管道自旋锁、描述符表锁之间的解耦：
+//!   回调执行与用户页拷贝（`Mm::copyout`）期间不持有底层管道或描述符表锁。
 
 use ::ktest::{Fixture, TestContext, TestError, TestResult};
 use alloc::sync::{Arc, Weak};
@@ -21,25 +49,32 @@ use crate::{cpu, mm, sched, task};
 
 use crate::fs::{O_CLOEXEC as CLOEXEC, O_NONBLOCK as NONBLOCK};
 
+/// 用户空间测试映射的起始虚拟地址（字节单位，页对齐）。
 const ADDRESS: usize = 0x4700_0000;
+/// 用户空间测试页的读写权限配置（可读、可写、不可执行）。
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
     execute: false,
 };
 
+/// 工作队列与任务元数据的统计快照类型别名。
 type Metadata = crate::workqueue::testing::MetadataStats;
+/// 指向 `epoll` 内部监听节点生命周期守卫的弱引用类型别名。
 type WatchWeak = Weak<dyn Send + Sync>;
-/// 保存子任务自己发表的弱身份，观察拥有不延长 Task 生命周期。
+/// 保存子任务自身发布的 `Task` 弱引用，用于在主线程观测子任务调度状态而不延长其生命周期。
 type TaskObserver = Arc<SpinLock<Option<Weak<Task>>>>;
 
+/// `epoll` 测试套件级夹具，负责在整组测试前后校验全局物理内存与任务元数据无泄漏。
 struct EpollSuite {
+    /// 套件启动前等待后台服务静止后记录的物理页与内核堆内存基线快照。
     memory: mm::MemoryStats,
+    /// 套件启动前记录的任务、工作队列 Worker 与 Domain 计数基线快照。
     metadata: Metadata,
 }
 
 impl Fixture for EpollSuite {
-    /// 原常驻服务停稳后记录同 VM 两层账的组基线，不创建事件或管道。
+    /// 等待日志、工作队列及各核定时器常驻服务进入阻塞态后，记录套件级内存与任务元数据基线。
     fn set_up(_context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         crate::klog::testing::wait_service_blocked();
         crate::workqueue::testing::wait_services_blocked();
@@ -55,7 +90,7 @@ impl Fixture for EpollSuite {
         })
     }
 
-    /// 最后 case 的真实拥有结束后比较第二层六域及 tasks/workers/domains。
+    /// 套件内所有用例执行完毕且资源释放后，校验内存统计与任务元数据计数完全回到套件基线。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         recovered(context, "epoll-suite-last-release", self.memory)?;
         let actual = crate::workqueue::testing::metadata_stats();
@@ -71,20 +106,30 @@ impl Fixture for EpollSuite {
     }
 }
 
+/// 单个 `epoll` 测试用例的资源拥有者夹具，统一管理测试管道、事件实例、并发子任务与同步门闸。
 struct EpollOwner {
+    /// 当前用例启动前的内存统计基线快照。
     before: mm::MemoryStats,
+    /// 当前用例启动前的任务与工作队列元数据基线快照。
     metadata: Metadata,
+    /// 被测 `EpollFile` 对应的打开文件对象（`FileRef`）。
     owner: Option<FileRef>,
+    /// 默认测试匿名管道的读端打开文件对象。
     reader: Option<FileRef>,
+    /// 默认测试匿名管道的写端打开文件对象。
     writer: Option<FileRef>,
+    /// 本例派生的并发内核子任务等待句柄列表。
     joins: Vec<JoinHandle>,
+    /// 最多 4 个并发子任务的弱引用槽位，由各槽内部自旋锁保护，用于查询调度器阻塞状态。
     observers: [Option<TaskObserver>; 4],
+    /// 跨线程同步门闸（`Completion`）列表，在清理阶段统一放行以防子任务永久卡死。
     gates: Vec<Arc<Completion>>,
+    /// 通知后台持续生产子任务退出的原子停止标志。
     stop: Arc<AtomicBool>,
 }
 
 impl EpollOwner {
-    /// 事件与两端均为实际 OFD，未准备成功的对象按原拥有结束。
+    /// 创建一对非阻塞匿名管道（读端与写端）和一个 `EpollFile` 实例，并存入夹具字段。
     fn prepare(&mut self, context: &TestContext<'_>) -> TestResult {
         let (reader, writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
         let owner: FileRef = checked(context, EpollFile::try_new(0))?;
@@ -94,24 +139,24 @@ impl EpollOwner {
         Ok(())
     }
 
-    /// 控制入口只借原事件 OFD，不构造另一层包装。
+    /// 获取被测 `EpollFile` 的 `FileRef` 引用。
     fn owner(&self) -> &FileRef {
         self.owner.as_ref().unwrap()
     }
-    /// scan 直接消费原具体事件对象。
+    /// 从被测文件引用中提取具体的 `EpollFile` 引用，供直接调用 `control` 和 `scan`。
     fn epoll(&self) -> &EpollFile {
         self.owner().epoll().unwrap()
     }
-    /// 读端借用结束不会改变端点寿命。
+    /// 获取默认测试管道读端的 `FileRef` 引用。
     fn reader(&self) -> &FileRef {
         self.reader.as_ref().unwrap()
     }
-    /// 写端由原管道实现产生 source 通知。
+    /// 获取默认测试管道写端的 `FileRef` 引用。
     fn writer(&self) -> &FileRef {
         self.writer.as_ref().unwrap()
     }
 
-    /// gate 保存在主体 catch 之外，清理能放行尚在真实 emit 窗口的任务。
+    /// 从预分配槽位中创建一个同步门闸（`Completion`），由夹具统一持有以便异常清理时放行等待任务。
     fn gate(&mut self) -> Result<Arc<Completion>, TestError> {
         assert!(self.gates.len() < self.gates.capacity());
         let gate =
@@ -120,7 +165,7 @@ impl EpollOwner {
         Ok(gate)
     }
 
-    /// 发表前准备真实弱任务观察与 JoinHandle，清理不依赖主体正常返回。
+    /// 在指定 CPU `cpu` 上创建并启动第 `index` 号内核测试子任务，记录其弱引用观察槽与 `JoinHandle`。
     fn run(
         &mut self,
         index: usize,
@@ -141,7 +186,7 @@ impl EpollOwner {
         Ok(())
     }
 
-    /// 原 scheduler 的 Blocked 是真实 SleepMutex 等待证据，开始标记或 sleep 不能替代。
+    /// 检查第 `index` 号子任务在调度器中是否已进入 `State::Blocked` 阻塞等待状态。
     fn blocked(&self, index: usize) -> bool {
         let task = self.observers[index]
             .as_ref()
@@ -152,7 +197,7 @@ impl EpollOwner {
         task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
 
-    /// 逐个 join 确认离栈并保留子任务错误，之后才放观察引用。
+    /// 逐个等待所有已派生的子任务退出并断言返回值为 0，随后清空全部任务弱引用观察槽。
     fn join(&mut self, context: &mut TestContext<'_>) {
         while let Some(join) = self.joins.pop() {
             context.expect_eq(join.join(), 0);
@@ -162,7 +207,7 @@ impl EpollOwner {
 }
 
 impl Fixture<EpollSuite> for EpollOwner {
-    /// 每例在临时申请前保存资源，固定预留清理 gate 和任务句柄槽。
+    /// 用例初始化：采集内存与任务元数据基线，并预分配 `joins`、`gates` 容器容量与 `stop` 原子标志。
     fn set_up(_context: &mut TestContext<'_>, _suite: &EpollSuite) -> Result<Self, TestError> {
         let before = settled()?;
         let metadata = crate::workqueue::testing::metadata_stats();
@@ -189,7 +234,7 @@ impl Fixture<EpollSuite> for EpollOwner {
         })
     }
 
-    /// 先停生产并放行 gate，结束控制者 OFD 后真实 join；不遗留 source 或后台栈。
+    /// 用例静止化：置位停止标志、唤醒所有同步门闸、释放 `epoll` 与管道文件引用，并等待全部子任务退出。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.stop.store(true, Ordering::Release);
         for gate in &self.gates {
@@ -203,7 +248,7 @@ impl Fixture<EpollSuite> for EpollOwner {
         Ok(())
     }
 
-    /// fixture 的 Vec、gate、观察及全部 OFD 结束后比较每例完整六域和三元数据。
+    /// 用例拆解：释放夹具自身持有的容器与同步对象后，校验物理内存与任务元数据完全恢复到用例前基线。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let before = self.before;
         let metadata = self.metadata;
@@ -223,12 +268,12 @@ impl Fixture<EpollSuite> for EpollOwner {
     }
 }
 
-/// 兴趣数据带高位，目标 poll 位在正式交付时去掉 ET/ONESHOT 私有位。
+/// 构造一个包含指定事件掩码 `events` 与 64 位用户数据 `data` 的 `EpollEvent`。
 fn event(events: u32, data: u64) -> EpollEvent {
     EpollEvent { events, data }
 }
 
-/// 本地接收端直接消费正式 scan，输出界限由同次 maxevents 保证。
+/// 调用 `EpollFile::scan` 扫描最多 `output.len()` 个就绪事件并顺序写入 `output` 切片，返回实际交付数量。
 fn collect(file: &EpollFile, output: &mut [EpollEvent]) -> Result<usize, FsError> {
     let mut count = 0;
     file.scan(output.len(), &mut |event| {
@@ -238,7 +283,7 @@ fn collect(file: &EpollFile, output: &mut [EpollEvent]) -> Result<usize, FsError
     })
 }
 
-/// 用户输出只编码目标字段并初始化 padding，不复制宿主结构裸内存。
+/// 将 `EpollEvent` 编码为 16 字节的小端序用户态 ABI 布局（前 4 字节为 `events`，中间 4 字节清零填充，后 8 字节为 `data`）。
 fn encoded(event: EpollEvent) -> [u8; 16] {
     let mut bytes = [0; 16];
     bytes[..4].copy_from_slice(&event.events.to_le_bytes());
@@ -246,7 +291,7 @@ fn encoded(event: EpollEvent) -> [u8; 16] {
     bytes
 }
 
-/// 真实 Mm 的完整项交付才能成功，跨未映射页保原复制前缀而报告 EFAULT。
+/// 将单个 `EpollEvent` 通过 `Mm::copyout` 拷贝到用户虚拟地址 `address`；若发生缺页错误或部分写入则返回 `FsError::BadAddress`。
 fn user_emit(memory: &Mm, address: usize, event: EpollEvent) -> Result<(), FsError> {
     let bytes = encoded(event);
     let result = memory.copyout(address, &bytes);
@@ -257,18 +302,18 @@ fn user_emit(memory: &Mm, address: usize, event: EpollEvent) -> Result<(), FsErr
     }
 }
 
-/// 观察原节点真实强拥有结束，弱控制尾在测试末释放后参与原资源账。
+/// 获取 `(target, fd)` 对应 `epoll` 内部监听节点的弱引用，用于断言节点在注销或关闭后是否被彻底销毁。
 fn watch(file: &EpollFile, target: &FileRef, fd: i32) -> WatchWeak {
     file.ktest_watch_lifetime(target, fd)
         .expect("epoll interest missing")
 }
 
-/// 只由正式 provider 复核事件自身，不以候选链非空冒充真正就绪。
+/// 对目标文件调用无等待表的 `poll(None)`，查询其当前的即时就绪事件掩码。
 fn mask(context: &TestContext<'_>, file: &FileRef) -> Result<PollMask, TestError> {
     checked(context, file.pollable().unwrap().poll(None))
 }
 
-/// 接收队列不冻结表；lookup 取得的原 OFD 在 control 返回后才结束临时拥有。
+/// 先从文件描述符表 `table` 查找 `fd` 对应的打开文件对象，再对其执行 `EpollFile::control` 操作。
 fn control_fd(
     context: &TestContext<'_>,
     fixture: &EpollOwner,
@@ -286,7 +331,7 @@ fn control_fd(
     )
 }
 
-/// 按真实规模准备消费位图，扫描只消费完整高位 data，不按规模展开内核栈。
+/// 分配并初始化长度为 `count` 的布尔位图，用于在大规模测试中校验每个预期事件是否均被精确交付一次。
 fn delivery_slots(count: usize) -> Result<Vec<bool>, TestError> {
     let mut seen = Vec::new();
     seen.try_reserve_exact(count)
@@ -295,7 +340,7 @@ fn delivery_slots(count: usize) -> Result<Vec<bool>, TestError> {
     Ok(seen)
 }
 
-/// 完整消费本轮每个 data 和普通事件位，重复、遗漏或外来 data 都失败。
+/// 扫描 `expected`（即 `seen.len()`）个就绪事件，校验每项 `events` 均为 `POLLIN` 且 `data` 落在 `[base, base + expected)` 范围内无重复、无遗漏。
 fn scan_data(
     context: &mut TestContext<'_>,
     file: &EpollFile,
@@ -320,7 +365,7 @@ fn scan_data(
     Ok(())
 }
 
-/// 原锚点集合只保留实际宏生成 suite，不增加中心分派或新 runner。
+/// 返回 `epoll` 测试套件的静态注册锚点，供上层文件系统测试入口汇总。
 pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
     events::__ktest_anchor()
 }
@@ -329,7 +374,12 @@ pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
 pub(crate) mod events {
     use super::*;
 
-    /// ADD 已 ready 立即交付；初始 IN 的写 OFD 改 OUT 后仍使用 ADD 登记的真实源。
+    /// 测试目标：验证 `EPOLL_CTL_ADD` 对已就绪管道的即时交付、`EPOLL_CTL_MOD` 修改监听方向后复用原唤醒源，以及无掩码时的 `POLLERR` 无条件上报。
+    /// 场景步骤：
+    /// 1. 先向管道写入数据，再将读端以 `POLLIN | EPOLLONESHOT` 注册到 `epoll`，验证重复 `ADD` 返回 `Exists` 且首次扫描立即返回 `POLLIN`。
+    /// 2. 写满管道缓冲区后，将写端先以 `POLLIN` 注册（扫描返回 0），随后 `MOD` 为 `POLLOUT | EPOLLONESHOT`，读出一块数据腾出空间后验证唤醒并交付 `POLLOUT`。
+    /// 3. 删除写端后以事件掩码 `0` 重新注册写端，关闭读端最后一个引用触发断管。
+    /// 预期结果：各阶段就绪事件掩码与 `data` 精确匹配；即使注册掩码为 `0`，读端关闭后写端仍能收到 `POLLERR` 事件。
     #[test]
     #[ktest(tags("T13"))]
     fn add_ready_modify_out_and_existing_sources(
@@ -338,6 +388,7 @@ pub(crate) mod events {
     ) -> TestResult {
         fixture.prepare(context)?;
         let data = 0xf123_4567_89ab_cdef;
+        // Step 1: 预先写入数据并注册读端，验证已就绪文件在 ADD 时立即入队且重复 ADD 报错。
         checked(context, fixture.writer().write(b"already"))?;
         checked(
             context,
@@ -371,6 +422,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 7);
         context.expect_eq(&bytes[..7], b"already");
 
+        // Step 2: 写满管道后注册写端为 POLLIN，再通过 MOD 改为 POLLOUT，验证读出数据后原有唤醒源能触发写就绪。
         for _ in 0..16 {
             checked(context, fixture.writer().write(&[0x5d; PIPE_BUF]))?;
         }
@@ -405,6 +457,7 @@ pub(crate) mod events {
         context.expect_eq(events[0], event(PollMask::POLLOUT.0, data + 1));
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
 
+        // Step 3: 验证 DEL 之后再次 MOD 返回 NotFound。
         checked(
             context,
             fixture
@@ -422,7 +475,7 @@ pub(crate) mod events {
             Err(FsError::NotFound),
         );
 
-        // ERR 不依赖用户兴趣；读 OFD 末释放撤其自身 watch 后通知写端真实源。
+        // Step 4: 验证 POLLERR 不受用户掩码限制，读端最后一个强引用释放后写端收到 POLLERR 通知。
         checked(
             context,
             fixture.epoll().control(
@@ -440,7 +493,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// dup 的两个整数键独立，同号新 OFD 不串旧 interest，最后外部 Arc 才撤旧端所有 hook。
+    /// 测试目标：验证 `(OpenFileDescription, fd)` 复合兴趣键的独立性、描述符编号复用隔离，以及最后一个外部 `Arc<File>` 释放时的自动注销。
+    /// 场景步骤：
+    /// 1. 将同一管道读端通过 `dup` 复制为两个描述符 `(fd, duplicate)` 并分别注册到 `epoll`，同时克隆一份子文件表保留额外引用 `held`。
+    /// 2. 关闭新旧表中的 `fd` 并将新管道读端分配到同一整数编号 `reused == fd`，验证对新管道执行 `DEL` 返回 `NotFound`，再将新管道注册到该编号。
+    /// 3. 向新旧两个管道分别写入数据并扫描，随后关闭所有表中的 `duplicate` 并释放 `held`。
+    /// 预期结果：第一次扫描同时收到旧管道的两个事件（`fd` 与 `duplicate`）和新管道的 `reused` 事件；直到最后一个外部强引用 `held` 释放后，旧管道的两个监听节点才被彻底销毁。
     #[test]
     #[ktest(tags("T14"))]
     fn dup_fd_reuse_and_last_external_ofd(
@@ -448,6 +506,7 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
+        // Step 1: 为同一打开文件对象创建两个描述符并分别注册，同时通过子表持有额外强引用。
         let table = checked(context, FileTable::try_new())?;
         let fd = checked(context, table.reserve(1024))?
             .publish(fixture.reader().clone(), DescriptorFlags::default());
@@ -474,6 +533,7 @@ pub(crate) mod events {
         let first_watch = watch(fixture.epoll(), &held, fd as i32);
         let dup_watch = watch(fixture.epoll(), &held, duplicate as i32);
 
+        // Step 2: 关闭原 fd 并在相同描述符编号上绑定新管道，验证新对象不会误匹配旧监听项。
         checked(context, table.close(fd))?;
         checked(context, child.close(fd))?;
         let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
@@ -512,6 +572,7 @@ pub(crate) mod events {
             );
         }
 
+        // Step 3: 关闭表内剩余描述符但保留外部强引用 held，验证此时监听节点尚未注销。
         checked(context, table.close(duplicate))?;
         checked(context, child.close(duplicate))?;
         drop(fixture.reader.take());
@@ -524,6 +585,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, held.read(&mut bytes))?, 7);
         context.expect_eq(&bytes, b"oldtail");
 
+        // Step 4: 释放最后一个外部强引用 held，验证旧管道的监听节点全部销毁且不再产生事件。
         drop(held);
         context.expect_eq(old_weak.upgrade().is_none(), true);
         context.expect_eq(first_watch.upgrade().is_none(), true);
@@ -538,7 +600,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// LT 复核剩余字节，ET 仅新通知再交付，ONESHOT 仅完整交付后禁用并可 MOD 重 arm。
+    /// 测试目标：验证水平触发（LT）、边缘触发（ET）和单次触发（`EPOLLONESHOT`）的状态转换与重新激活（re-arm）语义。
+    /// 场景步骤：
+    /// 1. 以默认 LT 模式注册读端并写入 4 字节，连续扫描两次后再分两次读空缓冲区。
+    /// 2. 通过 `EPOLL_CTL_MOD` 切换为 `EPOLLET` 模式，写入 1 字节后连续扫描两次，再追加写入 1 字节并扫描。
+    /// 3. 切换为 `EPOLLONESHOT` 模式，写入数据扫描一次后再次写入，验证被禁用；随后调用 `EPOLL_CTL_MOD` 重新激活并扫描。
+    /// 预期结果：LT 在缓冲区非空时每次扫描均返回事件；ET 仅在首次或新写入到达后返回一次；`EPOLLONESHOT` 交付一次后静默，直到 `MOD` 重新激活后立即交付剩余数据。
     #[test]
     #[ktest(tags("T15"))]
     fn level_edge_oneshot_and_rearm(
@@ -546,6 +613,7 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
+        // Step 1: 验证水平触发（LT）只要管道仍有未读字节就会在每次扫描时持续报告就绪。
         checked(
             context,
             fixture.epoll().control(
@@ -570,6 +638,7 @@ pub(crate) mod events {
         context.expect_eq(&bytes[..2], b"cd");
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
 
+        // Step 2: 切换为边缘触发（ET），验证未读取完数据时不重复报告，但新写入到达会再次触发。
         checked(
             context,
             fixture.epoll().control(
@@ -589,6 +658,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, fixture.reader().read(&mut bytes))?, 2);
         context.expect_eq(&bytes[..2], b"EF");
 
+        // Step 3: 切换为单次触发（EPOLLONESHOT），验证交付一次后自动禁用，且可通过 MOD 重新激活。
         checked(
             context,
             fixture.epoll().control(
@@ -625,7 +695,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// ET 的真实 emit 边界消耗旧输入后放行另一 CPU 写入，overflow 与未处理尾都必须保留。
+    /// 测试目标：验证边缘触发（ET）在 `scan` 回调执行期间并发到达的新写入通知不会丢失，且受 `maxevents` 限制未交付的溢出项会被保留。
+    /// 场景步骤：
+    /// 1. 注册两个 ET 管道读端并各写入初始数据，使两项均进入就绪队列。
+    /// 2. 以 `maxevents = 1` 调用 `scan`；在第一个管道的回调中读空初始字节 `"a"`，随后放行另一 CPU 上的子任务向两个管道分别追加写入 `"b"` 和 `"more"` 并等待其完成。
+    /// 3. 结束第一次 `scan` 后再次调用 `collect` 扫描。
+    /// 预期结果：第一次扫描仅交付第一个管道；第二次扫描同时交付因并发新写入重新入队的第一个管道，以及第一次因 `maxevents = 1` 溢出的第二个管道。
     #[test]
     #[ktest(tags("T16", "T11"), min_cpus = 2)]
     fn scan_overflow_new_input_from_other_cpu(
@@ -633,6 +708,7 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
     ) -> TestResult {
         fixture.prepare(context)?;
+        // Step 1: 注册两个边缘触发管道并写入初始数据，准备跨核并发写入任务。
         let (reader, writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
         checked(
             context,
@@ -673,6 +749,7 @@ pub(crate) mod events {
             }
         })?;
 
+        // Step 2: 在 maxevents=1 的扫描回调内读完首管道旧数据，并同步等待另一核完成新写入。
         let mut delivered = None;
         let mut consumed = [0; 1];
         let result = fixture.epoll().scan(1, &mut |event| {
@@ -689,6 +766,7 @@ pub(crate) mod events {
         context.expect_eq(&consumed, b"a");
         fixture.join(context);
 
+        // Step 3: 验证后续扫描既能收到首管道的新写入通知，也能收到次管道被推迟的溢出事件。
         let mut events = [EpollEvent::default(); 4];
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 2);
         context.expect_eq(
@@ -716,7 +794,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 实际用户页跨界故障保首项和正前缀，未完整交付的 ONESHOT 不禁用。
+    /// 测试目标：验证向用户空间拷贝事件发生跨页缺页错误（`EFAULT`）时，已成功交付的前缀计数与未完整交付的 `EPOLLONESHOT` 状态保持一致。
+    /// 场景步骤：
+    /// 1. 注册两个 `EPOLLONESHOT` 管道并写入数据；在用户地址空间映射单页，将输出起始地址设在页尾前 8 字节（`ADDRESS + PIPE_BUF - 8`），使首项 16 字节跨入未映射页。
+    /// 2. 将输出起始地址设在页尾前 16 字节（`ADDRESS + PIPE_BUF - 16`）再次扫描 2 项，使首项成功写入、次项跨入未映射页。
+    /// 3. 将输出地址设在页首 `ADDRESS` 扫描剩余项，随后验证两项均已因 `EPOLLONESHOT` 禁用，最后通过 `MOD` 重新激活。
+    /// 预期结果：首项跨界时返回 `BadAddress`，但页内前 8 字节已写入且两项均未消费；次项跨界时返回已成功交付数 `1`，次项保留在就绪队列并在第三次扫描中成功交付。
     #[test]
     #[ktest(tags("T17", "T11"))]
     fn output_fault_preserves_first_and_positive_prefix(
@@ -750,6 +833,7 @@ pub(crate) mod events {
         checked(context, fixture.writer().write(b"first"))?;
         checked(context, writer.write(b"second"))?;
 
+        // Step 1: 映射单页用户内存，使首项输出跨越页边界，验证返回 BadAddress 且首项保留就绪。
         let memory = Mm::try_new().map_err(|_| TestError("epoll user MM OOM"))?;
         memory
             .map_anonymous(ADDRESS, PIPE_BUF, RW, RW)
@@ -768,6 +852,7 @@ pub(crate) mod events {
             &encoded(event(PollMask::POLLIN.0, first))[..8],
         );
 
+        // Step 2: 从页尾前 16 字节开始输出，使首项完整写入而次项跨界，验证返回成功前缀 1 且次项未丢失。
         let output = ADDRESS + PIPE_BUF - 16;
         let mut address = output;
         let mut complete = 0;
@@ -796,6 +881,7 @@ pub(crate) mod events {
         let mut events = [EpollEvent::default(); 2];
         context.expect_eq(checked(context, collect(fixture.epoll(), &mut events))?, 0);
 
+        // Step 3: 验证两项完整交付后均进入 ONESHOT 禁用态，经 MOD 重新激活后可再次交付。
         checked(
             context,
             fixture.epoll().control(
@@ -825,7 +911,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 早通知先结束唯一 park Waiter，随后 provider 真正竞争 SleepMutex 仍可再创建原等待者。
+    /// 测试目标：验证对 `EpollFile` 自身执行带等待表的 `poll` 注册后，并发扫描持有的睡眠互斥锁（`SleepMutex`）能正确阻塞后续轮询查询且仅维护单一等待节点。
+    /// 场景步骤：
+    /// 1. 对空 `epoll` 实例调用 `poll(Some(&mut table))` 注册等待者，写入管道验证等待者被唤醒。
+    /// 2. 启动子任务 0 进入 `scan` 回调并暂停（持有 `scan` 睡眠锁）；启动子任务 1 先通过 `park_until` 消费唤醒，再调用 `poll(None)` 竞争睡眠锁。
+    /// 3. 主线程确认子任务 1 在调度器中进入 `State::Blocked` 后放行子任务 0，待两任务汇合后检查等待表长度与触发状态。
+    /// 预期结果：子任务 1 阻塞在 `scan` 的 `SleepMutex` 上；锁释放后查询成功完成，等待表长度保持为 1，且销毁等待表后新写入不再触发旧通知。
     #[test]
     #[ktest(tags("T11"), min_cpus = 2)]
     fn early_notifications_and_sleeping_query_have_one_waiter(
@@ -857,6 +948,7 @@ pub(crate) mod events {
         checked(context, fixture.writer().write(b"wake"))?;
         context.expect_eq(poll.triggered(), true);
 
+        // Step 1: 子任务 0 在 scan 回调内挂起以持有睡眠锁，子任务 1 唤醒后调用 poll(None) 竞争该锁。
         let inside = fixture.gate()?;
         let release = fixture.gate()?;
         let parked = fixture.gate()?;
@@ -897,6 +989,7 @@ pub(crate) mod events {
             fixture.blocked(1)
         })?;
 
+        // Step 2: 确认子任务 1 进入调度器 Blocked 状态后放行扫描锁，并验证等待表清理后不再收到通知。
         release.complete();
         fixture.join(context);
         context.expect_eq(table.len(), 1);
@@ -914,7 +1007,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 真 source 写入与 DEL、事件末释放、目标末关闭并行，注销后不再通知旧事件源。
+    /// 测试目标：验证后台持续向管道写入触发通知的同时，并发执行 `EPOLL_CTL_DEL`、释放 `EpollFile` 或关闭目标文件最后一个描述符的内存安全与注销彻底性。
+    /// 场景步骤：
+    /// 1. 阶段 0：另一 CPU 子任务循环向管道写入字节，主线程在累计至少 100 字节后执行 `EPOLL_CTL_DEL`，验证监听节点弱引用归零且后续写入不再唤醒 `epoll` 的轮询上下文。
+    /// 2. 阶段 1：重新注册并在并发写入期间直接释放 `EpollFile` 最后一个强引用，验证 `epoll` 实例与监听节点同步销毁且无悬挂通知。
+    /// 3. 阶段 2：新建 `epoll` 注册读端，在并发写入期间关闭描述符表中的最后一个读端描述符，验证写端收到 `BrokenPipe` 且监听节点同步销毁。
+    /// 预期结果：三种并发注销路径均无死锁或释放后使用（UAF），弱引用立即失效，且管道内已生产的字节数与读出字节数完全相等。
     #[test]
     #[ktest(tags("T18"), min_cpus = 2)]
     fn del_epoll_drop_and_last_close_race_real_notifications(
@@ -929,6 +1027,7 @@ pub(crate) mod events {
             context,
             fixture.owner().pollable().unwrap().poll(Some(&mut table)),
         )?;
+        // Step 1: 分两轮测试持续写入下并发执行 EPOLL_CTL_DEL（phase 0）与直接丢弃 EpollFile（phase 1）。
         for phase in 0..2 {
             let data = 0xab00 + phase as u64;
             checked(
@@ -983,7 +1082,7 @@ pub(crate) mod events {
             context.expect_eq(lifetime.upgrade().is_none(), true);
             poll.clear_triggered();
 
-            // 原源继续产生真实字节，旧 epoll hook 已同步撤完，不能再触达旧 poll context。
+            // Step 2: 后台继续写入管道，验证已注销的 epoll 监听钩子不会再触发上层 PollContext。
             let before = produced.load(Ordering::Acquire);
             let mut bytes = [0; 257];
             let mut read = checked(context, fixture.reader().read(&mut bytes))?;
@@ -1014,6 +1113,7 @@ pub(crate) mod events {
             }
         }
 
+        // Step 3: 测试持续写入期间并发关闭目标读端的最后一个文件描述符，验证自动注销与 BrokenPipe 传递。
         drop(table);
         let owner: FileRef = checked(context, EpollFile::try_new(0))?;
         fixture.owner = Some(owner);
@@ -1071,7 +1171,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// emit 内关闭最后描述符时 query 强拥有继续保端点，扫描解锁后末 put 才反向撤自身 watch。
+    /// 测试目标：验证在 `scan` 回调内部关闭目标文件的最后一个文件描述符时，扫描帧持有的临时强引用会将文件析构推迟到控制锁释放之后。
+    /// 场景步骤：
+    /// 1. 注册管道读端到 `epoll` 并丢弃夹具持有的读端副本，使文件描述符表中的 `fd` 成为唯一外部强引用。
+    /// 2. 写入数据后调用 `scan`，在回调内部调用 `table.close(fd)` 关闭该描述符，当场检查 `target.strong_count()` 并尝试从写端继续写入。
+    /// 3. `scan` 返回后再次检查目标文件与监听节点的弱引用，并尝试向写端写入。
+    /// 预期结果：回调内部关闭 `fd` 后强引用计数仍为 `1`（由 `scan` 临时持有），写端写入成功；`scan` 退出并释放内部锁后，目标文件与监听节点才被销毁，后续写入返回 `BrokenPipe`。
     #[test]
     #[ktest(tags("T14", "T18"))]
     fn scan_defers_last_target_put_until_control_unlock(
@@ -1117,7 +1222,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 匿名事件保持真实 stat、noop seek 和能力错误，不把兴趣数量当作对象能力。
+    /// 测试目标：验证 `EpollFile` 作为匿名内核文件对象的 `stat` 元数据、`seek` 空操作语义，以及不支持的文件操作和非法控制参数的错误码。
+    /// 场景步骤：
+    /// 1. 验证 `EpollFile::try_new(NONBLOCK)` 被拒绝，而 `CLOEXEC` 创建成功且两次创建的匿名 inode 编号递增；检查 `stat` 各字段默认值。
+    /// 2. 对 `EpollFile` 依次调用 `read`、`write`、`truncate`、`sync_range`、`read_at`、`write_at`、`seek`、`readdir` 与 `ioctl`。
+    /// 3. 验证将 `epoll` 自身或另一 `epoll` 实例注册为监听目标、传入未知事件位或 `maxevents = 0` 时的错误返回。
+    /// 预期结果：不支持的读写与控制操作分别返回 `InvalidOperation`、`IllegalSeek`、`NotDirectory` 或 `NotTty`，`seek` 始终返回 `Ok(0)`。
     #[test]
     #[ktest(tags("T13", "T14", "T18"))]
     fn anonymous_event_capabilities(
@@ -1226,7 +1336,13 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 实际 dup 表跨越旧额度；完整 data、陈旧复核、同键重加和 fd 复用都走原生产路径。
+    /// 测试目标：验证监听项数量跨越内部初始容量（127、128、129、1024）动态扩容时，64 位 `data` 完整性、陈旧水平触发复核、删除重加以及描述符复用均正常工作。
+    /// 场景步骤：
+    /// 1. 通过 `dup` 创建 `count` 个指向同一管道读端的描述符，全部注册到 `epoll` 并绑定高位 `base + fd` 数据；写入数据后调用 `scan_data` 校验全部交付。
+    /// 2. 读空管道后对 `epoll` 自身调用 `poll(None)`，验证所有陈旧的 LT 候选节点被一次性复核清空并返回空掩码。
+    /// 3. 删除中间编号描述符再重新添加，关闭首描述符 `first` 并将新管道复用在 `first` 编号上注册，向两个管道写入数据后校验 `count + 1` 项全部精确交付。
+    /// 4. 逆序逐个删除并关闭所有描述符，释放新旧管道读端。
+    /// 预期结果：所有规模下事件数据无截断或错位，全部引用释放后监听节点弱引用归零且写端返回 `BrokenPipe`。
     #[test]
     #[case("127", 127usize)]
     #[case("128", 128usize)]
@@ -1238,6 +1354,7 @@ pub(crate) mod events {
         fixture: &mut EpollOwner,
         count: usize,
     ) -> TestResult {
+        // Step 1: 批量复制描述符并注册 count 个监听项，验证首次全量扫描的数据完整性。
         fixture.prepare(context)?;
         let table = checked(context, FileTable::try_new())?;
         let first = checked(context, table.reserve(count + 1))?
@@ -1267,7 +1384,7 @@ pub(crate) mod events {
             bytes.len(),
         );
         context.expect_eq(old_bytes.as_slice(), bytes.as_slice());
-        // 全部 LT 候选已陈旧，自身 poll 必须一次走完真实增长规模的扫描拥有链。
+        // Step 2: 读空管道后查询 epoll 自身就绪态，验证全部陈旧 LT 候选节点被一次遍历清理。
         context.expect_eq(mask(context, fixture.owner())?, PollMask::default());
 
         checked(context, fixture.writer().write(bytes))?;
@@ -1284,6 +1401,7 @@ pub(crate) mod events {
             Some(event(PollMask::POLLIN.0, base + middle_fd as u64)),
         )?;
 
+        // Step 3: 关闭首描述符并在原编号上复用新管道，验证新旧管道事件互不干扰。
         checked(context, table.close(first))?;
         let (new_reader, new_writer) = checked(context, pipe::try_new(NONBLOCK, 0, 0))?;
         let reused = checked(context, table.reserve(count + 1))?
@@ -1317,6 +1435,7 @@ pub(crate) mod events {
         );
         context.expect_eq(new_bytes.as_slice(), replacement.as_slice());
 
+        // Step 4: 逆序注销并关闭所有描述符，确认全部监听节点与底层管道正常析构。
         for fd in (1..count).rev() {
             let lifetime = watch(fixture.epoll(), fixture.reader(), fd as i32);
             control_fd(context, fixture, &table, EPOLL_CTL_DEL, fd, None)?;
@@ -1339,7 +1458,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 千项 ready 和持续源在末事件拥有结束时分批撤销，原管道仍能完整消费后续字节。
+    /// 测试目标：验证当 1024 个已就绪监听项与上层 `PollTable` 同时存在时，直接销毁 `EpollFile` 能安全分批撤销所有底层唤醒源而不损坏原管道数据。
+    /// 场景步骤：
+    /// 1. 复制 1024 个管道读端描述符并全部注册到 `epoll`，写入 `"before-drop"` 使全部 1024 项进入就绪队列并扫描验证。
+    /// 2. 将 `epoll` 自身注册到上层 `PollTable`，随后直接丢弃 `EpollFile` 的唯一强引用。
+    /// 3. 向管道继续写入 `"after-drop"`，检查上层 `PollContext` 是否被误唤醒，并从管道读端读取全部字节。
+    /// 预期结果：`EpollFile` 及其 1024 个监听节点全部销毁，后续写入不再触发已销毁 `epoll` 的等待上下文，且管道先后写入的 21 字节被完整读出。
     #[test]
     #[ktest(tags("F08", "fs-epoll-growth"))]
     fn grown_ready_interests_last_epoll_drop_drains_all_sources(
@@ -1399,7 +1523,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 超过旧额度的独立目标在各自 emit 内失去最后描述符，扫描链逐项锁外 put 才能反向撤源。
+    /// 测试目标：验证超过内部批次容量的 129 个独立管道在同一次 `scan` 的回调中各自关闭最后一个描述符时，所有目标文件的析构均被安全推迟到锁外完成。
+    /// 场景步骤：
+    /// 1. 创建 129 对独立管道，向每个管道写入 `"payload"`，将读端存入描述符表并以 `EPOLLONESHOT` 注册到 `epoll`，随后丢弃栈上的读端变量。
+    /// 2. 调用一次 `scan(129, ...)`，在每项回调中读出 `"payload"`、关闭描述符表中的唯一 `fd`，并当场断言读端强引用计数仍为 `1` 且写端仍可写入 `"held"`。
+    /// 3. `scan` 返回后遍历全部 129 对管道，检查读端与监听节点的弱引用并对写端执行写入。
+    /// 预期结果：回调期间所有读端均由扫描帧保活；`scan` 结束后全部 129 个读端和监听节点均已释放，所有写端写入均返回 `BrokenPipe`。
     #[test]
     #[ktest(tags("F08", "fs-epoll-growth"))]
     fn grown_scan_defers_all_last_targets_until_control_unlock(
@@ -1469,7 +1598,12 @@ pub(crate) mod events {
         Ok(())
     }
 
-    /// 真实堆页耗尽使新兴趣返回 ENOMEM；已发表的超额候选无分配扫描，放压后同键可正式加入。
+    /// 测试目标：验证在内核堆与物理页耗尽（OOM）的内存压力下，新建 `epoll` 与新增监听项优雅返回 `NoMemory`，而已注册的 129 个监听项仍可无分配地正常扫描，且内存压力解除后可恢复注册。
+    /// 场景步骤：
+    /// 1. 预先注册 129 个管道描述符并写入数据，再额外复制一个描述符 `extra` 备用。
+    /// 2. 开启 `HeapPressure` 耗尽空闲物理页与堆内存，尝试调用 `EpollFile::try_new` 和对 `extra` 执行 `EPOLL_CTL_ADD`，随后对已有的 129 项执行 `scan`。
+    /// 3. 释放内存压力后，再次将 `extra` 注册到 `epoll` 并扫描全部 130 项。
+    /// 预期结果：OOM 期间创建与新增均返回 `FsError::NoMemory` 且未留下半成品节点，已注册的 129 项扫描无需内存分配即可全部成功交付；解除压力后第 130 项成功加入并交付。
     #[test]
     #[ktest(tags("F08", "fs-epoll-growth", "fs-oom"))]
     fn real_oom_preserves_grown_interests_and_recovers_add(
@@ -1499,6 +1633,7 @@ pub(crate) mod events {
         }
         let extra = checked(context, table.dup(first, count + 1))?;
 
+        // Step 1: 施加堆与页分配压力，验证 try_new 与 ADD 返回 NoMemory，而既有监听项扫描不受影响。
         let mut pressure = crate::cache::ktest::HeapPressure::prepare()?;
         let evidence = pressure.exhaust();
         let creation_error = EpollFile::try_new(0).err();
@@ -1533,6 +1668,7 @@ pub(crate) mod events {
         context.expect_eq(checked(context, scanned)?, count);
         context.expect_eq(seen[..count].iter().all(|slot| *slot), true);
 
+        // Step 2: 释放内存压力后重新注册 extra 描述符，验证控制路径恢复正常。
         control_fd(
             context,
             fixture,

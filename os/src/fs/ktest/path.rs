@@ -1,4 +1,35 @@
-//! 真实目录名字、逐组件路径和只读挂载的拥有与消费回归。
+//! VFS 路径解析、目录项缓存（`DentryCache`）、符号链接跟随、子树根边界、挂载点穿越与并发加载测试套件。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于文件系统内核测试子系统（`fs::ktest`）中，负责验证 `Vfs`、`FsContext`、`Path` 与 `DentryCache`
+//! 的路径查找与挂载生命周期语义。上游由 `fs::ktest` 测试注册表挂载执行，下游驱动 `Vfs`、`Ext4Volume`、
+//! `MemoryFs`（`tmpfs`/`procfs`/`devfs`）以及并发测试工作线程（`Owner`）。
+//!
+//! # 核心设计与目录项并发加载状态机
+//! 本模块围绕两项核心机制展开测试：
+//! 1. **挂载树与路径边界遍历**：验证 `.`、`..`、多余 `/`、非 UTF-8 原始字节文件名、最多 40 层符号链接展开、
+//!    显式子树根（`chroot` 风格边界）以及跨磁盘/内存文件系统的挂载覆盖（Mount Shadowing）与忙状态（`FsError::Busy`）卸载保护。
+//! 2. **目录项单飞（Singleflight）并发加载协议**：验证多个线程并发查找同一未缓存目录项时的等待合并与唤醒行为：
+//!
+//! ```text
+//!   线程 0 (Loader)                      线程 1, 2 (Waiters)
+//!   ----------------                     -------------------
+//!   lookup("pattern")
+//!     |-> 插入 InLookup 占位槽
+//!     |-> 触发 lookup_hook 阻塞在 gate    lookup("pattern")
+//!     |                                    |-> 命中 InLookup 占位槽
+//!     |                                    |-> 登记为等待者并睡眠等待
+//!     |   (此刻另一线程查找 "/empty" 不受阻塞，可独立完成)
+//!     |<-- gate.complete() 放行
+//!     |-> 完成后端磁盘目录查找与 Inode 加载
+//!     |   - 成功: 替换为正缓存 Dentry，唤醒线程 1, 2 共享同一 DentryRef 与 InodeRef
+//!     |   - 失败(如 Checksum): 移除占位槽(不留负缓存)，唤醒线程 1, 2 传播相同错误
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 测试线程与后台工作线程遵循 VFS 锁层级：挂载表锁 -> `DentryCache` 分片锁 -> `InodeCache` 锁 -> 底层卷元数据锁。
+//! - `lookup_hook` 在 `DentryCache` 释放内部自旋锁后、发起后端磁盘查找前触发阻塞，因此在 `gate.wait()` 期间不会持有自旋锁，其他无关目录项的查找可以并发推进。
+//! - 测试收尾（`quiesce`）必须先卸载 `lookup_hook` 并打开 `gate` 唤醒所有阻塞的工作线程，等待线程全部汇合（Join）并释放持有的 `Path`/`Vfs`/`Ext4Volume` 后，再停止底层块设备。
 
 use crate::fs::dentry::DentryRef;
 use crate::fs::file::{open_path_with_flags, FileIoContext};
@@ -6,23 +37,29 @@ use crate::fs::ktest::*;
 use crate::fs::memfs::{Filesystem, MemoryFs, MemoryFsKind, MemorySpecial};
 use crate::fs::{FsContext, Path, ResolveMode, Vfs};
 
+/// 路径与挂载测试夹具，在底层块设备夹具 `Owner` 之上维护当前用例的 `Vfs`、查找上下文与根卷实例。
 pub(super) struct PathOwner {
+    /// 底层块设备、Inode 缓存、并发工作线程与内存压力夹具。
     pub(super) owner: Owner,
+    /// 当前测试用例创建的虚拟文件系统实例；在 `prepare_path` 后初始化，在 `release_view` 时释放。
     vfs: Option<Arc<Vfs>>,
+    /// 当前测试用例的默认文件系统路径上下文（持有根目录与当前工作目录 `Path`）。
     context: Option<FsContext>,
+    /// 当前测试用例打开的根 ext4 卷引用。
     volume: Option<Arc<Ext4Volume>>,
 }
 
 impl PathOwner {
-    /// 按显式模式与挂载容量准备根视图，失败时原设备保留完整停止责任。
+    /// 按指定的访问模式 `mode` 与最大挂载容量 `mount_capacity` 打开 ext4 根卷并构建 `Vfs` 与 `FsContext`，同时安装针对 `"pattern"` 目录项的并发查找拦截钩子。
     pub(super) fn prepare_path(
         &mut self,
         context: &TestContext<'_>,
         mode: AccessMode,
         mount_capacity: usize,
     ) -> TestResult {
-        // 同一 gate 只观察名字加载，不能同时暂停另一个名字的 inode 后端。
+        // Step 1: 清除 Inode 缓存上的加载钩子，确保门控（gate）仅在目录项查找阶段拦截，避免在 Inode 加载阶段重复阻塞。
         self.owner.cache().ktest_set_load_hook(None);
+        // Step 2: 打开底层 ext4 卷并创建 `Vfs` 实例与根路径上下文 `FsContext`。
         let volume = checked(
             context,
             Ext4Volume::open(BlockView::whole(self.owner.disk()?.clone()), mode, 64),
@@ -40,6 +77,7 @@ impl PathOwner {
         .map_err(|_| TestError("path view owner OOM"))?;
         let fs_context = checked(context, FsContext::new(vfs.root(), vfs.root()))?;
 
+        // Step 3: 注册 `DentryCache` 查找钩子：当 `hold_loader` 置位且查找目标为 `"pattern"` 时，记录进入计数并在门控上阻塞等待。
         let observer = self.owner.observer().clone();
         let hook: Arc<dyn Fn(&DentryRef) + Send + Sync> =
             Arc::try_new(move |dentry: &DentryRef| {
@@ -59,19 +97,19 @@ impl PathOwner {
         Ok(())
     }
 
-    /// 正文借用完整视图，静止化之后不再允许取得新的路径。
+    /// 获取当前已初始化的 `Vfs` 实例引用；若在初始化前或 `release_view` 后调用则触发 panic。
     pub(super) fn vfs(&self) -> &Arc<Vfs> {
         self.vfs.as_ref().expect("path view consumed before body")
     }
 
-    /// 根与工作目录均持有真实 Path，不从当前任务推导查找上下文。
+    /// 获取当前已初始化的 `FsContext` 查找上下文引用（包含测试根目录与当前工作目录）。
     pub(super) fn context(&self) -> &FsContext {
         self.context
             .as_ref()
             .expect("path context consumed before body")
     }
 
-    /// 真实任务已停稳、外部 Path 已释放后撤观察入口并释放本例 FS 视图。
+    /// 移除 `DentryCache` 查找钩子，并按顺序释放 `FsContext`、`Vfs` 与 `Ext4Volume` 强引用。
     pub(super) fn release_view(&mut self) {
         if let Some(vfs) = &self.vfs {
             vfs.dcache().ktest_set_lookup_hook(None);
@@ -81,7 +119,7 @@ impl PathOwner {
         drop(self.volume.take());
     }
 
-    /// 普通路径错误保留生产原因，成功结果仍由调用者拥有。
+    /// 在默认 `FsContext` 下以跟随符号链接模式（`ResolveMode::Follow`）解析路径 `pathname`。
     fn resolve(&self, context: &TestContext<'_>, pathname: &[u8]) -> Result<Path, TestError> {
         checked(
             context,
@@ -90,7 +128,7 @@ impl PathOwner {
         )
     }
 
-    /// 清理自己的观察入口后真 join，释放所有路径与卷，再停止真实设备。
+    /// 停止测试夹具：先移除查找钩子并放行门控以唤醒所有阻塞的工作线程，等待工作线程全部退出后释放 VFS 视图并停止底层块设备。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         if let Some(vfs) = &self.vfs {
             vfs.dcache().ktest_set_lookup_hook(None);
@@ -107,7 +145,7 @@ impl PathOwner {
 }
 
 impl Fixture<DeviceInventory> for PathOwner {
-    /// 每例只构造完整原设备拥有者，卷与路径的准备失败属于正文并保留正常清理责任。
+    /// 初始化测试夹具的底层块设备与工作线程资源（`Vfs` 视图留待测试正文中按需调用 `prepare_path` 构建）。
     fn set_up(
         context: &mut TestContext<'_>,
         inventory: &DeviceInventory,
@@ -120,12 +158,12 @@ impl Fixture<DeviceInventory> for PathOwner {
         })
     }
 
-    /// 框架在失败时也保留本例原对象，无法收敛由既有 case-abort 终结。
+    /// 在测试结束或失败时执行静默化清理，确保所有后台任务汇合且块设备安全停止。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         PathOwner::quiesce(self, context)
     }
 
-    /// 路径、任务和卷已结束后消费原设备拥有者，核第二层完整六域。
+    /// 销毁测试夹具，释放残留的 `FsContext`、`Vfs` 与 `Ext4Volume` 引用，并校验底层设备与缓存的引用计数归零。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let Self {
             owner,
@@ -140,7 +178,7 @@ impl Fixture<DeviceInventory> for PathOwner {
     }
 }
 
-/// 读取消费者可见的完整首段图样，不以 inode 编号或名字缓存命中替代数据。
+/// 辅助验证函数：通过 `path` 获取目标 `Inode`，校验其文件大小等于 `PATTERN_SIZE`，并读取前 4096 字节验证内容符合预期测试图样。
 fn read_pattern(context: &mut TestContext<'_>, path: &Path) -> TestResult {
     let inode = checked(context, path.inode())?;
     context.expect_eq(
@@ -153,7 +191,7 @@ fn read_pattern(context: &mut TestContext<'_>, path: &Path) -> TestResult {
     Ok(())
 }
 
-/// 负名字与真实加载错误都通过最终 inode 消费分类，不假定缓存返回对象的形状。
+/// 辅助查找函数：在 `parent` 目录下查找 `name` 并尝试获取其关联 `Inode`，提取查找或加载过程中产生的 `FsError`。
 fn lookup_error(vfs: &Vfs, parent: &DentryRef, name: &[u8]) -> Option<FsError> {
     vfs.dcache()
         .lookup(vfs.inodes(), parent, name)
@@ -161,7 +199,7 @@ fn lookup_error(vfs: &Vfs, parent: &DentryRef, name: &[u8]) -> Option<FsError> {
         .err()
 }
 
-/// 父入口只并入真实静态宏锚点，不另建中央 case 名单。
+/// 返回本模块下全部 7 个路径测试套件的静态注册槽位数组，供上层 `fs::ktest` 统一挂载。
 pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
     [
         walk::__ktest_anchor(),
@@ -178,13 +216,20 @@ pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 7] {
 pub(crate) mod walk {
     use super::*;
 
-    /// 组件必须先存在且为目录，字节名与两个硬链接保持各自名字和同一文件身份。
+    /// 验证路径组件解析规则、`.` 与 `..` 导航、非目录组件拦截、非法名称过滤、硬链接身份共享以及非 UTF-8 原始字节文件名读取。
+    ///
+    /// # 测试目标
+    /// - 验证连续斜杠 `////`、`.`、`..` 在存在目录上的正确折叠与回退，以及不存在的中间组件（如 `/absent/..`）不会被 `..` 静默消解而是返回 `FsError::NotFound`。
+    /// - 验证将普通文件当作目录遍历（如 `/pattern/`、`/pattern/.`）返回 `FsError::NotDirectory`，含空字节 `\0`、斜杠或超长名称返回 `InvalidName` / `NameTooLong`。
+    /// - 验证硬链接 `/pattern` 与 `/hardlink` 拥有各自独立的 `Dentry` 但共享同一个 `Inode` 与 `AddressSpace` 实例。
+    /// - 验证非 UTF-8 原始字节文件名 `/name-\xff\xfe` 可正常解析并读取内容。
     #[test]
     #[ktest(tags("B16", "B17", "B19"))]
     fn components_bytes_and_types(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 准备只读 VFS 并验证多斜杠、`.` 与 `..` 在合法目录层级上的解析结果。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs();
         let root = fixture.resolve(context, b"////")?;
@@ -200,6 +245,7 @@ pub(crate) mod walk {
             true,
         );
 
+        // Step 2: 验证缺失父目录、在普通文件后追加路径组件、非法字符与超长组件名等错误分类。
         for pathname in [b"/absent/..".as_slice(), b"/walk/absent/../sub"] {
             context.expect_eq(
                 vfs.resolve(fixture.context(), pathname, ResolveMode::Follow)
@@ -240,6 +286,7 @@ pub(crate) mod walk {
             Some(FsError::NameTooLong),
         );
 
+        // Step 3: 验证两个硬链接路径拥有不同 `Dentry` 但指向同一 `Inode` 与页缓存映射，且均可读出完整图样。
         let file = fixture.resolve(context, b"/pattern")?;
         let hard = fixture.resolve(context, b"/hardlink")?;
         context.expect_eq(
@@ -261,6 +308,7 @@ pub(crate) mod walk {
         read_pattern(context, &file)?;
         read_pattern(context, &hard)?;
 
+        // Step 4: 验证包含非 UTF-8 字节的文件名解析与内容读取。
         let raw = fixture.resolve(context, b"/name-\xff\xfe")?;
         context.expect_eq(raw.dentry().name().as_slice(), b"name-\xff\xfe".as_slice());
         let mut bytes = [0xa7; 9];
@@ -275,13 +323,14 @@ pub(crate) mod walk {
         Ok(())
     }
 
-    /// 同一可写卷的独立挂载视图共用 inode，RO 视图拒绝写意图但读取原文件内容。
+    /// 验证同一个可写 `Ext4Volume` 同时挂载到只读（RO）与可写（RW）两个 `Vfs` 视图时，两者共享底层卷与 `Inode` 实例，且只读视图拒绝写权限检查与写打开请求。
     #[test]
     #[ktest(tags("W01"))]
     fn rw_volume_keeps_readonly_mount_view(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 两次以可写模式打开同一块设备视图，验证返回同一个 `Ext4Volume` 强引用实例。
         let volume = checked(
             context,
             Ext4Volume::open(
@@ -300,6 +349,7 @@ pub(crate) mod walk {
         )?;
         context.expect_eq(Arc::ptr_eq(&volume, &reopened), true);
 
+        // Step 2: 基于该可写卷分别构建只读 `Vfs`（`ro`）和可写 `Vfs`（`rw`），解析同一文件 `/pattern`。
         let ro = checked(
             context,
             Vfs::try_new(
@@ -331,6 +381,7 @@ pub(crate) mod walk {
             rw.resolve(&rw_context, b"/pattern", ResolveMode::Follow),
         )?;
 
+        // Step 3: 验证两个视图解析出的路径指向同一 `Inode`，只读视图拒绝写访问（`FsError::ReadOnly`），而两个视图均可正常读取文件内容。
         context.expect_eq(
             checked(context, ro_file.inode())?.ptr_eq(checked(context, rw_file.inode())?),
             true,
@@ -355,13 +406,14 @@ pub(crate) mod walk {
         Ok(())
     }
 
-    /// RAM 根与原 inode 缓存持续存活时，同盘普通卸载允许切换写模式并冷读同步后的完整数据。
+    /// 验证在内存根文件系统（`tmpfs`）和 `InodeCache` 持续存活期间，同一块设备卷历经“只读挂载 -> 卸载 -> 可写重新挂载修改同步 -> 卸载 -> 只读重新挂载”全流程的数据持久化与生命周期管理。
     #[test]
     #[ktest(tags("fs-mount-lifetime"))]
     fn ro_unmount_rw_reopen_persists_file(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 以 `tmpfs` 作为根文件系统创建 `Vfs`，建立 `/disk` 挂载点并以只读模式首次挂载 ext4 卷，读取校验 `/disk/pattern` 内容后卸载。
         let memory = checked(context, MemoryFs::try_new(MemoryFsKind::Tmpfs, 0o755))?;
         fixture.vfs = Some(
             Arc::try_new(checked(
@@ -418,6 +470,7 @@ pub(crate) mod walk {
         }
         checked(context, vfs.unmount(&covered))?;
 
+        // Step 2: 以可写模式重新打开并挂载同一块设备卷，创建临时文件、写入数据、重命名、截断并执行 `sync` 刷盘后再次卸载。
         let volume = checked(
             context,
             Ext4Volume::open(view.clone(), AccessMode::ReadWrite, 64),
@@ -461,6 +514,7 @@ pub(crate) mod walk {
         }
         checked(context, vfs.unmount(&covered))?;
 
+        // Step 3: 再次以只读模式打开并挂载该卷，验证重命名前的旧路径不存在，重命名并截断后的文件大小与内容已持久化到磁盘。
         let volume = checked(context, Ext4Volume::open(view, AccessMode::ReadOnly, 64))?;
         checked(
             context,
@@ -489,13 +543,14 @@ pub(crate) mod walk {
         Ok(())
     }
 
-    /// 链接消费父目录、当前根和末尾目录语义，缓存命中也服从 NoFollow 与四十次上限。
+    /// 验证相对/绝对符号链接解析、`ResolveMode::Follow` 与 `ResolveMode::NoFollow` 切换、末尾斜杠强制目录语义以及 40 层符号链接展开上限（`FsError::TooManySymlinks`）。
     #[test]
     #[ktest(tags("B18"))]
     fn links_follow_modes_and_limit(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 在工作目录 `/walk` 下跟随解析相对符号链接、绝对符号链接与双跳符号链接链，验证均指向 `/pattern`。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs();
         let walk = fixture.resolve(context, b"/walk")?;
@@ -514,6 +569,7 @@ pub(crate) mod walk {
             read_pattern(context, &path)?;
         }
 
+        // Step 2: 验证交替使用 `Follow` 与 `NoFollow` 解析同一缓存符号链接时，分别返回目标普通文件与符号链接自身。
         for mode in [
             ResolveMode::Follow,
             ResolveMode::NoFollow,
@@ -532,6 +588,7 @@ pub(crate) mod walk {
             );
         }
 
+        // Step 3: 验证指向目录的符号链接在末尾带 `/` 或 `/..` 时即使指定 `NoFollow` 也会跟随进入目标目录，而指向普通文件的符号链接带末尾 `/` 返回 `FsError::NotDirectory`。
         let link = checked(
             context,
             vfs.resolve(&cwd, b"directory", ResolveMode::NoFollow),
@@ -561,6 +618,7 @@ pub(crate) mod walk {
             Some(FsError::NotDirectory),
         );
 
+        // Step 4: 验证超过 40 层的符号链接链（`chain01`）与自环符号链接（`loop`）在 `Follow` 下返回 `FsError::TooManySymlinks`，而在 `NoFollow` 下可正常读取链接自身内容。
         for pathname in [b"chain01".as_slice(), b"loop"] {
             context.expect_eq(
                 vfs.resolve(&cwd, pathname, ResolveMode::Follow).err(),
@@ -580,7 +638,9 @@ pub(crate) mod walk {
 pub(crate) mod boundary {
     use super::*;
 
-    /// 显式子树根限制点点与绝对链接，工作目录必须位于该根的真实祖先关系内。
+    /// 验证显式指定子树根目录（Scoped Root）时的路径越界限制与工作目录合法性校验：
+    /// - `..` 回退与绝对路径（包括绝对符号链接）均被限制在子树根 `/walk` 内部，无法逃逸到上层目录；
+    /// - 若工作目录不在子树根的派生层级内，或根目录/工作目录不是目录类型，则拒绝构造 `FsContext`。
     #[test]
     #[ktest(tags("B17", "B18"))]
     fn scoped_root_and_cwd(context: &mut TestContext<'_>, fixture: &mut PathOwner) -> TestResult {
@@ -621,13 +681,19 @@ pub(crate) mod boundary {
 pub(crate) mod mounts {
     use super::*;
 
-    /// 第二个真实磁盘穿越有独立文件身份，活 Path 阻止普通卸载且点点退回父视图。
+    /// 验证跨磁盘挂载点穿越、父目录 `..` 回退、同卷多点挂载（Bind/Alias Mount）以及活跃 `Path` 引用阻止卸载（`FsError::Busy`）的生命周期语义。
+    ///
+    /// # 测试目标
+    /// - 验证在 `/mnt/extra` 挂载第二块 ext4 磁盘后，路径解析切换到新卷根 Inode，且 `/mnt/extra/..` 正确回退到宿主挂载点的父目录 `/mnt`。
+    /// - 验证同一 `Ext4Volume` 同时挂载到 `/mnt/extra` 与 `/walk` 时，两个挂载根拥有不同 `Path` 但共享同一个根 `Inode`。
+    /// - 验证只要存在指向挂载子树内部目录或文件的活跃 `Path`（或 `FsContext`）引用，`unmount` 即返回 `FsError::Busy`；待全部引用释放后方可成功卸载并恢复被遮蔽的原目录视图。
     #[test]
     #[ktest(tags("B16", "B18", "B23"))]
     fn second_disk_busy_release_and_parent(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 打开第二块磁盘的 ext4 卷并挂载到 `/mnt/extra`，验证挂载根切换、跨卷 Inode 身份隔离以及 `/mnt/extra/..` 回退到 `/mnt`。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs();
         let covered = fixture.resolve(context, b"/mnt/extra")?;
@@ -668,6 +734,7 @@ pub(crate) mod mounts {
             true,
         );
 
+        // Step 2: 验证以挂载点为子树根时的 `..` 边界，并读取挂载卷内的 `/mnt/extra/pattern` 文件。
         let extra_context = checked(context, FsContext::new(mounted.clone(), mounted.clone()))?;
         context.expect_eq(
             checked(
@@ -689,6 +756,7 @@ pub(crate) mod mounts {
         );
         read_pattern(context, &file)?;
 
+        // Step 3: 将同一个卷再次挂载到 `/walk`，验证共享根 Inode、活跃引用阻止卸载与重复挂载返回 `FsError::Busy`。
         checked(
             context,
             vfs.mount(
@@ -716,6 +784,7 @@ pub(crate) mod mounts {
         drop(alias);
         checked(context, vfs.unmount(&other))?;
 
+        // Step 4: 逐步释放 `extra_context`、`mounted` 与 `file` 引用，验证在最后一个内部引用释放前卸载返回 `FsError::Busy`，全部释放后卸载成功并恢复原 `/mnt/extra` 目录。
         context.expect_eq(vfs.unmount(&covered).err(), Some(FsError::Busy));
         drop(extra_context);
         drop(mounted);
@@ -737,6 +806,7 @@ pub(crate) mod mounts {
             Some(FsError::NotFound),
         );
 
+        // Step 5: 清理缓存后再次挂载并重读文件，验证卸载后再挂载工作正常且不影响宿主根卷文件读取。
         vfs.prune_unused();
         checked(
             context,
@@ -754,13 +824,20 @@ pub(crate) mod mounts {
         Ok(())
     }
 
-    /// 同一VFS挂入RAM目录，真实名字修改、清缓存、挂点转义与Busy卸载共用原路径协议。
+    /// 验证在同一 VFS 中混合挂载 `tmpfs`、`procfs` 与 `devfs` 内存文件系统时的目录增删、硬链接/符号链接、目录重命名、跨设备硬链接拦截、`/proc/mounts` 特殊字符八进制转义以及设备节点权限检查。
+    ///
+    /// # 测试目标
+    /// - 验证在 `tmpfs` 中创建含空格、制表符、换行、反斜杠与 `#` 的目录名，验证空目录删除、非空目录拒绝删除（`FsError::NotEmpty`）、同卷硬链接与符号链接创建。
+    /// - 验证目录重命名后 `..` 自动指向新父目录，拒绝将父目录重命名到自身子孙目录中（`FsError::InvalidOperation`），并拒绝跨文件系统创建硬链接（`FsError::CrossDevice`）。
+    /// - 验证嵌套挂载 `procfs` 后，`mounts_text` 生成的挂载表快照正确对挂载路径中的空白和特殊字符进行八进制转义（如 `\040`、`\011`、`\012`、`\134`、`\043`）。
+    /// - 验证只读挂载 `devfs` 下的字符设备节点（`null`）遵守只读挂载限制与 UID/GID 权限位检查，最后验证删除全部硬链接后链接计数归零但已打开的 `Path` 仍保持同一 `Inode`。
     #[test]
     #[ktest(tags("T01", "T30", "fs-path-memory"))]
     fn memory_names_and_actual_mount_snapshot(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 在 `/mnt/extra` 挂载可写 `tmpfs`，创建包含特殊字符的目录层级，并验证 `rmdir` 对空目录和非空目录的处理。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs();
         let fs_context = fixture.context();
@@ -815,6 +892,7 @@ pub(crate) mod mounts {
             Some(FsError::NotEmpty),
         );
 
+        // Step 2: 在 `tmpfs` 内创建普通文件、硬链接与相对符号链接，验证三者解析到同一个 `Inode`。
         let file = checked(
             context,
             vfs.open_with(
@@ -858,6 +936,7 @@ pub(crate) mod mounts {
             true,
         );
 
+        // Step 3: 将目录 `/mnt/extra/a` 重命名为 `/mnt/extra/b/moved`，验证 `..` 父指针更新、拒绝目录自环移动以及拒绝跨卷硬链接。
         checked(
             context,
             vfs.rename_from(
@@ -902,6 +981,7 @@ pub(crate) mod mounts {
             Some(FsError::CrossDevice),
         );
 
+        // Step 4: 在含特殊字符的子目录上嵌套只读挂载 `procfs`，校验 `mounts_text` 输出的设备号、文件系统类型及八进制转义路径。
         drop(file);
         vfs.prune_unused();
         let reopened = fixture.resolve(context, b"/mnt/extra/b/moved/file")?;
@@ -955,6 +1035,7 @@ pub(crate) mod mounts {
             2,
         );
 
+        // Step 5: 卸载 `procfs` 后在同一位置只读挂载 `devfs` 并初始化 `null` 设备节点，验证只读挂载拦截与 root/非 root 用户权限检查。
         let devfs = checked(context, MemoryFs::try_new(MemoryFsKind::Devfs, 0o755))?;
         checked(
             context,
@@ -981,6 +1062,7 @@ pub(crate) mod mounts {
         drop(device);
         checked(context, vfs.unmount(&nested))?;
 
+        // Step 6: 依次 `unlink` 删除文件的两个硬链接路径，验证链接计数递减至 0，释放全部活跃 `Path` 引用后卸载 `tmpfs`。
         checked(
             context,
             vfs.unlink_from(
@@ -1015,13 +1097,19 @@ pub(crate) mod mounts {
 pub(crate) mod pruning {
     use super::*;
 
-    /// 正负名字有界回收不修改盘面，活孩子仍保持父身份，放弃后可重新查得同一文件。
+    /// 验证 `DentryCache` 对正缓存项（Positive Dentry）、负缓存项（Negative Dentry）及父目录引用的按需回收（`prune_unused`）行为。
+    ///
+    /// # 测试目标
+    /// - 验证查找不存在的名称后生成负缓存项，重复查找直接命中负缓存而不触发后端磁盘查找；调用 `prune_unused` 可回收无外部引用的负缓存项。
+    /// - 验证被外部 `Path` 持有的正缓存项不会被 `prune_unused` 回收；释放 `Path` 后正缓存项可被回收，再次解析时重新从磁盘加载同一 Inode 号。
+    /// - 验证当子目录 `/walk/sub` 被外部持有时，其父目录 `/walk` 通过子目录的父指针保持存活，不会在 `prune_unused` 中丢失身份。
     #[test]
     #[ktest(tags("B23"))]
     fn clean_positive_negative_and_parent(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 解析 `/pattern` 建立正缓存，查找两次 `"absent"` 验证第二次命中负缓存，随后调用 `prune_unused` 回收负缓存项而保留被持有的 `/pattern`。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs();
         let root = vfs.root();
@@ -1041,6 +1129,7 @@ pub(crate) mod pruning {
         context.expect_eq(vfs.dcache().prune_unused(), 1);
         context.expect_eq(fixture.resolve(context, b"/pattern")?.ptr_eq(&file), true);
 
+        // Step 2: 释放 `/pattern` 的 `Path` 引用并调用 `prune_unused` 清空目录项缓存，验证重新解析与再次查找 `"absent"` 均触发后端重新加载。
         drop(file);
         context.expect_eq(vfs.dcache().prune_unused(), 1);
         context.expect_eq(vfs.dcache().is_empty(), true);
@@ -1053,6 +1142,7 @@ pub(crate) mod pruning {
         );
         context.expect_eq(vfs.dcache().ktest_load_count(), loads + 3);
 
+        // Step 3: 持有子目录 `/walk/sub` 并执行 `prune_unused`，验证父目录 `/walk` 的 `Dentry` 被子目录保活且身份不变。
         let sub = fixture.resolve(context, b"/walk/sub")?;
         let parent = sub
             .dentry()
@@ -1073,7 +1163,7 @@ pub(crate) mod pruning {
         Ok(())
     }
 
-    /// 两个 inode 槽顺序读取已关闭的文件，名字缓存不得阻止有限回收和下一次真实查找。
+    /// 验证当 `InodeCache` 容量受限时（仅 2 个槽位：根目录占 1 个，普通文件占 1 个），关闭上一个文件后，`DentryCache` 中未使用的缓存项不会阻碍 `InodeCache` 回收旧 Inode 并加载新文件。
     #[test]
     #[ktest(tags("B23", "fs-path-cache-budget"))]
     fn inode_budget_reclaims_unused_names(
@@ -1101,8 +1191,12 @@ pub(crate) mod pruning {
     }
 }
 
-/// 同名加载停点只挡 pattern，真实等待者登记后才放行首次真实后端查找。
+/// 辅助并发测试驱动函数：启动 3 个工作线程同时查找根目录下的 `"pattern"`，验证 `DentryCache` 的单飞（Singleflight）并发加载与等待者唤醒机制。
+///
+/// - 当 `failure == false` 时，验证仅首个线程执行后端查找，其余两个等待线程被唤醒后共享完全相同的 `DentryRef` 与 `InodeRef`。
+/// - 当 `failure == true` 时（配合损坏的 Inode CRC 镜像），验证全部 3 个线程均收到 `FsError::Checksum`，且失败条目不会残留在 `DentryCache` 中成为负缓存。
 fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bool) -> TestResult {
+    // Step 1: 开启 `hold_loader` 拦截标志并依次发布 3 个查找 `"pattern"` 的工作任务，等待线程 0 进入 `InLookup` 阻塞点且线程 1、2 登记为等待者。
     fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
     let vfs = fixture.vfs().clone();
     let root = vfs.root();
@@ -1141,6 +1235,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
     })?;
     context.expect_eq(vfs.dcache().ktest_load_count(), before_load + 1);
 
+    // Step 2: 清除拦截标志并打开门控放行线程 0，等待全部 3 个工作线程执行完毕。
     fixture
         .owner
         .observer()
@@ -1153,6 +1248,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
         &mut *fixture.owner.observer().results.lock(),
         [const { None }; 3],
     );
+    // Step 3: 根据 `failure` 模式校验返回结果：失败模式下验证错误传播且未残留缓存项；成功模式下验证 3 个线程共享同一 `Dentry` 与 `Inode` 且后端仅加载 1 次。
     if failure {
         for result in results {
             context.expect_eq(result.and_then(Result::err), Some(FsError::Checksum));
@@ -1205,7 +1301,7 @@ fn same_name(context: &mut TestContext<'_>, fixture: &mut PathOwner, failure: bo
 pub(crate) mod loading {
     use super::*;
 
-    /// 三个原生任务消费同一名字与 inode，首次后端查找只有一个胜出者。
+    /// 验证 3 个并发内核线程同时查找同一未缓存目录项 `"pattern"` 时，仅由单个加载线程发起后端磁盘查找，其余等待线程登记等待并在完成后共享同一 `Dentry` 与 `Inode` 实例。
     #[test]
     fn registered_waiters_share_name(
         context: &mut TestContext<'_>,
@@ -1214,13 +1310,14 @@ pub(crate) mod loading {
         same_name(context, fixture, false)
     }
 
-    /// 一个名字停在已发表加载点时，另一原生任务仍能完整读出不同名字。
+    /// 验证当一个线程在查找 `"pattern"` 处于 `InLookup` 阻塞等待状态时，另一个线程查找不相关的路径 `"/empty"` 不会被阻塞，能够独立完成路径解析与文件读取。
     #[test]
     #[ktest(tags("B15"))]
     fn other_name_progresses_while_loader_held(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 开启 `hold_loader` 并让工作线程 0 在查找 `"pattern"` 时阻塞于 `InLookup` 状态。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs().clone();
         let root = vfs.root();
@@ -1247,6 +1344,7 @@ pub(crate) mod loading {
                 && fixture.owner.observer().blocked(0)
         })?;
 
+        // Step 2: 在线程 0 仍处于阻塞状态时，发布工作线程 1 解析 `"/empty"`，验证线程 1 独立完成解析并成功读取空文件。
         fixture.owner.publish(
             1,
             Job::Resolve {
@@ -1279,6 +1377,7 @@ pub(crate) mod loading {
             InodeKind::Regular,
         );
 
+        // Step 3: 放行门控唤醒线程 0，验证 `"pattern"` 查找随后正常完成且文件内容可读。
         fixture
             .owner
             .observer()
@@ -1312,7 +1411,7 @@ pub(crate) mod loading {
 pub(crate) mod checksum {
     use super::*;
 
-    /// 普通 inode CRC 副本使两个真实等待者收到原 Checksum，失败名字不成为负缓存。
+    /// 验证并发查找的目标 Inode 发生 CRC 校验失败时，加载线程与所有已登记的等待线程均收到 `FsError::Checksum`，且失败的目录项从缓存中移除（不转为负缓存）。
     #[test]
     #[ktest(tags("B12"))]
     fn checksum_wakes_waiters_and_unhashes(
@@ -1327,13 +1426,14 @@ pub(crate) mod checksum {
 pub(crate) mod oom {
     use super::*;
 
-    /// 真实页和堆压力下命中保持身份，新名字失败不留下占位，放压后可读原盘文件。
+    /// 验证在物理页与内核堆同时耗尽（OOM）的压力下，已缓存的目录项仍能正常命中并保持同一 `Dentry` 身份，未命中的新目录项查找返回 `FsError::NoMemory` 且不在 `DentryCache` 中残留占位项，解除内存压力后可正常解析读取。
     #[test]
     #[ktest(tags("B23"))]
     fn real_pressure_miss_recovers(
         context: &mut TestContext<'_>,
         fixture: &mut PathOwner,
     ) -> TestResult {
+        // Step 1: 预先解析并缓存 `"/pattern"`，随后将内存压力容器移交给工作线程，在 OOM 条件下测试缓存命中（`"pattern"`）与未命中查找（`"empty"`）。
         fixture.prepare_path(context, AccessMode::ReadOnly, 4)?;
         let vfs = fixture.vfs().clone();
         let cached = fixture.resolve(context, b"/pattern")?;
@@ -1357,6 +1457,7 @@ pub(crate) mod oom {
         );
         fixture.owner.join_tasks()?;
 
+        // Step 2: 校验工作线程在 OOM 期间的观测结果：已缓存目录项命中原实例，新名称查找返回 `FsError::NoMemory`，缓存条目数与块设备 I/O 提交数均未增加。
         let returned = fixture.owner.observer().results.lock()[0]
             .take()
             .ok_or(TestError("path OOM result absent"))?;
@@ -1381,6 +1482,7 @@ pub(crate) mod oom {
         context.expect_eq(submitted_after, submitted_before);
         context.expect_eq(vfs.dcache().ktest_waiting(root.dentry(), b"empty"), 0);
 
+        // Step 3: 验证内存压力释放后，`"/empty"` 可正常解析并读取，且 `"/pattern"` 依旧命中原有缓存路径。
         let empty = fixture.resolve(context, b"/empty")?;
         let mut bytes = [0xa7; 1];
         context.expect_eq(

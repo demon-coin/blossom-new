@@ -1,4 +1,57 @@
-//! UDP 每个端点独立拥有原协议队列、操作权和后台工作；输入短锁只移动完整拥有。
+//! UDP 传输端点（`UdpEndpoint`）与数据报收发状态管理。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于网络协议栈的传输层，向上承接 `net::socket` 中的数据报套接字文件描述，向下依赖：
+//! - `smoltcp::socket::udp::Socket`：管理收发方向的离散数据报记录槽位（`PACKET_RECORDS`）与有效载荷环形缓冲区（`PAYLOAD_CAPACITY`）；
+//! - `net::table::NetTables`：维护全局 UDP 端口绑定租约（`BindLease`）及接收查找索引；
+//! - `net::NetStack`：执行出口路由解析、IP/UDP 报文发送与接收分发，以及端点的异步退休回收；
+//! - `workqueue::Work`：在后台异步消费输入数据报队列并向网络栈刷出待发送数据报。
+//!
+//! # 核心设计与数据流转
+//!
+//! ## 1. 延迟缓冲区分配与租约旁表（`leases`）
+//! - **冷启动与延迟分配**：`UdpEndpoint::try_new` 创建时仅初始化零容量的 `udp::Socket`，不在套接字刚打开时分配
+//!   两份 128 KiB 的收发缓冲区；直到首次执行 `bind`、`connect` 或 `send` 时才通过 `State::prepare_buffers` 在堆上分配。
+//! - **逐包端口租约保活**：每次 `send` 成功将一条数据报写入 `udp::Socket` 发送队列时，都会在 `State::leases`
+//!   队列末尾同步推入一份当前 `BindLease` 的 `Arc` 克隆；后台 `dispatch` 取出并发送该条数据报时再从 `leases`
+//!   队首弹出并附加到 `OwnedPacket` 上。这样即使应用层在数据报发出前断开重绑或关闭套接字，在途数据报占用的源端口也不会被提前复用。
+//!
+//! ```text
+//!   [用户态 send / sendto]                     [后台 Work: run_udp]
+//!             |                                         |
+//!   1. 解析路由与源端口租约 (BindLease)         1. process_input: 从 input.packets
+//!   2. prepare_buffers() 按需分配 128KiB 缓冲      取出报文写入 socket 接收队列
+//!   3. socket.send_slice(payload, meta)        2. dispatch: 从 socket 发送队列取出报文
+//!   4. leases.push_back(lease.clone())            与 leases.pop_front() 配对组装 OwnedPacket
+//!             |                                         |
+//!             +----------------> 唤醒 / 调度 -----------+
+//! ```
+//!
+//! ## 2. 关闭与异步排空退休生命周期
+//! ```text
+//!   Created / Bound / Connected
+//!       |
+//!       +-- 用户态关闭最后一个套接字文件描述 (close)
+//!             |
+//!             v
+//!   标记 state.closed = true, input.closed = true
+//!   触发 OperationGuard::drop -> schedule() 调度后台 Work
+//!             |
+//!             +-- 若 state.leases 非空（仍有待发 TX 数据报）：
+//!             |     继续在后台 dispatch 发送剩余数据报（遇 WouldBlock 则等待出口容量恢复）
+//!             |
+//!             +-- 当 state.closed && state.leases.is_empty() (ended)：
+//!                   关闭底层 socket，取消出口等待，从全局表注销 UDP 索引，
+//!                   调用 net.retire_udp(id) 移交异步退休线程执行 stop_sync()
+//! ```
+//!
+//! # 锁获取顺序（Lock Ordering）与并发契约
+//! 严禁违反以下锁层级顺序，否则会导致死锁：
+//! 1. **端点状态睡眠锁 `UdpEndpoint::state`（`SleepMutex`）**：最外层锁，保护 `udp::Socket`、端口租约与连接状态。
+//! 2. **网络栈控制准入锁 `NetStack::admission()`（`SleepMutex`）**：在 `bind`、`connect`、`send`、`set_reuse_address`
+//!    中更新全局绑定表或解析路由时获取，位于 `state` 锁之内、所有自旋锁之外。
+//! 3. **端点内部自旋锁（`SpinLock`）**：包括 `input`、`timeouts` 以及 `NetTables` 内部自旋锁。
+//!    自旋锁临界区极短且互不嵌套；必须在释放 `state` 与自旋锁之后才能调用 `PollWaitHead::notify` 或 `schedule`。
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -29,34 +82,53 @@ use crate::workqueue::Work;
 const PACKET_RECORDS: usize = 32;
 const PAYLOAD_CAPACITY: usize = 128 * 1024;
 
-/// 后台输入在普通操作持有协议对象时保留；预留槽位内的移动不分配。
+/// 端点的输入数据报缓冲队列与后台调度交接标志（由 `UdpEndpoint::input` 自旋锁保护）。
 struct Input {
+    /// 端点是否已关闭输入接收；置位后拒绝新报文入队。
     closed: bool,
+    /// 标记后台 `Work` 在尝试获取 `state` 睡眠锁时是否因锁被占用而退让；
+    /// 当前持有 `state` 锁的 `OperationGuard` 在释放锁时负责接力重新调度该 `Work`。
     owner_waiting: bool,
+    /// 待由后台 `Work` 消费的输入 IP/UDP 报文有界队列（容量上限为 `PACKET_RECORDS`）。
     packets: VecDeque<OwnedPacket>,
 }
 
-/// 原 raw 队列唯一保存消息；发送旁表只延长每条记录对应的绑定租约。
+/// UDP 端点的核心协议状态、收发队列与绑定控制属性（由 `UdpEndpoint::state` 睡眠锁保护）。
 struct State {
+    /// 底层 `smoltcp` UDP 套接字实例，维护收发环形缓冲区与报文元数据槽位。
     socket: udp::Socket<'static>,
+    /// 标记是否已为 `socket` 分配并安装了收发后备缓冲区（延迟分配标志）。
     buffers_ready: bool,
+    /// 接收缓冲区的字节配额上限（对应 `SO_RCVBUF`，单位：字节）。
     receive_budget: usize,
+    /// 发送缓冲区的字节配额上限（对应 `SO_SNDBUF`，单位：字节）。
     send_budget: usize,
+    /// 与 `socket` 发送队列中待发数据报一一对应的本地端口绑定租约队列，确保在途数据报完成发送前源端口租约保持有效。
     leases: VecDeque<Arc<BindLease>>,
+    /// 当前端点持有的本地地址与端口绑定租约（显式 `bind` 或自动分配产生）。
     binding: Option<Arc<BindLease>>,
+    /// 通过 `connect` 设置的默认远端对端地址与端口；未连接时为 `None`。
     peer: Option<InetEndpoint>,
+    /// 已调用 `connect` 时根据路由解析出的具体本地源地址与端口，供 `getsockname` 返回。
     route_local: Option<InetEndpoint>,
+    /// 标记当前 `binding` 是否由用户态显式调用 `bind` 产生；用于区分 `connect(None)` 断开时是否应保留本地绑定。
     explicit_bind: bool,
+    /// 是否启用 `SO_REUSEADDR` 地址复用选项。
     reuse: bool,
+    /// IPv6 端点是否启用 `IPV6_V6ONLY`（仅限 IPv6 通信，禁止 IPv4 映射地址）。
     v6_only: bool,
+    /// 读方向是否已通过 `shutdown(SHUT_RD)` 或 `close` 关闭。
     read_closed: bool,
+    /// 写方向是否已通过 `shutdown(SHUT_WR)` 或 `close` 关闭。
     write_closed: bool,
+    /// 端点是否已调用 `close` 进入关闭状态。
     closed: bool,
+    /// 待由用户态通过 `SO_ERROR` 取走的后台异步发送错误。
     error: Option<FsError>,
 }
 
 impl State {
-    /// 持操作锁准备两向后备，全部成功后才安装；热 raw 永不替换。
+    /// 在持有 `state` 睡眠锁的前提下按需分配并安装收发缓冲区；若已分配则直接返回。
     fn prepare_buffers(&mut self) -> Result<(), FsError> {
         if self.buffers_ready {
             return Ok(());
@@ -74,12 +146,12 @@ impl State {
         Ok(())
     }
 
-    /// 冷对象尚无记录且配置预算非零，不能由零容量 raw 伪造发送背压。
+    /// 判断当前发送缓冲区是否可接纳新数据报（尚未分配缓冲区的冷端点视为可写）。
     fn can_send(&self) -> bool {
         !self.buffers_ready || self.socket.can_send()
     }
 
-    /// 从原队列和方向关闭事实计算就绪，不驱动 dispatch 或领取输入。
+    /// 根据当前收发缓冲区状态、方向关闭标志及异步错误计算 `PollMask` 就绪掩码。
     fn mask(&self) -> PollMask {
         if self.closed {
             return PollMask::POLLERR | PollMask::POLLHUP;
@@ -103,7 +175,7 @@ impl State {
         mask
     }
 
-    /// 完整消息的零长度也须经过真实关闭检查，写关闭不能伪成功。
+    /// 检查当前端点是否允许发送数据报（即便发送 0 字节数据报也必须检查关闭与 `SHUT_WR` 状态）。
     fn check_send(&self) -> Result<(), FsError> {
         if self.closed {
             return Err(FsError::NotConnected);
@@ -115,59 +187,84 @@ impl State {
     }
 }
 
-/// 表、退休容器和根停止者保活稳定节点，节点只弱持网络域。
+/// UDP 传输层端点，封装数据报套接字的协议队列、绑定状态与后台工作项。
 pub struct UdpEndpoint {
+    /// 网络栈内全局唯一且不复用的端点标识号。
     id: u64,
+    /// 端点创建时固定的地址族（`AF_INET` 或 `AF_INET6`）。
     family: AddressFamily,
+    /// 所属网络栈实例的弱引用。
     stack: Weak<NetStack>,
+    /// 保护 `State` 协议状态与收发队列的可睡眠互斥锁。
     state: SleepMutex<State>,
+    /// 保护输入数据报队列与后台 `Work` 交接标志的自旋锁。
     input: SpinLock<Input>,
+    /// 保护收发超时配置（`SO_RCVTIMEO` / `SO_SNDTIMEO`）的自旋锁。
     timeouts: SpinLock<SocketTimeouts>,
+    /// 供 `poll` / `select` / `epoll` 注册和唤醒的轮询等待队列头。
     source: Arc<PollWaitHead>,
+    /// 推进后台收包入队与发送分发的异步工作项。
     work: Once<Pin<Arc<Work>>>,
+    /// 标记端点是否已进入同步停止流程（`stop_sync`），置位后拒绝新调度请求。
     stopped: AtomicBool,
+    /// 端点进入异步退休链表时的侵入式链接状态。
     pub(crate) retirement: RetirementLink,
+    /// 发送通道（Egress）容量不足时的轻量级等待链表节点。
     egress_wait: Arc<EgressWait>,
+    /// 占用网络栈全局端点配额的槽位守卫，随端点析构自动归还配额。
     _slot: EndpointSlot,
 }
 
+/// 获取 `UdpEndpoint::state` 睡眠锁时的操作模式。
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum OperationMode {
+    /// 修改模式：操作可能改变协议状态、关闭标志或队列配额，释放锁后需要计算新增事件通知并主动调度后台 `Work`。
     Modify,
+    /// 观察模式：仅读取状态，释放锁时不触发事件通知，仅在后台 `Work` 曾受阻退让（`owner_waiting`）时负责接力调度。
     Observe,
 }
 
-/// 普通操作释放原对象后才通知；观察也必须交接已受阻的 Work。
+/// UDP 端点状态操作守卫，封装 `state` 睡眠锁并在析构时统一完成轮询唤醒与后台 `Work` 调度交接。
 struct OperationGuard<'a> {
+    /// 所属的 UDP 端点引用。
     endpoint: &'a UdpEndpoint,
+    /// 底层 `State` 睡眠互斥锁守卫；在 `Drop::drop` 中提前 `take()` 释放，以便在锁外执行通知和调度。
     state: Option<SleepMutexGuard<'a, State>>,
+    /// 本次持锁的操作模式（修改或只读观察）。
     mode: OperationMode,
+    /// 获取锁时的初始 `PollMask` 就绪掩码。
     initial_mask: PollMask,
+    /// 获取锁时的初始发送配额（`send_budget`，单位：字节）。
     initial_send_budget: usize,
+    /// 获取锁时的初始读关闭标志。
     initial_read_closed: bool,
+    /// 获取锁时的初始写关闭标志。
     initial_write_closed: bool,
+    /// 获取锁时的初始端点关闭标志。
     initial_closed: bool,
 }
 
 impl Deref for OperationGuard<'_> {
     type Target = State;
 
-    /// 借用同一操作拥有保护内的协议对象。
+    /// 不可变借用受保护的 `State` 实例。
     fn deref(&self) -> &State {
         self.state.as_deref().unwrap()
     }
 }
 
 impl DerefMut for OperationGuard<'_> {
-    /// 修改只发生于端点自己的 SleepMutex 拥有期。
+    /// 可变借用受保护的 `State` 实例。
     fn deref_mut(&mut self) -> &mut State {
         self.state.as_deref_mut().unwrap()
     }
 }
 
 impl Drop for OperationGuard<'_> {
-    /// 先释放操作锁，再交接短锁中登记的真实拥有责任和新增方向通知。
+    /// 在持有 `state` 锁的末尾对比初始快照计算新增的轮询就绪事件，随后释放 `state` 锁，
+    /// 在锁外唤醒等待队列并按需调度后台 `Work`。
     fn drop(&mut self) {
+        // Step 1: 在修改模式下比对操作前后的状态差异，汇总新产生的轮询就绪掩码。
         let notification = if self.mode == OperationMode::Modify {
             let state = self.state.as_deref().unwrap();
             let mut mask = state.mask() & !self.initial_mask;
@@ -187,8 +284,10 @@ impl Drop for OperationGuard<'_> {
         } else {
             PollMask::default()
         };
+        // Step 2: 释放 state 睡眠锁。
         drop(self.state.take());
 
+        // Step 3: 检查持锁期间是否有后台 Work 因锁被占用而退让，并在锁外完成轮询通知与后台任务调度。
         let owner_waiting = {
             let mut input = self.endpoint.input.lock();
             core::mem::take(&mut input.owner_waiting)
@@ -203,7 +302,10 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl UdpEndpoint {
-    /// 域先取得节点拥有，创建零后备 raw 并预备有界输入、租约旁表及等待节点。
+    /// 在指定网络栈中创建并初始化一个新的 `UdpEndpoint` 实例。
+    ///
+    /// 初始创建零容量的 `udp::Socket`（延迟到首次绑定、连接或发送时才分配 128 KiB 缓冲区），
+    /// 预留有界输入队列与租约队列，并初始化后台 `Work` 与轮询等待队列头。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
@@ -259,7 +361,7 @@ impl UdpEndpoint {
         })
         .map_err(|_| FsError::NoMemory)?;
 
-        // UDP 不消耗 TCP 的协议 CPU 轮转序号；同一 Work 由原执行域调度。
+        // 初始化端点的后台处理 Work，交由所属网络栈的工作队列调度执行。
         let work = Work::try_new(
             net.work_queue(),
             0,
@@ -271,17 +373,19 @@ impl UdpEndpoint {
         Ok(endpoint)
     }
 
-    /// 查询端点共享的两向期限，不取得可能等待 raw 拥有者的操作锁。
+    /// 读取当前端点的收发超时时间配置（`SO_RCVTIMEO` / `SO_SNDTIMEO`）。
+    ///
+    /// 仅获取 `timeouts` 自旋锁，无需等待 `state` 睡眠锁。
     pub(crate) fn timeouts(&self) -> SocketTimeouts {
         *self.timeouts.lock()
     }
 
-    /// 控制值只占短锁，设置不能阻塞协议 Work 或修改 raw 消息责任。
+    /// 设置收发方向的阻塞等待超时时间（单位：纳秒，`None` 表示无限等待）。
     pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
         self.timeouts.lock().set(receive, timeout);
     }
 
-    /// metadata 和 payload 都在堆上预备，128KiB 后备不落任务栈。
+    /// 在堆上分配单向 `udp::PacketBuffer`（包含 `PACKET_RECORDS` 个报文元数据槽位与 `PAYLOAD_CAPACITY` 字节载荷缓冲）。
     fn packet_buffer() -> Result<udp::PacketBuffer<'static>, FsError> {
         let mut metadata = Vec::new();
         metadata
@@ -294,7 +398,7 @@ impl UdpEndpoint {
         ))
     }
 
-    /// 普通操作共享同一释放协议，观察不得主动安排新的协议进度。
+    /// 按指定操作模式（修改或只读观察）获取 `state` 睡眠锁，并采集初始状态快照构造 `OperationGuard`。
     fn operation(&self, mode: OperationMode) -> OperationGuard<'_> {
         let state = self.state.lock();
         let initial_mask = state.mask();
@@ -314,12 +418,12 @@ impl UdpEndpoint {
         }
     }
 
-    /// 返回域内不复用的身份，关闭后外部拥有仍保留该身份。
+    /// 返回端点在所属网络栈中的唯一标识号。
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// 只观察原 raw 的真实后备，冷对象检查不得通过配置容量推断已分配字节。
+    /// 供内核测试（`ktest`）观察底层 `udp::Socket` 是否已分配后备缓冲区及其实际报文槽位和字节容量。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_buffer_storage(&self) -> (bool, [usize; 4]) {
         let state = self.operation(OperationMode::Observe);
@@ -334,22 +438,22 @@ impl UdpEndpoint {
         )
     }
 
-    /// 根容量等待持同一轻量节点，不延长协议端点的业务寿命。
+    /// 返回端点的发送通道（Egress）容量等待链表节点引用。
     pub(crate) fn egress_wait(&self) -> &Arc<EgressWait> {
         &self.egress_wait
     }
 
-    /// OFD 地址族由构造固定，不从某条报文的协议族推测。
+    /// 返回端点创建时固定的地址族（`AF_INET` 或 `AF_INET6`）。
     pub fn family(&self) -> AddressFamily {
         self.family
     }
 
-    /// 与 raw 和真实 binding 在同一操作状态观察 V6ONLY。
+    /// 查询 IPv6 端点是否开启了 `IPV6_V6ONLY` 选项。
     pub fn v6_only(&self) -> bool {
         self.operation(OperationMode::Observe).v6_only
     }
 
-    /// 仅未绑定的 IPv6 端点可修改 V6ONLY，旧在途记录不改变该边界。
+    /// 设置 IPv6 端点的 `IPV6_V6ONLY` 选项（仅允许在尚未绑定本地端口的 `AF_INET6` 端点上修改）。
     pub fn set_v6_only(&self, value: bool) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if self.family != AddressFamily::Ipv6 || state.binding.is_some() {
@@ -362,7 +466,7 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 已正规化的核心地址仍须符合端点族、V6ONLY 和实际操作的错误边界。
+    /// 校验目标或本地 IP 地址是否符合当前端点的地址族与 `IPV6_V6ONLY` 策略，并按操作类型映射对应的错误码。
     fn check_family(
         &self,
         state: &State,
@@ -380,15 +484,19 @@ impl UdpEndpoint {
         }
     }
 
-    /// 双面只属于 IPv6 :: 通配且 V6ONLY 关闭的同一租约。
+    /// 判断本次绑定是否应作为 IPv6 双栈通配绑定（即 `AF_INET6`、未开启 `IPV6_V6ONLY` 且绑定在 `::` 未指定地址上）。
     fn dual_stack(&self, state: &State, local: InetEndpoint) -> bool {
         self.family == AddressFamily::Ipv6
             && !state.v6_only
             && matches!(local.address, IpAddress::Ipv6(address) if address.is_unspecified())
     }
 
-    /// 持操作权先准备两向后备再取得显式绑定，OOM 不发表地址或租约。
+    /// 将端点显式绑定到指定的本地地址与端口（`bind` 系统调用）。
+    ///
+    /// 先按需分配收发缓冲区并向全局表申请端口租约，随后在全局 UDP 表中发布接收索引；
+    /// 若绑定到具体的非通配 IPv6 地址，则同时将 `v6_only` 固定为 `true`。
     pub fn bind(self: &Arc<Self>, requested: InetEndpoint) -> Result<InetEndpoint, FsError> {
+        // Step 1: 校验端点未关闭、未重复绑定且请求地址符合地址族策略。
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
@@ -398,6 +506,7 @@ impl UdpEndpoint {
         }
         self.check_family(&state, requested.address, AddressOperation::Bind)?;
 
+        // Step 2: 获取网络栈准入锁，分配收发缓冲区并申请本地端口绑定租约。
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
         state.prepare_buffers()?;
@@ -411,6 +520,7 @@ impl UdpEndpoint {
         )?;
         let local = lease.local();
 
+        // Step 3: 在全局表中发布 UDP 接收索引，并更新端点绑定状态。
         net.tables().publish_udp(self.id, local, None)?;
         state.socket.set_endpoint(local.raw_listen());
         if matches!(local.address, IpAddress::Ipv6(address) if !address.is_unspecified()) {
@@ -421,7 +531,7 @@ impl UdpEndpoint {
         Ok(local)
     }
 
-    /// 自动绑定只保存一份真正通配租约，发送 metadata 单独保存选定源。
+    /// 为尚未显式绑定的端点向全局表申请本地址族通配地址上的临时端口租约。
     fn automatic_binding(
         &self,
         net: &NetStackRef,
@@ -440,8 +550,11 @@ impl UdpEndpoint {
         )
     }
 
-    /// 默认 peer 和每次目的独立；自动断开只撤当前租约，不清原消息队列。
+    /// 设置或清除 UDP 端点的默认远端对端地址（`connect` 系统调用，`peer` 为 `None` 表示 `AF_UNSPEC` 断开连接）。
+    ///
+    /// 若断开连接且此前为自动分配的临时端口绑定，则一并撤销全局 UDP 接收索引并释放当前绑定租约（已在发送队列中的报文由 `leases` 旁表继续保活租约）。
     pub fn connect(self: &Arc<Self>, peer: Option<InetEndpoint>) -> Result<(), FsError> {
+        // Step 1: 获取状态锁与网络栈准入锁；若 peer 为 None，执行断开连接逻辑。
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
             return Err(FsError::NotConnected);
@@ -460,7 +573,8 @@ impl UdpEndpoint {
             } else {
                 net.tables().unpublish_udp(self.id);
                 state.socket.set_endpoint(IpListenEndpoint::default());
-                // 已接纳 TX 的旁表和 Root owned 包各持旧 lease，最后 put 只撤己 lease_id。
+                // 已进入发送队列的数据报在 state.leases 或已发出的 OwnedPacket 中各自持有旧租约的 Arc，
+                // 此处移除当前 binding 不会影响在途数据报占用的源端口。
                 state.binding.take();
             }
             state.peer = None;
@@ -468,6 +582,7 @@ impl UdpEndpoint {
             return Ok(());
         };
 
+        // Step 2: 校验远端地址与端口有效性，解析出口路由并按需分配收发缓冲区与本地端口租约。
         if peer.port == 0 {
             return Err(FsError::InvalidOperation);
         }
@@ -488,6 +603,7 @@ impl UdpEndpoint {
             port: lease.local().port,
         };
 
+        // Step 3: 在全局 UDP 表中更新带对端过滤的索引，并记录默认对端与路由源地址。
         net.tables().publish_udp(self.id, local, Some(peer))?;
         state.socket.set_endpoint(local.raw_listen());
         state.binding = Some(lease);
@@ -496,12 +612,16 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 完整已复制消息只在原 TX record 接纳后报告成功；暂满不拆消息或提交旁表。
+    /// 将一条完整的 UDP 数据报写入端点发送队列（`send` / `sendto` / `sendmsg`）。
+    ///
+    /// 依次校验发送方向状态、目的地址与报文长度上限，解析出口路由与 MTU，按需分配缓冲区与自动端口租约，
+    /// 最后将有效载荷写入 `udp::Socket` 发送缓冲区，并将关联的端口租约推入 `state.leases` 队列。
     pub fn send(
         self: &Arc<Self>,
         payload: &[u8],
         destination: Option<InetEndpoint>,
     ) -> Result<IoProgress, FsError> {
+        // Step 1: 校验端点写状态、目的地址有效性以及协议与发送缓冲区配额上限。
         let mut state = self.operation(OperationMode::Modify);
         state.check_send()?;
         let destination = destination
@@ -519,6 +639,7 @@ impl UdpEndpoint {
             return Err(FsError::MessageTooLarge);
         }
 
+        // Step 2: 获取网络栈准入锁，解析出口路由并检查 IPv6 不分片路径 MTU 限制。
         let net = self.stack.upgrade().ok_or(FsError::NotConnected)?;
         let _admission = net.admission()?;
         let bound = state
@@ -532,6 +653,7 @@ impl UdpEndpoint {
             return Err(FsError::MessageTooLarge);
         }
 
+        // Step 3: 按需准备收发缓冲区，检查发送队列剩余空间，并获取或自动分配本地端口绑定租约。
         state.prepare_buffers()?;
         if !state.socket.can_send_size(payload.len()) {
             return Ok(IoProgress::Blocked);
@@ -553,9 +675,10 @@ impl UdpEndpoint {
             local_port: Some(lease.local().port),
             meta: PacketMeta::default(),
         };
-        // 准入只保护绑定发表和关门；完整 payload 复制不得占用全域操作权。
+        // 端口绑定与路由解析已完成，提前释放网络栈全局准入锁，避免后续复制数据报载荷时阻塞其他端点的控制操作。
         drop(_admission);
 
+        // Step 4: 将数据报写入底层发送缓冲区，并在成功后将对应端口租约推入 leases 队列保活。
         match state.socket.send_slice(payload, metadata) {
             Ok(()) => {
                 assert!(state.leases.len() < PACKET_RECORDS);
@@ -567,7 +690,9 @@ impl UdpEndpoint {
         }
     }
 
-    /// 输入仅发表有界 owned backlog，满时丢未接纳消息，不向 sender 提供可靠回压。
+    /// 验证收到的 IP/UDP 报文格式并将其推入端点的有界输入队列，随后调度后台 `Work` 消费。
+    ///
+    /// 若输入队列已满（达到 `PACKET_RECORDS` 上限），则返回 `Err(FsError::WouldBlock)` 丢弃该报文。
     pub fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
         packet.udp_payload()?;
         {
@@ -585,7 +710,9 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// peek 与 recv 在同一操作权下直接借原 record；用户复制不持表或接口短锁。
+    /// 从 UDP 接收队列读取一条数据报到 `target`（支持 `MSG_PEEK` 预览模式）。
+    ///
+    /// 当接收队列为空但读方向已关闭（`SHUT_RD`）时返回 0 字节结果；非预览模式下无论用户缓冲区是否发生截断或页错误，都会消费整条数据报。
     pub fn receive(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -609,14 +736,14 @@ impl UdpEndpoint {
             self.copy_datagram(target, payload, InetEndpoint::from_raw(metadata.endpoint))
                 .map(Some)
         } else {
-            // 原 recv 先消费整条，短复制和部分 fault 都不会把剩余尾部留给后继接收者。
+            // 非预览模式下先从接收队列弹出整条数据报记录；即便用户缓冲区较小发生截断或中途缺页失败，剩余尾部字节也会按 UDP 数据报语义直接丢弃。
             let (payload, metadata) = state.socket.recv().expect("UDP readable record");
             self.copy_datagram(target, payload, InetEndpoint::from_raw(metadata.endpoint))
                 .map(Some)
         }
     }
 
-    /// UDP 的部分 fault 直接传播；成功的短复制保原长和同条 source。
+    /// 将单条 UDP 数据报载荷复制到 `target` 缓冲区，构造包含源地址、原始长度及截断标志（`MSG_TRUNC`）的 `MessageResult`。
     fn copy_datagram(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -633,7 +760,7 @@ impl UdpEndpoint {
         })
     }
 
-    /// 观察真正租约地址，自动断开后不从旧在途包补回当前绑定。
+    /// 供内核测试（`ktest`）查询当前端点持有的本地绑定租约地址。
     #[cfg(feature = "ktest")]
     pub fn local(&self) -> Option<InetEndpoint> {
         self.operation(OperationMode::Observe)
@@ -642,7 +769,7 @@ impl UdpEndpoint {
             .map(|lease| lease.local())
     }
 
-    /// 显式或自动绑定的复用策略只修改当前 lease_id。
+    /// 设置 `SO_REUSEADDR` 地址复用选项，并在已持有绑定租约时同步更新全局绑定表策略。
     pub fn set_reuse_address(&self, reuse: bool) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
@@ -657,12 +784,14 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 观察当前真实复用策略，不修改租约或协议索引。
+    /// 查询当前端点是否开启了 `SO_REUSEADDR` 地址复用选项。
     pub fn reuse_address(&self) -> bool {
         self.operation(OperationMode::Observe).reuse
     }
 
-    /// connected 名称使用实际路由源，其余保持当前租约的真实通配值。
+    /// 获取当前端点的本地绑定地址与端口（`getsockname`）。
+    ///
+    /// 若已通过 `connect` 建立连接则返回路由选定的具体源地址；若仅完成绑定则返回租约记录的地址；未绑定时返回通配零地址和 0 端口。
     pub fn local_address(&self) -> Result<InetEndpoint, FsError> {
         let state = self.operation(OperationMode::Observe);
         if state.closed {
@@ -677,7 +806,7 @@ impl UdpEndpoint {
             }))
     }
 
-    /// 单次 sendto 的目的从不替换 connected 默认 peer 名称。
+    /// 获取通过 `connect` 设置的默认远端对端地址与端口（`getpeername`）。
     pub fn peer_address(&self) -> Result<InetEndpoint, FsError> {
         let state = self.operation(OperationMode::Observe);
         if state.closed {
@@ -686,17 +815,17 @@ impl UdpEndpoint {
         state.peer.ok_or(FsError::NotConnected)
     }
 
-    /// 返回配置的 RX 预算，冷对象保持与激活后相同的用户可见值。
+    /// 返回当前配置的接收缓冲区字节配额（`SO_RCVBUF`）。
     pub fn receive_budget(&self) -> usize {
         self.operation(OperationMode::Observe).receive_budget
     }
 
-    /// 返回配置的 TX 预算，不把冷 raw 的零容量作为 SO_SNDBUF。
+    /// 返回当前配置的发送缓冲区字节配额（`SO_SNDBUF`）。
     pub fn send_budget(&self) -> usize {
         self.operation(OperationMode::Observe).send_budget
     }
 
-    /// 冷对象只修改配置；热队列缩预算保留旧记录，提高后安排原 backlog。
+    /// 调整接收缓冲区的字节配额（`SO_RCVBUF`，有效范围为 `1..=PAYLOAD_CAPACITY`）。
     pub fn set_receive_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
@@ -712,7 +841,7 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 冷对象保存 TX 配置，热对象只改原队列预算，OUT 通知仍在锁外发生。
+    /// 调整发送缓冲区的字节配额（`SO_SNDBUF`，有效范围为 `1..=PAYLOAD_CAPACITY`）；若扩容后恢复可写，守卫析构时会自动唤醒 `POLLOUT` 等待者。
     pub fn set_send_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut state = self.operation(OperationMode::Modify);
         if state.closed {
@@ -728,22 +857,22 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 返回固定配置的 RX 后备容量，冷对象也允许完整范围内的早期预算。
+    /// 返回接收缓冲区的最大物理字节容量（`PAYLOAD_CAPACITY`）。
     pub fn receive_capacity(&self) -> usize {
         PAYLOAD_CAPACITY
     }
 
-    /// 返回固定配置的 TX 后备容量，与是否已安装 payload 无关。
+    /// 返回发送缓冲区的最大物理字节容量（`PAYLOAD_CAPACITY`）。
     pub fn send_capacity(&self) -> usize {
         PAYLOAD_CAPACITY
     }
 
-    /// 一次消费真正后台 dispatch 错误，不合成 ICMP 或重复回显。
+    /// 读取并清除挂起的后台异步发送错误（对应 `getsockopt(SO_ERROR)`）。
     pub fn take_error(&self) -> Option<FsError> {
         self.operation(OperationMode::Modify).error.take()
     }
 
-    /// 未连接也先提交方向关闭；已有原 RX record 先于读 EOF。
+    /// 关闭指定传输方向（`SHUT_RD`、`SHUT_WR` 或 `SHUT_RDWR`）；若端点尚未通过 `connect` 关联默认对端，则在更新关闭标志后返回 `Err(FsError::NotConnected)`。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
         if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
@@ -765,7 +894,7 @@ impl UdpEndpoint {
         }
     }
 
-    /// 登记持续源后只 Observe 原 raw 事实，不 pump、查路由或登记 Root 容量等待。
+    /// 注册可选的轮询等待表，并查询当前端点的 `PollMask` 就绪掩码。
     pub fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
         if let Some(table) = table {
             table.register(&self.source)?;
@@ -773,12 +902,12 @@ impl UdpEndpoint {
         Ok(self.operation(OperationMode::Observe).mask())
     }
 
-    /// Root 容量恢复只安排原 Work，释放 TX record 后才通知发送者。
+    /// 当网络栈发送通道（Egress）容量恢复时由网络栈调用，调度后台 `Work` 继续刷出待发数据报。
     pub fn notify_egress(&self) {
         self.schedule();
     }
 
-    /// 原 Work 合并 pending 票，根停止或本端点全尾后拒绝新增工作。
+    /// 将端点的后台处理任务排入工作队列；若端点已同步停止或网络栈正在停止则忽略。
     fn schedule(&self) {
         if self.stopped.load(Ordering::Acquire) {
             return;
@@ -796,7 +925,7 @@ impl UdpEndpoint {
         }
     }
 
-    /// 后台先登记拥有责任；末 OFD 后继续提交或终结已接纳 TX，暂满不自旋。
+    /// 后台 `Work` 的核心执行入口：尝试获取 `state` 睡眠锁，批量处理输入数据报与待发送数据报，并在已关闭且发送队列排空后触发异步退休。
     fn run(&self) {
         let Some(net) = self.stack.upgrade() else {
             return;
@@ -805,12 +934,15 @@ impl UdpEndpoint {
             return;
         }
 
+        // Step 1: 登记 owner_waiting 标志并尝试非阻塞获取 state 睡眠锁；
+        // 若用户态正持有 state 锁，则立即返回，由 OperationGuard::drop 负责在解锁后重新调度。
         self.input.lock().owner_waiting = true;
         let Some(mut state) = self.state.try_lock() else {
             return;
         };
         self.input.lock().owner_waiting = false;
 
+        // Step 2: 在未关闭状态下消费输入队列数据报，随后向网络栈分发待发送队列中的数据报。
         let mut notification = PollMask::default();
         if !state.closed {
             self.process_input(&mut state, &mut notification);
@@ -823,11 +955,12 @@ impl UdpEndpoint {
             }
         }
 
+        // Step 3: 判断端点是否已关闭且所有已入队的待发数据报均已排空（ended），并在锁外唤醒轮询等待者。
         let pending_tx = !state.leases.is_empty();
         let closed = state.closed;
         let ended = closed && !pending_tx;
         let binding = if ended {
-            // raw TX 已全部交给 Root 或以终结错误结束；已交包的后续 frame/DMA 仍持真实拥有。
+            // 所有待发数据报均已移交网络栈或因致命错误终止，关闭底层 socket 并取出本地端口绑定租约以便在锁外释放。
             state.socket.close();
             state.binding.take()
         } else {
@@ -838,6 +971,7 @@ impl UdpEndpoint {
         if !notification.is_empty() {
             self.source.notify(notification);
         }
+        // Step 4: 若已彻底结束，封闭输入队列、取消出口等待、从全局表注销索引并移交异步退休；否则按剩余队列状态继续调度。
         if ended {
             let packets = {
                 let mut input = self.input.lock();
@@ -860,7 +994,7 @@ impl UdpEndpoint {
         }
     }
 
-    /// 原 RX record 的真实接纳才通知 IN；当前 peer、族和关闭事实再次过滤旧查找。
+    /// 在 `PROTOCOL_BUDGET` 配额内从 `input.packets` 取出收到的 UDP 报文，校验读关闭、默认对端及地址族过滤后写入 `state.socket` 接收缓冲区。
     fn process_input(&self, state: &mut State, notification: &mut PollMask) {
         let mut remaining = PROTOCOL_BUDGET;
         while 0 < remaining {
@@ -897,7 +1031,10 @@ impl UdpEndpoint {
         }
     }
 
-    /// 队首 raw record 与 lease 同时结束；WouldBlock 保留二者，终结错误释放本条责任。
+    /// 在 `PROTOCOL_BUDGET` 配额内将 `state.socket` 发送缓冲区中的数据报封装为 `OwnedPacket` 并提交给网络栈发送。
+    ///
+    /// 每成功发出一包（或遇到非 `WouldBlock` 的致命错误），同步弹出 `state.leases` 队首对应的端口租约并置位 `POLLOUT` 通知；
+    /// 若网络栈发送通道暂满（`WouldBlock`），则保留当前报文与队首租约留待下次重试。
     fn dispatch(
         &self,
         net: &NetStackRef,
@@ -931,7 +1068,7 @@ impl UdpEndpoint {
                     if result == Err(FsError::WouldBlock) {
                         return result;
                     }
-                    // Ok 只提交本条 raw 消费；真实发送结果另存，错误不能冒充 Root 接纳。
+                    // 返回 Ok(()) 让 smoltcp 提交并弹出本条发送记录；实际发送结果保存在 completed 中供外层处理。
                     completed = Some(result);
                     Ok::<(), FsError>(())
                 })?;
@@ -950,7 +1087,7 @@ impl UdpEndpoint {
         Ok(())
     }
 
-    /// 末 OFD 只提交关闭并安排异步退休，不在本端点 Work 上 join 自己。
+    /// 当最后一个关联的套接字文件描述关闭时调用，标记端点与读写双方向关闭并封闭输入队列，交由后台 `Work` 排空剩余待发数据报后异步退休。
     pub fn close(&self) {
         let mut state = self.operation(OperationMode::Modify);
         state.closed = true;
@@ -961,12 +1098,16 @@ impl UdpEndpoint {
         self.input.lock().closed = true;
     }
 
-    /// reaper 或根停止局部拥有覆盖 Work 全尾，关门后再清原队列及 lease。
+    /// 同步停止端点并清理所有后台活动与挂起资源。
+    ///
+    /// 由网络栈异步退休任务或网络栈整体销毁流程在持有端点局部 `Arc` 强引用的前提下调用。
+    /// 先等待后台 `Work` 彻底执行完毕，再清空底层套接字队列、端口租约与全局表索引。
     pub(crate) fn stop_sync(&self) {
         assert!(
             !self.stopped.swap(true, Ordering::AcqRel),
             "UDP endpoint stopped twice"
         );
+        // Step 1: 封闭输入队列并同步停止后台 Work，等待正在执行的回调彻底退出。
         self.input.lock().closed = true;
         self.work
             .get()
@@ -974,6 +1115,7 @@ impl UdpEndpoint {
             .as_ref()
             .close_sync();
 
+        // Step 2: 清空协议状态、底层收发缓冲区、待发租约队列与残留输入报文。
         let binding = {
             let mut state = self.state.lock();
             state.closed = true;
@@ -991,6 +1133,7 @@ impl UdpEndpoint {
             core::mem::take(&mut input.packets)
         };
 
+        // Step 3: 取消出口等待、注销全局 UDP 索引，在锁外释放租约与报文并唤醒所有轮询等待者。
         if let Some(net) = self.stack.upgrade() {
             net.cancel_egress_wait(self.id);
             net.tables().unpublish_udp(self.id);
@@ -1001,10 +1144,12 @@ impl UdpEndpoint {
     }
 }
 
-/// 表或退休容器的真实拥有覆盖回调到返回的全部节点访问。
+/// 后台工作队列回调入口：还原 `UdpEndpoint` 引用并推进数据报收发。
 fn run_udp(work: Pin<&Work>) {
-    // SAFETY: context 来自稳定 Arc，发表后表、退休容器或根停止的局部 Arc 持续保活；
-    // 最后拥有释放前先同步关闭本 Work，回调不延长裸指针的寿命。
+    // SAFETY:
+    // 1. `work.context()` 在 `UdpEndpoint::try_new` 中由 `Arc::as_ptr(&endpoint) as usize` 初始化，指向堆上地址稳定的 `UdpEndpoint`；
+    // 2. 端点发布后由全局 UDP 表、异步退休容器或调用 `stop_sync` 的局部 `Arc` 强引用保活；
+    // 3. 在最后一个 `Arc` 强引用释放前，`stop_sync` 必定先调用 `work.close_sync()` 等待本回调彻底执行完毕并退出，因此解引用在回调生命周期内始终有效。
     let endpoint = unsafe { &*(work.context() as *const UdpEndpoint) };
     endpoint.run();
 }

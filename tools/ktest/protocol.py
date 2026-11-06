@@ -1,4 +1,12 @@
-"""按完整身份和生命周期检查 KTAP，不把任意业务日志当作成功。"""
+"""ktest 串口握手、KTAP 状态机与生命周期协议解析器。
+
+本模块负责解析客体内核通过串口输出的 KTAP 测试结果流与 `# KTEST ...` 扩展控制行：
+- 校验启动握手 `KTEST READY` 的架构、CPU 核数、构建模式与 panic 策略；
+- 严格按外层计划、子测试头、内层计划、套件启动、用例生命周期阶段（setup -> body -> quiesce -> join -> cleanup）
+  及最终完成标记驱动状态机；
+- 识别预期致命异常（armed/fatal）、清理失败中止（case-abort）、套件级错误（suite-error）以及原始串口 I/O 声明；
+- 拦截格式错误或顺序颠倒的协议记录，防止客体业务日志被误判为测试通过。
+"""
 
 from dataclasses import dataclass
 import json
@@ -15,7 +23,7 @@ FATAL_KINDS = ("illegal", "refill", "irq-schedule", "preempt-schedule", "oom",
 
 
 def ready(line, config):
-    """就绪必须与实际请求 CPU 和镜像策略逐字段相等。"""
+    """解析并校验 `KTEST READY` 握手行，确保客体报告的架构、核数、构建模式与 panic 策略与宿主期望完全一致。"""
     match = READY.fullmatch(line)
     require(match is not None, "malformed READY")
     arch, cpus, mode, panic = match.groups()
@@ -25,7 +33,7 @@ def ready(line, config):
 
 @dataclass(frozen=True)
 class CaseResult:
-    """完整 KTAP 行确认的本例身份和 Guest 结果。"""
+    """经完整 KTAP 结果行确认的单个测试用例执行结果（用例编号、状态与可选原因）。"""
 
     case_id: int
     status: str
@@ -33,10 +41,10 @@ class CaseResult:
 
 
 class KtapParser:
-    """一次 VM 仅一个 suite，结果发布晚于本例清理。"""
+    """解析单台 QEMU 虚拟机内单个测试套件的 KTAP 输出流与生命周期控制指令的状态机。"""
 
     def __init__(self, suite, items):
-        """按命令实际顺序记录期待列表，结果不能覆盖首次结果。"""
+        """初始化套件解析状态机，按命令行请求的用例顺序记录期望列表。"""
         self.suite = suite
         self.items = items
         self.results = {}
@@ -59,7 +67,8 @@ class KtapParser:
         self.complete = False
 
     def feed(self, line):
-        """返回生命周期、raw 声明或完整结果；普通日志不改变状态。"""
+        """向状态机输入单行串口文本，返回生命周期事件、原始 UART I/O 声明或 `CaseResult`；普通业务日志返回 `None`。"""
+        # 1. 解析 KTAP 外层与子测试头部声明，以及最终的 `# KTEST complete` 结束标记
         if line == "KTAP version 1":
             require(not self.version and not self.outer_plan, "duplicate KTAP version")
             self.version = True
@@ -85,6 +94,7 @@ class KtapParser:
             require(self.outer_result and not self.complete, "premature or duplicate complete")
             self.complete = True
             return "complete"
+        # 2. 解析套件级控制行（suite-begin 与 suite-error），校验其所处生命周期位置
         suite_control = SUITE_CONTROL.fullmatch(line)
         if suite_control:
             require(self.inner_plan and not self.outer_result and not self.complete
@@ -102,6 +112,7 @@ class KtapParser:
                     "suite cleanup error before case results")
             self.suite_error = dict(phase=phase, reason=reason)
             return "suite-error"
+        # 3. 解析用例级控制行（case-begin、case-abort、phase、armed、fatal、io）
         control = CONTROL.fullmatch(line)
         if control:
             require(not self.complete and not self.outer_result and self.inner_plan
@@ -128,7 +139,7 @@ class KtapParser:
                 phase, separator, payload = (value or "").partition(" ")
                 require(separator and phase in ("quiesce", "join", "cleanup")
                         and phase == self.phase, "case-abort outside actual cleanup phase")
-                # 保留重复键，不能让 JSON 的末值覆盖首个独立失败账本。
+                # 使用 object_pairs_hook=list 捕获所有键值对，防止重复 JSON 键静默覆盖此前的失败记录
                 try:
                     pairs = json.loads(payload, object_pairs_hook=list)
                 except json.JSONDecodeError as error:
@@ -168,6 +179,7 @@ class KtapParser:
                 self.fatal = value
                 self.fatal_message_seen = False
                 return "fatal"
+            # 解析原始 UART 字节流测试声明（支持 duplex 双工或 tx/rx/pause/slow 单向模式）
             require(kind == "io" and self.phase in ("setup", "body", "quiesce", "cleanup"),
                     "raw UART outside fixture phase")
             parts = (value or "").split()
@@ -199,6 +211,7 @@ class KtapParser:
                     "UART declaration exceeds bounds")
             return dict(direction=direction, length=length, digest=digest, delay_ms=delay,
                         case=cid)
+        # 4. 解析带缩进的内层用例结果行（ok / not ok）与不带缩进的外层套件汇总结果行
         result = RESULT.fullmatch(line)
         if result:
             indent, polarity, number, name = result.groups()
@@ -233,6 +246,7 @@ class KtapParser:
                 self.active = None
                 self.phase = None
                 return event
+            # 外层套件汇总结果行：必须所有内层用例均已结束（或已触发套件错误/用例中止），且汇总极性与实际结果一致
             require(self.inner_plan and self.suite_started
                     and (self.active is None or self.case_abort is not None)
                     and (len(self.results) == len(self.items) or self.suite_error is not None
@@ -244,9 +258,10 @@ class KtapParser:
             require(polarity == ("ok" if passed else "not ok"), "false suite PASS")
             self.outer_result = True
             return "outer"
+        # 拦截前缀像 KTAP 或 KTEST 协议行但未能通过上方正则校验的畸形行
         if line.lstrip().startswith(("ok ", "not ok ", "KTAP version", "KTEST READY", "1..", "# KTEST", "# Subtest:")):
             raise HostError(f"malformed or unexpected KTAP record: {line[:160]}")
-        # 业务诊断不决定结果；raw 字节由 UART channel 独占消费。
+        # 普通业务日志不改变协议状态机；若当前用例已触发预期致命异常，则顺带检查是否出现了预期的致命诊断子串
         if self.active is not None and self.fatal is not None:
             message = self.items[len(self.results)].case["fatal_message"]
             if message is not None and message in line:

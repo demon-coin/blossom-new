@@ -1,4 +1,53 @@
-//! 可写文件测试的共同拥有、真实同步与六类行为 suite 锚点。
+//! 可写文件系统（Ext4）与用户态写路径的集成测试公共夹具与校验工具模块。
+//!
+//! ## 模块职责与架构定位
+//! 本模块隶属于 `fs::ktest::user` 测试套件，为六大类可写文件行为测试子模块（`buffered` 缓冲写、`mmap` 共享内存映射写、
+//! `namespace` 目录与命名空间变更、`reclaim` 页面回收、`truncate` 截断与打洞、`writeback` 脏页回写与同步）提供统一的
+//! 生命周期管理夹具 [`WriteOwner`] 以及底层磁盘元数据校验工具。
+//! 上游由 `fs::ktest::user` 通过 [`anchor`] 注册测试套件，下游驱动 `/test/bin/user-write` 用户态程序并直接检验 `Ext4Volume`
+//! 的位图、Inode 记录及 Extent/间接块树结构。
+//!
+//! ## 核心机制与虚拟地址空间/清理状态机布局
+//! 1. **共享控制页与测试映射虚拟地址布局**：
+//! ```text
+//! 用户态地址空间 (Mm) 关键测试区域:
+//! +-----------------------+-------------------------------------------------------+
+//! | 虚拟地址              | 用途与内部偏移布局                                    |
+//! +-----------------------+-------------------------------------------------------+
+//! | 0x4800_0000 (SOURCE)  | 用户态写操作的数据源缓冲区映射基址                    |
+//! +-----------------------+-------------------------------------------------------+
+//! | 0x4900_0000           | 4 KiB 共享匿名控制页 (SharedAnonymous):               |
+//! |   (SHARED_CONTROL)    |   +0  (u32)  : 用户态发布的当前阶段检查点编号         |
+//! |                       |   +4  (u32)  : 内核写入的阶段放行门控字               |
+//! |                       |   +16 (usize): fork 子进程的真实线程 TID              |
+//! |                       |   +24 (u64)  : 共享文件映射的目标偏移量               |
+//! +-----------------------+-------------------------------------------------------+
+//! | 0x4a00_0000           | 独立地址空间 (`shared_alias`) 验证共享文件页一致性的  |
+//! |   (SHARED_ALIAS)      | 8 KiB 映射基址                                        |
+//! +-----------------------+-------------------------------------------------------+
+//! ```
+//!
+//! 2. **测试夹具静默与回收流程（`WriteOwner::quiesce`）**：
+//! ```text
+//! [1. 卸载测试钩子并唤醒所有挂起门控 (mkwrite/fault/truncate/unmap gates)]
+//!         │
+//!         ▼
+//! [2. 恢复模拟块设备 I/O 完成，等待内核消费线程与用户进程完全退出内核栈并回收]
+//!         │
+//!         ▼
+//! [3. 逐个 Inode 执行 sync_inode 回写文件脏页，验证无残留 Dirty/Writeback 页]
+//!         │
+//!         ▼
+//! [4. 若存在冷重载缓存 (cold_cache)，释放 Inode 引用并等待缓存驱逐异步任务完成]
+//!         │
+//!         ▼
+//! [5. 执行 sync_metadata 回写卷元数据并下发设备 FLUSH，验证无残留脏元数据块]
+//! ```
+//!
+//! ## 锁获取顺序与并发契约
+//! 1. 观测同步消费线程状态（[`SyncObservation`]）时，`executor` 与 `result` 各自使用独立的短临界区自旋锁，不可嵌套持有。
+//! 2. 准备已解除链接（Unlinked）文件的脏页回写时，必须先等待已有回写完成（`folio.wait_writeback()`），再获取 `folio.lock_content()`
+//!    内容锁，并在持锁期间调用 `mkclean` 清除共享可写页表项及完成跨核 TLB 刷新，最后启动块回写状态。
 
 use crate::arch::UserAccess;
 use crate::block::{Bio, BioAllocator, BlkOperation, IoResult, SECTOR_BYTES};
@@ -25,32 +74,41 @@ mod reclaim;
 mod truncate;
 mod writeback;
 
+/// 可读可写、不可执行的用户页权限常量。
 const RW: PagePermissions = PagePermissions {
     read: true,
     write: true,
     execute: false,
 };
+/// 只读、不可执行的用户页权限常量。
 const RO: PagePermissions = PagePermissions {
     read: true,
     write: false,
     execute: false,
 };
 
+/// 用户态写测试使用的源数据映射虚拟地址。
 const SOURCE: usize = 0x4800_0000;
+/// 用户态可写文件测试程序的路径。
 const PROGRAM_WRITE: &[u8] = b"/test/bin/user-write";
 
+/// 用户态与内核测试线程共享的匿名控制页虚拟地址。
 const SHARED_CONTROL: usize = 0x4900_0000;
+/// 共享控制页中存放文件映射偏移量的字节偏移。
 const SHARED_FILE_OFFSET: usize = 24;
+/// 独立验证地址空间中映射同一文件页的别名虚拟地址。
 pub(super) const SHARED_ALIAS: usize = 0x4a00_0000;
 
-/// 普通测试消费者的真实 Task 状态与同步结果观察，不承担 join 或文件拥有。
+/// 异步内核同步调用（如 `fsync` / `sync_inode`）消费线程的调度状态与返回结果观察器。
 pub(super) struct SyncObservation {
+    /// 正在执行同步调用的内核线程弱引用，由自旋锁保护。
     executor: SpinLock<Option<alloc::sync::Weak<Task>>>,
+    /// 同步调用完成后的返回值，未完成时为 `None`，由自旋锁保护。
     result: SpinLock<Option<Result<(), FsError>>>,
 }
 
 impl SyncObservation {
-    /// 只查询实际执行者的调度状态，entered 标记不能替代 Blocked。
+    /// 检查执行同步调用的内核线程当前是否处于调度器的 `Blocked`（睡眠阻塞）状态。
     pub(super) fn blocked(&self) -> bool {
         self.executor
             .lock()
@@ -59,23 +117,30 @@ impl SyncObservation {
             .is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
 
-    /// 返回真实同步调用已经写下的结果，不用观察任务退出代替底层结果。
+    /// 读取同步调用线程已写入的最终执行结果；若调用尚未返回则返回 `None`。
     pub(super) fn result(&self) -> Option<Result<(), FsError>> {
         *self.result.lock()
     }
 }
 
+/// 文件截断（Truncate）与页表反向映射解除（Unmap）并发测试的阶段同步控制器。
 struct TruncateControls {
+    /// 截断钩子当前到达的阶段计数。
     phase: AtomicUsize,
+    /// 测试进入错误清理流程时的取消标志，置位后放行所有钩子不再阻塞。
     cancelled: AtomicBool,
+    /// 用于在截断或反向映射的关键阶段暂停与恢复执行线程的三个完成门控。
     gates: [Completion; 3],
+    /// 页面缓存解除映射钩子（`FileUnmapPhase`）当前到达的阶段计数。
     unmap_phase: AtomicUsize,
+    /// 跨核 TLB 刷新同步（CSD）开始前记录的阶段快照。
     before_sync: SpinLock<Option<(usize, usize)>>,
+    /// 跨核 TLB 刷新同步（CSD）完成后记录的阶段快照。
     after_sync: SpinLock<Option<(usize, usize)>>,
 }
 
 impl TruncateControls {
-    /// 固定门仅暂停真实截断或 CSD 前后的拥有交接，错误清理放行同一批原参与者。
+    /// 分配并初始化截断与反向映射并发测试的同步控制器。
     fn new() -> Result<Arc<Self>, TestError> {
         Arc::try_new(Self {
             phase: AtomicUsize::new(0),
@@ -89,22 +154,32 @@ impl TruncateControls {
     }
 }
 
-/// 复用原用户、任务、卷及异步消费者拥有边界的可写文件夹具。
+/// 可写文件系统与用户态写测试的核心夹具，负责统一管理用户进程、打开的 Inode、后台同步线程及冷重载卷的生命周期。
 pub(super) struct WriteOwner {
+    /// 底层用户态测试环境与块设备持有者。
     pub(super) user: UserOwner,
+    /// 测试期间打开或操作过的 Inode 强引用列表，保留至清理阶段以执行强制回写与脏页检查。
     pub(super) inodes: Vec<InodeRef>,
+    /// 追加写（Append）并发测试使用的阶段同步门控。
     append_gate: Option<Arc<Completion>>,
+    /// 当前活跃的共享控制页所属用户地址空间引用，用于在清理阶段统一卸载测试钩子。
     shared_mm: Option<Arc<Mm>>,
+    /// 页面准备阶段并发测试使用的同步门控。
     prepare_gate: Option<Arc<Completion>>,
+    /// 截断与反向映射并发测试使用的同步控制器。
     truncate_controls: Option<Arc<TruncateControls>>,
+    /// 后台执行阻塞式文件同步操作的内核辅助线程句柄槽位。
     consumers: [Option<JoinHandle>; 2],
+    /// 冷挂载验证或命名空间测试中单独持有的 Ext4 卷实例。
     pub(super) cold_volume: Option<Arc<Ext4Volume>>,
+    /// 冷挂载验证中单独创建的 Inode 缓存实例。
     cold_cache: Option<Arc<InodeCache>>,
+    /// 用于等待 `cold_cache` 中所有 Inode 异步回收完毕的观察句柄。
     eviction: Option<InodeCacheWatch>,
 }
 
 impl WriteOwner {
-    /// 正文显式准备 RW 卷及同一根挂载，普通用户运行仍借原身份拥有者。
+    /// 预留 Inode 跟踪槽位，并以读写模式初始化底层 Ext4 卷与根挂载命名空间。
     fn prepare(&mut self, context: &TestContext<'_>) -> TestResult {
         self.inodes
             .try_reserve_exact(16)
@@ -112,7 +187,7 @@ impl WriteOwner {
         self.user.prepare_mode(context, AccessMode::ReadWrite, 4)
     }
 
-    /// 原生 namespace 消费者沿同一 RW PathOwner 准备，并让原清理无论 graph 状态都同步此卷。
+    /// 初始化读写命名空间测试环境，并记录卷引用以便在清理阶段强制同步元数据。
     pub(super) fn prepare_namespace(&mut self, context: &TestContext<'_>) -> TestResult {
         self.prepare(context)?;
         assert!(self.cold_volume.is_none() && self.cold_cache.is_none());
@@ -120,7 +195,7 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 准备可由测试组写入的 setgid 目录与只允许 root 搜索的负例子目录。
+    /// 创建具有 `setgid` 继承属性（GID 1001）的工作目录 `/test/ns-work`，以及仅允许 root 访问的权限测试子目录。
     fn prepare_namespace_parent(&mut self, context: &TestContext<'_>) -> TestResult {
         let vfs = self.user.path.vfs().clone();
         let fs_context = self.user.path.context().clone();
@@ -132,7 +207,7 @@ impl WriteOwner {
         let workspace = self.open(context, b"/test/ns-work", 0x10000)?;
         let inode = checked(context, workspace.path().unwrap().inode())?.clone();
 
-        // mkdir 不接受 SGID 模式位；父目录的继承属性通过受保护元数据更新设置。
+        // mkdir 系统调用会掩去 S_ISGID 位，因此通过底层的受保护元数据更新接口显式设置父目录的 SGID 位与所属组。
         checked(
             context,
             inode.update_metadata(checked(context, inode.disk_volume())?.claim(), |metadata| {
@@ -157,7 +232,7 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 删除普通用户无权移除的预置权限目录与最后一层测试目录。
+    /// 清理测试期间创建的 `/test/ns-work/ns-permission` 与 `/test/ns-work` 目录。
     fn remove_namespace_parent(&self, context: &TestContext<'_>) -> TestResult {
         let vfs = self.user.path.vfs();
         let fs_context = self.user.path.context();
@@ -173,7 +248,7 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 保留实际 inode 到同步排空之后；失败路径也不能丢弃已接受修改。
+    /// 解析路径并以指定标志打开文件，同时将该文件的 Inode 纳入夹具跟踪列表以确保清理时刷盘。
     pub(super) fn open(
         &mut self,
         context: &TestContext<'_>,
@@ -201,7 +276,7 @@ impl WriteOwner {
         )
     }
 
-    /// 保留末组件本身的 canonical inode，symlink 不跟随到其目标。
+    /// 以不跟随末尾符号链接（`ResolveMode::NoFollow`）的方式解析路径，并将目标本身的 Inode 纳入夹具跟踪列表。
     fn hold_nofollow(
         &mut self,
         context: &TestContext<'_>,
@@ -224,7 +299,7 @@ impl WriteOwner {
         Ok(inode)
     }
 
-    /// 从同一原根取得卷，根引用仅在正文和同步期间短暂保活。
+    /// 获取当前根文件系统挂载的底层 `Ext4Volume` 强引用。
     pub(super) fn volume(&self) -> Arc<Ext4Volume> {
         self.user
             .path
@@ -237,7 +312,7 @@ impl WriteOwner {
             .clone()
     }
 
-    /// 用户普通 syscall 自己断言返回值，内核仍消费 wait 状态与真实离栈 join。
+    /// 预打开测试目标文件以纳入回写跟踪，随后启动指定模式的 `/test/bin/user-write` 程序并等待其正常退出。
     fn run(&mut self, context: &mut TestContext<'_>, mode: &[u8]) -> TestResult {
         for pathname in [
             b"/test/write-user" as &[u8],
@@ -266,7 +341,7 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 普通 ELF 自己 mmap 文件；共享匿名控制页只承担检查点，不改变生产访问路径。
+    /// 加载指定模式的 `/test/bin/user-write` 程序，并在其地址空间中映射及清零 `SHARED_CONTROL` 共享匿名控制页。
     fn shared_image(
         &mut self,
         context: &TestContext<'_>,
@@ -291,7 +366,7 @@ impl WriteOwner {
         Ok(image)
     }
 
-    /// 用户执行固定在另一 CPU，控制者不持文件锁等待其普通指令检查点。
+    /// 以 root 权限在异核上启动已配置好共享控制页的用户程序。
     fn start_shared(&mut self, context: &TestContext<'_>, image: LoadedImage) -> TestResult {
         self.user.start_program(
             context,
@@ -303,7 +378,7 @@ impl WriteOwner {
         )
     }
 
-    /// 按指定的真实用户身份启动同一普通 ELF，并保留原 UserOwner 的 wait/join。
+    /// 以指定的用户凭证（UID/GID 等）在异核上启动已配置好共享控制页的用户程序。
     fn start_shared_as(
         &mut self,
         context: &TestContext<'_>,
@@ -320,7 +395,7 @@ impl WriteOwner {
         )
     }
 
-    /// 实际退出离栈必须在原十秒内可观察，随后消费原 wait 事件和全部子进程。
+    /// 等待共享控制模式的用户进程退出内核栈并回收全部子进程，验证退出状态码为 `0`。
     fn finish_shared(&mut self, context: &mut TestContext<'_>) -> TestResult {
         until("shared user did not leave original stack", || {
             self.user
@@ -343,7 +418,7 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 检查点同时核原用户绑定仍活，避免把用户提前死亡当作阶段完成。
+    /// 等待用户进程在 `SHARED_CONTROL + offset` 处写入预期的阶段号，同时检测进程是否异常提前退出。
     fn phase(&self, mm: &Mm, offset: usize, expected: u32) -> TestResult {
         until("shared user checkpoint missing", || {
             mm.load_user_u32(SHARED_CONTROL + offset) == Ok(expected)
@@ -362,13 +437,13 @@ impl WriteOwner {
         Ok(())
     }
 
-    /// 原 copyout 发布普通控制字，不能借文件原页或 PTE 裸写绕过 mkwrite。
+    /// 向 `SHARED_CONTROL + 4` 门控字写入指定值，放行正在等待门控的用户态线程。
     fn release(mm: &Mm, value: u32) -> TestResult {
         mm.store_user_u32(SHARED_CONTROL + 4, value)
             .map_err(|_| TestError("shared user gate publication failed"))
     }
 
-    /// 由普通 fork 已发表的真实 TID 取 child 原绑定，诊断引用不承担执行寿命。
+    /// 等待用户态 `fork` 将子进程 TID 写入 `SHARED_CONTROL + 16`，并在任务图中查找对应的子线程句柄。
     fn child(&self, mm: &Mm) -> Result<Arc<task::UserThread>, TestError> {
         let mut tid = 0;
         until("shared fork child identity missing", || {
@@ -381,7 +456,7 @@ impl WriteOwner {
             .ok_or(TestError("shared fork child binding missing"))
     }
 
-    /// 原 Task 运行真实同步调用，结果另存以消费预期错误，句柄保在 fixture 的清理边界外。
+    /// 在指定槽位启动一个后台内核线程以执行可能阻塞的同步闭包 `operation`，并返回其状态观察器。
     pub(super) fn consume_sync(
         &mut self,
         index: usize,
@@ -405,7 +480,7 @@ impl WriteOwner {
         Ok(observation)
     }
 
-    /// 冷消费者取得同一真实卷的文件与 Vfs；只需文件的调用者立即释放视图，旧卷完全退休后才可重开。
+    /// 在底层块设备上新建独立的 `Ext4Volume`、`InodeCache` 与 `Vfs` 实例（模拟冷启动挂载），并打开 `/test/write-reserve` 文件。
     fn cold_open(&mut self, context: &TestContext<'_>) -> Result<(FileRef, Vfs), TestError> {
         assert!(self.cold_volume.is_none() && self.cold_cache.is_none());
         self.inodes
@@ -447,7 +522,7 @@ impl WriteOwner {
         Ok((file, vfs))
     }
 
-    /// 正式同步后的全部旧 FS 拥有先退出，真实完成 Work 尾和弱引用到期后才重建同设备的卷及缓存。
+    /// 释放当前所有的内存映射、文件、Inode、缓存与卷引用，等待异步缓存回收与块设备完成队列彻底排空后，重新执行冷挂载打开。
     fn cold_reopen(
         &mut self,
         context: &mut TestContext<'_>,
@@ -465,6 +540,7 @@ impl WriteOwner {
         assert!(self.eviction.is_none());
         self.eviction = Some(self.cold_cache.as_ref().unwrap().watch());
 
+        // Step 1: 释放全部强引用并等待 InodeCache 异步驱逐任务与块设备在途完成回调彻底排空。
         drop((mm, file, inode, volume));
         self.inodes.clear();
         drop(self.cold_cache.take());
@@ -473,6 +549,7 @@ impl WriteOwner {
         drop(self.cold_volume.take());
         disk.test_flush_completions();
 
+        // Step 2: 断言块设备无在途 I/O 且旧的文件系统各层对象强引用计数全部归零。
         context.expect_eq(disk.test_snapshot().inflight, 0);
         context.expect_eq(weak_mm.upgrade().is_none(), true);
         context.expect_eq(weak_file.upgrade().is_none(), true);
@@ -488,11 +565,12 @@ impl WriteOwner {
             return Err(TestError("cold reload still has old FS owners"));
         }
 
+        // Step 3: 记录当前块设备累计提交次数，并在同一块设备上重新构建冷挂载视图。
         let reads_before = disk.test_snapshot().submitted;
         Ok((self.cold_open(context)?.0, reads_before))
     }
 
-    /// 未离栈句柄留在 fixture，错误返回仍先恢复设备完成再进行有限 join。
+    /// 等待所有后台同步消费线程退出内核栈并检查其返回值。
     pub(super) fn join_consumers(&mut self) -> TestResult {
         for join in self.consumers.iter().flatten() {
             until("shared kernel consumer did not leave stack", || {
@@ -513,7 +591,7 @@ impl WriteOwner {
 }
 
 impl Fixture<UserSuite> for WriteOwner {
-    /// 设备、网络域与压力存储均复用整组拥有，正文失败仍保原停止责任。
+    /// 创建可写文件测试夹具实例，复用底层 `UserOwner` 的块设备与运行环境。
     fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         Ok(Self {
             user: <UserOwner as Fixture<UserSuite>>::set_up(context, suite)?,
@@ -529,8 +607,9 @@ impl Fixture<UserSuite> for WriteOwner {
         })
     }
 
-    /// 所有生产者先退出和离栈，再真实写出文件页、元数据及 FLUSH，最后释放根并停止设备。
+    /// 静默并清理可写文件测试环境：卸载钩子、唤醒阻塞线程、回收用户进程，并将所有文件脏页与卷元数据同步刷回磁盘。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        // Step 1: 卸载地址空间与 Inode 上挂载的所有测试钩子，并完成所有同步门控以唤醒阻塞中的线程。
         if let Some(mm) = self.shared_mm.take() {
             mm.ktest_set_mkwrite_hook(None);
             mm.ktest_set_fault_hook(None);
@@ -555,6 +634,7 @@ impl Fixture<UserSuite> for WriteOwner {
             gate.complete();
         }
 
+        // Step 2: 恢复块设备完成回调，通知残留用户进程退出，并等待所有内核消费线程与用户线程完全离开内核栈。
         self.user
             .path
             .owner
@@ -595,6 +675,7 @@ impl Fixture<UserSuite> for WriteOwner {
         }
         self.user.release_pressure();
 
+        // Step 3: 将测试期间触碰过的所有 Inode 脏页同步回写到磁盘，并验证无残留 Dirty/Writeback 状态。
         for inode in &self.inodes {
             let result = crate::fs::writeback::sync_inode(inode);
             if result == Err(FsError::Io(BlockError::StopUnconfirmed)) {
@@ -616,6 +697,7 @@ impl Fixture<UserSuite> for WriteOwner {
             return Err(first.unwrap_or(TestError("write cleanup retains actual Dirty or WB")));
         }
 
+        // Step 4: 若存在冷挂载缓存，清空 Inode 引用并等待缓存异步回收彻底完成。
         if self.eviction.is_none() {
             self.eviction = self.cold_cache.as_ref().map(|cache| cache.watch());
         }
@@ -634,6 +716,7 @@ impl Fixture<UserSuite> for WriteOwner {
             drop(self.eviction.take());
         }
 
+        // Step 5: 同步 Ext4 卷的元数据缓存并验证所有元数据块均已落盘 clean，最后交由底层 UserOwner 完成清理。
         let volume = self
             .cold_volume
             .clone()
@@ -668,13 +751,13 @@ impl Fixture<UserSuite> for WriteOwner {
         cleanup
     }
 
-    /// 两层六域和 Task/worker/domain 均由原拥有者比较，不重置统计。
+    /// 销毁夹具并委托底层 `UserOwner` 校验全局内存、任务及块设备统计计数是否平衡。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         <UserOwner as Fixture<UserSuite>>::tear_down(self.user, context)
     }
 }
 
-/// 每个期望字节来自独立输入，短读取或读到旧缓存均失败。
+/// 从文件指定偏移读取字节并与预期切片精确比对，若出现短读或数据不一致则断言失败。
 pub(super) fn bytes_at(
     context: &mut TestContext<'_>,
     file: &FileRef,
@@ -691,7 +774,7 @@ pub(super) fn bytes_at(
     Ok(())
 }
 
-/// VM 错误保原原因，用户输入不经测试专用页或旁路复制。
+/// 将虚拟内存操作错误转换为测试错误，并输出详细的 `VmError` 诊断日志。
 fn vm<T>(context: &TestContext<'_>, result: Result<T, VmError>) -> Result<T, TestError> {
     result.map_err(|error| {
         context.diagnostic(format_args!("write-vm error={:?}", error));
@@ -699,7 +782,7 @@ fn vm<T>(context: &TestContext<'_>, result: Result<T, VmError>) -> Result<T, Tes
     })
 }
 
-/// 每份别名有独立 Mm 和 VA，文件页偏移由本例实际准备的范围决定。
+/// 创建独立的地址空间并将文件指定偏移映射到 `SHARED_ALIAS`，预触发一次读缺页以建立共享页表映射。
 pub(super) fn shared_alias(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -715,7 +798,7 @@ pub(super) fn shared_alias(
     Ok(mm)
 }
 
-/// 完整复制的字节与独立输入比较，PFN 诊断不能替代实际内容。
+/// 从用户地址空间的指定虚拟地址拷贝字节并与预期数据比对。
 fn mapped_bytes(context: &mut TestContext<'_>, mm: &Mm, address: usize, expected: &[u8]) {
     let mut bytes = [0xa7; 4096];
     context.expect_eq(
@@ -725,13 +808,14 @@ fn mapped_bytes(context: &mut TestContext<'_>, mm: &Mm, address: usize, expected
     context.expect_eq(&bytes[..expected.len()], expected);
 }
 
-/// 位图只在 writer 已停稳后读取；未初始化组仍使用正式描述符合法计数。
+/// 遍历 Ext4 卷的所有块组描述符与已初始化的块/Inode 位图，校验 CRC 校验和并断言块组汇总计数与超级块空闲计数一致。
 pub(super) fn allocation_counts(
     context: &mut TestContext<'_>,
     volume: &Ext4Volume,
 ) -> Result<(u64, u64), TestError> {
     let g = volume.geometry();
     let cache = volume.metadata_cache();
+    // Step 1: 读取超级块中的全局空闲块数与空闲 Inode 数。
     let superblock = checked(
         context,
         cache
@@ -759,6 +843,7 @@ pub(super) fn allocation_counts(
     let super_free = checked(context, decoded)?;
     drop(superblock);
 
+    // Step 2: 逐个块组读取组描述符，累加空闲计数，并对已初始化的位图校验 CRC 及逐位统计空闲位数量。
     let mut sum = (0, 0);
     for group in 0..g.groups_count {
         let byte = group * g.descriptor_size as u64;
@@ -836,6 +921,7 @@ pub(super) fn allocation_counts(
             context.expect_eq(free, expected);
         }
     }
+    // Step 3: 验证所有块组的空闲计数总和与超级块记录完全相等。
     context.expect_eq(sum, super_free);
     context.diagnostic(format_args!(
         "write-allocation free-blocks={} free-inodes={} bitmap-count-crc=1",
@@ -844,7 +930,7 @@ pub(super) fn allocation_counts(
     Ok(sum)
 }
 
-/// 正常分配和末使用释放都从当前共同位图取真实 inode 位，并验证同一记录的 checksum。
+/// 查询指定编号的 Inode 在所属块组的 Inode 位图中是否已置位（已分配），同时校验位图 CRC。
 pub(super) fn inode_allocation_bit(volume: &Ext4Volume, number: u64) -> Result<bool, FsError> {
     let g = volume.geometry();
     let group = (number - 1) / g.inodes_per_group;
@@ -877,22 +963,31 @@ pub(super) fn inode_allocation_bit(volume: &Ext4Volume, number: u64) -> Result<b
     })?
 }
 
+/// 文件块映射树（Extent 树或传统多级间接块树）的遍历统计结果。
 #[derive(Default, Debug)]
 struct Tree {
+    /// 文件映射的数据块总数（逻辑叶节点指向的物理块数）。
     data: u64,
+    /// 外部元数据索引节点块总数（不含嵌入在 Inode 内的根部区域）。
     nodes: u64,
+    /// Extent 叶节点中的连续区间条目（Extent）总数。
     extents: usize,
+    /// Extent 树的根部深度（0 表示叶节点直接保存在 Inode 内）。
     depth: u16,
+    /// 遍历期间收集到的所有数据块与索引节点块的物理块号列表（用于去重与位图校验）。
     blocks: Vec<u64>,
 }
 
-/// 停稳其他分配与释放者后核物理位；几何排除或真实 used 返回 Some(true)，未初始化且仍有空闲返回 None。
+/// 查询指定物理块号在所属块组的块位图中是否处于已占用状态。
+///
+/// 若物理块位于超级块/块组描述符保留区或已在位图中置位，返回 `Ok(Some(true))`；
+/// 若所属块组位图尚未初始化且仍有剩余空闲块，返回 `Ok(None)`。
 pub(super) fn block_allocation_bit(
     volume: &Ext4Volume,
     physical: u64,
 ) -> Result<Option<bool>, FsError> {
     let g = volume.geometry();
-    // validate_blocks 只核卷边界和固定 super/GDT 保留范围，这些地址不能成为新 data。
+    // validate_blocks 检查卷边界以及固定的超级块和块组描述符保留区，这些保留块视为已被占用。
     if g.validate_blocks(physical, 1).is_err() {
         return Ok(Some(true));
     }
@@ -918,7 +1013,7 @@ pub(super) fn block_allocation_bit(
         if group == 0 || g.features_ro_compat & (0x10 | codec::METADATA_CSUM) == 0 {
             return Err(FsError::Corrupt);
         }
-        // 未初始化 bitmap 不含权威位；正式 free_blocks=0 时 allocator 会跳过整组。
+        // 未初始化的块位图不直接提供逐位占用信息；仅当组描述符记录的 free_blocks 为 0 时可确认为全部占用。
         return Ok((state.free_blocks == 0).then_some(true));
     }
 
@@ -931,7 +1026,7 @@ pub(super) fn block_allocation_bit(
     })?
 }
 
-/// 每个连接到树的物理块必须有自己的真实位图位，不能只靠总计数相等。
+/// 验证物理块号合法且在块位图中已标记为分配，并将其追加到遍历树的块列表中。
 fn account_block(volume: &Ext4Volume, physical: u64, tree: &mut Tree) -> Result<(), FsError> {
     volume.geometry().validate_blocks(physical, 1)?;
     if block_allocation_bit(volume, physical)? != Some(true)
@@ -943,7 +1038,7 @@ fn account_block(volume: &Ext4Volume, physical: u64, tree: &mut Tree) -> Result<
     Ok(())
 }
 
-/// 实际读取每个 extent 节点并消费正式 CRC，不以逻辑块扫描代替 grow/split 的树证据。
+/// 递归遍历 Ext4 Extent 树节点，校验各层外部索引块的 CRC 校验和，并统计数据块、索引块与 Extent 条目数。
 fn extent_tree(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -996,7 +1091,7 @@ fn extent_tree(
     Ok(())
 }
 
-/// 传统指针树逐个访问实际节点，空指针不计块，所有层的节点都计入 i_blocks。
+/// 递归遍历传统的直接/间接块指针树（0 表示空洞跳过），统计所有数据块与各级间接索引块。
 fn indirect_tree(
     volume: &Ext4Volume,
     physical: u64,
@@ -1026,7 +1121,7 @@ fn indirect_tree(
     Ok(())
 }
 
-/// inode 本身的 CRC、实际根格式和全部外部节点共同决定数据/节点计数。
+/// 加载磁盘上的 Inode 记录，遍历其块映射树（Extent 或间接块），并验证无重复物理块且 `i_blocks` 扇区计数准确。
 fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestError> {
     let volume = checked(context, inode.disk_volume())?;
     let data = checked(context, volume.load_inode(inode.number(), None))?;
@@ -1037,6 +1132,7 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
         )
         .map_err(|_| TestError("write tree observations OOM"))?;
 
+    // Step 1: 根据 Inode 的 EXTENTS 标志选择遍历 Extent 树或传统的 15 槽位直接/间接指针树。
     if data.flags & codec::EXTENTS != 0 {
         let header = checked(context, codec::extent_header(&data.block, None))?;
         tree.depth = header.depth;
@@ -1058,6 +1154,7 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
         }
     }
 
+    // Step 2: 对收集到的全部物理块排序查重，并验证磁盘与内存中的 i_blocks 512 字节扇区计数完全匹配。
     tree.blocks.sort_unstable();
     context.expect_eq(tree.blocks.windows(2).all(|pair| pair[0] != pair[1]), true);
     context.expect_eq(
@@ -1080,13 +1177,14 @@ fn tree(context: &mut TestContext<'_>, inode: &InodeRef) -> Result<Tree, TestErr
     Ok(tree)
 }
 
-/// 真实 PagePressure 只占物理页，堆类别不耗尽，控制槽在施压之前完成预留。
+/// 物理页内存压力测试辅助器，用于在预留好管理槽位的前提下耗尽全局伙伴系统（Buddy Allocator）的空闲物理页。
 struct PagePressure {
+    /// 已从伙伴系统分配并持有的物理页凭证列表，在销毁时自动归还给页分配器。
     pages: Vec<mm::OwnedPages>,
 }
 
 impl PagePressure {
-    /// 固定容量记录原页凭证，压力期间不分配控制对象。
+    /// 根据当前系统存在的物理页总数预分配 `Vec` 容量，确保后续施压分配过程中不会触发堆内存扩容。
     fn prepare() -> Result<Self, TestError> {
         let mut pages = Vec::new();
         pages
@@ -1095,7 +1193,7 @@ impl PagePressure {
         Ok(Self { pages })
     }
 
-    /// 原 allocator 的真实 None 是页耗尽证据；放压由原凭证 Drop 归还。
+    /// 收缩缓存并循环分配高阶与单页物理内存直至分配器返回 `None`，确认物理页已被完全耗尽。
     fn exhaust(&mut self) -> bool {
         mm::shrink_all();
         mm::drain_all_pages();
@@ -1111,7 +1209,7 @@ impl PagePressure {
     }
 }
 
-/// 生产者停稳后逐个有界检查原 metadata 索引，残留真实义务时不得销毁 cache 平账。
+/// 检查指定 Ext4 卷的元数据缓存中是否仍存在处于 `Dirty` 或 `Writeback` 状态的缓存页。
 fn metadata_pending(volume: &Ext4Volume) -> bool {
     let cache = volume.metadata_cache();
     for mark in [
@@ -1134,7 +1232,7 @@ fn metadata_pending(volume: &Ext4Volume) -> bool {
     false
 }
 
-/// 用真实文件块地址和原页凭证准备数据回写，并将完成字节归入所属卷。
+/// 为已解除目录链接（Unlinked）但仍持有物理页的 Inode 准备底层数据回写范围与 `FolioWriteback` 凭证。
 fn prepare_unlinked_original_writeback(
     inode: &InodeRef,
     folio: &crate::mm::FolioRef,
@@ -1159,8 +1257,10 @@ fn prepare_unlinked_original_writeback(
             continue;
         }
         let target = targets[offset / block_size].ok_or(FsError::Corrupt)?;
-        // SAFETY: 与生产准备路径一样，内容 guard 排斥许可提交；mkclean 已撤销
-        // 同源共享 W 并完成全 CPU CSD，返回凭证随后由原 FsClaim/Bio 全尾收权。
+        // SAFETY:
+        // 1. 当前持有 `folio.lock_content()` 内容锁，排斥并发的写许可提交。
+        // 2. 前置 `inode.mapping().mkclean(0, &folio, &mut content)` 已撤销所有共享可写页表映射并完成跨核 TLB 同步。
+        // 3. 返回的 `FolioWriteback` 凭证将移交底层块设备 I/O 请求持有，直至 Bio 完成回调执行完毕后释放页面的回写状态。
         if let Some(writeback) = unsafe { content.begin_writeback(offset, block_size)? } {
             ranges.push((
                 volume.view().absolute_byte(target, block_size)?,
@@ -1177,7 +1277,7 @@ fn prepare_unlinked_original_writeback(
     Ok(ranges)
 }
 
-/// 在短内容锁内复制完整的真实 inode 记录，支持本例两种 ext4 记录尺寸。
+/// 读取并拷贝磁盘上指定编号 Inode 的原始字节记录（支持 128 字节与 256 字节两种 Ext4 Inode 尺寸）。
 fn inode_record_snapshot(
     context: &mut TestContext<'_>,
     volume: &Ext4Volume,
@@ -1199,7 +1299,7 @@ fn inode_record_snapshot(
     Ok((record, size))
 }
 
-/// 保留六类行为的实际注册槽，父入口继续只借一个槽而不维护逐例分派。
+/// 汇总六类可写文件测试子模块的注册锚点，供上层测试套件统一引用以防止链接器丢弃。
 pub(super) fn anchor() -> &'static ::ktest::SuiteSlot {
     core::hint::black_box([
         buffered::cases::__ktest_anchor(),

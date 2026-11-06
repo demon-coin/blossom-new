@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""创建内核 ext4 回归专用的只读、损坏和可写夹具，不修改外部输入树。"""
+"""构建内核 ext4 文件系统回归测试所需的只读、故障注入（损坏）与可写磁盘镜像夹具。
+
+本脚本在宿主机临时目录中组装测试文件树，并调用 `mke2fs`、`debugfs`、`e2fsck`、`dumpe2fs` 等标准
+e2fsprogs 工具生成三类测试镜像：
+1. 只读基准镜像（`readonly`）：覆盖 `seed4k`、`nojournal4k`、`legacy1k` 三种几何配置，包含硬链接、
+   快速/块级符号链接、非 UTF-8 原始字节文件名、多层深孔洞稀疏文件、二层 extent 树、间接块映射及
+   HTree（dx）索引大目录。
+2. 损坏与特性边界镜像（`*-bad-*` / `*-unknown-*`）：从只读正盘复制独立副本，定点翻转超级块、块组描述符、
+   inode、extent 节点、目录块或 HTree 块的校验字节，或注入不兼容布局与未知兼容位，用于测试内核挂载与读取的防御能力。
+3. 可写回归镜像（`writable`）：在源根文件系统的私有副本中安装 `user-write` 测试程序、空占槽文件、
+   预分配 unwritten 区及接近满盘（`--nearly-full`）的保留空间，供内核与用户态写路径测试使用。
+"""
 
 import argparse
 import os
@@ -24,7 +35,10 @@ DEEP_EXTENTS = 1500
 
 
 def punch_holes(image, block_size):
-    """子块 hole 用工具明确 punch，避免依赖宿主 4KiB SEEK_HOLE 的粒度。"""
+    """使用 `debugfs` 的 `punch` 命令在 `/deep` 与 `/sparse` 文件中显式打出逻辑块孔洞。
+
+    直接通过 `debugfs` 按文件系统块粒度打孔，避免受宿主机临时文件系统 `SEEK_HOLE` 最小粒度（通常为 4KiB）的影响。
+    """
     with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", prefix="holes-",
                                      suffix=".commands", dir=image.parent) as requests:
         for logical in range(1, (DEEP_EXTENTS - 1) * 2, 2):
@@ -36,20 +50,20 @@ def punch_holes(image, block_size):
 
 
 def pattern(offset, length):
-    """生成文件逻辑偏移对应的非零周期图样，内核按同一外部数据合同核验。"""
+    """根据文件逻辑字节偏移生成确定性的非零周期字节图样，供内核测试端按相同公式核对读取内容。"""
     return bytes((37 + (position // 512) * 17 + position % 512) & 255
                  for position in range(offset, offset + length))
 
 
 def write_pattern(path, length):
-    """分段写普通 staging 文件，避免把整盘数据保留在宿主内存。"""
+    """以 64KiB 为分块向目标文件写入确定性字节图样，避免一次性在内存中分配整块大缓冲区。"""
     with path.open("xb") as stream:
         for offset in range(0, length, 65536):
             stream.write(pattern(offset, min(65536, length - offset)))
 
 
 def create_readonly_fixture_tree(directory, block_size):
-    """从普通文件构造链接、字节名、稀疏文件和真实多层映射的输入树。"""
+    """在临时目录中构造只读测试镜像所需的各类文件、链接、稀疏布局与目录结构。"""
     directory.mkdir()
     write_pattern(directory / "pattern", PATTERN_SIZE)
     os.link(directory / "pattern", directory / "hardlink")
@@ -101,7 +115,7 @@ def create_readonly_fixture_tree(directory, block_size):
 
 
 def optimize_fixture_directories(image, profile):
-    """目录优化使用正式工具生成 dx 及 CRC，第二次只读检查必须干净退出。"""
+    """运行 `e2fsck -fyD` 构建 HTree（dx）目录索引并更新校验和，再用只读检查确认文件系统完全一致。"""
     run_checked_command(["e2fsck", "-fyD", image], image.with_suffix(".log"), accepted=(0, 1))
     run_checked_command(["e2fsck", "-fn", image], image.with_suffix(".log"))
     run_checked_command(["dumpe2fs", "-h", image], image.with_suffix(".log"))
@@ -113,7 +127,7 @@ def optimize_fixture_directories(image, profile):
 
 
 def create_readonly_fixture_image(output, profile, size_mib):
-    """每种几何独立制盘，预分配区由 debugfs 建立且保持 unwritten 状态。"""
+    """按指定几何配置（`profile`）构建单个只读 ext4 测试镜像，并校验二层 extent 树与 HTree 索引深度。"""
     block_size = PROFILES[profile][0]
     with tempfile.TemporaryDirectory(prefix="staging-", dir=output.parent) as temporary:
         source = Path(temporary) / "root"
@@ -126,7 +140,7 @@ def create_readonly_fixture_image(output, profile, size_mib):
     optimize_fixture_directories(output, profile)
     if profile != "legacy1k":
         stat = run_debugfs_command(output, "stat /deep")
-        # ETB1 是实际二层树节点；格式来自 debugfs，不实现内核 extent 解码。
+        # 确认 debugfs 报告中出现 (ETB1)，即 /deep 文件已形成深度至少为 2 的多级 extent 树
         if "(ETB1)" not in stat:
             raise ValueError("debugfs did not produce a depth-two extent tree")
     tree = run_debugfs_command(output, "htree_dump /indexed")
@@ -135,7 +149,7 @@ def create_readonly_fixture_image(output, profile, size_mib):
 
 
 def duplicate(source, name):
-    """破坏副本只从本次正盘复制到全新输出文件，原正盘始终保留。"""
+    """将基准镜像复制到同目录下的 `<name>.img` 新文件，作为故障注入的独立副本。"""
     target = source.with_name(name + ".img")
     with source.open("rb") as input_file, target.open("xb") as output:
         shutil.copyfileobj(input_file, output, 1024 * 1024)
@@ -143,7 +157,7 @@ def duplicate(source, name):
 
 
 def flip(image, offset):
-    """翻转指定校验或内容字节，故意保留旧 CRC，不复制格式校验算法。"""
+    """翻转镜像指定字节偏移处的最低位（异或 `0x01`），故意保持原有 CRC 不变以触发内核校验和失败。"""
     with image.open("r+b") as stream:
         stream.seek(offset)
         original = stream.read(1)
@@ -156,7 +170,7 @@ def flip(image, offset):
 
 
 def inode_offset(image, name, block_size):
-    """inode 的实际位置由 debugfs imap 给出，不自行重算组布局。"""
+    """通过 `debugfs imap` 查询指定路径的 inode 在镜像文件中的精确字节偏移。"""
     text = run_debugfs_command(image, f"imap /{name}")
     found = re.search(r"located at block\s+(\d+),\s+offset\s+(0x[0-9a-fA-F]+)", text)
     if found is None:
@@ -165,7 +179,7 @@ def inode_offset(image, name, block_size):
 
 
 def physical_block(image, name, logical):
-    """实际物理地址只消费 bmap 的完整结果，unwritten 的合法标记不改变地址。"""
+    """通过 `debugfs bmap` 查询文件指定逻辑块对应的物理块号（兼容带 `(uninit)` 标记的预分配块）。"""
     text = run_debugfs_command(image, f"bmap /{name} {logical}")
     numbers = re.findall(r"^([0-9]+)(?: \(uninit\))?$", text, re.MULTILINE)
     if len(numbers) != 1 or int(numbers[0]) == 0:
@@ -174,7 +188,7 @@ def physical_block(image, name, logical):
 
 
 def overwrite(image, offset, data):
-    """有界覆盖本次独立副本的格式字段，旧内容与写入范围保留在工具日志。"""
+    """覆盖镜像指定字节偏移处的一段数据，并将修改前后的十六进制前缀追加记录到同名 `.log` 日志中。"""
     with image.open("r+b") as stream:
         stream.seek(offset)
         old = stream.read(len(data))
@@ -187,7 +201,7 @@ def overwrite(image, offset, data):
 
 
 def corrupt_indirect_data(image):
-    """只破坏合法 IND 节点的首个 data 指针，inode root 与前三文件页保持有效。"""
+    """将 `/pattern` 文件一级间接块（`IND`）中的首个数据块指针覆写为 `0xffffffff`，用于测试间接块越界错误处理。"""
     text = run_debugfs_command(image, "stat /pattern")
     found = re.search(r"\(IND\):([0-9]+)", text)
     if found is None:
@@ -196,7 +210,7 @@ def corrupt_indirect_data(image):
 
 
 def create_damaged_fixture_images(directory):
-    """各错误类型独立镜像保留证据，结构修改由 debugfs 重算所属 inode/super CRC。"""
+    """以 `seed4k.img` 和 `legacy1k.img` 为基准，派生各类校验和损坏、特性位不兼容与结构畸变的测试镜像。"""
     source = directory / "seed4k.img"
     block_size = 4096
     flip(duplicate(source, "seed4k-bad-super"), 1024 + 1020)
@@ -220,7 +234,7 @@ def create_damaged_fixture_images(directory):
     for field in ("compat", "ro_compat"):
         unknown = duplicate(source, f"seed4k-unknown-{field}")
         run_checked_command(["dumpe2fs", "-h", unknown], unknown.with_suffix(".log"))
-        # ssv 保留正盘已知位，同时加入只读必须允许的未知位；CRC 由工具更新。
+        # 在保留原有兼容/只读兼容特性位的基础上置入最高位未知标志，并由 debugfs 自动重算超级块 CRC
         offset = 92 if field == "compat" else 100
         with unknown.open("rb") as stream:
             stream.seek(1024 + offset)
@@ -247,11 +261,11 @@ def create_damaged_fixture_images(directory):
 
 
 def copy_writable_fixture_tree(source, destination):
-    """为可写夹具复制独立树，保留输入树中的硬链接身份与符号链接。"""
+    """将源根文件系统目录树复制到私有临时目录，同时保持目录内的硬链接关系与符号链接不变。"""
     copied = {}
 
     def copy_file(source_path, destination_path):
-        """同一源 inode 的后续名字链接到本次副本，不与外部树共享可写 inode。"""
+        """复制单个普通文件；若同一源 `(st_dev, st_ino)` 已复制过，则在目标树中建立内部硬链接，避免与外部源目录共享 inode。"""
         status = os.stat(source_path)
         identity = (status.st_dev, status.st_ino)
         if identity in copied:
@@ -265,7 +279,7 @@ def copy_writable_fixture_tree(source, destination):
 
 
 def install_writable_fixture_files(directory, user_write_program):
-    """仅在本次私有副本放入已编译的写测试 ELF 和每个消费者的独立文件。"""
+    """在私有副本的 `/test` 目录下安装用户态写测试程序（`user-write`）及各个写测试用例专用的预置文件。"""
     test = directory / "test"
     binary_directory = test / "bin"
     if test.is_symlink() or binary_directory.is_symlink():
@@ -295,7 +309,7 @@ def install_writable_fixture_files(directory, user_write_program):
 
 def create_writable_fixture_image(source_tree_dir, user_write_program, output_image_path,
                                   profile="seed4k", image_size_mib=256, nearly_full=False):
-    """在私有副本安装写夹具，共同制卷后显式预分配，检查通过才发布全新夹具。"""
+    """构建可写 ext4 测试镜像：复制源树、安装写测试文件、注入预分配块（及可选的近满盘占空比），通过一致性检查后原子发布。"""
     source = Path(source_tree_dir).resolve(strict=True)
     program = Path(user_write_program).resolve(strict=True)
     output = Path(os.path.abspath(output_image_path))
@@ -320,6 +334,7 @@ def create_writable_fixture_image(source_tree_dir, user_write_program, output_im
         try:
             create_ext4_image(tree, image, profile, image_size_mib)
             block_size = PROFILES[profile][0]
+            # 为非 legacy1k 镜像预分配 unwritten 范围，并在物理块中填入非零脏字节（0xa7），验证内核读取 unwritten 块时返回零而非底层脏数据
             preallocated = () if profile == "legacy1k" else (
                 ("write-unwritten", 16384 // block_size), ("write-merge", 64),
             )
@@ -331,6 +346,7 @@ def create_writable_fixture_image(source_tree_dir, user_write_program, output_im
                         stream.seek(physical * block_size)
                         stream.write(b"\xa7" * block_size)
                 run_debugfs_command(image, f"set_inode_field /test/{name} size {blocks * block_size}", writable=True)
+            # 若请求构造接近满盘的镜像，则用 fallocate 占用大部分空闲块，仅留出少量空间供 ENOSPC 边界测试使用
             if nearly_full:
                 with image.open("rb") as stream:
                     stream.seek(1024 + 12)
@@ -350,7 +366,7 @@ def create_writable_fixture_image(source_tree_dir, user_write_program, output_im
 
 
 def main(argv=None):
-    """只读夹具创建三种几何及原损坏副本；可写夹具要求明确源树和已编译程序。"""
+    """命令行入口：支持 `readonly`（生成三种几何只读盘与全套损坏盘）和 `writable`（生成可写测试盘）两个子命令。"""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     actions = parser.add_subparsers(dest="action", required=True)
     readonly = actions.add_parser("readonly", allow_abbrev=False)

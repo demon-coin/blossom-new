@@ -1,4 +1,49 @@
-//! 卷级有限回写使用共享 worker；原页状态、真实完成带宽和 writer 等待共用同一责任域。
+//! 卷级后台回写调度域（`WritebackDomain`）、实测回写带宽采样与前台脏页平衡限速（`balance_dirty_pages`）模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块为每个已挂载的 ext4 卷维护独立的后台脏页回写生命周期、脏页/在途回写页计数、实测完成带宽估算以及写入者流控：
+//! - **上游调用者**：文件写入与缺页写路径（调用 [`balance_dirty_pages`] 进行脏页限速）、页缓存状态变更（调用 [`account_folio`] / [`WritebackDomain::notify_dirty`]）、内存回收扫描（调用 `request_progress` / `wait_progress`）以及卷挂载与退休流程（`activate` / `stop_sync`）。
+//! - **下游依赖**：专用内存回收级工作队列 `WB_QUEUE`（[`WorkQueue`]）、高精度单调时钟与定时器（[`Timer`]）、统一页面回写引擎（[`crate::fs::writeback`]）以及块层预留内存池（[`BioReserve`]）。
+//!
+//! # 核心机制与状态机
+//!
+//! ## 1. `WritebackDomain` 生命周期与异步卷票（Raw `Arc` Ticket）转移
+//! `Ext4Volume` 强持有 `Arc<WritebackDomain>`。为避免空闲时循环引用导致卷无法卸载，后台任务 `DelayedWork` 仅保存指向 `WritebackDomain` 的裸指针；
+//! 仅当 `schedule` 成功将任务排入工作队列时，才通过 `Arc::into_raw(volume.clone())` 导出唯一一份卷强引用票存入 `State::pending`：
+//!
+//! ```text
+//!   try_new() ──► Inactive (active=false, pending=0, running=false)
+//!                    │
+//!                    │ activate() (卷绑定至 Inode 域后启用)
+//!                    ▼
+//!                 Active ◄──────────────────────────────────────────┐
+//!                    │                                              │
+//!                    │ schedule(): queue(delay) 接受任务             │ run_round 结束，且无剩余脏页
+//!                    │ 导出唯一卷票存入 state.pending                │ (或再次 schedule 开启下一轮)
+//!                    ▼                                              │
+//!                 Queued (pending != 0, running=false)              │
+//!                    │                                              │
+//!                    ├─► run_writeback 回调启动:                     │
+//!                    │   原子取走 pending 还原 Arc<Ext4Volume>，      │
+//!                    │   置 running=true 执行最多 48+16 页定量回写 ──┘
+//!                    │
+//!                    └─► stop_sync() (卷退休停机):
+//!                        1. 置 active=false, stopping=true, 递增 stop_sequence
+//!                        2. cancel_sync() 取消未触发定时器并等待运行中回调退出
+//!                        3. wait_storage_returned() 等待借出的 WbStorage 归还
+//!                        4. 若 pending != 0 (回调未启动即被取消)，回收该卷票
+//! ```
+//!
+//! ## 2. 全局与分卷脏页阈值及前台写入限速
+//! - **全局可脏页基数（`dirtyable`）**：由伙伴分配器空闲页 + 每核 PCP 缓存页 + 存活文件缓存页（`FILE_PAGES`）之和近似，按 `DIRTY_RATIO`（10%）折算并钳制在 `[32, 4096]` 页之间作为全局上限 `global_limit`。
+//! - **分卷配额（`limits`）**：优先按本卷实测带宽占全局活跃卷总带宽（`ACTIVE_BANDWIDTH`）的比例切分 `global_limit`；尚无带宽样本时按当前脏/回写页占比分配。后台唤醒阈值为硬上限的一半（`limit / 2`）。
+//! - **前台限速（`balance_dirty_pages`）**：写入者在释放全部文件系统与页面锁后检查本卷压力（`dirty_pages + writeback_pages`）：超过后台阈值时触发异步回写；超过硬上限时按超出字节数与实测带宽计算最多 `200ms` 的暂停窗口睡眠等待。
+//!
+//! # 锁获取顺序与并发契约
+//! 1. **禁止持文件系统锁进入限速或停机**：调用 [`balance_dirty_pages`] 前必须已释放 Inode 锁、目录游标、失效锁与 `FolioContent` 锁；调用 [`WritebackDomain::stop_sync`] 时不得持有缓存索引锁，也不得在后台工作回调自身内部调用。
+//! 2. **停机串行化睡眠锁**（`WritebackDomain::stop: SleepMutex`）：包裹整个停机取消与工作缓冲区回收等待流程。
+//! 3. **域状态与缓冲区自旋锁**（`WritebackDomain::state`、`WritebackDomain::scratch`、`GLOBAL_COMPLETION`）：均为极短临界区自旋锁，持锁期间严禁睡眠、堆分配或发起块层请求；所有等待队列唤醒（`waiters.wake_all()`）与被拒卷票释放均在释放 `state` 锁之后执行。
+//! 4. **页描述符用途锁与块层提交锁隔离**：`account_folio` 仅在 `PageDesc` 用途锁内对原子计数器执行零/非零边沿增减，不获取 `state` 自旋锁；`note_submitted` 仅做原子累加，防止在块层 `Bio`/队列自旋锁下嵌套获取回写域锁。
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -18,43 +63,71 @@ use crate::timer::{Timer, TimerKind};
 use crate::wait::{WaitNode, WaitQueue, Waiter, Waker};
 use crate::workqueue::{DelayedWork, WorkQueue, WorkQueueConfig};
 
+/// 全局脏页硬上限占系统可脏页总数（`dirtyable`）的百分比分子（10%）。
 const DIRTY_RATIO: usize = 10;
+/// 单轮后台回写回调最多标记并回写的文件数据页预算上限（48 页）。
 const DATA_BUDGET: usize = 48;
+/// 单轮后台回写回调最多标记并回写的卷元数据页预算上限（16 页）。
 const METADATA_BUDGET: usize = 16;
+/// 脏页未达后台压力阈值时的默认延迟回写超时期限，以及回写遇错后的重试退避延迟（200 毫秒）。
 const DIRTY_EXPIRE: Duration = Duration::from_millis(200);
+/// 前台写入者在 `balance_dirty_pages` 中单次阻塞限速等待的最长持续时间（200 毫秒，单位：纳秒）。
 const MAX_PAUSE_NS: u64 = 200_000_000;
+/// 更新实测回写带宽样本的最小滑动采样时间窗长度（200 毫秒，单位：纳秒）。
 const BANDWIDTH_INTERVAL_NS: u64 = 200_000_000;
+/// 全局后台回写工作队列 `WB_QUEUE` 允许并发运行的最大活跃工作项数量。
 const WB_MAX_ACTIVE: usize = 8;
+/// 全局脏页硬上限的下界保护值（单位：4 KiB 页）。
 const MIN_DIRTY_PAGES: usize = 32;
+/// 全局脏页硬上限的上界保护值（单位：4 KiB 页）。
 const MAX_DIRTY_PAGES: usize = 4096;
+/// 百分比换算分母常量（100）。
 const PERCENT: usize = 100;
 
+/// 全局共享的后台回写工作队列（启用 `reclaim` 救援进展保证，最多 `WB_MAX_ACTIVE` 个并发工作项）。
 static WB_QUEUE: Once<WorkQueue> = Once::new();
+/// 全系统当前已安装且存活的文件角色（`File`）页缓存物理页总数。
 static FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// 全系统当前至少包含一个脏扇区（`dirty != 0`）的页缓存物理页总数（含文件页与元数据页）。
 static DIRTY_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// 全系统当前至少包含一个在途回写扇区（`writeback != 0`）的页缓存物理页总数（含文件页与元数据页）。
 static WRITEBACK_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// 当前所有处于活跃状态（`active == true`）的回写域实测带宽之和（单位：字节/秒）。
 static ACTIVE_BANDWIDTH: AtomicU64 = AtomicU64::new(0);
+/// 全局回写完成字节数与吞吐率采样器（受自旋锁保护）。
 static GLOBAL_COMPLETION: SpinLock<Completion> = SpinLock::new(Completion::new());
 
-/// 带宽只由真实完成 byte 差与同一单调时间差产生；零时间不建立样本。
+/// 回写完成流量统计与基于单调时钟窗口的实测吞吐率采样器。
+///
+/// 仅根据块设备真实结束的字节增量与对应的单调时钟时间差计算带宽；时间差为零时不生成无效样本。
 struct Completion {
+    /// 已提交至设备并结束处理的请求总范围字节数（含部分失败请求的总长度，单位：字节）。
     accepted_bytes: u64,
+    /// 设备实际成功落盘的累计完成字节数（单位：字节）。
     completed_bytes: u64,
+    /// 回写批次完成事件单调递增序号，供等待者判断是否有新完成进展。
     sequence: u64,
+    /// 回写准备或传输错误事件单调递增序号，供限速与内存回收等待者及时感知异常并退出等待。
     error_sequence: u64,
+    /// 当前带宽采样窗口的起始单调时间戳；尚未发起任何回写时为 `None`。
     sample_time: Option<MonotonicInstant>,
+    /// 当前带宽采样窗口起始时刻对应的 `completed_bytes` 快照值（单位：字节）。
     sample_bytes: u64,
+    /// 最近一次有效采样窗口测得的设备回写吞吐率（单位：字节/秒）；建立首样本前为 `0`。
     bandwidth: u64,
+    /// 最近一次更新带宽样本时窗口内累计完成的字节数（仅 `ktest` 诊断核对使用）。
     #[cfg(feature = "ktest")]
     last_sample_bytes: u64,
+    /// 最近一次更新带宽样本时窗口经历的纳秒时长（仅 `ktest` 诊断核对使用）。
     #[cfg(feature = "ktest")]
     last_sample_elapsed_ns: u64,
+    /// 最近一次更新带宽样本时的窗口结束单调时钟纳秒值（仅 `ktest` 诊断核对使用）。
     #[cfg(feature = "ktest")]
     last_sample_end_ns: u64,
 }
 
 impl Completion {
-    /// 未提交任何原页时保持空样本，不能用默认吞吐代替设备完成。
+    /// 创建初始零状态采样器；在设备实际完成回写前带宽保持为 `0`，不使用预设默认吞吐率。
     const fn new() -> Self {
         Self {
             accepted_bytes: 0,
@@ -73,7 +146,7 @@ impl Completion {
         }
     }
 
-    /// 原范围开始 WB 时记录首个测量起点，不重置仍在累计的实际完成窗口。
+    /// 在物理页首次进入回写状态时记录初始采样时间起点；若当前已有进行中的采样窗口则保持原起点不变。
     fn start(&mut self, now: MonotonicInstant) {
         if self.sample_time.is_none() {
             self.sample_time = Some(now);
@@ -81,7 +154,7 @@ impl Completion {
         }
     }
 
-    /// 已接受范围完成后累计真实前缀，初样本即时建立，后续只在有限测量窗更新。
+    /// 在一批已接受的回写请求结束时累加完成字节数，并按采样时间窗口更新实测带宽（首个非零耗时样本立即建立，后续每满 `BANDWIDTH_INTERVAL_NS` 滚动更新）。
     fn complete(&mut self, accepted: usize, completed: usize, now: MonotonicInstant) {
         assert!(0 < accepted && completed <= accepted);
         self.accepted_bytes += accepted as u64;
@@ -115,96 +188,155 @@ impl Completion {
     }
 }
 
-/// 本轮只有选中的原节点和已完成 IO 的标量事实，不保存第二个 inode 或页名单。
+/// 单轮后台定量回写（`run_round`）的扫描与完成统计记录。
+///
+/// 仅保存标量统计值，不额外持有任何 `Inode` 或物理页引用。
 #[derive(Clone, Copy, Default)]
 struct Round {
+    /// 本轮启动时脏 Inode 索引表的槽位总数上限。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(dead_code, reason = "ktest 的有限回写轮观察核对扫描上限与实际扫描数")
     )]
     limit: usize,
+    /// 本轮实际扫描过的脏 Inode 槽位数量。
     scanned: usize,
+    /// 本轮标记进入 `ToWrite` 的文件数据页总数（上限为 `DATA_BUDGET`）。
     selected_data: usize,
+    /// 本轮标记进入 `ToWrite` 的卷元数据页总数（上限为 `METADATA_BUDGET`）。
     selected_metadata: usize,
+    /// 本轮发起的后台回写凭证在完成时累计报告的已接受字节数（单位：字节）。
     accepted_bytes: u64,
+    /// 本轮发起的后台回写凭证在完成时累计报告的实际成功落盘字节数（单位：字节）。
     completed_bytes: u64,
+    /// 本轮结束时本卷是否仍存在未清零的脏页或在途回写页，决定是否需要继续调度下一轮。
     later_dirty: bool,
 }
 
+/// 受 [`WritebackDomain::state`] 自旋锁保护的卷级回写调度与统计可变状态。
 struct State {
+    /// 当前回写域是否已激活并允许接纳新的后台回写调度与工作缓冲区借用。
     active: bool,
+    /// 当前回写域是否正处于 `stop_sync` 停机排空流程中。
     stopping: bool,
+    /// 是否因底层块设备返回 `StopUnconfirmed`（DMA 未确认停止）而永久熔断后续自动调度。
     halted: bool,
-    /// 唯一尚未进入业务回调的真实 Arc<Ext4Volume>::into_raw 票。
+    /// 已排入工作队列但尚未被 `run_writeback` 回调取走的唯一 `Arc::into_raw(volume)` 裸指针地址；无排队任务时为 `0`。
     pending: usize,
+    /// 后台回写回调 `run_writeback` 当前是否正在执行本卷的回写轮次。
     running: bool,
+    /// 在 `running == true` 期间是否收到过新的标脏或推进通知；若为 `true` 则在轮末补调下一轮。
     notified: bool,
+    /// 下一轮后台回写扫描脏 Inode 槽位表时的起始轮询下标，避免前排热门文件饥饿后续文件。
     next_slot: usize,
+    /// 本卷的回写完成字节计数与实测吞吐率采样器。
     completion: Completion,
+    /// 本卷当前计入全局 `ACTIVE_BANDWIDTH` 的带宽份额（单位：字节/秒）；停机时清零。
     contribution: u64,
+    /// 累计已启动的后台回写轮次计数。
     rounds: u64,
+    /// 累计已执行完毕退出的后台回写轮次计数。
     finished_rounds: u64,
+    /// 每次调用 `stop_sync` 时单调递增的停机代次序号，用于使旧借用的工作缓冲区失效。
     stop_sequence: u64,
+    /// 当前正在执行或最近一轮后台回写的明细统计。
     round: Round,
+    /// 前台写入者在 `balance_dirty_pages` 中因超限而进入睡眠限速的累计次数。
     writer_waits: u64,
+    /// 前台限速睡眠写入者从 `park` 恢复唤醒的累计次数。
     writer_wakes: u64,
+    /// 当前正处于 `balance_dirty_pages` 限速等待循环中的写入者线程数量。
     waiting_writers: usize,
 }
 
-/// 有限 WB 轮完成后的同一只读观察合同。
+/// `ktest` 专用回调钩子类型：在每轮后台回写完成并唤醒等待者后、调度下一轮前接收只读状态快照。
 #[cfg(feature = "ktest")]
 type RoundHook = Arc<dyn Fn(WritebackSnapshot) + Send + Sync>;
 
-/// 卷强持服务，服务只为已接受的一次 pending/running 保卷票，不永久反持卷。
+/// 单个 `Ext4Volume` 专属的后台回写控制、脏页记账与写入限速协调域。
+///
+/// 由所属 `Ext4Volume` 强持有；自身仅在异步工作项已入队（`pending != 0`）或正在执行（`running`）期间通过临时卷票反向保活 `Ext4Volume`，空闲时不形成循环引用。
 pub(crate) struct WritebackDomain {
+    /// 构造时一次性初始化并固定在堆上的延迟工作项（绑定至全局 `WB_QUEUE`）。
     work: Once<Pin<Arc<DelayedWork>>>,
+    /// 保护回写生命周期标志、排队卷票、轮次游标与带宽统计的自旋锁。
     state: SpinLock<State>,
+    /// 串行化 `stop_sync` 停机流程的睡眠互斥锁。
     stop: SleepMutex<()>,
+    /// 读写卷关联的块层预留内存池（只读挂载卷为 `None`）。
     source: Option<Arc<BioReserve>>,
+    /// 每次卷停机时递增的元数据 I/O 边界序号，供 `MetadataIoContext` 拦截跨停机周期的旧请求。
     metadata_sequence: AtomicU64,
+    /// 读写卷预分配的唯一后台回写工作缓冲区槽位；借出期间为 `None`，归还后恢复为 `Some`。
     scratch: SpinLock<Option<Box<writeback::WbStorage>>>,
+    /// 本卷当前含脏扇区的缓存物理页数量（含本卷文件页与元数据页）。
     dirty_pages: AtomicUsize,
+    /// 本卷当前含在途回写扇区的缓存物理页数量（含本卷文件页与元数据页）。
     writeback_pages: AtomicUsize,
+    /// 块设备驱动已接纳进入硬件传输队列的本卷回写累计字节数（单位：字节）。
     submitted_bytes: AtomicU64,
+    /// 供前台限速写入者、内存回收等待者及等待 `scratch` 归还的线程共用的等待队列。
     waiters: WaitQueue,
+    /// 测试专用的单轮回写完成观察钩子。
     #[cfg(feature = "ktest")]
     round_hook: SpinLock<Option<RoundHook>>,
 }
 
-/// 值边界只记录真实域事实，不保活后继轮或把开始计数当完成。
+/// 内存回收等调用方在请求推进回写前捕获的回写域状态快照边界。
+///
+/// 仅保存标量序号与字节计数，供 [`WritebackDomain::wait_progress`] 比对是否有真实完成、轮次结束、错误或停机事件发生。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WritebackBoundary {
+    /// 产生该边界的 `WritebackDomain` 实例内存地址标识，用于断言防止跨卷混用边界。
     identity: usize,
+    /// 捕获时刻的回写完成事件序号（`Completion::sequence`）。
     completion_sequence: u64,
+    /// 捕获时刻的回写错误事件序号（`Completion::error_sequence`）。
     error_sequence: u64,
+    /// 捕获时刻已结束的后台回写轮次数（`State::finished_rounds`）。
     finished_rounds: u64,
+    /// 捕获时刻的停机代次序号（`State::stop_sequence`）。
     stop_sequence: u64,
+    /// 捕获时刻驱动已接纳的累计提交字节数（单位：字节）。
     submitted_bytes: u64,
+    /// 捕获时刻设备已完成的累计落盘字节数（单位：字节）。
     completed_bytes: u64,
+    /// 捕获时刻该回写域是否未激活或正在停机。
     inactive: bool,
+    /// 捕获时刻该回写域是否已因停机未确认而熔断停止。
     halted: bool,
 }
 
-/// 本边界之后的真实增量；停止或零提交轮结束并不冒称释放了文件页。
+/// 相对于某一 [`WritebackBoundary`] 观察到的回写推进结果增量。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WritebackProgress {
+    /// 自边界捕获以来新增提交至设备驱动的字节数（单位：字节）。
     pub submitted_bytes: u64,
+    /// 自边界捕获以来新增由设备完成落盘的字节数（单位：字节）。
     pub completed_bytes: u64,
+    /// 回写域在边界时已处于非活跃状态，或在等待期间发生了停机。
     pub stopped: bool,
+    /// 回写域在边界时已熔断，或在等待期间记录到了新的回写错误。
     pub error: bool,
 }
 
-/// 借出时把唯一预建 Box 移出域，不让 idle scratch 反持活请求或 inode。
+/// 从 [`WritebackDomain`] 独占借出的预分配回写工作缓冲区租约守卫（RAII Guard）。
+///
+/// 借出期间将唯一的 `Box<WbStorage>` 移出回写域并进入 `ReclaimScope::noio()` 保护作用域；
+/// 析构时在锁外清空所有临时引用与块层通道，再将空缓冲区放回域槽位并唤醒等待者。
 pub(crate) struct WbStorageLease {
+    /// 借出该工作缓冲区的所属回写域强引用。
     domain: Arc<WritebackDomain>,
+    /// 当前租约独占持有的预分配工作缓冲区；仅在 `Drop::drop` 归还时取走变为 `None`。
     storage: Option<Box<writeback::WbStorage>>,
+    /// 租约存活期间禁止当前任务递归进入 I/O 型内存回收的作用域守卫。
     _scope: ReclaimScope,
 }
 
 impl Deref for WbStorageLease {
     type Target = writeback::WbStorage;
 
-    /// 正式借用只暴露仍由本 guard 唯一持有的窗口。
+    /// 返回当前租约独占持有的 [`writeback::WbStorage`] 共享引用。
     fn deref(&self) -> &Self::Target {
         self.storage
             .as_deref()
@@ -213,7 +345,7 @@ impl Deref for WbStorageLease {
 }
 
 impl DerefMut for WbStorageLease {
-    /// 原窗口没有第二份拥有，可在同一 Task 的 guard 下逐窗复用。
+    /// 返回当前租约独占持有的 [`writeback::WbStorage`] 可变引用，供同一回写任务跨多个滑动窗口复用。
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.storage
             .as_deref_mut()
@@ -222,7 +354,7 @@ impl DerefMut for WbStorageLease {
 }
 
 impl Drop for WbStorageLease {
-    /// 临时凭证及 book 在域锁外清空，再归还空 Box 并通知所有真实等待者。
+    /// 析构时取走工作缓冲区，在回写域自旋锁外清空临时凭证后归还至 `scratch` 槽位并唤醒等待队列。
     fn drop(&mut self) {
         let storage = self
             .storage
@@ -232,64 +364,101 @@ impl Drop for WbStorageLease {
     }
 }
 
-/// 同卷真实状态快照；本轮实际完成者发布 accepted 账，提交瞬间与在途数仍由原 Disk/Bio 观察。
+/// 单个卷回写域在某一时刻的只读运行状态与统计快照（仅 `ktest` 测试断言与诊断使用）。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WritebackSnapshot {
+    /// 本卷当前脏缓存页数。
     pub dirty_pages: usize,
+    /// 本卷当前在途回写缓存页数。
     pub writeback_pages: usize,
+    /// 驱动已接纳的累计回写字节数（单位：字节）。
     pub submitted_bytes: u64,
+    /// 已完成回写批次的总接受范围字节数（单位：字节）。
     pub accepted_bytes: u64,
+    /// 设备实际成功落盘的累计字节数（单位：字节）。
     pub completed_bytes: u64,
+    /// 回写批次完成事件单调序号。
     pub completion_seq: u64,
+    /// 回写错误事件单调序号。
     pub error_seq: u64,
+    /// 本卷最近一次采样测得的回写带宽（单位：字节/秒）。
     pub bandwidth_bytes_per_sec: u64,
+    /// 最近一次带宽采样窗口内完成的字节数（单位：字节）。
     #[cfg(feature = "ktest")]
     pub sample_bytes: u64,
+    /// 最近一次带宽采样窗口经历的时长（单位：纳秒）。
     #[cfg(feature = "ktest")]
     pub sample_elapsed_ns: u64,
+    /// 最近一次带宽采样窗口结束时的单调时钟读数（单位：纳秒）。
     #[cfg(feature = "ktest")]
     pub sample_end_ns: u64,
+    /// 累计已启动的后台回写轮次数。
     pub rounds: u64,
+    /// 累计已结束的后台回写轮次数。
     pub finished_rounds: u64,
+    /// 当前停机代次序号。
     pub stop_sequence: u64,
+    /// 最近一轮后台回写启动时的脏 Inode 槽位上限。
     pub round_limit: usize,
+    /// 最近一轮后台回写实际扫描的脏 Inode 槽位数。
     pub round_scanned: usize,
+    /// 最近一轮后台回写选中的文件数据页数。
     pub round_selected_data: usize,
+    /// 最近一轮后台回写选中的卷元数据页数。
     pub round_selected_metadata: usize,
+    /// 最近一轮后台回写已接受的请求总字节数（单位：字节）。
     pub round_accepted_bytes: u64,
+    /// 最近一轮后台回写实际落盘完成的字节数（单位：字节）。
     pub round_completed_bytes: u64,
+    /// 最近一轮结束时本卷是否仍有残留脏页或在途回写页。
     pub later_dirty: bool,
+    /// 前台写入者进入限速等待的累计次数。
     pub writer_waits: u64,
+    /// 前台写入者从限速等待被唤醒的累计次数。
     pub writer_wakes: u64,
+    /// 当前正在限速等待中的前台写入者数量。
     pub waiting_writers: usize,
+    /// 回写域当前是否处于已激活状态。
     pub active: bool,
+    /// 工作队列中是否挂有尚未启动的本卷回写任务票。
     pub pending: bool,
+    /// 后台回写回调当前是否正在运行。
     pub running: bool,
 }
 
-/// 全局页账与当前文件页近似阈值；metadata 参与脏账但不计文件可回收页。
+/// 全局文件缓存页计数、脏页压力阈值与全局回写带宽快照（仅 `ktest` 诊断与断言使用）。
+///
+/// 元数据缓存页计入全局 `dirty_pages` / `writeback_pages` 压力账，但不计入可回收文件页 `file_pages`。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirtySnapshot {
+    /// 全系统当前存活的文件角色缓存页总数。
     #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出存活文件页账")]
     pub file_pages: usize,
+    /// 全系统当前含脏扇区的缓存页总数。
     #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出当前脏页账")]
     pub dirty_pages: usize,
+    /// 全系统当前含在途回写扇区的缓存页总数。
     #[expect(dead_code, reason = "全局回写压力诊断通过 Debug 输出当前回写页账")]
     pub writeback_pages: usize,
+    /// 用于折算全局脏页上限的可脏页基数（空闲伙伴页 + PCP 缓存页 + 存活文件页）。
     #[expect(
         dead_code,
         reason = "全局回写压力诊断通过 Debug 输出计算脏页阈值的 dirtyable 页数"
     )]
     pub dirtyable_pages: usize,
+    /// 全局脏页硬上限（单位：页）。
     pub dirty_limit: usize,
+    /// 全局后台异步回写触发阈值（`dirty_limit / 2`，单位：页）。
     pub background_limit: usize,
+    /// 全局累计已完成落盘的回写字节数（单位：字节）。
     pub completed_bytes: u64,
+    /// 全局实测回写吞吐率（单位：字节/秒）。
     pub bandwidth_bytes_per_sec: u64,
 }
 
-/// BSP 在共享 pool 准备后、运行许可发布前预建独立准入的 reclaim WB 队列。
+/// 在系统启动期共享工作线程池就绪后，初始化全局专用的内存回收级后台回写工作队列 `WB_QUEUE`。
 pub(crate) fn initialize() -> Result<(), FsError> {
     assert!(
         WB_QUEUE.get().is_none(),
@@ -306,7 +475,9 @@ pub(crate) fn initialize() -> Result<(), FsError> {
 }
 
 impl WritebackDomain {
-    /// 卷发表前准备全部控制对象；context 只定位本域，接受异步工作时另交真实卷票。
+    /// 在卷发布前创建并初始化回写域控制结构、预分配工作缓冲区（读写卷）以及绑定至 `WB_QUEUE` 的延迟工作项。
+    ///
+    /// `DelayedWork` 仅保存 `WritebackDomain` 的裸指针地址作为上下文；实际触发异步回写时由 `schedule` 另行传递 `Arc<Ext4Volume>` 强引用票来保证生命周期。
     pub(crate) fn try_new(volume: &Arc<Ext4Volume>) -> Result<Arc<Self>, FsError> {
         let source = if volume.mode() == crate::block::AccessMode::ReadWrite {
             volume.metadata_cache().reserve()
@@ -364,10 +535,11 @@ impl WritebackDomain {
         Ok(domain)
     }
 
-    /// 捕获本卷停止边界，再在所有 FS 业务锁外等待 scratch 和共用来源中的完整 lane。
+    /// 在不持有任何文件系统业务锁的可调度任务上下文中，捕获当前卷停机边界并阻塞借出预分配的回写工作缓冲区与块层预留通道（`BioLane`）。
     pub(crate) fn borrow_storage(self: &Arc<Self>) -> Result<WbStorageLease, FsError> {
         sched::assert_switchable();
         let source = self.source.as_ref().ok_or(FsError::ReadOnly)?;
+        // Step 1: 检查卷是否处于活跃可回写状态，并捕获本次借用绑定的停机代次与元数据代次边界。
         let (boundary, metadata_boundary) = {
             let state = self.state.lock();
             if !state.active || state.stopping || state.halted {
@@ -379,6 +551,7 @@ impl WritebackDomain {
             )
         };
 
+        // Step 2: 循环尝试取走唯一预分配的 scratch 缓冲区，并在 noio 保护作用域内向 BioReserve 申请回写通道。
         loop {
             if self.storage_stopped(boundary) {
                 return Err(FsError::Io(BlockError::QueueStopped));
@@ -404,7 +577,10 @@ impl WritebackDomain {
 
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 的真实 Arc 保域，pin 栈节点，所有出口先结束登记。
+            // Step 3: 若 scratch 当前已被其他回写任务借走，注册到等待队列后复查条件并睡眠等待归还通知。
+            // SAFETY:
+            // 1. `self` 由调用方持有的 `&Arc<Self>` 强引用保活，`node` 通过 `pin!` 固定在当前栈帧上；
+            // 2. `_registration` 为栈上局部变量（未使用 `mem::forget`），无论从提前返回分支还是循环末尾退出，都会先于 `node` 析构并从 `self.waiters` 链表脱链。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
             if self.storage_stopped(boundary) {
                 return Err(FsError::Io(BlockError::QueueStopped));
@@ -416,13 +592,13 @@ impl WritebackDomain {
         }
     }
 
-    /// 原借用只能核原单调边界，stop 后新 activate 不能复活它。
+    /// 检查给定停机代次 `boundary` 对应的工作缓冲区借用是否已失效（卷发生了停机、熔断或重新激活推进了 `stop_sequence`）。
     pub(crate) fn storage_stopped(&self, boundary: u64) -> bool {
         let state = self.state.lock();
         state.stop_sequence != boundary || !state.active || state.stopping || state.halted
     }
 
-    /// ctx 借本卷的停止序列与物理来源，另一卷的停止不推进此序列。
+    /// 基于本卷的块层预留池与元数据停机序号构造 [`MetadataIoContext`]，用于隔离不同卷之间的停机状态检查。
     pub(crate) fn metadata_io_context(&self, boundary: u64) -> MetadataIoContext<'_> {
         MetadataIoContext::for_view(
             self.source
@@ -433,7 +609,7 @@ impl WritebackDomain {
         )
     }
 
-    /// 清空和来源通知都在短锁外；锁内只移回唯一空窗口。
+    /// 在自旋锁外清空已用完的工作缓冲区与预留通道，随后将其放回 `scratch` 槽位并唤醒所有等待者。
     fn return_storage(&self, mut storage: Box<writeback::WbStorage>) {
         storage.clear();
         {
@@ -444,7 +620,7 @@ impl WritebackDomain {
         self.waiters.wake_all();
     }
 
-    /// 停止等待实际借出 Box 归还，不以 running=false 或来源控制可用代替业务尾。
+    /// 在停机流程中阻塞等待已借出的 `WbStorage` 实例真正归还至 `scratch` 槽位，确保所有借用该缓冲区的回写路径已彻底退出。
     fn wait_storage_returned(&self) {
         if self.source.is_none() {
             return;
@@ -455,7 +631,9 @@ impl WritebackDomain {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: stop caller 保域，固定栈节点在返回前撤销登记。
+            // SAFETY:
+            // 1. 调用方在执行 `stop_sync` 期间持有 `&self` 强保活所属回写域，`node` 通过 `pin!` 固定在当前栈帧上；
+            // 2. `_registration` 在每次循环迭代结束或函数提前返回时自动析构脱链，先于栈上 `node` 释放。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
             if self.scratch.lock().is_some() {
                 return;
@@ -464,13 +642,13 @@ impl WritebackDomain {
         }
     }
 
-    /// driver 接受前缀时只做原子记账，不能在 Bio/Request 锁下转取本域短锁。
+    /// 在块设备驱动接纳回写请求时原子累加已提交字节数（可安全在 `Bio` 或设备队列自旋锁内调用，不获取本域 `state` 自旋锁）。
     pub(crate) fn note_submitted(&self, bytes: usize) {
         self.submitted_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    /// 在调度前记录真实尾边界；拒准入明确返回停止/错误事实，不合成完成。
+    /// 捕获当前回写域的完成序号与字节计数边界，并在域处于正常活跃状态时立即触发一轮零延迟后台回写（供内存回收路径调用）。
     pub(crate) fn request_progress(
         self: &Arc<Self>,
         volume: &Arc<Ext4Volume>,
@@ -495,7 +673,7 @@ impl WritebackDomain {
         boundary
     }
 
-    /// 最多等待一个真实完成/error/有限轮尾/stop 边界，不轮询 rounds 开始或 WB0。
+    /// 在可调度上下文中阻塞等待回写状态推进越过给定的 `boundary`（出现新的设备完成、后台轮次结束、回写错误或停机事件）。
     pub(crate) fn wait_progress(&self, boundary: WritebackBoundary) -> WritebackProgress {
         assert_eq!(
             boundary.identity, self as *const Self as usize,
@@ -508,7 +686,9 @@ impl WritebackDomain {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: caller 保真实域，节点固定且登记先于二次边界检查。
+            // SAFETY:
+            // 1. 调用方持有的 `&self` 保证 `self.waiters` 在本函数返回前始终存活，`node` 通过 `pin!` 固定在当前栈帧上；
+            // 2. `_registration` 在每次迭代末尾或提前 `return` 时正常执行 `Drop` 从队列脱链，早于 `node` 生命周期结束。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
             if let Some(progress) = self.progress_after(boundary) {
                 return progress;
@@ -517,7 +697,7 @@ impl WritebackDomain {
         }
     }
 
-    /// 值读取只报告本边界之后的实际 byte 与停止/错误，不把提交量当完成量。
+    /// 检查当前回写域状态相较于快照 `boundary` 是否已发生完成推进、轮次结束、错误或停机；若尚未越过边界则返回 `None`。
     fn progress_after(&self, boundary: WritebackBoundary) -> Option<WritebackProgress> {
         let state = self.state.lock();
         let stopped = boundary.inactive || state.stop_sequence != boundary.stop_sequence;
@@ -543,7 +723,9 @@ impl WritebackDomain {
         })
     }
 
-    /// 真正新 canonical 域绑定后开放原服务；此前停止必须已经结束全部回调尾部。
+    /// 在卷成功绑定至活跃 Inode 域后开放后台回写服务，重置熔断标志与带宽采样起点。
+    ///
+    /// 调用前上一生命周期的停机流程必须已彻底排空所有回调与借出资源。
     pub(crate) fn activate(&self) {
         let mut state = self.state.lock();
         assert!(!state.active && !state.stopping && !state.running && state.pending == 0);
@@ -558,7 +740,9 @@ impl WritebackDomain {
         state.completion.bandwidth = 0;
     }
 
-    /// 标脏通知不分配或睡眠；已有有限 pending 票保持不变，运行中的通知留给轮尾复查。
+    /// 在页面或 Inode 首次变脏时通知回写域按需调度后台回写（无堆分配、不睡眠）。
+    ///
+    /// 若后台回调正在运行则仅置位 `notified` 交由轮末复查；若已有排队工作项则保持不变；否则按当前脏页压力决定立即调度（`Duration::ZERO`）或延迟到期调度（`DIRTY_EXPIRE`）。
     pub(crate) fn notify_dirty(self: &Arc<Self>, volume: &Arc<Ext4Volume>) {
         {
             let mut state = self.state.lock();
@@ -582,7 +766,7 @@ impl WritebackDomain {
         self.schedule(volume, delay);
     }
 
-    /// 调度锁覆盖卷票取得、queue 接受和 pending 发表，拒绝票仅在锁外恢复归还。
+    /// 在 `state` 自旋锁保护下克隆一份 `Arc<Ext4Volume>` 强引用票并将延迟任务排入 `WB_QUEUE`；若工作项已在队列中则在锁外释放多余的卷引用。
     fn schedule(&self, volume: &Arc<Ext4Volume>, delay: Duration) {
         assert!(core::ptr::eq(volume.writeback_domain().as_ref(), self));
         let rejected = {
@@ -610,15 +794,20 @@ impl WritebackDomain {
             }
         };
         if let Some(ticket) = rejected {
-            // SAFETY: ticket 来自本次 into_raw 且 queue 未接受，唯一归还者在调度锁外消费它。
+            // SAFETY:
+            // 1. `ticket` 刚刚由上方 `Arc::into_raw(volume.clone())` 导出；
+            // 2. 因 `work().queue(delay)` 返回 `false`（工作项已在队列中），该指针未存入 `state.pending` 也未暴露给其他线程，此处在锁外唯一调用 `Arc::from_raw` 还原并释放该强引用。
             drop(unsafe { Arc::from_raw(ticket) });
         }
     }
 
-    /// cache 关闭且本卷最后 canonical 槽退休后调用；不能持索引锁或从自身回调等待。
+    /// 同步停止本卷的后台回写服务并排空所有异步回调与借出资源。
+    ///
+    /// 在缓存关闭且本卷最后一个活跃 Inode 槽位退休后调用；调用方必须处于可睡眠任务上下文，严禁持有缓存索引锁或在后台工作回调自身内部调用。
     pub(crate) fn stop_sync(&self) {
         sched::assert_switchable();
         let _stop = self.stop.lock();
+        // Step 1: 置位停机标志、递增数据与元数据停机代次，并从全局活跃带宽总和中扣除本卷份额。
         {
             let mut state = self.state.lock();
             state.active = false;
@@ -628,14 +817,17 @@ impl WritebackDomain {
             ACTIVE_BANDWIDTH.fetch_sub(state.contribution, Ordering::Relaxed);
             state.contribution = 0;
         }
+        // Step 2: 唤醒本域所有等待者与块层预留池等待者，使阻塞在借用或限速上的线程尽快感知停机退出。
         self.waiters.wake_all();
         if let Some(source) = &self.source {
             source.notify_available();
         }
 
+        // Step 3: 同步取消工作队列中的延迟任务（若回调正在运行则等待其彻底执行完毕退出），并等待借出的 WbStorage 归还。
         self.work().cancel_sync();
         self.wait_storage_returned();
 
+        // Step 4: 清理停机状态并回收尚未进入 run_writeback 回调的排队卷票（若有）。
         let ticket = {
             let mut state = self.state.lock();
             assert!(!state.running, "writeback callback survived cancellation");
@@ -644,23 +836,25 @@ impl WritebackDomain {
             core::mem::take(&mut state.pending)
         };
         if ticket != 0 {
-            // SAFETY: cancel_sync 已结束 timer/Work 全尾；未进入 callback 的唯一 pending 票只在此归还。
+            // SAFETY:
+            // 1. 上方 `self.work().cancel_sync()` 已确保延迟定时器与工作队列回调彻底终止，且 `assert!(!state.running)` 确认无并发回调运行；
+            // 2. 非零 `ticket` 是此前 `schedule` 通过 `Arc::into_raw` 存入 `state.pending` 但尚未被 `run_writeback` 取走的唯一强引用票，此处通过 `core::mem::take` 独占取出并还原释放。
             drop(unsafe { Arc::from_raw(ticket as *const Ext4Volume) });
         }
     }
 
-    /// 用途锁内仅增减本卷真实 mask 的零与非零转换，不进入调度、分配或等待。
+    /// 在 `PageDesc` 用途自旋锁内根据页面 `dirty` 和 `writeback` 位图的零/非零边沿转换，原子增减本卷的脏页与在途回写页计数。
     pub(crate) fn account_folio(&self, old_dirty: u8, new_dirty: u8, old_wb: u8, new_wb: u8) {
         account_mask(&self.dirty_pages, old_dirty, new_dirty);
         account_mask(&self.writeback_pages, old_wb, new_wb);
     }
 
-    /// 内容用途锁外记录真实 WB 起点；没有完成以前不会发表任何带宽。
+    /// 在页面开始回写时（已释放 `PageDesc` 用途锁）记录本卷带宽采样的初始时间起点。
     pub(crate) fn note_writeback_start(&self) {
         self.state.lock().completion.start(time::now());
     }
 
-    /// 真实完成前缀更新本卷计数、活域带宽贡献和通知，原 errseq 仍由 mapping 保存。
+    /// 在一批回写请求完成时更新本卷完成字节计数、错误序号、带宽样本及全局活跃带宽贡献值，并唤醒等待队列上的限速写入者与回收等待者。
     pub(crate) fn note_completion(
         &self,
         accepted: usize,
@@ -691,13 +885,13 @@ impl WritebackDomain {
         self.waiters.wake_all();
     }
 
-    /// 准备或提交返回真实错误后立即结束合理限速等待，错误本身仍留在原 Result/errseq。
+    /// 在回写准备或块层提交过程遇到错误时递增错误序号并唤醒等待者，避免限速写入者在无法推进回写时长时间阻塞（具体错误仍通过原 `Result` 或映射的 `errseq` 向上传递）。
     fn note_error(&self) {
         self.state.lock().completion.error_sequence += 1;
         self.waiters.wake_all();
     }
 
-    /// 后台同步在标记 ToWrite 后立即记录实际数量，后续准备错误不会抹去已选事实。
+    /// 在后台回写轮次标记 `ToWrite` 页面后立即记录本轮选中的文件数据页或元数据页数量，并断言不超过单轮预算上限。
     pub(crate) fn note_selection(&self, pages: usize, metadata: bool) {
         let mut state = self.state.lock();
         assert!(state.running, "background selection outside its round");
@@ -710,19 +904,19 @@ impl WritebackDomain {
         }
     }
 
-    /// 本轮原凭证在真实完成时分别报告 accepted 与 completed，不将选页数当提交量。
+    /// 在后台回写凭证完成 DMA 时累加本轮实际接受与成功落盘的字节数。
     pub(crate) fn note_round_io(&self, accepted: usize, completed: usize) {
         let mut state = self.state.lock();
         state.round.accepted_bytes += accepted as u64;
         state.round.completed_bytes += completed as u64;
     }
 
-    /// 页失效或脏状态变化后允许 writer 重查本域压力，不要求整个系统清脏。
+    /// 在页面失效（invalidate/truncate）或脏位清除后唤醒本域等待队列，使正在限速睡眠的前台写入者及时重新检查本卷压力。
     pub(crate) fn wake_writers(&self) {
         self.waiters.wake_all();
     }
 
-    /// 只读真实计数及最后一个有限 round 的事实，不驱动 WB 或合成完成。
+    /// 读取本卷回写域当前的只读统计与轮次状态快照（仅 `ktest` 使用）。
     #[cfg(feature = "ktest")]
     pub(crate) fn snapshot(&self) -> WritebackSnapshot {
         let state = self.state.lock();
@@ -760,20 +954,22 @@ impl WritebackDomain {
         }
     }
 
-    /// 观察有限轮次已结束、后继尚未由本回调安排的真实边界，旧回调在短锁外释放。
+    /// 设置或清除每轮后台回写结束时的测试观察钩子，并在释放自旋锁后再析构旧钩子闭包（仅 `ktest` 使用）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_round_hook(&self, hook: Option<RoundHook>) {
         let previous = core::mem::replace(&mut *self.round_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 读取当前实际带宽与脏占比推导的本域上下限，不修改阈值或制造测试压力。
+    /// 返回当前按实测带宽或脏页占比计算出的本卷脏页硬上限与后台唤醒阈值（仅 `ktest` 使用）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_limits(&self) -> (usize, usize) {
         self.limits()
     }
 
-    /// 全局上限按活域实测带宽分配；没有本域样本时只借当前真实脏占比启动 WB。
+    /// 计算本卷当前的脏页硬上限与后台异步回写触发阈值 `(limit, background_limit)`。
+    ///
+    /// 当本卷与全局均存在非零实测带宽样本时，按本卷带宽占 `ACTIVE_BANDWIDTH` 的比例切分全局上限；尚未建立带宽样本时，按本卷脏/回写页数占全局总压力页数的比例分配。
     fn limits(&self) -> (usize, usize) {
         let (_, global_limit) = dirty_limit();
         let bandwidth = self.state.lock().completion.bandwidth;
@@ -795,12 +991,12 @@ impl WritebackDomain {
         (limit, (limit / 2).max(1))
     }
 
-    /// Dirty 与 WB 分别保留同页的两种义务，限速不把在途页当作已完成。
+    /// 返回本卷当前的脏页压力页数（脏缓存页数与在途回写页数之和）。
     fn pressure(&self) -> usize {
         self.dirty_pages.load(Ordering::Relaxed) + self.writeback_pages.load(Ordering::Relaxed)
     }
 
-    /// 返回构造时准备的固定 Work，不建立新控制对象或更换队列。
+    /// 返回构造时预初始化的固定延迟工作项引用 `Pin<&DelayedWork>`。
     fn work(&self) -> Pin<&DelayedWork> {
         self.work
             .get()
@@ -808,8 +1004,11 @@ impl WritebackDomain {
             .as_ref()
     }
 
-    /// 一次回调至多走入口槽数和 48+16 页；首错仍保留下轮实际脏义务。
+    /// 执行单轮有界后台回写：最多扫描一轮脏 Inode 槽位表，并回写最多 `DATA_BUDGET`（48）张文件数据页与 `METADATA_BUDGET`（16）张元数据页。
+    ///
+    /// 轮末若卷仍存在脏页/在途回写页或运行期间收到了新通知，则自动调度下一轮（若本轮遇到错误则退避延迟 `DIRTY_EXPIRE`）。
     fn run_round(self: &Arc<Self>, volume: &Arc<Ext4Volume>) {
+        // Step 1: 初始化本轮统计，并从上一轮留下的 next_slot 轮询起点开始扫描脏 Inode 表。
         let limit = volume.dirty_inode_limit();
         let start = {
             let mut state = self.state.lock();
@@ -828,6 +1027,7 @@ impl WritebackDomain {
 
         let mut first_error = None;
         let mut unconfirmed = false;
+        // Step 2: 借用本卷预分配的 WbStorage，按槽位轮询回写各脏 Inode 的数据页（累计不超过 DATA_BUDGET）。
         match self.borrow_storage() {
             Ok(mut storage) => {
                 for offset in 0..limit {
@@ -856,6 +1056,7 @@ impl WritebackDomain {
                     }
                 }
 
+                // Step 3: 若文件数据回写未发生停机未确认异常，继续按 METADATA_BUDGET 预算回写卷元数据脏页。
                 if !unconfirmed && !storage.stopped(self) {
                     if let Err(error) =
                         writeback::sync_metadata_budget(volume, METADATA_BUDGET, &mut storage)
@@ -872,6 +1073,7 @@ impl WritebackDomain {
             }
         }
 
+        // Step 4: 更新轮次结束状态并唤醒本域等待者；若仍有残留脏页或新通知且未熔断停机，则排入下一轮后台回写任务。
         let pending = self.pressure() != 0 || volume.metadata_cache().has_dirty_or_writeback();
         let again = {
             let mut state = self.state.lock();
@@ -901,7 +1103,7 @@ impl WritebackDomain {
 }
 
 impl Drop for WritebackDomain {
-    /// 最后 owner 只核对已接受责任和带宽贡献已退休，不在析构中等待 worker。
+    /// 在最后一个 `Arc<WritebackDomain>` 引用释放时断言所有排队卷票、运行中回调、活跃带宽份额及借出的工作缓冲区均已彻底归还。
     fn drop(&mut self) {
         let state = self.state.lock();
         assert_eq!(state.pending, 0, "dropping pending writeback volume ticket");
@@ -914,10 +1116,12 @@ impl Drop for WritebackDomain {
     }
 }
 
-/// 回调先唯一消费 pending 卷票，局部 Arc 通过卷字段保域到最后一次业务访问。
+/// 后台回写延迟工作项入口回调：从 `state.pending` 取出唯一卷强引用票还原为 `Arc<Ext4Volume>`，驱动该卷执行一轮有界回写。
 fn run_writeback(work: Pin<&DelayedWork>) {
     let pointer = work.context() as *const WritebackDomain;
-    // SAFETY: 接受 queue 前取得的真实卷票强持已发表的域；pending 取走前该票不会被任何其他路径消费。
+    // SAFETY:
+    // 1. `schedule` 在将本工作项排入队列前已克隆一份 `Arc<Ext4Volume>` 存入 `state.pending`，而 `Ext4Volume` 强持有 `Arc<WritebackDomain>`；
+    // 2. 在本回调下方获取 `domain.state` 锁并取走 `pending` 之前，`stop_sync` 的 `cancel_sync` 会阻塞等待本回调完成，因此 `pointer` 指向的 `WritebackDomain` 在此处必然存活有效。
     let domain = unsafe { &*pointer };
     let ticket = {
         let mut state = domain.state.lock();
@@ -927,12 +1131,14 @@ fn run_writeback(work: Pin<&DelayedWork>) {
         state.running = true;
         ticket
     };
-    // SAFETY: ticket 是当前回调从 pending 唯一取走的 into_raw 强票；cancel_sync 只能归还未被取走的票。
+    // SAFETY:
+    // 1. `ticket` 刚刚在 `domain.state` 自旋锁内通过 `core::mem::take(&mut state.pending)` 唯一取出（上方 `assert_ne!(ticket, 0)` 确认有效）；
+    // 2. `stop_sync` 仅在 `cancel_sync` 等待本回调彻底退出后才检查残留的 `pending`，不会与此处重复还原同一份 `Arc::into_raw` 指针。
     let volume = unsafe { Arc::from_raw(ticket as *const Ext4Volume) };
     volume.writeback_domain().run_round(&volume);
 }
 
-/// file-role 在真实安装和最终 take_backing 时配对，索引数量不参与此计数。
+/// 在物理页被安装为文件缓存页（`added = true`）或最终回收释放底层页（`added = false`）时，配对增减全局存活文件页计数 `FILE_PAGES`。
 pub(crate) fn account_file_page(added: bool) {
     if added {
         FILE_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -944,13 +1150,13 @@ pub(crate) fn account_file_page(added: bool) {
     }
 }
 
-/// 每次原页用途状态转换只计算 mask 的零与非零，不按写入 byte 重复计页。
+/// 在 `PageDesc` 用途自旋锁内根据物理页 `dirty` 与 `writeback` 扇区位图的零/非零边沿转换，更新全局脏页与回写页计数器。
 pub(crate) fn account_folio(old_dirty: u8, new_dirty: u8, old_wb: u8, new_wb: u8) {
     account_mask(&DIRTY_PAGES, old_dirty, new_dirty);
     account_mask(&WRITEBACK_PAGES, old_wb, new_wb);
 }
 
-/// 保持一个页级标量与原 mask 的零边界配对，不执行任何调度或复杂析构。
+/// 当扇区位图从 `0` 变为非零时将页级计数器加 `1`，从非零清零时减 `1`（下溢时直接触发断言 panic）。
 fn account_mask(counter: &AtomicUsize, old: u8, new: u8) {
     if old == 0 && new != 0 {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -962,12 +1168,12 @@ fn account_mask(counter: &AtomicUsize, old: u8, new: u8) {
     }
 }
 
-/// 原页开始真实 WB 时在用途锁外建立全局测量起点。
+/// 在任意物理页开始回写时记录全局完成采样器的初始单调时钟起点。
 pub(crate) fn note_writeback_start() {
     GLOBAL_COMPLETION.lock().start(time::now());
 }
 
-/// 全局只累计已经结束的真实 accepted 范围及其完成前缀；取消不增加吞吐。
+/// 在已提交给块设备的回写范围结束时，累加全局已完成字节数并按采样窗口更新全局实测回写带宽。
 pub(crate) fn note_completion(accepted: usize, completed: usize) {
     if accepted != 0 {
         GLOBAL_COMPLETION
@@ -976,7 +1182,9 @@ pub(crate) fn note_completion(accepted: usize, completed: usize) {
     }
 }
 
-/// 无匿名 swap/LRU 政策时，以实际空闲加存活 File-role 页近似当前文件 dirtyable。
+/// 计算当前系统的可脏页基数与全局脏页硬上限 `(dirtyable_pages, dirty_limit)`。
+///
+/// 由于当前页面回收仅针对文件缓存页，可脏页基数取伙伴空闲页、每核 PCP 缓存页与存活文件页之和，再按 `DIRTY_RATIO`（10%）折算并钳制到 `[MIN_DIRTY_PAGES, MAX_DIRTY_PAGES]`。
 fn dirty_limit() -> (usize, usize) {
     let memory = mm::stats();
     let dirtyable =
@@ -987,7 +1195,7 @@ fn dirty_limit() -> (usize, usize) {
     )
 }
 
-/// 只读取本 VM 当前原页账和真实完成样本，跨锁快照不提供停稳证明。
+/// 读取当前全局文件页计数、脏页压力阈值及全局完成带宽快照（仅 `ktest` 诊断使用）。
 #[cfg(feature = "ktest")]
 pub(crate) fn global_snapshot() -> DirtySnapshot {
     let (dirtyable, limit) = dirty_limit();
@@ -1004,14 +1212,18 @@ pub(crate) fn global_snapshot() -> DirtySnapshot {
     }
 }
 
-/// 磁盘 writer 在释放 inode、cursor、invalidate 和内容 guard 后按本域实测完成有限等待。
-/// 本接口不返回写入错误，已接受的正前缀不能被限速改成未写；原错误由 errseq 消费。
+/// 前台磁盘文件写入后的脏页平衡与流控限速入口。
+///
+/// 调用方必须处于可调度任务上下文，且已释放所有 Inode 锁、目录游标、失效锁及 `FolioContent` 锁。
+/// 当本卷脏/回写页压力超过后台阈值时触发异步回写；超过硬上限时按超出量与实测带宽进入有界睡眠等待（单次最长 `200ms`）。
+/// 本函数不向写入者返回回写 I/O 错误（已写入页缓存的数据保持有效，异步落盘错误由文件描述符在 `fsync` 时通过 `errseq` 报告）。
 pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
     sched::assert_switchable();
     let volume = inode
         .disk_volume()
         .expect("dirty balancing requires a disk inode");
     let domain = volume.writeback_domain();
+    // Step 1: 计算本卷脏页阈值与当前压力；未达后台阈值直接返回，超过后台阈值则唤醒后台回写，未超硬上限亦直接返回。
     let (limit, background) = domain.limits();
     let pressure = domain.pressure();
     if pressure <= background {
@@ -1022,6 +1234,7 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
         return;
     }
 
+    // Step 2: 压力超过硬上限，读取当前完成序号与实测带宽，计算本次限速等待的目标完成字节数或最长暂停截止时间（最多 200ms）。
     let (sequence, errors, completed, bandwidth) = {
         let state = domain.state.lock();
         (
@@ -1046,11 +1259,14 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
         (completed + target_bytes.max(1).min(excess), Some(deadline))
     };
 
+    // Step 3: 注册到本卷等待队列并在锁下复查退出条件；若仍超限则挂载高精度超时定时器进入睡眠等待。
     let mut waiting = false;
     loop {
         let waiter = Waiter::new();
         let mut node = pin!(WaitNode::new(waiter.waker()));
-        // SAFETY: inode 强持卷和固定域，栈节点固定；每次退出先撤登记，之后才释放节点与 Waiter。
+        // SAFETY:
+        // 1. 调用方持有的 `inode` 强引用保活所属 `Ext4Volume` 及其 `WritebackDomain`（含 `domain.waiters`），`node` 通过 `pin!` 固定在当前栈帧上；
+        // 2. `registration` 在每次循环末尾或提前 `break` 分支中均先于 `node` 和 `waiter` 显式 `drop` 脱链。
         let registration = unsafe { domain.waiters.register(node.as_mut()) };
         let mut state = domain.state.lock();
         let finished = !state.active
@@ -1084,14 +1300,16 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
             waker.as_ref().get_ref() as *const Waker as usize
         ));
         if let Some(deadline) = deadline {
-            // SAFETY: timer 与 Waker 固定在本栈，取消同步结束 IRQ 真尾部后才退出作用域；回调只通知。
+            // SAFETY:
+            // 1. `timer` 与 `waker` 均通过 `pin!` 固定在当前循环迭代栈帧上；
+            // 2. 下方从 `waiter.park()` 唤醒后必定先执行 `timer.as_ref().cancel_sync()` 等待正在运行的定时器中断回调彻底退出，随后才退出作用域销毁 `timer` 与 `waker`。
             unsafe { timer.as_ref().arm_borrowed(deadline) }
                 .expect("fresh dirty balance timer rejected");
         }
         waiter.park();
         domain.state.lock().writer_wakes += 1;
         drop(registration);
-        // Timer 同步取消自身可能等待，必须先结束当前 Task 的唯一 active wait。
+        // `Timer::cancel_sync` 在等待远端核中断回调结束时可能内部自建等待，因此必须先显式 drop 当前任务的 `waiter` 以结束本轮活跃等待状态。
         drop(waiter);
         if deadline.is_some() {
             timer.as_ref().cancel_sync();
@@ -1102,9 +1320,11 @@ pub(crate) fn balance_dirty_pages(inode: &InodeRef) {
     }
 }
 
-/// 精确定时器只通知本次等待，不把超时发布为写回完成或清除 Dirty。
+/// 前台脏页限速定时器的中断到期回调：通过上下文指针唤醒对应的限速等待者重新检查压力与超时条件。
 fn wake_writer(timer: Pin<&Timer>) {
-    // SAFETY: balance 的固定 Waker 保持到 cancel_sync 确认回调尾部，IRQ 不保存指针或访问页内容。
+    // SAFETY:
+    // 1. `timer.context()` 保存的是 `balance_dirty_pages` 栈上已固定 `Waker` 的裸指针；
+    // 2. `balance_dirty_pages` 在 `waker` 离开作用域前必定调用 `timer.as_ref().cancel_sync()` 等待本中断回调彻底执行完毕退出，且 `Waker::notify` 仅需共享引用即可并发安全调用。
     let waker = unsafe { &*(timer.context() as *const Waker) };
     waker.notify();
 }

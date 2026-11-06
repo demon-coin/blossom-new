@@ -1,4 +1,11 @@
-"""拥有 QEMU、调试器、工作盘、网络 peer 与一个独立 UART 通道。"""
+"""ktest 单台 QEMU 虚拟机测试会话生命周期与外设资源管理器。
+
+本模块封装了单次 QEMU 启动与测试所需的全部宿主侧资源：
+- 创建独占的临时工作盘目录（root/extra/scratch）、UART Unix 域套接字目录与 `qemu.log` 控制台日志；
+- 按需启动宿主侧 `NetUserPeer` 网络端点与多核 AP 冻结 GDB 调试器；
+- 负责在绝对截止时刻内完成 UART 连接与 `KTEST READY` 握手，并在虚拟机退出后统一核对资源消耗、
+  回收子进程组及清理临时文件。
+"""
 
 import errno
 import json
@@ -23,10 +30,10 @@ CANCELLED = threading.Event()
 
 
 class QemuTestSession:
-    """独占每次测试的进程与临时资源，所有串口操作由 uart 承担。"""
+    """管理单次测试会话的 QEMU 进程、GDB 调试器、临时工作盘、网络对端及独占 UART 通道。"""
 
     def check(self, deadline):
-        """日志数量和字节进度都不改变固定截止时刻。"""
+        """检查全局取消标志、当前单调时钟是否已超过绝对截止时刻，以及 GDB 调试器是否异常退出。"""
         require(not CANCELLED.is_set(), "host run cancelled")
         if deadline <= time.monotonic():
             raise DeadlineExpired("absolute host deadline expired")
@@ -35,7 +42,7 @@ class QemuTestSession:
 
 
     def handshake(self, config, command, deadline):
-        """唯一早期 READY 之后只发送一次 catalog 或 run 命令。"""
+        """建立 UART 套接字连接，等待客体输出 `KTEST READY` 并校验配置，随后发送单条测试控制命令（catalog 或 run）。"""
         self.connect(deadline)
         while True:
             line = self.uart.line(deadline)
@@ -46,7 +53,7 @@ class QemuTestSession:
 
 
     def verify_resources(self, deadline):
-        """真实退出后核对 UART、网络 peer 原字节及本 VM 的冻结现场。"""
+        """在 QEMU 进程退出后，核对 UART 声明的输入/输出字节、GDB 冻结现场及宿主网络对端状态是否全部符合预期。"""
         self.uart.verify_consumed()
         if self.debugger is not None:
             try:
@@ -61,7 +68,7 @@ class QemuTestSession:
 
 
     def __init__(self, args, kernel, directory, names):
-        """独占盘和 live peer 在启动前准备，QEMU 真正 wait 后才释放。"""
+        """准备独占的工作盘副本、宿主网络对端与 UART 通道，拼装命令行并启动独立会话组的 QEMU 子进程。"""
         self.args = args
         self.directory = directory
         self.process = None
@@ -76,12 +83,14 @@ class QemuTestSession:
         self.console = None
         self.disk_directory = None
         try:
+            # 初始化串口通道、QEMU 标准输出日志与本次会话独占的工作盘副本
             self.uart = UartChannel(args, directory, self.check)
             self.console = (directory / "qemu.log").open("xb", buffering=0)
             self.disk_directory = tempfile.TemporaryDirectory(prefix="disks-", dir=directory)
             disks = prepare_disks(names, args, Path(self.disk_directory.name))
             if "net-user" in names:
                 self.net_user = NetUserPeer(directory)
+            # 拼装 QEMU 基础机器参数、串口套接字后端、网络参数与块设备参数
             command = [args.qemu or f"qemu-system-{args.arch}", "-machine", "virt", "-accel", "tcg",
                        "-kernel", str(kernel), "-m", args.memory, "-smp", str(args.cpus),
                        "-display", "none", "-monitor", "none", "-no-reboot",
@@ -100,6 +109,7 @@ class QemuTestSession:
                 virtio_access_platform="virtio-access-platform" in names,
                 root_device=args.root, root_mode=args.root_mode,
                 extra_root_device=args.extra_root, network_peer_ports=ports)
+            # 若当前测试声明了多核 ap-freeze 资源，则开启 QEMU GDB stub 并准备 GDB 自动化脚本命令
             if "ap-freeze" in names and 2 <= args.cpus:
                 endpoint = str(Path(self.socket_directory.name) / "gdb.sock")
                 command += ["-chardev", f"socket,id=ktest-gdb,path={endpoint},server=on,wait=off",
@@ -107,6 +117,7 @@ class QemuTestSession:
                 self.gdb_command = ap_freeze.command(args, kernel, directory, endpoint)
                 (directory / "gdb-command.json").write_text(json.dumps(self.gdb_command) + "\n", encoding="utf-8")
                 self.debug_log = (directory / "ap-freeze-gdb.log").open("xb", buffering=0)
+            # 保存完整 QEMU 命令行快照并启动独立进程组的 QEMU 实例
             (directory / "command.json").write_text(json.dumps(command) + "\n", encoding="utf-8")
             self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=self.console,
                                             stderr=subprocess.STDOUT, start_new_session=True)
@@ -116,7 +127,7 @@ class QemuTestSession:
 
 
     def connect(self, deadline):
-        """在同一个启动绝对期限内等待真实 Unix UART 端点。"""
+        """在启动绝对截止时刻内轮询连接 QEMU 创建的 Unix 域串口套接字，并在连接成功后按需启动 GDB 调试器。"""
         self.uart.serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         while True:
             self.check(deadline)
@@ -137,9 +148,10 @@ class QemuTestSession:
 
 
     def close(self):
-        """先真正 wait 进程，再取消并 join peer，最后关闭句柄及工作盘。"""
+        """按序终止并 wait 回收 GDB 与 QEMU 进程组，随后关闭网络对端、串口、日志文件并清理临时目录。"""
         if self._closed:
             return
+        # 先向 GDB 和 QEMU 所在进程组发送 SIGTERM 并等待退出，超时未退则发送 SIGKILL 强制回收
         for process in (self.debugger, self.process):
             if process is None:
                 continue
@@ -156,6 +168,7 @@ class QemuTestSession:
             except ProcessLookupError:
                 pass
             process.wait()
+        # 进程完全退出后再关闭网络对端、UART 通道、日志文件并删除临时目录
         peer = getattr(self, "net_user", None)
         if peer is not None:
             peer.close()

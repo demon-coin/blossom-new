@@ -1,3 +1,48 @@
+//! `#[ktest::suite]` 过程宏实现。
+//!
+//! # 模块职责与架构定位
+//! 本模块在编译期解析内联测试模块（`mod`）上的套件属性与内部测试函数，校验函数签名与属性合法性，
+//! 并将其展开为 `ktest` 运行时所需的静态元数据表（`SuiteDesc`、`CaseDesc`）、参数化实例包装函数以及 `.ktest.suites` 链接段注册槽。
+//! - **上游调用者**：内核与宿主测试代码中带有 `#[ktest::suite(...)]` 属性的内联模块。
+//! - **下游依赖方**：展开后的代码直接调用 `ktest` crate 中的 `run_suite`、`run_case`、`IntoTestResult` 等运行时接口，并由链接器收集 `.ktest.suites` 段中的 `SuiteSlot`。
+//!
+//! # 核心设计与代码展开布局
+//!
+//! ## 1. 源码输入到生成代码的映射流程
+//! ```text
+//! #[ktest::suite(fixture = Dev, suite_resources = Base, ...)]
+//! mod my_suite {
+//!     #[test]
+//!     #[case("a", 1)]
+//!     #[case("b", 2)]
+//!     fn check(ctx: &mut TestContext, dev: &mut Dev, val: u32) -> TestResult { ... }
+//! }
+//!                           |
+//!                           v  (编译期过程宏展开)
+//! mod my_suite {
+//!     // 1. 保留原模块中的辅助类型与剥离了专用属性后的原始测试函数 `fn check(...)`
+//!     // 2. 为每个静态参数实例生成独立包装函数：
+//!     //    fn __ktest_case_0(ctx, res) -> CaseOutcome { run_case::<Dev, Base>(...) }
+//!     //    fn __ktest_case_1(ctx, res) -> CaseOutcome { run_case::<Dev, Base>(...) }
+//!     // 3. 生成静态用例描述符数组：
+//!     //    pub static __KTEST_CASES: &[CaseDesc] = &[CaseDesc { ... }, CaseDesc { ... }];
+//!     // 4. 生成索引分派器与套件运行入口：
+//!     //    fn __ktest_dispatch(ctx, res, idx) -> CaseOutcome
+//!     //    fn __ktest_run(ctx, runner) -> SuiteOutcome
+//!     // 5. 生成套件描述符与 `.ktest.suites` 链接段槽位及归档导出锚点：
+//!     //    pub static __KTEST_SUITE: SuiteDesc = ...;
+//!     //    #[link_section = ".ktest.suites"] pub static __KTEST_SLOT: SuiteSlot = ...;
+//!     //    pub fn __ktest_anchor() -> &'static SuiteSlot { &__KTEST_SLOT }
+//! }
+//! ```
+//!
+//! ## 2. 套件与用例属性合并规则
+//! - `context`：仅允许在套件级指定（默认 `Thread`），防止同一套件内的用例混用不同执行上下文。
+//! - `isolation`：默认 `Suite`；若套件或用例任一方指定为 `Case`，或者声明了 `expected_fatal`，则自动提升为 `Case` 级隔离。
+//! - `min_cpus`：取套件与用例声明值的较大者（默认 `1`）。
+//! - `timeout_ms`：优先采用用例级覆盖值，未指定则继承套件级配置（默认 `10_000` 毫秒）。
+//! - `tags` / `resources`：取套件级列表与用例级列表的去重并集。
+
 use std::collections::BTreeSet;
 
 use proc_macro::TokenStream;
@@ -8,7 +53,7 @@ use syn::{
     ItemFn, ItemMod, Lit, LitStr, Meta, ReturnType, Token, Type,
 };
 
-/// 将内联 suite 模块展开为静态描述符与具体类型的生命周期 wrapper。
+/// 将带有 `#[ktest::suite]` 属性的内联模块展开为静态测试套件描述符、用例分派表及生命周期包装函数。
 #[proc_macro_attribute]
 pub fn suite(attributes: TokenStream, input: TokenStream) -> TokenStream {
     match expand(attributes.into(), input.into()) {
@@ -17,29 +62,44 @@ pub fn suite(attributes: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
+/// 解析后的套件级或用例级 `#[ktest(...)]` 配置选项集合。
 #[derive(Default, Clone)]
 struct Options {
+    /// 用例级独立夹具类型（仅允许在套件属性中通过 `fixture = Type` 指定）。
     fixture: Option<Type>,
+    /// 套件级共享资源类型（仅允许在套件属性中通过 `suite_resources = Type` 指定）。
     base: Option<Type>,
+    /// 附加在 `module_path!()` 之后的自定义套件子名称。
     name: Option<LitStr>,
+    /// 套件执行上下文名称（`"Boot"` 或 `"Thread"`，仅套件级有效）。
     context: Option<LitStr>,
+    /// 隔离级别名称（`"Suite"` 或 `"Case"`）。
     isolation: Option<LitStr>,
+    /// 静态分类标签字符串字面量列表。
     tags: Vec<LitStr>,
+    /// 依赖的平台资源标识符字符串字面量列表。
     resources: Vec<LitStr>,
+    /// 要求的最少在线 CPU 数量。
     min_cpus: Option<u32>,
+    /// 超时时间配额（单位：毫秒）。
     timeout_ms: Option<u64>,
+    /// 跳过该套件或用例的原因字符串。
     ignore: Option<LitStr>,
+    /// 预期触发的内核致命异常类型名称。
     fatal: Option<LitStr>,
+    /// 预期致命异常发生时要求匹配的诊断消息子串。
     fatal_message: Option<LitStr>,
+    /// 已出现过的属性键名集合，用于检测并拒绝重复属性。
     seen: BTreeSet<String>,
 }
 
-/// 仅接受列出的少量元属性，重复属性在作者位置报错。
+/// `Options` 的编译期属性解析实现。
 impl Options {
-    /// 解析 suite 或 case 的静态选项，不解释业务参数表达式。
+    /// 解析 `#[ktest::suite(...)]`（当 `suite == true` 时）或 `#[ktest(...)]`（当 `suite == false` 时）中的键值对与列表属性。
     fn parse(&mut self, tokens: Tokens, suite: bool) -> syn::Result<()> {
         let entries = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(tokens)?;
         for entry in entries {
+            // Step 1: 提取属性标识符并检查同一作用域内是否重复声明了相同属性。
             let key = entry
                 .path()
                 .get_ident()
@@ -48,6 +108,7 @@ impl Options {
             if !self.seen.insert(key.clone()) {
                 return Err(syn::Error::new(entry.span(), "duplicate ktest attribute"));
             }
+            // Step 2: 按属性名与语法形态分发校验，分别解析标签/资源列表、类型、字符串枚举及正整数配额。
             match (key.as_str(), &entry) {
                 ("tags" | "resources", Meta::List(list)) => {
                     let values =
@@ -189,7 +250,7 @@ impl Options {
     }
 }
 
-/// 元信息只接受字符串字面量，运行时表达式不能改变目录。
+/// 从 AST 表达式中提取字符串字面量；若传入非常量字符串字面量则返回编译错误，确保测试目录元数据在编译期完全确定。
 fn literal_string(expr: &Expr) -> syn::Result<LitStr> {
     if let Expr::Lit(value) = expr {
         if let Lit::Str(value) = &value.lit {
@@ -198,7 +259,7 @@ fn literal_string(expr: &Expr) -> syn::Result<LitStr> {
     }
     Err(syn::Error::new(expr.span(), "expected a string literal"))
 }
-/// 名字不得含控制字符和全名的歧义分隔符。
+/// 校验套件名、标签名或参数实例名：必须非空，且不得包含控制字符或用于拼接用例全限定名的分隔符（`:`、`[`、`]`）。
 fn valid_label(value: &LitStr) -> syn::Result<()> {
     let name = value.value();
     if name.trim().is_empty()
@@ -213,7 +274,7 @@ fn valid_label(value: &LitStr) -> syn::Result<()> {
     }
     Ok(())
 }
-/// ignore 与 fatal 信息保持单行且非空。
+/// 校验 `ignore` 原因与 `fatal_message` 诊断子串：必须非空且不包含控制字符（保证单行日志协议不被破坏）。
 fn valid_message(value: &LitStr) -> syn::Result<()> {
     if value.value().trim().is_empty() || value.value().chars().any(char::is_control) {
         return Err(syn::Error::new(
@@ -224,34 +285,48 @@ fn valid_message(value: &LitStr) -> syn::Result<()> {
     Ok(())
 }
 
+/// 单个参数化测试用例实例（对应一条 `#[case("label", arg1, arg2, ...)]` 属性或无参默认实例）。
 struct Instance {
+    /// 参数实例的名称标签；普通非参数化测试为 `None`。
     label: Option<LitStr>,
+    /// 传递给测试函数静态参数列表的实参表达式集合。
     arguments: Vec<Expr>,
 }
+/// 解析并校验通过后的单个测试函数完整描述。
 struct Test {
+    /// 剥离了 `#[test]`、`#[case]`、`#[ktest]` 等框架专用属性后的原始测试函数 AST。
     function: ItemFn,
+    /// 用例级 `#[ktest(...)]` 与 `#[ignore]` 属性解析结果。
     options: Options,
+    /// `#[should_panic]` 属性声明的预期 Panic 消息子串（无参 `#[should_panic]` 对应空字符串 `""`）。
     panic: Option<LitStr>,
+    /// 该测试函数展开出的全部执行实例（至少包含一个元素）。
     instances: Vec<Instance>,
+    /// 测试函数首个参数是否接收 `&mut TestContext`。
     context: bool,
+    /// 测试函数第二个参数是否接收用例夹具 `&mut Fixture`。
     fixture: bool,
 }
 
+/// 检查函数参数类型树中是否包含 `impl Trait` 匿名泛型语法的 AST 访问器。
 struct AnonymousGeneric {
+    /// 是否在参数类型中发现了 `TypeImplTrait` 节点。
     found: bool,
 }
 
 impl<'ast> Visit<'ast> for AnonymousGeneric {
+    /// 遇到 `impl Trait` 类型节点时标记为已发现。
     fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
         self.found = true;
     }
 
-    // 常量表达式中的局部函数不属于测试参数的匿名泛型。
+    /// 不递归进入类型内部的常量表达式（如数组长度 `[u8; { fn helper(x: impl Sized) {} 4 }]`），避免误判局部辅助函数。
     fn visit_expr(&mut self, _: &'ast Expr) {}
 }
 
-/// 消费测试专用属性，保留作者函数及其断言不变。
+/// 解析并校验单个标记了 `#[test]` 的函数，提取测试属性、参数注入方式与参数化实例列表。
 fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
+    // Step 1: 校验函数签名修饰符，测试函数必须是安全、非泛型（含无 `impl Trait` 参数）、同步的普通 Rust 函数。
     let signature = &function.sig;
     if signature.asyncness.is_some()
         || signature.unsafety.is_some()
@@ -274,6 +349,7 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
             "ktest requires a safe, non-generic, synchronous Rust function",
         ));
     }
+    // Step 2: 校验函数返回类型，仅允许默认返回、`-> ()` 或 `-> TestResult`。
     match &signature.output {
         ReturnType::Default => (),
         ReturnType::Type(_, ty)
@@ -289,6 +365,7 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
             ))
         }
     }
+    // Step 3: 扫描并提取函数上的 `#[test]`、`#[case]`、`#[ktest]`、`#[ignore]`、`#[should_panic]` 属性，同时拒绝单个函数上的 `#[cfg]`。
     let mut options = Options::default();
     let mut panic = None;
     let mut panic_seen = false;
@@ -385,10 +462,11 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
     }
     function.attrs = retained;
     let inputs: Vec<_> = function.sig.inputs.iter().collect();
+    // Step 4: 识别前两个参数是否为框架注入的 `&mut TestContext` 与 `&mut Fixture`，并校验其余静态参数位置未误放 `TestContext` 或 `self`。
     let context = inputs
         .first()
         .is_some_and(|arg| is_mut_reference(arg, "TestContext"));
-    // 第二个可变借用交给具体 fixture；路径别名的等价性由正常 Rust 类型检查判断。
+    // 当首个参数为 `&mut TestContext` 且套件声明了 `fixture` 时，第二个可变引用参数即视为用例夹具引用（具体类型一致性由编译器后续类型检查保证）。
     let fixture = context
         && suite.fixture.is_some()
         && matches!(inputs.get(1).copied(), Some(FnArg::Typed(arg)) if matches!(&*arg.ty, Type::Reference(reference) if reference.mutability.is_some()));
@@ -407,6 +485,7 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
             return Err(syn::Error::new(arg.span(), "test cannot have a receiver"));
         }
     }
+    // Step 5: 若未声明任何 `#[case]`，则生成单个无标签默认实例；并校验每个实例的实参个数与函数静态参数个数严格一致。
     if instances.is_empty() {
         instances.push(Instance {
             label: None,
@@ -421,6 +500,7 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
             ));
         }
     }
+    // Step 6: 校验 `should_panic` 与 `expected_fatal` 互斥关系，以及 `fatal_message` 的配套约束。
     if panic.is_some() && (options.fatal.is_some() || suite.fatal.is_some()) {
         return Err(syn::Error::new(
             function.sig.span(),
@@ -454,9 +534,8 @@ fn parse_test(mut function: ItemFn, suite: &Options) -> syn::Result<Test> {
     })
 }
 
-/// 从路径类型取末尾名，用于有限签名识别。
+/// 提取路径类型的最末段标识符名称，用于在语法层面识别 `TestContext` 与 `TestResult`。
 fn type_name(ty: &Type) -> Option<&str> {
-    // Ident 字符串不能借出临时值，固定名字直接匹配。
     if let Type::Path(path) = ty {
         let ident = &path.path.segments.last()?.ident;
         if ident == "TestContext" {
@@ -470,12 +549,12 @@ fn type_name(ty: &Type) -> Option<&str> {
         None
     }
 }
-/// 上下文参数必须是可变借用，生命周期交由 Rust 正常检查。
+/// 判断函数参数是否为指向指定类型名称 `name` 的可变引用（`&mut <name>`）。
 fn is_mut_reference(arg: &FnArg, name: &str) -> bool {
     matches!(arg, FnArg::Typed(arg) if matches!(&*arg.ty, Type::Reference(reference) if reference.mutability.is_some() && type_name(&reference.elem) == Some(name)))
 }
 
-/// 取 suite 与 case 静态集合的并集，不重复目录条目。
+/// 合并套件级与用例级字符串列表（如 `tags` 或 `resources`），保持原有顺序并去除重复项。
 fn merged_strings(base: &[LitStr], case: &[LitStr]) -> Vec<LitStr> {
     let mut result = base.to_vec();
     for value in case {
@@ -485,7 +564,7 @@ fn merged_strings(base: &[LitStr], case: &[LitStr]) -> Vec<LitStr> {
     }
     result
 }
-/// 属性解析后生成有效默认值，隔离只允许提升。
+/// 合并套件级 `base` 与可选用例级 `case` 属性，生成 `ktest::Defaults` 结构体字面量的 TokenStream。
 fn defaults(base: &Options, case: Option<&Options>) -> Tokens {
     let context = if base
         .context
@@ -534,7 +613,7 @@ fn defaults(base: &Options, case: Option<&Options>) -> Tokens {
     });
     quote!(ktest::Defaults { context: #context, isolation: #isolation, tags: &[#(#tags),*], min_cpus: #min_cpus, timeout_ms: #timeout, resources: &[#(#resources),*] })
 }
-/// 将可选字符串编码为静态 Option。
+/// 将编译期可选字符串字面量转换为运行时的 `Some("...")` 或 `None` 表达式 TokenStream。
 fn optional(value: Option<&LitStr>) -> Tokens {
     match value {
         Some(value) => quote!(Some(#value)),
@@ -542,8 +621,9 @@ fn optional(value: Option<&LitStr>) -> Tokens {
     }
 }
 
-/// 为每个静态参数实例生成 wrapper，类型错误仍由正常 Rust 类型检查负责。
+/// 展开 `#[ktest::suite]` 模块：解析套件选项、收集测试函数、生成用例包装函数与静态注册表。
 fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
+    // Step 1: 解析套件级属性，并确保输入是一个内联模块（`mod name { ... }`）。
     let mut options = Options::default();
     options.parse(attributes, true)?;
     let mut module: ItemMod = syn::parse2(input)?;
@@ -552,6 +632,7 @@ fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
         .content
         .as_mut()
         .ok_or_else(|| syn::Error::new(module_span, "suite requires an inline module"))?;
+    // Step 2: 遍历模块内条目，分离出带有 `#[test]` 的测试函数并校验无重名测试，其余辅助条目原样保留。
     let mut tests = Vec::new();
     let mut names = BTreeSet::new();
     let mut preserved = Vec::new();
@@ -582,6 +663,7 @@ fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
             "suite must contain at least one test",
         ));
     }
+    // Step 3: 为每个测试函数的每个参数化实例生成 `CaseDesc` 静态描述符、生命周期包装函数 `__ktest_case_N` 及分派分支。
     let fixture = options
         .fixture
         .clone()
@@ -634,7 +716,7 @@ fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
             }
             arguments.extend(instance.arguments.iter().map(ToTokens::to_token_stream));
             wrappers.push(quote!(
-                /// 具体 fixture 保留在主体捕获边界外，参数表达式只在主体内求值。
+                /// 执行单个测试实例的包装函数：将夹具构造与销毁交由 `run_case` 管理，仅在测试主体闭包内对参数表达式求值并调用测试函数。
                 fn #wrapper(__context: &mut ktest::TestContext<'_>, __resources: &#base) -> ktest::CaseOutcome {
                     ktest::run_case::<#fixture, #base>(__context, __resources, |__context, __fixture| {
                         ktest::IntoTestResult::into_test_result(#name(#(#arguments),*))
@@ -645,15 +727,15 @@ fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
         }
         preserved.push(Item::Fn(test.function));
     }
-    // export_name 使用真实 crate/module 路径，避免跨 crate 同短名的归档锚点碰撞。
+    // Step 4: 生成静态用例表、索引分派器、套件运行入口、`.ktest.suites` 注册槽及链接归档锚点函数（使用完整模块路径作为导出符号名以避免跨模块同名冲突）。
     let generated: syn::File = syn::parse2(quote!(
         #(#wrappers)*
         pub static __KTEST_CASES: &[ktest::CaseDesc] = &[#(#cases),*];
-        /// 分派唯一静态实例索引；运行器必须先验证该索引属于当前 suite。
+        /// 根据静态用例索引分派执行对应的包装函数 `__ktest_case_N`。
         fn __ktest_dispatch(__context: &mut ktest::TestContext<'_>, __resources: &#base, __index: usize) -> ktest::CaseOutcome {
             match __index { #(#arms,)* _ => panic!("invalid ktest case index") }
         }
-        /// suite 基础资源包住本次选择，并由具体类型实施停止和销毁。
+        /// 套件统一运行入口：初始化套件级共享资源 `#base` 并驱动 `CaseRunner` 执行选中的用例。
         fn __ktest_run(__context: &mut ktest::TestContext<'_>, __runner: &mut dyn ktest::CaseRunner) -> ktest::SuiteOutcome {
             ktest::run_suite::<#base>(__context, __runner, __KTEST_CASES, __ktest_dispatch)
         }
@@ -664,7 +746,7 @@ fn expand(attributes: Tokens, input: Tokens) -> syn::Result<Tokens> {
         #[link_section = ".ktest.suites"]
         #[export_name = concat!("__ktest_register__", module_path!())]
         pub static __KTEST_SLOT: ktest::SuiteSlot = ktest::SuiteSlot(&__KTEST_SUITE);
-        /// 显式引用本 suite 槽；归档抽取使用统一导出前缀，不依赖 used 代替链接规则。
+        /// 返回当前套件注册槽的静态引用，作为编译产物中的显式符号引用锚点，确保静态库链接时保留 `.ktest.suites` 槽位。
         #[inline(never)]
         pub fn __ktest_anchor() -> &'static ktest::SuiteSlot { &__KTEST_SLOT }
     ))?;

@@ -1,4 +1,46 @@
-//! 设备停机先终止 DMA，再等待本设备的中断与工作执行尾部。
+//! 块设备安全停机（Stop / Reset）与文件系统扇区范围占用（`FsClaim`）管理。
+//!
+//! ## 模块职责与架构定位
+//! 本模块位于块设备子系统的生命周期控制路径，负责两项紧密相关的核心职责：
+//! 1. **文件系统范围占用仲裁（`FsClaim`）**：上游缓存层（`crate::cache`）与文件系统层在挂载或
+//!    访问块视图（`BlockView`）前，通过 [`Disk::claim_fs`] 登记扇区区间与读写模式；与并发的裸设备
+//!    写入（Raw Write）及其他挂载点在同一物理磁盘的 `queue` 自旋锁下互斥仲裁。当最后一个 `FsClaim`
+//!    引用被释放（Drop）时，自动通知元数据页缓存（`MetadataPages`）失效不再被任何占用覆盖的扇区。
+//! 2. **设备停机与硬件复位（`Disk::stop` / `Disk::fault_reset`）**：按严格顺序排空在途请求生成者、
+//!    等待门铃通知与后端命令执行退出、发起并轮询硬件复位（Reset）、执行 DMA 屏障，最后同步注销
+//!    中断（IRQ）与关闭工作队列任务（Work）。若硬件复位超时未确认，则将队列转入隔离状态
+//!    （`Quarantined`），保留底层设备与在途 DMA 缓冲区所有权，防止硬件 DMA 踩坏已回收内存。
+//!
+//! ## 核心状态机：停机与故障复位流程
+//! ```text
+//!   Prepared ──────────────────────────────┐
+//!                                          ▼
+//!   Live ──(stop: mounts == 0)──► Draining ──(generators/slots/notify == 0)──► Resetting
+//!    │                               │                                           │
+//!    └──(设备故障)──────────────► Faulting ─────────(fault_reset 认领)───────────┘
+//!                                                                                │
+//!                                     ┌────────(2s 超时未确认 reset_complete)────┤
+//!                                     ▼                                          ▼
+//!                                Quarantined                                DmaStopped
+//!                        (永久保留 DMA 页面与设备，                        (DMA 屏障已生效，
+//!                         拒绝回收以防 DMA 踩内存)                          清理在途 Submitted 槽，
+//!                                                                           同步注销 IRQ 与 Work)
+//!                                                                                │
+//!                                                                                ▼
+//!                                                                             Stopped
+//! ```
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! 1. `Disk::control`（`SleepMutex`）：串行化外部任务发起的 `start()` 与 `stop()` 操作；进度工作任务
+//!    （`progress_work`）在执行 `fault_reset()` 时**不获取** `control` 锁，避免与正在等待队列排空的
+//!    `stop()` 死锁。
+//! 2. `Disk::queue`（`SpinLock<QueueState>`）：保护队列阶段（`QueuePhase`）、在途槽位、裸写链表
+//!    （`raw_writers`）与文件系统占用链表（`claim_head`）。持锁期间严禁睡眠。
+//! 3. `MetadataPages` 内部索引锁与缓冲页状态锁：在 `FsClaimInner::drop` 中，保持持有 `Disk::queue`
+//!    自旋锁的同时调用 `MetadataPages::retire_range`（锁顺序：`Disk::queue` ➔ `MetadataPages` 内部自旋锁），
+//!    确保在扇区缓存失效完成前，不会有新的裸写入或新挂载并发准入该扇区范围。
+//! 4. `Disk::irq`（`SpinLock`）：仅在脱离 `Disk::queue` 锁后获取以取出 `IrqRegistration`，随后在锁外
+//!    调用 `unregister_sync()` 阻塞等待中断处理函数彻底退出。
 
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
@@ -12,49 +54,70 @@ use crate::cache::MetadataPages;
 use crate::wait::{WaitNode, Waiter};
 use crate::{sched, time, timer};
 
+/// 等待硬件复位完成的最大超时时间（2 秒）。
 const RESET_TIMEOUT: Duration = Duration::from_secs(2);
+/// 轮询硬件复位完成状态的睡眠间隔（1 毫秒）。
 const RESET_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// 文件系统占用共享同一个真实磁盘及模式，克隆不增加队列占用数。
+/// 文件系统对块设备扇区范围的占用凭证。
+///
+/// 多个 `FsClaim` 克隆实例共享同一个底层 [`FsClaimInner`] 引用计数，克隆不会增加物理磁盘上的
+/// `mounts` 占用计数。当最后一个 `FsClaim` 被释放（Drop）时，会自动失效无其他占用覆盖的元数据缓存页并摘除占用记录。
 #[derive(Clone)]
 pub struct FsClaim {
+    /// 引用计数的内部占用节点，保活至最后一个克隆体以及关联的所有子请求槽位释放完毕。
     inner: Arc<FsClaimInner>,
 }
 
+/// 文件系统扇区范围占用的内部状态节点（侵入式单向链表节点）。
 pub(super) struct FsClaimInner {
+    /// 本次占用绑定的块设备扇区视图（包含目标磁盘引用、起始扇区与扇区总数）。
     view: BlockView,
+    /// 本次占用的访问模式（只读 `ReadOnly` 或读写 `ReadWrite`）。
     mode: AccessMode,
+    /// 标记该节点是否已成功挂入物理磁盘的 `claim_head` 链表并增加了 `mounts` 计数。
     claimed: bool,
+    /// 指向同一物理磁盘上下一个活跃 `FsClaimInner` 的链表指针，由 `view.disk().queue` 自旋锁保护。
     next: UnsafeCell<*const FsClaimInner>,
 }
 
-// SAFETY: next 只在 view.disk.queue 锁下访问，强引用覆盖发表到摘链的整个寿命。
+// SAFETY:
+// 1. `view` 与 `mode` 在构造后只读；
+// 2. `next` 裸指针仅在持有 `view.disk().queue` 自旋锁时读写，且节点在从链表摘除前始终由 `Arc<FsClaimInner>` 保活。
 unsafe impl Send for FsClaimInner {}
-// SAFETY: 范围和模式发表后不变，裸链只由同一物理队列锁修改。
+// SAFETY:
+// 1. 公开方法仅读取不可变的 `view` 和 `mode`；
+// 2. 侵入式链表指针 `next` 的并发修改完全由同一把物理磁盘 `queue` 自旋锁串行化。
 unsafe impl Sync for FsClaimInner {}
 
 impl FsClaim {
-    /// 借用本次占用的访问模式，不从设备可写能力推导视图权限。
+    /// 返回本次文件系统占用的访问模式（`ReadOnly` 或 `ReadWrite`）。
     pub fn mode(&self) -> AccessMode {
         self.inner.mode
     }
 
-    /// 借用实际磁盘拥有者，调用方不得以设备身份值伪造该占用。
+    /// 返回本次占用所属的物理块设备引用。
     pub fn disk(&self) -> &DiskRef {
         self.inner.view.disk()
     }
 
-    /// 借用本次真实范围，克隆仍共享同一个占用登记。
+    /// 返回本次占用覆盖的块设备扇区视图（[`BlockView`]）。
     pub fn view(&self) -> &BlockView {
         &self.inner.view
     }
 }
 
 impl Disk {
-    /// 外部普通 Task 串行停止设备；不得由本设备的完成回调或进度 Work 调用。
-    /// 活挂载返回 Busy，无法确认 reset 时保留原设备及全部 DMA 拥有者。
+    /// 在普通可睡眠任务上下文中串行停止块设备。
+    ///
+    /// # 调用契约与返回值
+    /// - 必须在可调度的普通任务上下文中调用，严禁在本设备的完成回调、中断处理函数或进度 `Work` 中调用（否则等待自身退出将导致死锁）。
+    /// - 若磁盘上仍存在活跃的文件系统占用（`mounts != 0`），返回 `Err(BlockError::Busy)`。
+    /// - 若硬件复位超时未能确认 DMA 停止，队列转入 `Quarantined` 状态并返回 `Err(BlockError::StopUnconfirmed)`，此时底层设备与 DMA 内存保持原状不予释放。
+    /// - 若停机前设备已发生硬件故障但成功完成复位与清理，最终返回 `Err(BlockError::DeviceFault)`。
     pub fn stop(&self) -> Result<(), BlockError> {
         sched::assert_switchable();
+        // Step 1: 获取 `control` 睡眠锁串行化外部控制操作，并在 `queue` 自旋锁内检查挂载计数与切换阶段。
         let _control = self.control.lock();
         {
             let mut queue = self.queue.lock();
@@ -72,7 +135,7 @@ impl Disk {
                 _ => {}
             }
         }
-
+        // Step 2: 唤醒等待槽位的任务并刷出待发送通知，循环等待已接纳请求排空并执行硬件复位。
         self.available.wake_all();
         self.unplug();
         loop {
@@ -100,7 +163,7 @@ impl Disk {
                 self.fault_reset()?;
             }
         }
-
+        // Step 3: 硬件 DMA 已确认停止，等待全部软件完成回调与通知彻底退出，然后同步注销 IRQ 与关闭 Work。
         self.wait_quiescent_until(accepted_finished);
         let registration = { self.irq.lock().take() };
         if let Some(registration) = registration {
@@ -115,6 +178,7 @@ impl Disk {
             }
         }
 
+        // Step 4: 释放底层后端设备控制器，将队列阶段标记为最终的 `Stopped` 并唤醒所有等待者。
         let device = { self.queue.lock().device.take() };
         drop(device);
         let result = {
@@ -128,8 +192,10 @@ impl Disk {
         result
     }
 
-    /// 由队列 phase 唯一认领故障 reset，不等待外部 stop 正持有的 control 锁。
-    /// 进度回调只完成 DMA 停止与失败移交，IRQ 注销及 Work 关闭留给外部 stop。
+    /// 在设备发生故障（`Faulting`）时抢占并执行硬件复位，并在 DMA 停止后将所有已提交（`Submitted`）请求置为失败。
+    ///
+    /// 此函数通过 `QueuePhase` 状态转换保证只有一个执行流认领 `Resetting` 阶段，且不获取外部 `control` 睡眠锁，
+    /// 因此既可由进度工作任务（`progress_work`）调用，也可由外部 `stop()` 调用。IRQ 注销与 `Work` 关闭仍由外部 `stop()` 负责。
     pub(super) fn fault_reset(&self) -> Result<(), BlockError> {
         sched::assert_switchable();
         loop {
@@ -163,14 +229,16 @@ impl Disk {
         }
     }
 
-    /// IRQ 或任务报告真实设备故障后闭门并排预建进度 Work，不在报告者中睡眠。
+    /// 从中断处理函数或任务上下文报告设备故障，立即关闭新请求准入并调度预分配的进度 `Work` 异步执行复位（不在当前上下文睡眠）。
     pub(super) fn request_retire(&self, error: BlockError) {
         self.mark_fault(error);
     }
 
-    /// 唯一 Resetting 认领者等通知真尾部，再请求并有限轮询真实 reset 完成。
-    /// 状态读回零和完整设备屏障以前不收回任何在途页面。
+    /// 由唯一将队列置为 `Resetting` 阶段的认领者调用：等待门铃通知和正在执行的后端命令退出后，发起并轮询硬件复位。
+    ///
+    /// 在硬件状态寄存器确认复位完成且执行完 `arch::dma_barrier()` 之前，绝不回收任何在途物理页；若超时则将队列转入 `Quarantined`。
     fn reset_claimed(&self) -> Result<(), BlockError> {
+        // Step 1: 等待所有活跃的门铃通知（`notify_active`）和正在同步执行后端命令的槽位（`Executing`）全部退出。
         self.wait_quiescent_until(|queue| {
             queue.phase == QueuePhase::Quarantined
                 || (queue.notify_active == 0
@@ -179,6 +247,7 @@ impl Disk {
                         .iter()
                         .any(|state| *state == crate::block::disk::SlotState::Executing))
         });
+        // Step 2: 向后端硬件发出复位请求（如向 VirtIO 状态寄存器写 0）。
         {
             let mut queue = self.queue.lock();
             if queue.phase == QueuePhase::Quarantined {
@@ -195,7 +264,7 @@ impl Disk {
                 queue.ktest_stop.reset_requests += 1;
             }
         }
-
+        // Step 3: 在 `RESET_TIMEOUT`（2 秒）期限内轮询硬件复位是否完成；若超时则转入 `Quarantined` 隔离阶段。
         let deadline = time::now()
             .checked_add(RESET_TIMEOUT)
             .expect("block reset deadline overflows monotonic time");
@@ -214,7 +283,7 @@ impl Disk {
             let stopped = {
                 let mut queue = self.queue.lock();
                 assert_eq!(queue.phase, QueuePhase::Resetting);
-                // 测试控制者只拒绝读取/承认确认；真实 reset 写入和单调期限不变。
+                // 测试钩子：当 `withhold_confirmation` 置位时模拟硬件迟迟不返回复位确认，以测试超时隔离路径。
                 #[cfg(feature = "ktest")]
                 let withheld = queue.ktest_stop.withhold_confirmation;
                 #[cfg(not(feature = "ktest"))]
@@ -244,7 +313,9 @@ impl Disk {
         }
     }
 
-    /// 登记固定栈等待节点后复查队列事实，所有 park 和通知均在队列锁外。
+    /// 在 `quiescent` 等待队列上睡眠，直到谓词 `done` 对 `QueueState` 返回 `true`。
+    ///
+    /// 采用标准的“注册栈上等待节点 ➔ 加锁复查条件 ➔ 锁外 `park()` 睡眠”模式，防止唤醒丢失。
     fn wait_quiescent_until(&self, done: impl Fn(&QueueState) -> bool) {
         if done(&self.queue.lock()) {
             return;
@@ -252,7 +323,9 @@ impl Disk {
         loop {
             let waiter = Waiter::new();
             let mut node = core::pin::pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self 保活永久源，栈节点固定到 registration 析构，登记不会被遗忘。
+            // SAFETY:
+            // 1. `self.quiescent` 属于当前借用的 `Disk`，在本次函数调用期间始终有效；
+            // 2. `node` 固定（Pin）在当前栈帧上，且返回的 `registration` 守卫在本轮循环退出前必定执行 `drop` 将节点从等待队列摘除，不会悬垂。
             let registration = unsafe { self.quiescent.register(node.as_mut()) };
             if done(&self.queue.lock()) {
                 return;
@@ -266,8 +339,14 @@ impl Disk {
         }
     }
 
-    /// 实际范围占用与已接受 raw 写、slot 写在同一物理队列锁下仲裁。
-    /// 相同范围允许并发取得 canonical 候选，部分重叠的可写卷拒绝。
+    /// 申请对指定块视图（`view`）和访问模式（`mode`）的文件系统扇区占用凭证（[`FsClaim`]）。
+    ///
+    /// # 仲裁规则
+    /// - 若请求 `ReadWrite` 模式但底层设备为只读，返回 `Err(BlockError::ReadOnly)`。
+    /// - 在同一物理磁盘的 `queue` 自旋锁下检查：
+    ///   1. 队列必须处于 `QueuePhase::Live` 阶段；
+    ///   2. 目标扇区范围不得与任何在途的裸设备写请求（`raw_writers` 或 `slot_writes`）重叠；
+    ///   3. 允许对完全相同的扇区范围并发申请占用（供上层单飞合并同一卷的挂载候选），但拒绝与已有占用存在**部分重叠且任意一方为可写**的冲突请求，冲突时返回 `Err(BlockError::Busy)`。
     pub fn claim_fs(view: &BlockView, mode: AccessMode) -> Result<FsClaim, BlockError> {
         let disk = view.disk();
         if mode == AccessMode::ReadWrite && disk.limits.readonly {
@@ -292,7 +371,10 @@ impl Disk {
             {
                 return Err(BlockError::Busy);
             }
-            // SAFETY: 本 inner 尚未发表，queue 锁串行链表，Arc 在 drop 摘链前保活节点。
+            // SAFETY:
+            // 1. `owner` 刚刚分配且尚未对外发布，`Arc::get_mut` 证明当前拥有唯一可变访问权；
+            // 2. 当前持有 `disk.queue` 自旋锁，串行化对 `claim_head` 链表的所有读写；
+            // 3. `inner.claimed` 置为 `true` 后，节点在 `FsClaimInner::drop` 持同一把锁将其从链表摘除前始终由 `Arc` 保活。
             unsafe {
                 *inner.next.get() = queue.claim_head;
             }
@@ -305,7 +387,8 @@ impl Disk {
 }
 
 impl FsClaimInner {
-    /// 在 queue 锁内扣除其他活占用，只退休本 claim 最后负责的 sector 段。
+    /// 在持有物理磁盘 `queue` 自旋锁的前提下，扫描 `self.view` 覆盖的扇区区间，跳过仍被其他活跃 `FsClaim`
+    /// 覆盖的子区间，仅将本 `FsClaim` 独占负责的扇区段从共享元数据缓存（`pages`）中淘汰失效。
     fn retire_metadata(&self, queue: &QueueState, pages: &MetadataPages) {
         let mut cursor = self.view.start_sector();
         let end = cursor + self.view.sectors();
@@ -314,8 +397,9 @@ impl FsClaimInner {
             let mut next_start = end;
             let mut node = queue.claim_head;
             while !node.is_null() {
-                // SAFETY: queue 锁保护链，本 claim 尚未摘离；其他节点同样由各自
-                // Arc 的完整 Drop 保活到同锁摘离，即使其最后强引用也正在结束。
+                // SAFETY:
+                // 1. 调用方持有 `queue` 自旋锁；
+                // 2. 链表中的所有 `FsClaimInner` 节点在从链表摘除前都需要在 `Drop::drop` 中获取同一把 `queue` 锁，因此当前指针指向的节点必定存活且有效。
                 let claim = unsafe { &*node };
                 if !ptr::eq(claim, self) {
                     let start = claim.view.start_sector();
@@ -326,15 +410,16 @@ impl FsClaimInner {
                         next_start = next_start.min(start);
                     }
                 }
-                // SAFETY: next 仅由同一 queue 锁访问，当前节点仍在链上。
+                // SAFETY: 当前持有 `queue` 自旋锁，保护链表节点的 `next` 指针读取。
                 node = unsafe { *claim.next.get() };
             }
             if cursor < covered_end {
                 cursor = covered_end;
             } else {
-                // SAFETY: [cursor, next_start) 没有其他活 claim，本 claim 的最后
-                // Drop 证明其 Buffer/Read/WB 已结束；仍持 queue 锁并保留链上占用，
-                // 完成精确失效前 raw 写与新 claim 均不能重新准入。
+                // SAFETY:
+                // 1. 上述链表扫描已确认 `[cursor, next_start)` 扇区区间不再被任何其他活跃 `FsClaim` 覆盖；
+                // 2. 当前正在执行本 `FsClaimInner` 的 `Drop`（最后一个强引用已释放），表明关联的所有请求槽位、元数据读入与回写均已结束；
+                // 3. 当前仍持有 `queue` 自旋锁且尚未将 `self` 从 `claim_head` 摘除，因此在 `retire_range` 完成前不会有冲突的裸写入或新 `FsClaim` 准入该区间。
                 unsafe { pages.retire_range(cursor, next_start) };
                 cursor = next_start;
             }
@@ -343,7 +428,8 @@ impl FsClaimInner {
 }
 
 impl Drop for FsClaimInner {
-    /// 最后责任先在 queue→index→用途锁下失效无其他占用的范围，再撤链并锁外通知。
+    /// 当最后一个强引用（`Arc<FsClaimInner>`）被释放时，在 `queue` 自旋锁保护下失效不再被其他占用覆盖的元数据缓存范围，
+    /// 将自身从 `claim_head` 链表摘除并递减 `mounts` 计数，最后在锁外唤醒等待队列。
     fn drop(&mut self) {
         if !self.claimed {
             return;
@@ -352,12 +438,14 @@ impl Drop for FsClaimInner {
         {
             let mut queue = self.view.disk().queue.lock();
             assert!(0 < queue.mounts, "block mount claim underflow");
-            // 内容锁可能属于相邻卷的读入或 WB；失效只改用途锁内的范围状态。
+            // 先在持有 `queue` 锁时失效本占用独占的元数据缓存扇区，随后再从链表摘除以维持互斥。
             if let Some(pages) = &pages {
                 self.retire_metadata(&queue, pages);
             }
             let mut link = &mut queue.claim_head as *mut *const FsClaimInner;
-            // SAFETY: queue 锁保护完整链，所有发表节点在摘链前由自己的 Arc 保活。
+            // SAFETY:
+            // 1. 当前持有 `queue` 自旋锁，独占访问 `claim_head` 及整条链表的 `next` 指针；
+            // 2. 链表中每个已登记节点在执行到此处的摘除逻辑前均未完成 `Drop`，内存保持有效。
             unsafe {
                 while !(*link).is_null() {
                     if ptr::eq(*link, self) {
@@ -374,16 +462,18 @@ impl Drop for FsClaimInner {
     }
 }
 
-/// 半开范围只在存在真实公共扇区时冲突，紧邻 scratch 可正常写入。
+/// 判断两个左闭右开扇区区间 `[a.0, a.1)` 与 `[b.0, b.1)` 是否存在交集（紧邻但不重叠的区间返回 `false`）。
 pub(super) fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-/// raw 写准入不能绕过任何活 FS 范围，调用者持对应物理队列锁。
+/// 检查待准入的裸设备写入扇区区间 `span` 是否与任何已登记的文件系统占用（`claim_head`）重叠。
+///
+/// 调用方必须持有对应物理磁盘的 `queue` 自旋锁。
 pub(super) fn mounted_write_conflicts(queue: &QueueState, span: (u64, u64)) -> bool {
     let mut node = queue.claim_head;
     while !node.is_null() {
-        // SAFETY: queue 锁和 claim 的 Arc 协议保活当前节点，范围发表后不变。
+        // SAFETY: 调用方持有 `queue` 自旋锁，链表节点在持同一把锁摘除前由各自的 `Arc<FsClaimInner>` 保活。
         let claim = unsafe { &*node };
         if overlaps(
             span,
@@ -394,17 +484,19 @@ pub(super) fn mounted_write_conflicts(queue: &QueueState, span: (u64, u64)) -> b
         ) {
             return true;
         }
-        // SAFETY: 同一 queue 锁保护下一节点指针。
+        // SAFETY: 调用方持有 `queue` 自旋锁，保护 `next` 链表指针读取。
         node = unsafe { *claim.next.get() };
     }
     false
 }
 
-/// FS 候选允许相同范围的 canonical 竞争，部分重叠的写权限不能独立授予。
+/// 检查待申请的文件系统占用 `(view, mode)` 是否与已有占用存在部分重叠的写冲突。
+///
+/// 完全相同的扇区范围允许并发申请（供上层归并共享同一挂载视图），但范围不同且存在交集时，只要任一方为 `ReadWrite` 即视为冲突。
 fn claim_conflicts(queue: &QueueState, view: &BlockView, mode: AccessMode) -> bool {
     let mut node = queue.claim_head;
     while !node.is_null() {
-        // SAFETY: 调用者持物理队列锁，节点直到同锁摘链前保活。
+        // SAFETY: 调用方持有 `queue` 自旋锁，链表节点在持同一把锁摘除前由各自的 `Arc<FsClaimInner>` 保活。
         let claim = unsafe { &*node };
         if !view.same_range(&claim.view)
             && (mode == AccessMode::ReadWrite || claim.mode == AccessMode::ReadWrite)
@@ -418,17 +510,17 @@ fn claim_conflicts(queue: &QueueState, view: &BlockView, mode: AccessMode) -> bo
         {
             return true;
         }
-        // SAFETY: 同一 queue 锁保护链接。
+        // SAFETY: 调用方持有 `queue` 自旋锁，保护 `next` 链表指针读取。
         node = unsafe { *claim.next.get() };
     }
     false
 }
 
-/// 已接受生成者与仍在回调尾的 slot 都阻止重叠范围新占用。
+/// 检查目标扇区区间 `span` 是否与任何在途的裸设备写请求生成者（`raw_writers`）或已提交的裸写请求槽位（`slot_writes`）重叠。
 fn raw_write_conflicts(queue: &QueueState, span: (u64, u64)) -> bool {
     let mut node = queue.raw_writers;
     while !node.is_null() {
-        // SAFETY: accepted 生成者保活节点，只有同一 queue 锁中的尾部才摘链。
+        // SAFETY: 调用方持有 `queue` 自旋锁，`raw_writers` 链表中的 `BioInner` 节点由已准入的请求生成者保活，直至在持同一把锁的 `finish_generation_tail` 中摘除。
         let bio = unsafe { &*node };
         if overlaps(
             span,
@@ -439,7 +531,7 @@ fn raw_write_conflicts(queue: &QueueState, span: (u64, u64)) -> bool {
         ) {
             return true;
         }
-        // SAFETY: raw_writer_next 只由本物理队列锁访问。
+        // SAFETY: 调用方持有 `queue` 自旋锁，保护 `raw_writer_next` 链表指针读取。
         node = unsafe { *bio.raw_writer_next.get() };
     }
     queue
@@ -449,12 +541,12 @@ fn raw_write_conflicts(queue: &QueueState, span: (u64, u64)) -> bool {
         .any(|other| overlaps(span, *other))
 }
 
-/// 生成者计数覆盖父完成回调，slot 计数覆盖每轮资源使用，通知计数覆盖真实门铃尾部。
+/// 判断所有已准入的请求生成者（含父 Bio 完成回调）、活跃请求槽位以及门铃通知是否均已彻底执行完毕并退出。
 fn accepted_finished(queue: &QueueState) -> bool {
     queue.generators == 0 && queue.active_slots == 0 && queue.notify_active == 0
 }
 
-/// 停机完成保留故障语义；重复 stop 不重复关闭 IRQ 或 Work。
+/// 根据队列是否记录过故障错误，返回停机操作的最终结果。
 fn stop_result(queue: &QueueState) -> Result<(), BlockError> {
     if queue.failure.is_some() {
         Err(BlockError::DeviceFault)

@@ -1,7 +1,12 @@
-"""net-user 的具体宿主消费者，端口和原字节归同一 VM，QEMU wait 后才释放。
+"""ktest 用户态网络（net-user）宿主端对端消费者与流量记录器。
 
-TCP 两向原文单独落盘；UDP 每次 recvfrom/sendto 的边界、地址和全文留在 peer.json。
-仅三个明确 case tag 选择协议，宿主观察不替代客体 NIC、DMA 或资源账的断言。
+本模块在 QEMU 启动前在宿主机 127.0.0.1 上绑定动态分配的 TCP 与 UDP 端口，
+并通过内核启动参数将端口告知客体。在测试用例执行期间，根据用例标签
+（network-nic-tcp、network-nic-udp、network-nic-native）启动对应的后台线程，
+在用例绝对截止时刻内完成收发校验：
+- TCP：将收发双向原始字节流分别落盘为 `.raw` 文件，并校验固定长度与内容图样；
+- UDP：将每次 recvfrom/sendto 的报文边界、两端地址与十六进制内容记录到 `peer.json`。
+宿主套接字一直保持到 QEMU 进程退出并完成回收后才关闭。
 """
 
 import json
@@ -15,14 +20,14 @@ from .catalog import HostError, require
 
 
 class PeerStopped(Exception):
-    """实际取消管道已就绪，消费者不再开始下一次 socket 操作。"""
+    """表示宿主主线程已通过取消管道通知后台网络线程停止下一次套接字操作。"""
 
 
 class NetUserPeer:
-    """每 VM 两个独占 loopback 端点，具体 case 线程只使用原绝对期限。"""
+    """管理单台 QEMU 虚拟机独占的宿主机环回 TCP/UDP 端点与按用例运行的后台服务线程。"""
 
     def __init__(self, directory):
-        """QEMU 启动前实际绑定动态端口，任一步失败都归还已取得句柄。"""
+        """在 QEMU 启动前绑定动态非阻塞 TCP/UDP 环回端口并初始化 `peer.json`；若失败则关闭已申请套接字。"""
         self.directory = directory
         self.tcp = self.udp = None
         self.active = None
@@ -34,6 +39,7 @@ class NetUserPeer:
         self.closed_at = None
         self.verified_at = None
         try:
+            # 在 127.0.0.1 上绑定动态分配的非阻塞 TCP 监听套接字与 UDP 套接字，供 QEMU 虚拟网卡转发连接
             self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp.bind(("127.0.0.1", 0))
             self.tcp.listen(1)
@@ -51,7 +57,7 @@ class NetUserPeer:
             raise
 
     def _save(self):
-        """只有线程准备前或实际 join 后写快照，错误与原字节不归一化。"""
+        """将当前端口、各用例网络事件、未归属报文及失败摘要序列化写入会话目录下的 `peer.json`。"""
         report = dict(addresses=self.addresses, ports=self.ports, cases=self.cases,
                       unassigned=self.unassigned, verified_at=self.verified_at,
                       closed_at=self.closed_at, failures=self.failures)
@@ -59,7 +65,7 @@ class NetUserPeer:
             json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _error(self, row, error):
-        """保留首次及后继实际错误，只有客体 Pass 才参与宿主失败判定。"""
+        """向指定记录追加一条带单调时钟戳的异常信息；若用例在客体侧报 Pass，则同步登记到宿主失败表。"""
         row["errors"].append(dict(type=type(error).__name__, message=str(error),
                                   repr=repr(error), errno=getattr(error, "errno", None),
                                   at=time.monotonic()))
@@ -67,12 +73,14 @@ class NetUserPeer:
             self.failures[row["case"]] = "; ".join(entry["message"] for entry in row["errors"])
 
     def begin(self, case, deadline):
-        """在原 begin 的 case deadline 确定后，以目录 tags 绑定唯一具体消费者。"""
+        """在用例开始时排空残留报文，并根据用例网络标签启动对应的后台服务线程。"""
+        # 确认上一个用例的网络工作线程已结束，并排空用例切换期间残留的套接字数据
         if self.active is not None:
             require(not self.active["thread"].is_alive(), "previous network peer thread is still active")
             self._release_pipe()
             self.active = None
         self._drain(self.last or self.unassigned)
+        # 根据用例标签决定本次需要启动的协议服务类型（tcp、udp 或 native）
         tags = case["tags"]
         kinds = [kind for tag, kind in (("network-nic-tcp", "tcp"),
                                        ("network-nic-udp", "udp"),
@@ -87,6 +95,7 @@ class NetUserPeer:
                    thread_entered_at=None, thread_exited_at=None, joined_at=None,
                    complete=False, errors=[], events=[], tcp_eof=False,
                    tcp_received=0, tcp_sent=0, udp_received=0, udp_sent=0)
+        # 创建用于跨线程取消阻塞 select 的匿名管道，并启动后台网络服务线程
         reader, writer = os.pipe()
         self.cases.append(row)
         self.last = row
@@ -103,7 +112,7 @@ class NetUserPeer:
             raise
 
     def _ready(self, endpoint, row, reader, writing=False):
-        """同一绝对期限内等待真实 socket 或取消管道，不用 sleep 猜网络窗口。"""
+        """在用例绝对截止时刻内通过 select 等待套接字就绪或取消管道唤醒，超时则抛出 HostError。"""
         remaining = row["deadline"] - time.monotonic()
         require(0 < remaining, "network peer absolute deadline expired")
         readable, writable, _ = select.select(
@@ -115,7 +124,7 @@ class NetUserPeer:
         raise HostError("network peer absolute deadline expired")
 
     def _serve(self, row, reader):
-        """具体业务错误留在本例观察中，普通 UDP 须四条完整收发才结束消费者。"""
+        """后台网络服务线程入口：按协议类型分发处理，并捕获运行期或取消异常写入用例记录。"""
         row["thread_entered_at"] = time.monotonic()
         try:
             if row["kind"] == "tcp":
@@ -137,7 +146,7 @@ class NetUserPeer:
             row["thread_exited_at"] = time.monotonic()
 
     def _tcp(self, row, reader):
-        """一次真实连接全文核对 98317 字节及 EOF，再发送另一图样的 65539 字节。"""
+        """处理单次 TCP 连接：接收并校验客体发来的 98317 字节请求流及 EOF，随后回发 65539 字节响应流。"""
         self._ready(self.tcp, row, reader)
         connection, address = self.tcp.accept()
         with connection:
@@ -151,6 +160,7 @@ class NetUserPeer:
             row["tcp_sent_file"] = sent_path
             with (self.directory / received_path).open("xb", buffering=0) as received, \
                     (self.directory / sent_path).open("xb", buffering=0) as sent:
+                # 循环接收客体发来的 TCP 请求流，落盘原始字节并校验 98317 字节的预设图样直至对端半关闭
                 while True:
                     self._ready(connection, row, reader)
                     block = connection.recv(65536)
@@ -168,6 +178,7 @@ class NetUserPeer:
                     expected = bytes((i * 37 + (i >> 8) + 19) & 255
                                      for i in range(offset, row["tcp_received"]))
                     require(block == expected, f"TCP request payload mismatch at offset {offset}")
+                # 生成 65539 字节的响应数据并分块发回客体，发送完毕后执行写半关闭（SHUT_WR）
                 response = bytes((i * 53 + (i >> 7) + 91) & 255 for i in range(65539))
                 while row["tcp_sent"] < len(response):
                     self._ready(connection, row, reader, writing=True)
@@ -183,7 +194,7 @@ class NetUserPeer:
                 row["events"].append(dict(kind="tcp-shutdown-write", at=time.monotonic()))
 
     def _udp_record(self, row, kind, data, address):
-        """每条 UDP 记录保实际消息边界、两端地址和完整原 bytes，包括零长消息。"""
+        """记录单条 UDP 收发事件的长度、完整十六进制负载、源目地址与时间戳（含零长数据报）。"""
         sending = kind == "udp-send"
         row["events"].append(dict(kind=kind, length=len(data), bytes_hex=data.hex(),
                                    source=self.addresses["udp"] if sending else address,
@@ -191,7 +202,7 @@ class NetUserPeer:
                                    at=time.monotonic()))
 
     def _udp_send(self, row, reader, data, address):
-        """每条应答只真实发送一次，返回零只有零长消息合法。"""
+        """等待 UDP 套接字可写后发送单条响应数据报，记录发送事件并校验完整发出。"""
         self._ready(self.udp, row, reader, writing=True)
         count = self.udp.sendto(data, address)
         self._udp_record(row, "udp-send", data[:count], address)
@@ -199,7 +210,7 @@ class NetUserPeer:
         row["udp_sent"] += 1
 
     def _udp(self, row, reader):
-        """普通 UDP 核四条并接收第五条；native 响应 NB/count、P 和 NP/index。"""
+        """运行 UDP 接收循环：在标准模式下校验 4 条固定图样报文并回显，在 native 模式下响应探测与突发请求。"""
         source = None
         while True:
             self._ready(self.udp, row, reader)
@@ -207,6 +218,7 @@ class NetUserPeer:
             self._udp_record(row, "udp-recv", data, address)
             index = row["udp_received"]
             row["udp_received"] += 1
+            # 标准 UDP 模式：依次校验 4 条不同长度（含 0 字节与分片大小）的报文并按字节异或 0xa5 回显
             if row["kind"] == "udp":
                 require(index < 4, "unexpected fifth UDP message; oversized send reached host")
                 if source is None:
@@ -216,6 +228,7 @@ class NetUserPeer:
                 expected = bytes((i * 29 + (i >> 4) + 45) & 255 for i in range(length))
                 require(data == expected, f"UDP request payload mismatch at message {index}")
                 self._udp_send(row, reader, bytes(byte ^ 0xa5 for byte in data), address)
+            # 原生网卡测试模式（native）：处理单字节探测 P、带序号探测 NP 以及突发报文请求 NB
             elif data == b"P":
                 self._udp_send(row, reader, b"Q", address)
             elif data[:2] == b"NP":
@@ -232,14 +245,14 @@ class NetUserPeer:
                     self._udp_send(row, reader, b"NR" + index.to_bytes(2, "little") + body, address)
 
     def _cancel(self):
-        """管道唤醒正在 select 的实际消费者，不提前释放 live 端口。"""
+        """向取消管道写入唤醒字节以中断后台线程的 select 等待，但不关闭底层网络套接字。"""
         if self.active is not None and not self.active["cancelled"]:
             os.write(self.active["writer"], b"X")
             self.active["cancelled"] = True
             self.active["row"]["cancel_at"] = time.monotonic()
 
     def _join(self, deadline):
-        """线程等待只使用原绝对期限，首次真实 join 时间保留到 VM 结束。"""
+        """在给定绝对截止时刻前等待后台网络线程退出，成功汇合时记录首次 join 时间并返回 True。"""
         thread = self.active["thread"]
         thread.join(timeout=max(0, deadline - time.monotonic()))
         if thread.is_alive():
@@ -249,7 +262,7 @@ class NetUserPeer:
         return True
 
     def finish(self, status, deadline):
-        """原 status 后只有 Pass 要求完整消费者；Fail/Error 保原观察且不被覆盖。"""
+        """在用例结束时停止并汇合后台网络线程、排空残留数据；若客体报 Pass 则要求宿主网络交互完整无误。"""
         if self.active is None:
             return
         row = self.active["row"]
@@ -276,7 +289,7 @@ class NetUserPeer:
                     self.failures.get(row["case"], "network peer consumer is incomplete"))
 
     def _drain(self, row):
-        """线程停稳后及 QEMU wait 后读尽真正已排队的额外消息，不用静默窗口证明。"""
+        """非阻塞轮询并读尽 UDP 与 TCP 套接字中额外排队的数据报或连接，将其记为非预期流量错误。"""
         while select.select([self.udp], [], [], 0)[0]:
             data, address = self.udp.recvfrom(65535)
             self._udp_record(row, "udp-recv", data, address)
@@ -290,7 +303,7 @@ class NetUserPeer:
             self._error(row, HostError("unexpected additional TCP connection"))
 
     def verify(self, deadline):
-        """VM 真实退出后保存完整错误和尾部证据，Pass 才受具体 peer 错误约束。"""
+        """在 QEMU 进程退出后停止残留线程、排空套接字并保存最终 `peer.json`，校验无宿主侧网络失败。"""
         if self.active is not None:
             self._cancel()
             joined = self._join(deadline)
@@ -301,12 +314,12 @@ class NetUserPeer:
         require(not self.failures, "network peer verification failed: " + str(self.failures))
 
     def _release_pipe(self):
-        """对应线程已经结束或尚未启动时，归还本例的两个取消管道句柄。"""
+        """关闭当前用例后台线程使用的取消管道读写端文件描述符。"""
         os.close(self.active["reader"])
         os.close(self.active["writer"])
 
     def close(self):
-        """调用者已真正 wait QEMU；取消并 join 全尾后才关闭两个原 bound socket。"""
+        """在 QEMU 进程已回收后执行最终清理：停止后台线程、排空残留流量、关闭 TCP/UDP 套接字并落盘报告。"""
         if self.closed:
             return
         self._cancel()

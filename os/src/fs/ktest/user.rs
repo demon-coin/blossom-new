@@ -1,4 +1,40 @@
-//! 用户 ELF 按普通、网络、串口业务共享具体 suite 资源；每例 wait、离栈 join 与资源归还保持独立。
+//! 用户态 ELF 程序集成测试的核心夹具与套件生命周期管理模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于文件系统与用户态集成测试层（`fs::ktest::user`），提供运行用户态 ELF 测试程序所需的
+//! 套件级设备库存（`UserSuite`）与用例级执行夹具（`UserOwner`）。
+//! 上游由 `fs::ktest` 注册各测试套件锚点（`anchor`、`write_anchor`、`namespace_anchor` 等），
+//! 下游整合 `PathOwner`（块设备与 ext4/devfs 挂载）、`TaskGraph`（进程组/会话身份树）、
+//! `exec::prepare`（ELF 镜像加载）以及 `NetStack` / `UartStage`（网络与串口外设协同）。
+//!
+//! # 核心生命周期与状态流转
+//! 每个测试用例在共享 `UserSuite` 设备库存的基础上，独立经历以下阶段：
+//!
+//! ```text
+//! [UserSuite::set_up]  扫描并初始化底层块设备库存（整个测试套件共享一次）
+//!        |
+//!        v
+//! [UserOwner::set_up]  记录任务元数据基线，为单条用例初始化 PathOwner
+//!        |
+//!        +-- prepare / prepare_tty / prepare_system
+//!        |     挂载只读/读写 ext4 根文件系统（及可选 /dev 控制台），创建 TaskGraph 身份树
+//!        |
+//!        +-- load / load_named + start_program
+//!        |     解析 ELF 镜像与初始栈参数，绑定目标 CPU（或任意 CPU），发布用户态根进程
+//!        |
+//!        +-- wait + reap_children
+//!        |     等待根进程退出并确认其内核线程已完全退出内核栈（Join），随后回收所有子孙进程
+//!        v
+//! [UserOwner::quiesce] 释放预留描述符、向进程树发送退出请求、恢复块设备完成队列与网络配置、检查串口阶段已关闭
+//!        |
+//!        v
+//! [UserOwner::tear_down] 销毁网络栈与文件系统视图，校验内存六域与任务/工作队列元数据无泄漏
+//! ```
+//!
+//! # 锁与资源回收顺序契约
+//! 1. **先停业务任务，后拆底层设施**：在 `quiesce` 中必须先唤醒可能阻塞在 `FileTable` 预留槽位的辅助内核线程（`release_reserved`），
+//!    再通过 `wait` 与 `reap_children` 确保进程树中的所有用户线程均已退出并脱离内核栈（`JoinHandle::join` 完成），最后才能销毁 `TaskGraph` 与 `PathOwner`。
+//! 2. **块设备完成队列恢复优先于 `wait`**：若测试期间主动挂起了块设备完成中断（如模拟 I/O 停顿），在 `quiesce` 等待用户进程退出前必须先调用 `test_resume_completions()`，否则等待磁盘 I/O 的用户进程将无法退出从而导致死锁。
 
 use crate::fs::ktest::path::PathOwner;
 use crate::fs::ktest::tty::SerialTtyOwner;
@@ -36,72 +72,93 @@ mod tmpfs;
 mod tty;
 mod write;
 
+/// 默认用户态冒烟测试 ELF 程序路径。
 const PROGRAM: &[u8] = b"/test/bin/user-smoke";
+/// 用户态与内核测试线程共享的 Futex/事件协同控制页虚拟地址。
 const FUTEX_CONTROL: usize = 0x4400_0000;
 
-/// 用户控制例修改前的接口与路由快照，由原 quiesce 恢复。
+/// 网络控制类测试修改网卡配置前的接口与路由表快照（包含 2 个接口快照与 3 条路由快照），用于在 `quiesce` 阶段恢复初始网络状态。
 type NetworkControlSnapshot = ([Option<InterfaceSnapshot>; 2], [Option<RouteSnapshot>; 3]);
 
+/// 正在运行的主测试用户进程状态跟踪结构。
 struct RunningProgram {
+    /// 用户态根进程的 PID。
     pid: usize,
+    /// 当启用跨核亲和性绑定时，记录预期的目标运行 CPU 编号；未绑定时为 `None`。
     target: Option<usize>,
+    /// 发起启动操作的协调者内核线程所在 CPU 编号。
     coordinator: usize,
+    /// 预期的根线程内核任务 ID（`TaskId`），用于校验 `wait` 回收的事件是否来自同一个执行体。
     expected_task: Option<TaskId>,
+    /// 根线程的内核任务汇合句柄（`JoinHandle`），用于等待其完全退出内核栈。
     join: JoinHandle,
 }
 
+/// 预先占用用户进程文件描述符表 0 号槽位的辅助内核任务控制结构。
 struct ReservedDescriptor {
+    /// 通知辅助内核任务释放 0 号文件描述符预留槽位的完成信号。
     release: Arc<Completion>,
+    /// 辅助内核任务的汇合句柄（`JoinHandle`）。
     join: JoinHandle,
 }
 
-/// 普通用户与文件测试只共享一次发现的设备库存。
+/// 普通用户态与文件系统测试共享的套件级设备库存夹具。
 struct UserSuite {
+    /// 套件初始化阶段发现并持有的底层块设备库存。
     inventory: DeviceInventory,
 }
 
 impl Fixture for UserSuite {
-    /// 稳定库存先于 case 基线准备，不启动网络或串口接收。
+    /// 在套件首个用例开始前发现并初始化块设备库存（此阶段不启动网络协议栈或串口接收）。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let inventory = <DeviceInventory as Fixture>::set_up(context, &())?;
         Ok(Self { inventory })
     }
 
-    /// case 的任务和路径结束后停止原库存。
+    /// 在套件所有用例及其路径资源停止后，使底层块设备库存进入静默状态。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         <DeviceInventory as Fixture>::quiesce(&mut self.inventory, context)
     }
 
-    /// 消费同一库存，保留原设备资源归还检查。
+    /// 销毁块设备库存并校验设备级资源是否完整归还。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         <DeviceInventory as Fixture>::tear_down(self.inventory, context)
     }
 }
 
+/// 单条用户态测试用例的资源与生命周期管理器。
 struct UserOwner {
+    /// 本用例的文件系统路径、VFS 挂载视图与块设备缓存管理器。
     path: PathOwner,
+    /// 本用例可选挂载的独立网络协议栈引用。
     net: Option<NetStackRef>,
-    /// 控制例保存修改前的小值，用户异常退出后仍由原 fixture 恢复共享域。
+    /// 网络控制类用例在修改接口/路由前保存的快照；即使测试中途异常退出，也会由 `quiesce` 恢复。
     network_control: Option<NetworkControlSnapshot>,
+    /// 用例开始前的任务与工作队列元数据统计基线，用于在 `tear_down` 时校验是否发生泄漏。
     metadata_before: MetadataStats,
+    /// 本用例的用户进程身份关系图（`TaskGraph`）。
     graph: Option<Arc<TaskGraph>>,
+    /// 当前正在受控运行的根用户进程状态。
     running: Option<RunningProgram>,
+    /// 可选的 0 号文件描述符预留占用任务（用于测试首个可用 FD 非 0 的边界场景）。
     reserved: Option<ReservedDescriptor>,
+    /// 可选的后台状态观察内核线程汇合句柄。
     observer: Option<JoinHandle>,
-    /// 观测例负责停止自己开启的固定捕获，失败清理仍沿原用户 owning 边界。
+    /// 标记本用例是否开启了内核事件追踪（Trace）；若开启则由 `quiesce` 负责停止捕获。
     observation_trace: bool,
+    /// 进程生命周期测试中额外跟踪的子线程离栈观察器。
     lifecycle_child: Option<JoinObserver>,
-    /// 本例共享UART协议阶段的显式owner。
+    /// 宿主双工串口（UART）测试阶段的协议握手与配额控制器。
     tty_io: crate::fs::ktest::tty::UartStage,
 }
 
 impl UserOwner {
-    /// 每例只用本例设备与根建立身份域，库存由同一 suite 保活到最后一个 case。
+    /// 使用默认只读模式与 4 个挂载槽位容量初始化本用例的文件系统视图与内核根进程图（`RootRole::Kernel`）。
     fn prepare(&mut self, context: &TestContext<'_>) -> TestResult {
         self.prepare_mode(context, AccessMode::ReadOnly, 4)
     }
 
-    /// 显式卷权限与挂载容量决定本例视图，普通消费者始终建立 Kernel 根图。
+    /// 按指定的块设备访问模式（只读/读写）与最大挂载槽位数初始化文件系统路径，并创建 `RootRole::Kernel` 类型的进程身份图。
     fn prepare_mode(
         &mut self,
         context: &TestContext<'_>,
@@ -118,13 +175,13 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 按本例显式容量准备根视图，再把真实 devfs 挂在 ext4 的空 `/dev` 目录。
+    /// 按指定挂载槽位容量准备只读根文件系统，并将 `devfs` 挂载到 `/dev` 目录以提供控制台与串口设备节点。
     fn prepare_tty(&mut self, context: &TestContext<'_>, mount_capacity: usize) -> TestResult {
         self.prepare_mode(context, AccessMode::ReadOnly, mount_capacity)?;
         self.mount_console_devfs(context)
     }
 
-    /// 系统例直接在同源八槽视图中构造唯一系统图，准备失败仍由原夹具回收。
+    /// 准备 8 槽位只读根文件系统，创建系统级进程身份图（`RootRole::System`），并在 `/dev` 挂载 `devfs`。
     fn prepare_system(&mut self, context: &TestContext<'_>) -> TestResult {
         self.path.prepare_path(context, AccessMode::ReadOnly, 8)?;
         self.graph = Some(
@@ -136,7 +193,7 @@ impl UserOwner {
         self.mount_console_devfs(context)
     }
 
-    /// 所有 console 消费者在原 ext4 的实际挂载点安装同一种 devfs。
+    /// 解析根文件系统中的 `/dev` 挂载点，创建内存态 `devfs` 实例并以只读模式挂载。
     fn mount_console_devfs(&self, context: &TestContext<'_>) -> TestResult {
         let mountpoint = checked(
             context,
@@ -155,12 +212,12 @@ impl UserOwner {
         )
     }
 
-    /// 仅借本例已构造的身份图，不取得调度队列或运行资源拥有。
+    /// 获取本用例已初始化的进程身份图（`TaskGraph`）引用。
     fn graph(&self) -> &Arc<TaskGraph> {
         self.graph.as_ref().expect("user graph was not prepared")
     }
 
-    /// 正式逐组件解析并打开真实普通文件，文件引用保活根与同源 FileMapping。
+    /// 在本用例的 VFS 视图中解析指定路径并打开对应的普通文件，返回持有底层映射生命周期的 `FileRef`。
     fn file(&self, context: &TestContext<'_>, pathname: &[u8]) -> Result<FileRef, TestError> {
         let path = checked(
             context,
@@ -171,7 +228,7 @@ impl UserOwner {
         checked(context, crate::fs::open_path(self.path.vfs(), path))
     }
 
-    /// 内核初次参数来自已拥有字节，与普通启动使用相同初始栈契约。
+    /// 构造默认冒烟测试程序（`/test/bin/user-smoke`）的命令行参数（`argv`）、环境变量（`envp`）与默认用户栈大小。
     fn arguments(&self) -> Result<Arguments, ExecError> {
         Arguments::from_kernel(
             PROGRAM,
@@ -181,7 +238,7 @@ impl UserOwner {
         )
     }
 
-    /// 从本例文件系统快照准备真实程序，路径、凭据和解释器解析共用正式入口。
+    /// 从当前 VFS 视图加载默认冒烟测试程序镜像（包含 ELF 解析、凭据绑定及动态链接解释器准备）。
     fn load(&self, context: &TestContext<'_>) -> Result<LoadedImage, TestError> {
         let arguments = self.arguments().map_err(|error| {
             context.diagnostic(format_args!("user-arguments-prepare error={:?}", error));
@@ -199,13 +256,13 @@ impl UserOwner {
         })
     }
 
-    /// 原首ELF保持真实远核退出断言，具名后续负载复用同一准备与发表。
+    /// 使用根凭据（`Credentials::ROOT`）启动已加载的用户程序镜像，默认将其绑定到非当前 CPU 上运行且不预留 0 号描述符。
     fn start(&mut self, context: &TestContext<'_>, image: LoadedImage) -> TestResult {
         let fs_context = self.path.context().clone();
         self.start_program(context, image, fs_context, true, false, Credentials::ROOT)
     }
 
-    /// 映像与运行资源使用调用者同一 FS 快照，完整预留准备后才发表身份和普通用户 Task。
+    /// 创建用户态运行时（`UserRuntime`）与内核任务，可选地预先占用 0 号文件描述符，然后将用户进程正式发布到调度器。
     fn start_program(
         &mut self,
         context: &TestContext<'_>,
@@ -215,6 +272,7 @@ impl UserOwner {
         reserve_parent_fd: bool,
         credentials: Credentials,
     ) -> TestResult {
+        // Step 1: 确保当前夹具没有尚未回收的运行中子进程，并基于给定的文件系统上下文、凭据和网络栈构建 UserRuntime。
         assert!(
             self.running.is_none(),
             "user fixture already has a running child"
@@ -229,6 +287,7 @@ impl UserOwner {
             ),
         )?;
 
+        // Step 2: 选择目标 CPU（协调核的下一个 CPU），在 TaskGraph 中准备用户态根进程及其地址空间与执行上下文。
         let coordinator = cpu::current().id;
         let target = (coordinator + 1) % cpu::count();
         let prepared =
@@ -238,6 +297,8 @@ impl UserOwner {
                     TestError("user program task preparation failed")
                 })?;
 
+        // Step 3: 若调用方要求预先占用 0 号文件描述符（`reserve_parent_fd`），则在目标 CPU 上启动一个辅助内核线程，
+        //         在用户进程发布前抢先预留槽位 0，并等待其就绪后再继续。
         if reserve_parent_fd {
             let files = prepared
                 .user()
@@ -272,6 +333,7 @@ impl UserOwner {
             ready.wait();
         }
 
+        // Step 4: 将准备好的用户进程正式发布到调度器队列，并在夹具中记录其 PID、目标核与 JoinHandle。
         let pid = prepared.pid();
         let join = prepared.publish().map_err(|error| {
             context.diagnostic(format_args!("user-program-publish error={:?}", error));
@@ -287,7 +349,7 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 具名普通程序以原始 argv 和真实根凭据经过同一程序准备入口。
+    /// 使用根凭据加载指定路径（`program`）与单模式参数（`mode`）的用户态 ELF 镜像。
     fn load_named(
         &self,
         context: &TestContext<'_>,
@@ -312,7 +374,7 @@ impl UserOwner {
         })
     }
 
-    /// 具名模式显式传入完整预期退出状态，正常信号退出不关闭可继续运行的身份图。
+    /// 以根凭据加载并运行指定路径与模式参数的用户态程序，校验其退出状态码等于 `expected_status` 并回收全部子进程。
     fn run_named(
         &mut self,
         context: &mut TestContext<'_>,
@@ -331,7 +393,7 @@ impl UserOwner {
         )
     }
 
-    /// 映像与 Runtime 共用真实凭据；只有实际 wait 状态不符才永久取消本图的余下用户。
+    /// 以指定凭据加载并运行具名用户态程序，等待其退出并回收整个进程树与预留资源。
     fn run_named_as(
         &mut self,
         context: &mut TestContext<'_>,
@@ -341,6 +403,7 @@ impl UserOwner {
         expected_status: i32,
         credentials: Credentials,
     ) -> Result<WaitEvent, TestError> {
+        // Step 1: 组装命令行参数并从 VFS 加载目标 ELF 镜像。
         let arguments =
             Arguments::from_kernel(program, &[program, mode], &[], exec::DEFAULT_STACK_BYTES)
                 .map_err(|_| TestError("named user arguments failed"))?;
@@ -350,6 +413,7 @@ impl UserOwner {
                 TestError("named user image failed")
             })?;
 
+        // Step 2: 根据模式首字母决定是否强制跨核亲和性断言，随后启动用户态进程。
         let affine_group = !matches!(mode.first(), Some(b't' | b'T' | b'g' | b'c'));
         let fs_context = self.path.context().clone();
         self.start_program(
@@ -361,11 +425,13 @@ impl UserOwner {
             credentials,
         )?;
 
+        // Step 3: 等待根进程退出；若退出状态码不符合预期，则向整个进程图广播 SIGKILL (9) 强制终止残留进程。
         let event = self.wait(context)?;
         let cancelling = event.status != expected_status;
         if cancelling {
             self.graph().request_root_exit(9);
         }
+        // Step 4: 回收进程图中所有过继给根节点的子进程，并释放可能预留的 0 号文件描述符辅助任务。
         self.reap_children(context, cancelling)?;
         self.release_reserved(context);
         context.diagnostic(format_args!(
@@ -375,7 +441,9 @@ impl UserOwner {
         Ok(event)
     }
 
-    /// 逐个消费转亲的其他子组并等全部成员离栈，取消的退出状态不充当主体断言。
+    /// 循环调用 `wait_root` 回收进程图中所有已退出的子进程并等待其内核线程完全脱离内核栈。
+    ///
+    /// 当 `cancelling` 为 `false` 时，同时断言每个被回收子进程的退出状态码均为 0。
     fn reap_children(&self, context: &mut TestContext<'_>, cancelling: bool) -> TestResult {
         loop {
             match self.graph().wait_root() {
@@ -402,7 +470,7 @@ impl UserOwner {
         }
     }
 
-    /// 发出原完成token后等待预留拥有者离栈，不能先丢仍借文件表的worker。
+    /// 触发完成信号通知占用 0 号文件描述符预留槽位的辅助内核任务退出，并等待其完全脱离内核栈。
     fn release_reserved(&mut self, context: &mut TestContext<'_>) {
         if let Some(reserved) = self.reserved.take() {
             reserved.release.complete();
@@ -410,14 +478,17 @@ impl UserOwner {
         }
     }
 
-    /// 消费一次用户退出事件，再等待原 Task 离栈；两次观察必须属于同一实际执行者。
+    /// 等待当前受控根用户进程退出（`TaskGraph::wait`），随后等待其内核线程完全脱离内核栈（`JoinHandle::join`），
+    /// 并校验两次观测到的 PID、任务 ID、运行 CPU 与退出状态码严格一致。
     fn wait(&mut self, context: &mut TestContext<'_>) -> Result<WaitEvent, TestError> {
+        // Step 1: 在进程身份图上等待目标 PID 的退出事件。
         let running = self.running.as_ref().expect("user fixture has no child");
         let event = self.graph().wait(None, running.pid).map_err(|error| {
             context.diagnostic(format_args!("user-program-wait error={:?}", error));
             TestError("user child wait failed")
         })?;
 
+        // Step 2: 取出运行记录，校验退出事件的 PID 与 TaskId 与启动时记录的执行体一致。
         let RunningProgram {
             pid,
             target,
@@ -430,6 +501,7 @@ impl UserOwner {
             context.expect_eq(event.task_id, expected_task);
         }
 
+        // Step 3: 等待底层内核线程完全退出内核栈，并在绑定了目标核的场景下校验实际退出 CPU 与状态码。
         let task_status = join.join();
         if let Some(target) = target {
             context.expect_eq(event.cpu, target);
@@ -448,7 +520,7 @@ impl UserOwner {
         Ok(event)
     }
 
-    /// 使用原设备拥有者已经预留的真实堆压力对象，不在 OOM 期准备观测存储。
+    /// 获取底层块设备夹具预先分配的堆内存压力控制器（`HeapPressure`）可变引用，用于在 OOM 测试中精确消耗堆空间。
     fn pressure(&mut self) -> &mut crate::cache::ktest::HeapPressure {
         self.path
             .owner
@@ -457,14 +529,14 @@ impl UserOwner {
             .expect("user pressure was not prepared")
     }
 
-    /// 移出并销毁原压力拥有，之后才能进行可能分配的诊断与恢复准备。
+    /// 释放并销毁堆内存压力控制器，恢复空闲堆空间以便后续诊断输出与资源清理能够正常分配内存。
     fn release_pressure(&mut self) {
         drop(self.path.owner.pressure.take());
     }
 }
 
 impl Fixture<UserSuite> for UserOwner {
-    /// 每例保留原设备清理责任；普通路径与身份不取得无关网络。
+    /// 在单条用户态测试用例开始前记录工作队列与任务元数据基线，并基于套件设备库存初始化 `PathOwner`。
     fn set_up(context: &mut TestContext<'_>, suite: &UserSuite) -> Result<Self, TestError> {
         let metadata_before = metadata_stats();
         Ok(Self {
@@ -482,17 +554,19 @@ impl Fixture<UserSuite> for UserOwner {
         })
     }
 
-    /// 取消时向本例整个身份图请求合法点退出，原wait及离栈join完成后才释放两层资源。
+    /// 在单条测试用例结束或失败中止时，按安全顺序停止所有用户进程与辅助线程、恢复外设状态并静默文件系统路径。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
+        // Step 1: 释放可能预留的 0 号描述符辅助任务，并向进程图广播退出信号（SIGKILL = 9）。
         self.release_reserved(context);
         if let Some(graph) = &self.graph {
             graph.request_root_exit(9);
         }
 
-        // 用户wait仍可能等原盘完成；只恢复消费，不提前释放DMA拥有。
+        // Step 2: 恢复所有测试磁盘的完成队列处理，防止正在等待磁盘 I/O 的用户进程无法响应退出信号。
         for disk in &self.path.owner.disks {
             disk.test_resume_completions();
         }
+        // Step 3: 等待主测试进程、后台观察线程以及进程图中的所有子进程完全退出并脱离内核栈。
         if self.running.is_some() {
             self.wait(context)?;
         }
@@ -505,6 +579,7 @@ impl Fixture<UserSuite> for UserOwner {
             self.lifecycle_child_left_stack()?;
         }
 
+        // Step 4: 停止本用例开启的追踪捕获、恢复网络接口与路由配置，并确认宿主 UART 阶段已正常结束。
         if self.observation_trace {
             checked(context, crate::trace::stop())?;
             self.observation_trace = false;
@@ -514,12 +589,13 @@ impl Fixture<UserSuite> for UserOwner {
             return Err(TestError("TTY UART stage is still active at quiesce"));
         }
 
+        // Step 5: 销毁进程身份图与堆内存压力对象，最后静默底层文件系统与块设备路径。
         drop(self.graph.take());
         self.release_pressure();
         <PathOwner as Fixture<DeviceInventory>>::quiesce(&mut self.path, context)
     }
 
-    /// 原设备夹具完成离栈和六域停稳后，只读取一次本例Task/worker/domain归还计数。
+    /// 在所有进程与外设静默后销毁夹具，校验底层块设备内存六域以及任务/工作队列元数据统计是否完全恢复至用例前基线。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         assert!(
             self.running.is_none()
@@ -547,7 +623,7 @@ impl Fixture<UserSuite> for UserOwner {
     }
 }
 
-/// 保活各用户行为叶的原生 suite 槽，所有叶仍由同一具名目录发现。
+/// 保活并导出所有用户态测试子套件的注册锚点，确保链接器不会剔除各子模块的测试用例。
 pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     core::hint::black_box(network_programs::__ktest_anchor());
     core::hint::black_box(serial_programs::__ktest_anchor());
@@ -559,27 +635,27 @@ pub(crate) fn anchor() -> &'static ::ktest::SuiteSlot {
     programs::__ktest_anchor()
 }
 
-/// 可写消费者仍注册在原文件测试目录，不构造另一运行入口。
+/// 导出可写文件系统用户态测试套件的注册锚点。
 pub(crate) fn write_anchor() -> &'static ::ktest::SuiteSlot {
     write::anchor()
 }
 
-/// 新名字空间消费者沿唯一 user ELF 锚点进入现有具名测试目录。
+/// 导出命名空间（Namespace）用户态测试套件的注册锚点。
 pub(crate) fn namespace_anchor() -> &'static ::ktest::SuiteSlot {
     namespace::anchor()
 }
 
-/// 独立读历史与真实多原页读批次沿现有原生宏注册槽保活。
+/// 导出文件预读（Readahead）与多页批量读取用户态测试套件的注册锚点。
 pub(crate) fn readahead_anchor() -> &'static ::ktest::SuiteSlot {
     readahead::reads::__ktest_anchor()
 }
 
-/// 卷级后台进度消费者复用原设备库存与文件测试入口。
+/// 导出后台回写（Background Writeback）用户态测试套件的注册锚点。
 pub(crate) fn background_anchor() -> &'static ::ktest::SuiteSlot {
     background::anchor()
 }
 
-// suite 宏消费完整 inline 模块；include 不改变原全名、锚点与 module_path。
+// 通过 `include!` 将通用程序、网络程序与串口程序测试套件内联到当前模块命名空间，保持测试路径与宏锚点一致。
 include!("user/programs.rs");
 include!("user/network_programs.rs");
 include!("user/serial_programs.rs");

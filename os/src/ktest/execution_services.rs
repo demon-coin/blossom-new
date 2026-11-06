@@ -1,4 +1,36 @@
-//! 时间、定时器、工作域与日志的具名场景；成功fixture在主体捕获边界外承担原拥有责任。
+//! 时间、软件定时器、工作队列、内核日志与追踪服务的测试基础设施及对象生命周期账务。
+//!
+//! # 模块职责与架构定位
+//! 本模块作为 `ktest::execution_services` 测试组的公共支撑层，组织 `time`、`timer`、`workqueue`、`klog`、
+//! `mixed` 与 `trace` 六个子模块，并向本组及 `execution_core` 测试套件提供统一的资源收敛基线与异步对象托管容器：
+//! - 上游入口：由 `ktest::registry` 通过 [`anchors`] 收集全部 8 个测试套件描述符，并在套件前后运行 [`SuiteBaseline`]。
+//! - 下游依赖：`crate::timer`（[`Timer`]）、`crate::workqueue`（[`Work`]、[`DelayedWork`]、[`WorkQueue`]）、
+//!   `crate::klog`、`crate::fs::devfs` 以及 `crate::mm`（内存统计与缓存收缩）。
+//!
+//! # 核心设计与异步对象回收协议
+//! ```text
+//!   SuiteBaseline::set_up (套件级初始快照：MemoryStats + Workqueue MetadataStats)
+//!        |
+//!        v
+//!   用例 set_up  ---> Nodes::new 预留固定容量；构造 Timer / DelayedWork / Work / WorkQueue 并保存在捕获边界外
+//!        |
+//!        v
+//!   用例 Body    ---> 生产路径触发硬中断回调、底半部服务或工作线程池执行（可选经 on_zero 固定在 CPU 0 协调）
+//!        |
+//!        v
+//!   Nodes::stop  ---> 严格按依赖逆序同步关闭：Timer -> DelayedWork -> Work -> WorkQueue (含救援线程 join)
+//!        |
+//!        v
+//!   Nodes::tails ---> 等待异步回调彻底退出并归还锁外强引用（校验 Arc::strong_count 降至固定夹具持有的 3 份）
+//!        |
+//!        v
+//!   reclaimed / SuiteBaseline::tear_down ---> 排空后台服务与每核页缓存，逐项比对内存与元数据完全归零收敛
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - [`Nodes`] 内部的四个注册表向量各自受独立的 [`SpinLock`] 保护，仅在推入新对象或按索引克隆强引用时短暂加锁。
+//! - **严禁在持有 `Nodes` 内部自旋锁期间调用 `close_sync()` 或 `QueueOwner::stop()`**：`close_sync` 可能阻塞睡眠等待正在运行的回调退出，
+//!   且回调本身可能访问测试状态；必须先在锁内按索引克隆出 `Pin<Arc<T>>` 或 `Arc<QueueOwner>`，释放自旋锁后再执行同步关闭。
 
 mod klog;
 mod mixed;
@@ -18,20 +50,21 @@ use core::ops::Deref;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// 内存分配器六项指标与工作队列存活元数据计数的联合资源基线快照。
 pub(crate) type Baseline = (mm::MemoryStats, crate::workqueue::testing::MetadataStats);
 
-/// 套件准备后到最后用例控制对象释放后，实际比较跨例的内存与任务资源账。
+/// 跨整个测试套件生命周期校验全局内存与工作队列元数据无泄漏的套件级夹具（Suite Resource）。
 pub(crate) struct SuiteBaseline(Baseline);
 
 impl ::ktest::Fixture for SuiteBaseline {
-    /// 常驻服务停稳后保存实际六域和元数据基线，不持有或重置生产资源。
+    /// 在套件首个用例开始前等待后台常驻服务静止，记录并输出初始内存与工作队列元数据基线。
     fn set_up(context: &mut ::ktest::TestContext<'_>, _: &()) -> Result<Self, ::ktest::TestError> {
         let initial = baseline();
         context.diagnostic(format_args!("EXECUTION SUITE initial={:?}", initial));
         Ok(Self(initial))
     }
 
-    /// 原suite作用域已join后检查全部case控制对象归还，保真实前后值用于定位。
+    /// 在套件全部用例及其夹具释放完毕后重新采集基线，校验所有动态分配页、SLUB 对象与工作队列元数据完全复原。
     fn tear_down(self, context: &mut ::ktest::TestContext<'_>) -> TestResult {
         let actual = baseline();
         context.diagnostic(format_args!(
@@ -46,7 +79,7 @@ impl ::ktest::Fixture for SuiteBaseline {
     }
 }
 
-/// 只沿原始硬件counter限制协调等待，生产进度仍经过真实IRQ、等待源与scheduler。
+/// 基于底层硬件单调计数器（15 秒超时上限）轮询等待条件成立，未满足时通过 `sched::yield_now()` 主动让出 CPU。
 pub(crate) fn wait(mut predicate: impl FnMut() -> bool, name: &'static str) -> TestResult {
     let end = arch::read_counter()
         .checked_add(arch::counter_frequency().checked_mul(15).unwrap())
@@ -60,14 +93,18 @@ pub(crate) fn wait(mut predicate: impl FnMut() -> bool, name: &'static str) -> T
     Ok(())
 }
 
+/// 绑定在 CPU 0 固定协调线程栈上的异常恢复守卫，确保协调动作中途返回错误或发生子线程失败时自动放行阻塞门控。
 struct Coordinator<T> {
+    /// 被协调用例共享状态的强引用。
     owner: Arc<T>,
+    /// 协调失败或异常展开时用于打开业务阻塞门控的释放回调。
     release: fn(&T),
+    /// 标记协调动作是否正常完成且期间无任何子线程报错；为 `false` 时在析构中执行 `release`。
     success: bool,
 }
 
 impl<T> Drop for Coordinator<T> {
-    /// 当前动作已退栈后只释放该具体fixture的测试gate；远核IRQ不能阻挡Any父恢复清理。
+    /// 若协调动作未能成功完成，调用 `release` 回调解除其他工作线程的等待状态以便父线程进入清理流程。
     fn drop(&mut self) {
         if !self.success {
             (self.release)(&self.owner);
@@ -75,12 +112,13 @@ impl<T> Drop for Coordinator<T> {
     }
 }
 
-/// 原scope发表真正fixed-0协调Task，闭包只捕获独立拥有Arc；suite仍是原可迁核Task。
+/// 在 CPU 0 上派生固定亲和性的协调子线程执行 `action` 并同步等待其退出；若中途失败则由 [`Coordinator`] 自动释放门控。
 pub(super) fn on_zero<T: Send + Sync + 'static>(
     owner: Arc<T>,
     release: fn(&T),
     action: impl FnOnce() -> TestResult + Send + 'static,
 ) -> TestResult {
+    // Step 1: 在 CPU 0 上启动携带异常门控释放守卫 `Coordinator` 的子线程执行协调逻辑。
     let child = crate::ktest::spawn_result_on(0, move |_| {
         let mut guard = Coordinator {
             owner,
@@ -92,6 +130,7 @@ pub(super) fn on_zero<T: Send + Sync + 'static>(
         result.map(|()| 0)
     })?;
 
+    // Step 2: 阻塞等待协调子线程彻底退出内核栈，并核对子线程状态与退出码。
     let value = child.join()?;
     if crate::ktest::child_failed() {
         return Err(TestError("fixed coordinator child failed"));
@@ -102,8 +141,9 @@ pub(super) fn on_zero<T: Send + Sync + 'static>(
     Ok(())
 }
 
-/// 常驻服务和远核离栈尾部结束以后排空MM缓存，不抵消SLUB占用。
+/// 等待日志、工作队列、软件定时器后台服务全部进入阻塞态且所有远端 CPU 进入 idle 后，收缩并排空内存缓存，采集当前资源快照。
 pub(crate) fn baseline() -> Baseline {
+    // Step 1: 等待内核常驻后台线程处理完挂起任务并阻塞，同时确认除当前核外的所有在线 CPU 均已进入 idle 循环。
     crate::klog::testing::wait_service_blocked();
     crate::workqueue::testing::wait_services_blocked();
     timer::wait_services_blocked();
@@ -116,12 +156,13 @@ pub(crate) fn baseline() -> Baseline {
     )
     .unwrap();
 
+    // Step 2: 收缩 SLUB 空闲 slab 并排空每核 PCP 页缓存，消除延迟释放与每核缓存抖动后读取统计快照。
     mm::shrink_all();
     mm::drain_all_pages();
     (mm::stats(), crate::workqueue::testing::metadata_stats())
 }
 
-/// fixture及原控制对象释放后同时核对完整六域和真实Task/Worker/Domain payload。
+/// 重新采集全局静止基线并与预期快照 `expected` 逐项比对，确认临时物理内存与工作队列元数据均已完全回收。
 pub(crate) fn reclaimed(expected: Baseline) -> TestResult {
     let actual = baseline();
     if actual.0 != expected.0 {
@@ -133,7 +174,7 @@ pub(crate) fn reclaimed(expected: Baseline) -> TestResult {
     Ok(())
 }
 
-/// 用独立只读 devfs 的真实名字和 inode 打开观测设备，返回的 Path 保活原挂载。
+/// 挂载一个独立的只读内存 `devfs` 实例并按给定路径名与标志打开内核观测设备文件（如日志或追踪设备）。
 pub(super) fn open_observation(
     name: &[u8],
     flags: u32,
@@ -149,20 +190,23 @@ pub(super) fn open_observation(
     fs::open_path_with_flags(&vfs, path, flags, fs::FileIoContext::Kernel)
 }
 
-/// 原WorkQueue只有一个关闭责任；Arc仅保活同一个域owner，不复制域或执行者。
+/// 工作队列（[`WorkQueue`]）的单次同步关闭包装器，供夹具与测试代码通过 `Arc` 共享引用并保证 `close_sync` 幂等且不并发重入。
 pub(super) struct QueueOwner {
+    /// 底层工作队列实例；在 `Nodes::queue` 完成两阶段构造后恒为 `Some`。
     queue: Option<WorkQueue>,
+    /// 标记底层 `WorkQueue::close_sync`（含救援线程回收）是否已彻底执行完毕返回。
     closed: AtomicBool,
+    /// 标记是否已有调用方正在执行关闭流程，用于拦截未收敛的并发重复关闭。
     closing: AtomicBool,
 }
 
 impl QueueOwner {
-    /// 显式关闭一次，原实现仍负责排空颜色、释放预留和join真实rescuer。
+    /// 同步关闭底层工作队列并排空在途工作项与救援线程；若此前已完成关闭则直接返回。
     pub(super) fn close_sync(&self) {
         self.stop().unwrap();
     }
 
-    /// 关闭尚未真实返回时保留原owner，拒绝把提前closed位当成rescuer已经join。
+    /// 执行一次性的同步关闭状态转换：仅在 `WorkQueue::close_sync` 完整返回后才置位 `closed` 标志。
     fn stop(&self) -> TestResult {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
@@ -180,22 +224,26 @@ impl QueueOwner {
 impl Deref for QueueOwner {
     type Target = WorkQueue;
 
-    /// 只有真实构造成功的owner才能进入正文或原flush。
+    /// 解引用获取已构造完成的底层 [`WorkQueue`] 引用。
     fn deref(&self) -> &Self::Target {
         self.queue.as_ref().expect("unpublished work queue")
     }
 }
 
-/// 只保存这些场景实际产生的三种节点与原域owner；没有动态类型、回滚或第二执行池。
+/// 托管单个测试用例在捕获边界外持有的全部定时器、普通工作项、延迟工作项与工作队列实例的注册容器。
 pub(super) struct Nodes {
+    /// 当前用例创建的软件定时器强引用列表（容量在 `Nodes::new` 中预留，由自旋锁保护）。
     timers: SpinLock<Vec<Pin<Arc<Timer>>>>,
+    /// 当前用例创建的普通工作队列节点强引用列表（由自旋锁保护）。
     works: SpinLock<Vec<Pin<Arc<Work>>>>,
+    /// 当前用例创建的延迟工作节点列表及其是否已完成 `close_sync` 的布尔标记（由自旋锁保护）。
     delayed: SpinLock<Vec<(Pin<Arc<DelayedWork>>, bool)>>,
+    /// 当前用例创建的工作队列域包装器列表（由自旋锁保护）。
     queues: SpinLock<Vec<Arc<QueueOwner>>>,
 }
 
 impl Nodes {
-    /// case setup预备登记容量，后续节点发表前无分配地保留原owner的强引用。
+    /// 按给定上限一次性预分配四类异步对象的登记槽位，避免在后续测试运行或内存受限阶段触发向量扩容。
     pub(super) fn new(
         timer_capacity: usize,
         work_capacity: usize,
@@ -226,7 +274,7 @@ impl Nodes {
         })
     }
 
-    /// 原Timer构造后、任何arm之前把同一固定分配保存在catch外。
+    /// 创建绑定到指定逻辑 CPU 的软件定时器，在首次启动（arm）前将其强引用登记到夹具容器并返回。
     pub(super) fn timer(
         &self,
         cpu: usize,
@@ -241,7 +289,7 @@ impl Nodes {
         owner
     }
 
-    /// 先准备空owner控制块，再创建真实域；失败没有已发表Work或未关闭域遗失。
+    /// 先分配 `QueueOwner` 壳再构造底层 [`WorkQueue`]，成功后登记到夹具容器并返回共享句柄。
     pub(super) fn queue(&self, config: WorkQueueConfig) -> Arc<QueueOwner> {
         {
             let slots = self.queues.lock();
@@ -261,7 +309,7 @@ impl Nodes {
         owner
     }
 
-    /// 在queue接受任何票之前保活同一个真实Work。
+    /// 在指定工作队列上创建普通 [`Work`] 节点，在入队前将其强引用登记到夹具容器并返回。
     pub(super) fn work(
         &self,
         queue: &WorkQueue,
@@ -276,7 +324,7 @@ impl Nodes {
         owner
     }
 
-    /// 在delay登记之前保存原DelayedWork，不复制内部timer/work票。
+    /// 在指定工作队列上创建 [`DelayedWork`] 延迟工作节点，在提交延迟调度前登记到夹具容器并返回。
     pub(super) fn delayed(
         &self,
         queue: &WorkQueue,
@@ -292,7 +340,7 @@ impl Nodes {
         owner
     }
 
-    /// 记录该D真实close_sync已经返回；domain.closed不能代替内部timer的尾部责任。
+    /// 对夹具内登记的指定 [`DelayedWork`] 执行同步关闭（停止内部定时器与工作项）并标记为已关闭，重复调用时自动跳过。
     pub(super) fn close_delayed(&self, object: Pin<&DelayedWork>) {
         let (index, complete) = {
             let slots = self.delayed.lock();
@@ -308,8 +356,9 @@ impl Nodes {
         }
     }
 
-    /// 具体fixture已停止所有生产者、释放业务gate及测试停点以后停止真实节点与原域。
+    /// 按“定时器 -> 延迟工作项 -> 普通工作项 -> 工作队列域”的依赖逆序同步停止夹具中登记的全部异步对象。
     pub(super) fn stop(&self) -> TestResult {
+        // Step 1: 停止全部独立软件定时器，等待正在执行的硬中断或底半部定时回调退出。
         let timers = self.timers.lock().len();
         for index in 0..timers {
             let owner = self.timers.lock()[index].clone();
@@ -319,12 +368,14 @@ impl Nodes {
             }
         }
 
+        // Step 2: 停止全部延迟工作项，确保其内部定时器不再向后续将要关闭的工作队列提交新任务。
         let delayed = self.delayed.lock().len();
         for index in 0..delayed {
             let owner = self.delayed.lock()[index].0.clone();
             self.close_delayed(owner.as_ref());
         }
 
+        // Step 3: 停止全部普通工作项，排空或取消队列中挂起与运行中的回调。
         let works = self.works.lock().len();
         for index in 0..works {
             let owner = self.works.lock()[index].clone();
@@ -334,6 +385,7 @@ impl Nodes {
             }
         }
 
+        // Step 4: 最后同步关闭所有工作队列域并回收其救援线程。
         let queues = self.queues.lock().len();
         for index in 0..queues {
             let owner = self.queues.lock()[index].clone();
@@ -342,7 +394,7 @@ impl Nodes {
         Ok(())
     }
 
-    /// 原scope已经join后确认每种异步票均归还；失败仍保留所有fixture拥有者供case-abort。
+    /// 等待夹具中所有定时器、普通工作项与延迟工作项由异步执行上下文持有的临时强引用全部在锁外释放归还。
     pub(super) fn tails(&self) -> TestResult {
         let timers = self.timers.lock().len();
         for index in 0..timers {
@@ -365,9 +417,11 @@ impl Nodes {
     }
 }
 
-/// 仅夹具保留的原强引用允许留下，close清位不能代替锁外拥有票归还。
+/// 等待固定在堆上的异步节点归还所有队列与回调执行期强引用，仅保留夹具容器、`tails` 局部变量与本次观察克隆共 3 份强引用。
 fn owned_tail<T>(object: &Pin<Arc<T>>) -> TestResult {
-    // SAFETY: 克隆仅观察固定Arc控制块；原Pin不移出对象并保活到观察结束。
+    // SAFETY:
+    // 1. 此处拆包的是 `object.clone()` 产生的临时 `Pin<Arc<T>>` 副本，仅用于传入 `Arc::strong_count` 读取控制块引用计数；
+    // 2. 绝不获取可变引用或移出底层 `T` 实例，且原始 `object` 在整个等待期间保持 `Pin` 固定存活。
     let observed = unsafe { Pin::into_inner_unchecked(object.clone()) };
     wait(
         || Arc::strong_count(&observed) == 3,
@@ -375,7 +429,7 @@ fn owned_tail<T>(object: &Pin<Arc<T>>) -> TestResult {
     )
 }
 
-/// 每个返回项都是宏生成的实际只读注册槽，不是手写case目录。
+/// 返回 `execution_services` 测试组下全部 8 个子套件由 `#[ktest::suite]` 宏生成的静态注册槽引用。
 pub(crate) fn anchors() -> [&'static ::ktest::SuiteSlot; 8] {
     [
         time::cases::__ktest_anchor(),

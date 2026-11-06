@@ -1,23 +1,86 @@
-//! 普通作业控制 ELF 的阶段协调；用户 wait、生产阻塞、稳定 PGID 与离栈完成分别核对。
+//! 用户态作业控制（Job Control）、控制终端（Controlling TTY）与会话生命周期集成测试。
+//!
+//! # 模块定位与职责
+//! 本模块位于文件系统与用户态运行时集成测试层（`fs::ktest::user`），
+//! 负责加载并执行 `/test/bin/user-jobs` 用户态测试程序，通过内核测试协调器（`UserOwner`）
+//! 与 UART/TTY 夹具协同，验证前台/后台进程组切换、终端输入信号（`SIGINT`/`SIGTSTP`）、
+//! 后台读写暂停信号（`SIGTTIN`/`SIGTTOU`）、孤儿进程组 `SIGHUP` 终止、控制终端跨 `execve` 保持、
+//! 退役进程组 ID（`PGID`）对象隔离，以及终端窗口大小变更（`SIGWINCH`）等核心语义。
+//!
+//! # 阶段协调状态机与共享控制页布局
+//! 每个测试阶段（`phase`）按如下四步握手推进：
+//! ```text
+//! [用户态进程]                           [内核协调器 (UserOwner)]
+//!      |                                            |
+//!      |--- 1. 写入 phase (+0) -------------------->|
+//!      |    (若需预先进入 I/O 或停止阻塞，          |--- 2. 观测目标任务进入 Blocked / Stopped，
+//!      |     子进程在此刻阻塞于内核队列)            |       按需预装 UART RX/TX 测试字节，
+//!      |                                            |       写入 gate = phase (+4) 放行
+//!      |<-- 3. 读取 gate 放行（或由串口中断唤醒）---|
+//!      |    执行系统调用 / 消费 waitid 事件         |
+//!      |--- 4. 写入 done = phase (+8) ------------->|
+//!      |                                            |--- 5. 校验串口收发完成与子进程退出状态
+//! ```
+//!
+//! `FUTEX_CONTROL` 共享控制页在作业测试中的字节偏移布局：
+//! ```text
+//! +-----------------------+-------------------------------------------------------+
+//! | 字节偏移 (Offset)     | 用途说明                                              |
+//! +-----------------------+-------------------------------------------------------+
+//! | +0  (u32)             | 用户态当前发布的阶段号（`phase`）                     |
+//! | +4  (u32)             | 内核协调器写入的阶段放行门禁（`gate`）                |
+//! | +8  (u32)             | 用户态完成当前阶段检查后写入的确认号（`done`）        |
+//! | +12 (i32)             | 用户态记录的最近一次关键系统调用返回值                |
+//! | +16 (u32)             | 当前受测子进程（或旧会话首进程/替代进程）的 PID       |
+//! | +20 (u32)             | 孤儿进程组测试中的孙进程 PID                          |
+//! | +24 (u32)             | 替代进程组收到 `SIGUSR1` 的信号处理函数计数           |
+//! | +32 (u32)             | 用户态通过 `waitid(WSTOPPED)` 累计观测到的停止事件数  |
+//! | +36 (u32)             | 阶段 1 子进程成功完成前台读取的标志                   |
+//! | +40 (u32)             | 用户态内部断言失败时的检查点编号（正常为 0）          |
+//! | +44 (u32)             | `setsid` 脱离控制终端测试子进程的 PID                 |
+//! | +48 (u32)             | `setsid` 子进程完成控制终端检查的确认标志             |
+//! | +64 (u32)             | 内核协调器通知 `setsid` 子进程退出的门禁字            |
+//! +-----------------------+-------------------------------------------------------+
+//! ```
+//!
+//! # 锁顺序与并发契约
+//! - 协调器通过 `mm.load_user_u32` / `mm.store_user_u32` 访问共享控制页，内部仅短暂获取 `Mm` 锁。
+//! - 观测任务阻塞与停止状态时，依次调用 `sched::test_state` 与 `group.signals().has_stopped_jobs()`，
+//!   两把自旋锁各自独立获取并立即释放，不存在嵌套持锁。
 
 use super::*;
 use crate::fs::file::FileIoContext;
 use crate::fs::tty::{self, termios::Termios};
 use crate::task::signal::SignalError;
 
+/// 受测用户态作业控制 ELF 程序的虚拟文件系统路径。
 const PROGRAM: &[u8] = b"/test/bin/user-jobs";
 
+/// 单个作业控制测试阶段中，内核协调器对受测进程阻塞/停止状态的观测时机要求。
 #[derive(Clone, Copy)]
 enum JobsWait {
+    /// 仅同步阶段门禁（`gate`），不在放行前后额外等待任务进入内核阻塞状态。
     GateOnly,
+    /// 在打开阶段门禁（`gate`）之前，要求受测子进程已进入内核阻塞状态（`State::Blocked`）且未处于作业停止态。
     ChildBlockedBefore,
+    /// 在打开阶段门禁（`gate`）之后、阶段完成（`done`）之前，要求受测子进程进入内核阻塞状态。
     ChildBlockedAfter,
+    /// 在打开阶段门禁（`gate`）之后、阶段完成（`done`）之前，要求用户态根进程进入内核阻塞状态。
     RootBlockedAfter,
+    /// 在打开阶段门禁（`gate`）之前，要求受测子进程已因作业控制信号进入内核停止状态（`State::Blocked` 且 `has_stopped_jobs() == true`）。
     ChildStopped,
 }
 
 impl UserOwner {
-    /// 同一原 UserOwner 承担真实前后台、停止、继续、输入信号与孤儿组退出的全部拥有。
+    /// 验证前台/后台进程组切换、终端信号递送（`SIGINT`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`）、作业停止与继续（`SIGCONT`）以及孤儿进程组 `SIGHUP` 终止。
+    ///
+    /// - **测试目标**：确认控制终端在各个作业阶段正确向目标进程组递送信号，后台进程读写终端时按规范停止，
+    ///   且当中间父进程退出导致已停止的孙进程组变为孤儿进程组时，内核自动向其发送 `SIGHUP` + `SIGCONT` 使其终止。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. 启动 `/test/bin/user-jobs` 的 `j` 模式，依次推进阶段 1~7，涵盖前台读取、`^C`（`SIGINT`）、`^Z`（`SIGTSTP`）、
+    ///      `SIGCONT` 恢复前台读取、后台读触发 `SIGTTIN` 停止、忽略 `SIGTTOU` 后台写、不忽略 `SIGTTOU` 后台写停止；
+    ///   2. 推进阶段 8（[`Self::jobs_orphan`]），使中间父进程退出并验证停止态孤儿孙进程被 `SIGHUP` 终止；
+    ///   3. 推进阶段 99 收尾，验证根进程退出码为 `0` 并恢复终端默认 `termios` 配置。
     pub(super) fn jobs_front_background_signals(
         &mut self,
         context: &mut TestContext<'_>,
@@ -92,12 +155,23 @@ impl UserOwner {
         self.finish_jobs(context, mm, b"j")
     }
 
-    /// exec 通过真实继承 pipe 保 ctty；旧 Arc 的递送不得命中新同号进程组。
+    /// 验证 `setsid` 控制终端脱离、跨 `execve` 的控制终端保持、会话挂断（Hangup）以及退役 `PGID` 引用与同号新进程组的隔离。
+    ///
+    /// - **测试目标**：确认 `setsid` 子进程脱离原控制终端并彻底退出内核栈；旧会话首进程退出后，
+    ///   即使新创建的替代进程组复用了相同的数字 `PGID`，向旧 `Pgid` 内核对象发送信号也必须返回 `ESRCH`（`SignalError::NoProcess`），
+    ///   绝不能误中同号的新进程组；同时验证控制终端通过继承的管道跨越 `execve` 保持有效。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. 启动 `/test/bin/user-jobs` 的 `h` 模式，等待 `setsid` 子进程完成控制终端检查并验证其调度任务彻底退出；
+    ///   2. 阶段 1 记录原会话首进程的 `Pgid` 强引用（`old_pgid`）及其数字编号，等待其退出；
+    ///   3. 阶段 2 获取复用了相同数字编号的新进程组对象（`new_pgid`），断言两者数字相同但非同一内核对象，
+    ///      并向 `old_pgid` 发送 `SIGUSR1`，断言返回 `SignalError::NoProcess` 且新进程组未收到信号；
+    ///   4. 阶段 3 配合串口收发完成挂断后的控制终端读写验证，最后调用 [`Self::finish_jobs`] 收尾。
     pub(super) fn jobs_open_hangup_identity(
         &mut self,
         context: &mut TestContext<'_>,
     ) -> TestResult {
         let mm = self.start_jobs(context, b"h")?;
+        // Step 1: 等待 setsid 子进程完成脱离控制终端的自检，随后放行退出门禁并等待其彻底离开内核栈。
         until(
             "setsid child did not finish its controlling TTY checks",
             || jobs_word(&mm, 48) == Ok(1),
@@ -118,6 +192,7 @@ impl UserOwner {
             ));
         }
 
+        // Step 2: 阶段 1 记录旧会话首进程的 Pgid 对象及其数字编号，随后放行其退出。
         jobs_phase(&mm, 1)?;
         let leader = self.jobs_thread(&mm, 16)?;
         let identity = leader
@@ -138,6 +213,7 @@ impl UserOwner {
             Some(0),
         )?;
 
+        // Step 3: 阶段 2 验证新进程组复用了相同的 PGID 编号但对应全新的 Pgid 对象，且向旧 Pgid 对象发信号返回 NoProcess。
         jobs_phase(&mm, 2)?;
         let replacement = self.jobs_thread(&mm, 16)?;
         let identity = replacement
@@ -182,6 +258,7 @@ impl UserOwner {
         ));
         drop(old_pgid);
 
+        // Step 4: 阶段 3 验证跨 execve 继承管道的控制终端读写与挂断行为，最后完成收尾。
         self.jobs_stage(
             context,
             &mm,
@@ -195,7 +272,10 @@ impl UserOwner {
         self.finish_jobs(context, mm, b"h")
     }
 
-    /// winsize 的实际信号由前台子进程 sigtimedwait 消费，不声明空 UART 阶段。
+    /// 验证终端窗口大小（`winsize`）变更时向当前前台进程组递送 `SIGWINCH` 信号。
+    ///
+    /// - **测试目标**：确认 `TIOCSWINSZ` 更新终端尺寸后，前台子进程可通过 `sigtimedwait` 同步接收 `SIGWINCH` 并读取新尺寸。
+    /// - **场景步骤（Given-When-Then）**：启动 `w` 模式，在阶段 1 观测子进程进入 `sigtimedwait` 阻塞后放行门禁，等待根进程校验通过并正常退出。
     pub(super) fn jobs_winsize_changes(&mut self, context: &mut TestContext<'_>) -> TestResult {
         let mm = self.start_jobs(context, b"w")?;
         self.jobs_stage(
@@ -211,7 +291,7 @@ impl UserOwner {
         self.finish_jobs(context, mm, b"w")
     }
 
-    /// 与旧串口客体共用 devfs、真实磁盘 loader、TaskGraph 和 UART 阶段 owner。
+    /// 初始化 TTY 设备与默认 `Termios` 属性，加载并启动指定模式（`mode`）的 `/test/bin/user-jobs` 程序，返回其地址空间 `Arc<Mm>`。
     fn start_jobs(&mut self, context: &TestContext<'_>, mode: &[u8]) -> Result<Arc<Mm>, TestError> {
         self.prepare_tty(context, 4)?;
         checked(
@@ -231,7 +311,7 @@ impl UserOwner {
         Ok(mm)
     }
 
-    /// 从客体公布的真实 PID 找原执行者，不通过 phase/yield 推断其生产等待状态。
+    /// 从共享控制页指定偏移（`FUTEX_CONTROL + offset`）读取用户态发布的进程 PID，并在任务图中查找对应的 `UserThread`。
     fn jobs_thread(&self, mm: &Mm, offset: usize) -> Result<Arc<task::UserThread>, TestError> {
         let pid = jobs_word(mm, offset)? as usize;
         self.graph()
@@ -239,7 +319,10 @@ impl UserOwner {
             .ok_or(TestError("jobs published child has no live user binding"))
     }
 
-    /// 有线路先 begin 再放 gate，done 后 finish；无线路完全不取得 raw UART 所有权。
+    /// 执行单个作业控制测试阶段的握手、阻塞状态观测、串口收发驱动与子进程退出校验。
+    ///
+    /// 若本阶段包含串口收发数据（`rx` 或 `tx` 非空），则在打开阶段门禁（`gate`）之前先调用 `tty_io.begin` 启动串口事务，
+    /// 并在收到阶段完成标志（`done`）之后调用 `tty_io.finish` 完成校验；无串口数据时不占用底层 UART 测试通道。
     #[expect(
         clippy::too_many_arguments,
         reason = "单段作业测试显式列出客体阶段、线路字节、真实等待状态、停止事件与退出预期"
@@ -255,6 +338,7 @@ impl UserOwner {
         stopped_events: u32,
         expected_exit: Option<i32>,
     ) -> TestResult {
+        // Step 1: 等待用户态发布当前阶段号，校验累计停止事件数，并解析受测线程与进程组。
         jobs_phase(mm, phase)?;
         context.expect_eq(jobs_word(mm, 32)?, stopped_events);
         let user = if matches!(waiting, JobsWait::RootBlockedAfter) {
@@ -280,9 +364,10 @@ impl UserOwner {
             jobs_blocked(&executor, &group, matches!(waiting, JobsWait::ChildStopped))?;
         }
 
+        // Step 2: 按需预置 UART 收发缓冲（RX 设置延迟以便协调器观测子进程阻塞窗口），随后打开阶段门禁并等待阶段完成。
         let wire = !rx.is_empty() || !tx.is_empty();
         if wire {
-            // RX 延迟给协调者实际观察 child 的生产 Blocked 窗口，不替代该观察。
+            // 为串口接收注入设置短暂延迟，确保协调器能在字节到达前观测到子进程进入内核 I/O 阻塞状态。
             let rx_delay = if rx.is_empty() { 0 } else { 80 };
             self.tty_io.begin(context, rx, tx, rx_delay, 0)?;
         }
@@ -310,6 +395,7 @@ impl UserOwner {
         ));
         drop((user, executor, group));
 
+        // Step 3: 若本阶段预期子进程退出，等待其调度任务彻底离开内核栈并核对退出状态码。
         if let Some((observer, expected)) = completion {
             let actual = observer.join();
             context.expect_eq(actual, expected);
@@ -322,7 +408,11 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 停止孙组的观察者在 gate 前保存，HUP 退出事件与原 join 均在正常路径消费。
+    /// 执行阶段 8 的孤儿进程组（Orphaned Process Group）生命周期测试。
+    ///
+    /// 在打开阶段门禁前预先保存中间父进程与处于停止态的孙进程的退出观察者（`JoinObserver`）；
+    /// 放行门禁使中间父进程退出后，原本停止的孙进程组变为孤儿进程组，内核自动向其广播 `SIGHUP` 与 `SIGCONT`，
+    /// 协调器随后通过内核父进程 `wait` 与调度器 `JoinObserver` 双重确认孙进程因 `SIGHUP`（状态码 `1`）终止。
     fn jobs_orphan(&mut self, context: &mut TestContext<'_>, mm: &Arc<Mm>) -> TestResult {
         jobs_phase(mm, 8)?;
         context.expect_eq(jobs_word(mm, 32)?, 6);
@@ -382,7 +472,7 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 99 gate 只在所有 UART 和子事件结束后放行；正常退出仍由原 wait/reap/join 收尾。
+    /// 放行阶段 99 收尾门禁，等待 `/test/bin/user-jobs` 根进程退出，回收子进程并重置 TTY 工作队列与默认 `Termios` 属性。
     fn finish_jobs(
         &mut self,
         context: &mut TestContext<'_>,
@@ -413,33 +503,33 @@ impl UserOwner {
     }
 }
 
-/// 共享页只经正式 Mm uaccess 读数，不创建用户可写字节的 Rust 引用。
+/// 通过 `Mm` 的用户空间安全访问接口读取 `FUTEX_CONTROL + offset` 处的 32 位控制字。
 fn jobs_word(mm: &Mm, offset: usize) -> Result<u32, TestError> {
     mm.load_user_u32(FUTEX_CONTROL + offset)
         .map_err(|_| TestError("jobs shared control word is not readable"))
 }
 
-/// guest 发布 phase 后保持 gate 等待，控制者不把该等待算作 I/O 阻塞。
+/// 轮询等待用户态根进程在共享控制页偏移 `+0` 处发布指定的阶段号 `phase`。
 fn jobs_phase(mm: &Mm, phase: u32) -> TestResult {
     until("jobs root did not publish the requested phase", || {
         jobs_word(mm, 0) == Ok(phase)
     })
 }
 
-/// 放行只更新既有共享 gate，不增加测试 syscall 或伪造 scheduler 状态。
+/// 向共享控制页偏移 `+4` 处写入阶段号 `phase`，通知用户态进程跨过当前阶段门禁。
 fn jobs_gate(mm: &Mm, phase: u32) -> TestResult {
     mm.store_user_u32(FUTEX_CONTROL + 4, phase)
         .map_err(|_| TestError("jobs shared gate is not writable"))
 }
 
-/// done 由普通客体完成真实 syscall 和 wait 后发布，UART ACK 不提前消费。
+/// 轮询等待用户态根进程完成当前阶段的系统调用与事件检查，并在共享控制页偏移 `+8` 处写入完成阶段号 `phase`。
 fn jobs_done(mm: &Mm, phase: u32) -> TestResult {
     until("jobs root did not complete the requested phase", || {
         jobs_word(mm, 8) == Ok(phase)
     })
 }
 
-/// 生产 Task Blocked 与全组已确认 stop 分开查询，pending stop 不充当停止作业。
+/// 轮询等待目标调度任务进入 `State::Blocked` 状态，同时验证其所属线程组的已确认作业停止状态（`has_stopped_jobs()`）与 `stopped` 预期一致。
 fn jobs_blocked(
     executor: &Arc<task::Task>,
     group: &Arc<crate::task::process::ThreadGroup>,

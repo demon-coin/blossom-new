@@ -1,4 +1,12 @@
-"""宿主 lifecycle 回归；运行 python3 -m unittest discover -s tools/ktest。"""
+"""宿主侧 ktest VM 生命周期、超时控制、崩溃续跑与测试报告生成回归测试。
+
+本模块验证 `ktest.batch`、`ktest.uart_channel` 与 `ktest.net_user` 在测试执行全过程中的行为：
+1. 绝对超时控制、进程退出同步以及末尾串口缓冲区排空与非法尾缀拦截；
+2. 用例失败、套件级错误（`suite-error`）与用例清理中止（`case-abort`）的状态流转与报告导出；
+3. 用户态网络对端（`NetUserPeer`）握手回执与跨用例消息收发时序；
+4. 致命错误（`fatal`）或进程异常退出后的剩余用例续跑边界与防重复执行保护。
+运行方式：`python3 -m unittest discover -s tools/ktest`。
+"""
 
 import io
 import json
@@ -24,17 +32,17 @@ from ktest.uart_channel import DeadlineExpired, UartChannel
 
 
 class TerminalLifecycleTests(unittest.TestCase):
-    """绝对期限、真实退出与 UART 尾文的终结顺序。"""
+    """验证串口通道的绝对超时截止时间、VM 进程退出等待与末尾串口输出收尾顺序。"""
 
     def test_buffered_log_flood_cannot_extend_deadline(self):
-        """已缓冲的大量行也要检查绝对期限，不能只检查 recv。"""
+        """验证即使串口接收缓冲区中已积压大量日志行，逐行读取时仍会检查绝对超时截止时间。"""
         vm = session_fixture()
         vm.uart.buffer = bytearray(b"log\n" * 1000)
         with self.assertRaises(DeadlineExpired):
             vm.uart.line(time.monotonic() - 1)
 
     def test_final_waits_for_exit_and_rejects_late_or_partial_control(self):
-        """真实 socket 终结后普通诊断合法，迟到 final 和半条结果不能通过。"""
+        """验证收到 `# KTEST complete` 后等待连接关闭，允许普通诊断日志但拒绝迟到的控制行或残缺结果行。"""
         for payload, rejected in ((b'ordinary diagnostic\n{"type":"business","value":1}\nunfinished business log', False),
                                   (b"# KTEST complete\n", True), (b"  ok 1", True),
                                   (b'{"type":"catalog_end"', True)):
@@ -66,7 +74,7 @@ class TerminalLifecycleTests(unittest.TestCase):
                     guest.close()
 
     def test_uart_exit_does_not_skip_bytes_after_readiness_check(self):
-        """真实退出发生在空就绪检查后，普通尾文仍落盘，迟到及半条控制仍拒绝。"""
+        """验证当子进程在首次 `select` 就绪检查返回空之后才写入末尾输出并退出时，宿主仍能完整排空管道并拦截非法控制行。"""
         for payload, rejected in ((b"final diagnostic\n", False),
                                   (b"# KTEST complete\n", True), (b"  ok 1", True)):
             with self.subTest(payload=payload):
@@ -90,7 +98,7 @@ class TerminalLifecycleTests(unittest.TestCase):
                 crossed = False
 
                 def exit_after_readiness(readers, writers, errors, timeout):
-                    """先取真实空就绪结果，再放子进程写尾文并等待其真实退出。"""
+                    """首次调用返回空就绪集并唤醒子进程写入末尾数据并退出，后续调用恢复正常 `select`。"""
                     nonlocal crossed
                     if not crossed:
                         crossed = True
@@ -125,10 +133,10 @@ class TerminalLifecycleTests(unittest.TestCase):
 
 
 class LifecycleAndReportTests(unittest.TestCase):
-    """崩溃续跑、首次失败和报告退出合同。"""
+    """验证批次执行中的普通失败、网络对端同步、套件错误、用例清理中止与结果报告导出。"""
 
     def execute_serial(self, rows, lines, directory, args=None, guest_tail=""):
-        """通过真实 socket、独立进程和宿主解析器执行给定 guest 输出。"""
+        """启动模拟客体串口输出的子进程，并通过 `execute_batch` 运行单批次测试返回结果列表。"""
         args = args or options()
         host, guest = socket.socketpair()
         script = (
@@ -155,7 +163,7 @@ class LifecycleAndReportTests(unittest.TestCase):
         vm.connect = lambda deadline: None
 
         def close():
-            """测试范围始终收回真实子进程及 socket。"""
+            """关闭宿主端串口套接字并确保模拟客体的子进程已终止回收。"""
             host.close()
             if process.poll() is None:
                 process.terminate()
@@ -169,7 +177,7 @@ class LifecycleAndReportTests(unittest.TestCase):
         return results
 
     def test_ordinary_failure_continues_same_vm_and_all_skip_remains_distinct(self):
-        """普通 Fail 的完整清理允许后例同 VM；全 Skip 保独立退出等级。"""
+        """验证普通 `Fail` 用例走完清理阶段后允许后续用例在同一 VM 中继续执行，且全部 `Skip` 时返回独立退出码 4。"""
         rows = [case_record(0), case_record(1)]
         for statuses, outer, code in ((("Fail", "Pass"), "not ok", 1),
                                       (("Skip", "Skip"), "ok", 4)):
@@ -184,7 +192,7 @@ class LifecycleAndReportTests(unittest.TestCase):
                 self.assertEqual(CLI.exit_status(results), code)
 
     def test_network_peer_ack_orders_real_consumers_and_successor(self):
-        """真实跨例 P/Q 在 BEGIN 后产生；管道固定 begin 和 finish/drain 尚未完成的窗口。"""
+        """验证 `NetUserPeer` 的 `BEGIN` 与 `END` 回执严格界定每个用例的网络收发窗口，防止跨用例消息串扰。"""
         rows = [case_record(index, tags=["network-nic-native"], resources=["net-user"])
                 for index in range(2)]
         script = """
@@ -275,7 +283,7 @@ os._exit(0)
             raw = None
 
             def window(marker, deadline):
-                """子进程在无回执的真实等待中应答管道，不通过 sleep 推测它已经停住。"""
+                """向门控管道写入标记并等待子进程从反馈管道回传状态字节，以此精确观测子进程所处的同步窗口。"""
                 os.write(gate_writer, marker)
                 readable, _, _ = select_io.select(
                     [feedback_reader], [], [], max(0, deadline - time.monotonic()))
@@ -285,7 +293,7 @@ os._exit(0)
                 return feedback
 
             def construct_vm(args, kernel, current, names):
-                """仅代替 QEMU 启动，UART、进程、具体 peer 和正式 VM 消费方法保持真实。"""
+                """构造挂载了 `NetUserPeer` 与子进程串口套接字的测试会话，用于拦截并检验 `begin` / `finish` 时序。"""
                 nonlocal raw
                 self.assertIn("net-user", names)
                 peer = NetUserPeer(current)
@@ -307,7 +315,7 @@ os._exit(0)
                 original_finish = peer.finish
 
                 def begin(case, deadline):
-                    """固定消费者未准备窗口；错误提前放行时先确认 P 已在真实端点排队。"""
+                    """在向客体发送 `BEGIN` 回执前探测子进程状态；若子进程提前发包则确认数据已到达 UDP 套接字。"""
                     feedback = window(b"B", deadline)
                     windows.append(("begin", case["case"], feedback))
                     if feedback == b"p":
@@ -317,7 +325,7 @@ os._exit(0)
                     original_begin(case, deadline)
 
                 def finish(status, deadline):
-                    """固定原 finish/join/drain 前窗口，后继不得在其返回前进入 UART。"""
+                    """在回收工作线程并发送 `END` 回执前探测子进程状态，确保后继用例尚未提前写入串口。"""
                     feedback = window(b"F", deadline)
                     windows.append(("finish", peer.active["row"]["case"], feedback))
                     if feedback == b"x":
@@ -327,11 +335,11 @@ os._exit(0)
                     original_finish(status, deadline)
 
                 def connect(deadline):
-                    """UART 已由真实继承句柄建立，原 handshake 仍消费 READY 和发送命令。"""
+                    """跳过 QEMU 启动，仅在握手前检查模拟子进程是否存活。"""
                     vm.check(deadline)
 
                 def close():
-                    """先终结并 wait 子进程，再关闭 peer 全尾及实际 UART 句柄。"""
+                    """依次终止回收子进程、关闭 `NetUserPeer`、串口套接字与原始日志文件。"""
                     if process.poll() is None:
                         process.terminate()
                     process.wait(timeout=2)
@@ -382,7 +390,7 @@ os._exit(0)
                     os.close(descriptor)
 
     def test_suite_errors_keep_case_states_and_independent_json_junit_error(self):
-        """suite 各阶段错误经真实 UART 落到独立报告，保全各例状态。"""
+        """验证套件在 `setup`、`execution`、`cleanup` 阶段报错时保留各用例真实状态，并在 JSON 与 JUnit 报告中生成独立的 `SuiteError` 记录。"""
         rows = [case_record(0), case_record(1)]
         for phase, statuses in (("setup", ["NotRun", "NotRun"]),
                                 ("execution", ["Fail", "NotRun"]),
@@ -420,7 +428,7 @@ os._exit(0)
                 self.assertEqual(node.find("error").attrib["message"], errors[0]["reason"])
 
     def test_case_abort_cleanup_failures_preserve_independent_ledgers_in_json_and_junit(self):
-        """三处真实中止经 socket/进程终结与双报告保全主体、子任务和清理失败。"""
+        """验证在 `quiesce`、`join`、`cleanup` 阶段发生 `case-abort` 时，JSON 与 JUnit 报告完整保留主体、子任务与清理失败账本。"""
         rows = [case_record(0), case_record(1)]
         for phase in ("quiesce", "join", "cleanup"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
@@ -452,7 +460,7 @@ os._exit(0)
                                  dict(phase=phase, **ledger))
 
     def test_case_abort_requires_valid_terminal_protocol_and_real_zero_exit_without_replay(self):
-        """缺终结、假 PASS、迟到记录、断 UART、非零退出和活 VM 均不得确认中止。"""
+        """验证 `case-abort` 之后必须跟随合法的 `not ok` 汇总行、`# KTEST complete` 以及进程 0 退出，否则标记为基础设施错误且不重跑后续用例。"""
         rows = [case_record(0), case_record(1), case_record(2)]
         ledger = dict(primary=None, child="child failed", cleanup="join unsafe",
                       expectations=1, reason="cannot safely converge")
@@ -481,7 +489,7 @@ os._exit(0)
                 self.assertEqual(CLI.exit_status(results), 2)
 
     def test_case_abort_does_not_renew_existing_absolute_cleanup_deadline(self):
-        """中止控制行不能给已经开始的清理期限重新计时。"""
+        """验证 `case-abort` 控制行不会重置已启动的清理阶段绝对超时计时器。"""
         rows = [case_record(0), case_record(1), case_record(2)]
         ledger = dict(primary=None, child=None, cleanup="join failed", expectations=0, reason="unsafe")
         lines = ["KTAP version 1", "1..1", "  # Subtest: os::tests0",
@@ -496,7 +504,7 @@ os._exit(0)
         vm.close = lambda: None
 
         def line(deadline):
-            """使用正式缓冲行读取，仅控制业务日志所消耗的单调时间。"""
+            """读取串口缓冲行，并在遇到特定进度日志时推进模拟单调时钟以触发清理超时。"""
             value = UartChannel.line(vm.uart, deadline)
             if value.endswith("progress"):
                 clock[0] += 1.5
@@ -516,7 +524,7 @@ os._exit(0)
         self.assertEqual(CLI.exit_status(results), 2)
 
     def test_suite_stage_deadlines_are_absolute_and_do_not_rewrite_cases(self):
-        """suite setup 与末尾 cleanup 均受绝对期限约束，业务进度不延期。"""
+        """验证套件级 `setup` 与末尾 `cleanup` 阶段均受绝对超时约束，持续输出普通业务日志无法延长截止时间。"""
         rows = [case_record(0), case_record(1)]
         for phase, statuses in (("setup", ["NotRun", "NotRun"]),
                                 ("cleanup", ["Pass", "Pass"])):
@@ -534,7 +542,7 @@ os._exit(0)
                 vm.close = lambda: None
 
                 def line(deadline):
-                    """先走真实缓冲行读取，再让业务日志消耗单调时间。"""
+                    """读取串口缓冲行，并在遇到普通进度日志时推进模拟单调时钟。"""
                     value = UartChannel.line(vm.uart, deadline)
                     if value == "ordinary progress":
                         clock[0] += 3
@@ -553,7 +561,7 @@ os._exit(0)
                 self.assertEqual(CLI.exit_status(results), 2)
 
     def test_exit_priority_and_same_run_json_junit(self):
-        """Error 优先于 Fail，Skip 不等于成功，两个报告来自同一结果。"""
+        """验证命令行退出码的优先级（`Error` > `Fail` > `Skip` > `Pass`），以及 JSON 与 JUnit 报告内容的一致性。"""
         self.assertEqual(CLI.exit_status([dict(status="Skip")]), 4)
         self.assertEqual(CLI.exit_status([dict(status="Pass")]), 0)
         self.assertEqual(CLI.exit_status([dict(status="Fail"), dict(status="Error")]), 2)
@@ -572,10 +580,10 @@ os._exit(0)
 
 
 class HostFatalReplayTests(unittest.TestCase):
-    """真实 VM 传输、独立 guest 和副作用验证 fatal 与不可重放边界。"""
+    """通过模拟 QEMU 客体可执行脚本，验证致命错误（`fatal`）判定与剩余未执行用例的安全续跑边界。"""
 
     def execute_guest(self, rows, body, directory, args=None):
-        """只替换 QEMU 可执行文件，正式 VM、socket、解析和进程退出保持真实。"""
+        """生成模拟 QEMU 的可执行 Python 脚本并调用 `execute_batch`，记录每次启动收到的 `run` 命令。"""
         executable = directory / "guest.py"
         executable.write_text(
             "#!" + sys.executable + "\n"
@@ -602,13 +610,13 @@ class HostFatalReplayTests(unittest.TestCase):
                              invocations(rows, args), directory)
 
     def payload(self, rows, tail):
-        """保留完整 suite/case 身份，再加入实际事件序列。"""
+        """拼接包含 KTAP 头部、套件计划行、首个用例前序阶段行与指定尾部行序列的串口输出文本。"""
         return "\n".join(["KTAP version 1", "1..1", "  # Subtest: os::tests0",
                           f"  1..{len(rows)}", "  # KTEST suite-begin setup",
                           *case_lines(rows[0])[:3], *tail]) + "\n"
 
     def assert_reports(self, directory, results, statuses, exit_code):
-        """同次 JSON/JUnit 必须与真实生命周期结果及出口等级一致。"""
+        """断言批次执行结果的状态列表、退出码以及导出的 JSON / JUnit 报告均符合预期。"""
         self.assertEqual([row["status"] for row in results], statuses)
         self.assertEqual(CLI.exit_status(results), exit_code)
         CLI.export_reports(directory, dict(results=results, **CONFIG))
@@ -626,7 +634,7 @@ class HostFatalReplayTests(unittest.TestCase):
 
 
     def test_guest_pass_with_missing_external_uart_records_is_real_error(self):
-        """客体 ok 保留原文；实际 UART 观察缺项使同例失败，不能只附成功摘要。"""
+        """验证当客体上报 `ok` 但宿主侧外部串口日志校验发现缺失预期记录时，用例最终判定为 `Error` 且原始串口日志保留不变。"""
         row = case_record(
             name="os::ktest::execution_services::klog::records::allocation_free_record_identity")
         payload = self.payload([row], [*case_lines(row)[3:],
@@ -640,7 +648,7 @@ class HostFatalReplayTests(unittest.TestCase):
                           (directory / "part-0" / "uart.log").read_bytes())
 
     def test_guest_pass_with_incomplete_network_peer_is_real_error(self):
-        """真实 peer 缺少业务消息时保存其错误和 Guest ok，不把原文改成失败输出。"""
+        """验证当客体上报 `ok` 但 `NetUserPeer` 未收到预期的网络交互流量时，用例最终判定为 `Error` 并保留原始串口日志。"""
         row = case_record(tags=["network-nic-udp"], resources=["net-user"])
         start = "\n".join(["KTAP version 1", "1..1", "  # Subtest: os::tests0",
                            "  1..1", "  # KTEST suite-begin setup",
@@ -664,7 +672,7 @@ class HostFatalReplayTests(unittest.TestCase):
                           (directory / "part-0" / "uart.log").read_bytes())
 
     def test_buffered_executed_successor_is_not_replayed_after_deadline(self):
-        """A 日志耗尽期限时，B 已真实执行但 begin/final 未读，不能重放其副作用。"""
+        """验证当前序用例因日志耗时触发超时时，即使串口缓冲区中后续用例已执行完毕，宿主也不会在新 VM 中重复执行后续用例。"""
         rows = [case_record(0), case_record(1)]
         first = self.payload(rows, ["deadline-consuming-business-log",
                                   *case_lines(rows[0])[3:], *case_lines(rows[1], 2),
@@ -676,7 +684,7 @@ class HostFatalReplayTests(unittest.TestCase):
         original_line = UartChannel.line
 
         def consuming_line(vm, deadline):
-            """真实读到业务日志后消耗固定时间，其余串口内容保持排队。"""
+            """读取串口行，并在读到特定耗时日志行时休眠以触发用例超时。"""
             line = original_line(vm, deadline)
             if line == "deadline-consuming-business-log":
                 time.sleep(0.6)
@@ -691,7 +699,7 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assert_reports(directory, results, ["Timeout", "NotRun"], 1)
 
     def test_body_return_disarms_expected_fatal_before_quiesce_oom(self):
-        """正常返回后的 quiesce OOM 是实际 Crash，不能借 body 的 armed 得到 Pass。"""
+        """验证用例主体正常返回进入 `quiesce` 阶段后，原本在 `body` 阶段注册的预期致命错误（`armed`）自动失效，此时发生 OOM 仍判定为 `Crash`。"""
         rows = [case_record(expected_fatal="oom")]
         payload = self.payload(rows, ["  # KTEST armed 0 oom",
                                       "  # KTEST phase 0 quiesce", "  # KTEST fatal 0 oom"])
@@ -702,7 +710,7 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assertNotIn("infrastructure_error", results[0])
 
     def test_prefatal_business_message_cannot_match_wrong_actual_panic(self):
-        """旧业务文本含 wanted，真正 fatal 后只含 wrong 时必须失败而非 Pass。"""
+        """验证预期 panic 消息子串必须出现在 `KTEST fatal` 事件之后；仅在事件前的业务日志中出现目标词而实际 panic 消息不符时判定为 `Crash`。"""
         rows = [case_record(expected_fatal="panic", fatal_message="wanted")]
         payload = self.payload(rows, ["  # KTEST armed 0 panic", "business wanted",
                                       "  # KTEST fatal 0 panic", "actual panic: wrong"])
@@ -713,7 +721,7 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assertNotIn("infrastructure_error", results[0])
 
     def test_valid_unexpected_or_mismatched_fatal_is_crash_not_infrastructure(self):
-        """同 ID 的真实 fatal 不因未 armed 或类型不符而伪装协议 Error。"""
+        """验证未提前声明 `armed` 或实际故障类型与预期不符的合法 `KTEST fatal` 事件判定为 `Crash`，而不标记为协议基础设施错误。"""
         for expected, tail in ((None, ["  # KTEST fatal 0 oom"]),
                                ("illegal", ["  # KTEST armed 0 illegal",
                                             "  # KTEST fatal 0 oom"])):
@@ -726,7 +734,7 @@ class HostFatalReplayTests(unittest.TestCase):
                 self.assertNotIn("infrastructure_error", results[0])
 
     def test_noreturn_fatal_self_exit_confirms_safe_successor_without_repeating_failure(self):
-        """真实 fatal 自退出0证明后缀未开始，保留先前 Fail 且后缀副作用仅一次。"""
+        """验证 `KTEST fatal` 触发后客体立即以退出码 0 自退出时，宿主能够确认后续用例尚未启动并在新 VM 中仅续跑剩余用例一次。"""
         rows = [case_record(0), case_record(1), case_record(2)]
         first = "\n".join(["KTAP version 1", "1..1", "  # Subtest: os::tests0",
                            "  1..3", "  # KTEST suite-begin setup",
@@ -748,7 +756,7 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assertFalse(any("infrastructure_error" in row for row in results))
 
     def test_complete_case_abort_self_exit_runs_only_confirmed_suffix_once(self):
-        """完整中止和自行 exit0 后才重开后缀 VM，原主体与后缀副作用均只执行一次。"""
+        """验证 `case-abort` 完整走完终止协议并以退出码 0 退出后，宿主会在新 VM 中安全续跑剩余未开始的用例，且各用例只执行一次。"""
         rows = [case_record(0), case_record(1), case_record(2)]
         for phase in ("quiesce", "join", "cleanup"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
@@ -778,7 +786,7 @@ class HostFatalReplayTests(unittest.TestCase):
                 self.assertFalse(any("infrastructure_error" in row for row in results))
 
     def test_unconfirmed_process_crash_preserves_failure_and_does_not_retry_suffix(self):
-        """仅 begin 加真实进程退出9不足以证明后缀未开始，首次 Fail/Crash 不重放。"""
+        """验证若用例仅输出阶段行便以非零退出码崩溃且无 `fatal`/`case-abort` 确认，宿主不会盲目重跑后续用例。"""
         rows = [case_record(0), case_record(1), case_record(2)]
         payload = "\n".join(["KTAP version 1", "1..1", "  # Subtest: os::tests0",
                              "  1..3", "  # KTEST suite-begin setup",
@@ -792,7 +800,7 @@ class HostFatalReplayTests(unittest.TestCase):
             self.assert_reports(directory, results, ["Fail", "Crash", "NotRun"], 1)
 
     def test_expected_fatal_needs_postevent_message_and_real_zero_exit(self):
-        """正确消息只在事件后有效；活进程、非零退出和缺实际事件均不能 Pass。"""
+        """验证预期致命错误（`expected_fatal`）必须在 `KTEST fatal` 事件后输出匹配消息且进程以 0 退出才判定为 `Pass`。"""
         rows = [case_record(expected_fatal="panic", fatal_message="wanted")]
         for tail, process_tail, status in (
                 (["  # KTEST armed 0 panic", "business wanted",
@@ -813,7 +821,7 @@ class HostFatalReplayTests(unittest.TestCase):
                 self.assertEqual((directory / "commands").read_bytes(), b"run 0 17 0 0\n")
 
     def test_wrong_identity_duplicate_unknown_or_late_fatal_remains_protocol_error(self):
-        """真实传输中的错 ID、重复、未知类型、终结后记录仍为 Error/出口2。"""
+        """验证错误的用例 ID、未知故障类型、重复 `fatal` 或在 `# KTEST complete` 之后迟到的 `fatal` 均会被记为协议错误（退出码 2）。"""
         rows = [case_record(0)]
         for tail, status in ((["  # KTEST fatal 9 oom"], "Error"),
                              (["  # KTEST fatal 0 invented"], "Error"),
@@ -824,7 +832,7 @@ class HostFatalReplayTests(unittest.TestCase):
                 directory = Path(temporary)
                 payload = self.payload(rows, tail)
                 results = self.execute_guest(rows, f"uart.sendall({payload.encode()!r})", directory)
-                # 迟到控制不能覆盖已经发布的首次 Pass，只在同一行补协议错误。
+                # 在 # KTEST complete 之后收到的迟到控制行不会篡改已确认的用例 Pass 状态，但会附加 infrastructure_error 标记使退出码变为 2。
                 if status == "Pass":
                     self.assertEqual([row["status"] for row in results], ["Pass"])
                     self.assertEqual(CLI.exit_status(results), 2)

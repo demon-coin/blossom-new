@@ -1,4 +1,14 @@
-"""宿主 boot 回归；运行 python3 -m unittest discover -s tools/ktest。"""
+"""宿主侧内核 ELF 布局校验、开发板启动镜像打包与陷入（trap）诊断回归测试。
+
+本模块验证：
+1. `kernel_elf` 与 `ktest.boot` 对双架构（riscv64 / loongarch64）内核 ELF 镜像段布局、
+   权限、符号及损坏输入的边界检查；
+2. 仓库内开发板设备树（DTB）编译规则与失败回退保护；
+3. `package_board_boot_images` 生成 `kernel.bin`、`kernel.uImage`、`root.uInitrd`、`board.dtb`
+   及 `boot.env` 的地址布局、CRC 校验与原子发布行为；
+4. `verify_trap` 对致命陷入事件后寄存器现场诊断行的校验规则。
+运行方式：`python3 -m unittest discover -s tools/ktest`。
+"""
 
 import contextlib
 import io
@@ -19,7 +29,15 @@ from package_board_boot_images import LEGACY_HEADER, U32_LIMIT, make_legacy_head
 
 
 def kernel_image(architecture, target_platform="qemu-virt", empty_unwind_header=False):
-    """构造含实际 LOAD、普通生产节及公开符号的 ELF 字节，不充当客体链接或执行证明。"""
+    """构造包含 LOAD 程序头、标准节表与公开符号表的最小 64 位内核 ELF 字节镜像。
+
+    参数：
+        architecture: 目标架构名称（`"riscv64"` 或 `"loongarch64"`）。
+        target_platform: 目标平台名称（`"qemu-virt"`、`"visionfive2"` 或 `"ls2k1000la"`）。
+        empty_unwind_header: 是否附加长度为 0 的 `.eh_frame_hdr` 节。
+    返回：
+        `(image, entry, loads)` 三元组，分别为 ELF 字节数组、入口虚拟地址与 LOAD 段元组列表。
+    """
     rv = architecture == "riscv64"
     entry = 0x80200000 if rv else 0x9000000090000000
     text = 0xFFFFFFFF80200000 if rv else entry
@@ -38,6 +56,7 @@ def kernel_image(architecture, target_platform="qemu-virt", empty_unwind_header=
         (b".bss", 8, 3, text + 0x2040, first + 0x2040, 32)]
     if empty_unwind_header:
         sections.append((b".eh_frame_hdr", 1, 2, text + 0x1010, first + 0x1010, 0))
+    # 写入内核链接脚本导出的关键边界符号与平台标识符号
     symbol_values = {"__blossom_platform": {"qemu-virt": 0, "visionfive2": 1, "ls2k1000la": 2}[target_platform],
                      "__kernel_phys_start": entry if rv else physical,
                      "__kernel_virt_start": 0xFFFFFFFF80000000 if rv else entry,
@@ -50,6 +69,7 @@ def kernel_image(architecture, target_platform="qemu-virt", empty_unwind_header=
     sections += [(b".strtab", 3, 0, 0, 0x5300, len(symbol_strings)),
                  (b".symtab", 2, 0, 0, 0x5100, (len(symbol_values) + 1) * 24)]
     names = b"\0" + b"\0".join(section[0] for section in sections) + b"\0.shstrtab\0"
+    # 依次打包 ELF 文件头、Program Header 表、Section Header 表、字符串表与符号表
     image = bytearray(0x5800)
     struct.pack_into("<16sHHIQQQIHHHHHH", image, 0, b"\x7fELF\x02\x01\x01", 2,
                      243 if rv else 258, 1, entry, 64, 0x5400, 5 if rv else 0x43,
@@ -75,10 +95,10 @@ def kernel_image(architecture, target_platform="qemu-virt", empty_unwind_header=
 
 
 class BootELFTests(unittest.TestCase):
-    """实际装载格式的边界检查；合成 ELF 不充当客体执行或链接证明。"""
+    """验证内核 ELF 装载布局、节权限与文件完整性边界检查。"""
 
     def test_load_contract_rejects_corruption_and_allows_empty_optional_header(self):
-        """两架构拒错入口、映射、权限和表界，合法零长 eh_frame_hdr 不阻断发现。"""
+        """验证双架构下非法入口、越界映射、错误段权限及截断文件均会被拒绝，且允许零长度 `.eh_frame_hdr` 节。"""
         for architecture in ("riscv64", "loongarch64"):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
                 image, entry, loads = kernel_image(architecture, empty_unwind_header=True)
@@ -88,6 +108,7 @@ class BootELFTests(unittest.TestCase):
                 self.assertEqual(layout["entry"], entry)
                 self.assertEqual(layout["sections"][".eh_frame_hdr"]["size"], 0)
                 self.assertEqual(layout["sections"][".bss"]["flags"], 6)
+                # 依次篡改 ELF 类型、机器码、入口地址、节表偏移、段权限与文件大小，验证均能被拦截
                 corruptions = [
                     ("<H", 16, 3), ("<H", 18, 258 if architecture == "riscv64" else 243),
                     ("<Q", 24, entry + 4), ("<Q", 40, 1 << 63), ("<I", 64 + 4, 7),
@@ -105,7 +126,7 @@ class BootELFTests(unittest.TestCase):
                     validate_test_kernel_layout(kernel, architecture)
 
     def test_common_reader_accepts_four_production_platforms_without_test_sections(self):
-        """共同读取器保留四平台事实和公开符号，不要求测试或展开节。"""
+        """验证通用 ELF 读取器能够解析四种目标平台的生产镜像与公开符号，且不强制要求包含 ktest 或栈展开节。"""
         for architecture, platform in (("riscv64", "qemu-virt"), ("loongarch64", "qemu-virt"),
                                        ("riscv64", "visionfive2"), ("loongarch64", "ls2k1000la")):
             with self.subTest(architecture=architecture, platform=platform), tempfile.TemporaryDirectory() as temporary:
@@ -122,7 +143,7 @@ class BootELFTests(unittest.TestCase):
                 self.assertNotIn(".eh_frame_hdr", layout["sections"])
 
     def test_common_reader_preserves_format_and_io_errors(self):
-        """格式错保留 ValueError，文件不存在保留 OSError，测试边界转换为 HostError。"""
+        """验证通用读取器对文件缺失抛出 `OSError`、对格式损坏抛出 `ValueError`，而测试布局校验将其统一转换为 `HostError`。"""
         with tempfile.TemporaryDirectory() as temporary:
             kernel = Path(temporary) / "kernel.elf"
             with self.assertRaises(OSError):
@@ -142,7 +163,7 @@ class BootELFTests(unittest.TestCase):
 
 
 def write_root_payload(directory):
-    """构造包装器可识别的最小 ext4 头及载荷字节，不模拟文件系统挂载。"""
+    """在指定目录中生成带合法 ext4 魔数（`0xef53`）的最小 4KB 根文件系统镜像。"""
     target = directory / "root.ext4"
     payload = bytearray(4096)
     payload[1080:1082] = b"\x53\xef"
@@ -151,7 +172,7 @@ def write_root_payload(directory):
 
 
 def write_os_tree(directory, with_chosen=True):
-    """通过 dtc 生成可消费的树，已有 initrd 属性故意保留与本次包装无关的历史范围。"""
+    """调用 `dtc` 编译生成测试用设备树（DTB），可选附带包含历史 initrd 地址范围的 `/chosen` 节点。"""
     chosen = """
         chosen {
             bootargs = "console=ttyS0";
@@ -178,23 +199,23 @@ def write_os_tree(directory, with_chosen=True):
 
 
 def read_fdt_address(path, property_name):
-    """让 fdtget 实际解析输出树的 chosen 地址，按大端 cell 顺序还原物理值。"""
+    """调用 `fdtget` 读取设备树 `/chosen` 节点下的地址属性，并按大端 32 位 cell 拼接还原为 64 位整数地址。"""
     result = subprocess.run(["fdtget", "-t", "x", str(path), "/chosen", property_name],
                             text=True, capture_output=True, check=True)
     return int("".join(f"{int(cell, 16):08x}" for cell in result.stdout.split()), 16)
 
 
 def read_boot_environment(directory):
-    """读取可交给固件的环境变量，忽略不影响执行语义的说明文字。"""
+    """解析输出目录中的 `boot.env` 文件，忽略空行与 `#` 注释行，返回键值对字典。"""
     return dict(line.split("=", 1) for line in (directory / "boot.env").read_text().splitlines()
                 if line and not line.startswith("#"))
 
 
 class BoardDtbSourceTests(unittest.TestCase):
-    """验证仓内板树生成及失败时保留已有输出。"""
+    """验证仓库内开发板设备树（DTB）从源码编译生成，且在编译失败时保留已有产物不被破坏。"""
 
     def test_board_trees_use_repository_sources_and_exclude_stale_boot_state(self):
-        """两板真实DTB来自仓内源码，编译失败不能替换上一次结果。"""
+        """验证 VisionFive2 与 LS2K1000LA 的 DTB 均由仓内源码构建、不含残留启动参数，且编译失败时原文件保持不变。"""
         repository = Path(__file__).resolve().parents[2]
         environment = dict(os.environ, VF2_LINUX_SRC="/nonexistent/unused-sdk")
         boards = (
@@ -221,6 +242,7 @@ class BoardDtbSourceTests(unittest.TestCase):
                     self.assertNotIn("bootargs", chosen)
                     self.assertNotIn("linux,initrd-start", chosen)
                     self.assertNotIn("linux,initrd-end", chosen)
+                    # 检查各开发板特有的外设节点属性是否符合预期配置
                     if platform == "ls2k1000la":
                         ports = subprocess.run(
                             ["fdtget", "-t", "x", str(output),
@@ -232,6 +254,7 @@ class BoardDtbSourceTests(unittest.TestCase):
                             status = subprocess.run(["fdtget", "-t", "s", str(output), node, "status"],
                                                     text=True, capture_output=True, check=True).stdout.strip()
                             self.assertEqual(status, "okay")
+                    # 注入必然失败的 HOSTCC，确认构建失败不会覆盖或清空已生成的 DTB 文件
                     before = output.read_bytes()
                     failed = subprocess.run([*command, "HOSTCC=false"], cwd=repository, env=environment,
                                             text=True, capture_output=True)
@@ -240,10 +263,10 @@ class BoardDtbSourceTests(unittest.TestCase):
 
 
 class BoardPackagingTests(unittest.TestCase):
-    """验证离线文件内容、发布边界和正式 CLI，不把生成物当作实板运行证据。"""
+    """验证开发板启动镜像离线打包输出的文件格式、内存地址规划、CRC 校验与失败时的原子回滚保护。"""
 
     def test_production_images_crc_memory_spans_and_optional_inputs(self):
-        """两板容器地址、CRC 与 DTB 载荷范围满足各自运行地址协议。"""
+        """验证两款开发板的内核镜像、U-Boot 头部 CRC、RAM 根文件系统与设备树地址区间均符合各自平台的启动约定。"""
         for architecture, platform in (("riscv64", "visionfive2"), ("loongarch64", "ls2k1000la")):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -253,6 +276,7 @@ class BoardPackagingTests(unittest.TestCase):
                 output = directory / "boot images"
                 direct_base = 0 if architecture == "riscv64" else 0x9000000000000000
                 package_board_boot_images(architecture, platform, kernel, output)
+                # 1. 验证仅提供内核时，kernel.bin / kernel.uImage / boot.env 的内容与头部校验和
                 self.assertEqual((output / "kernel.elf").read_bytes(), image)
                 raw = (output / "kernel.bin").read_bytes()
                 self.assertEqual(len(raw), loads[-1][3] + loads[-1][4] - loads[0][3])
@@ -277,6 +301,7 @@ class BoardPackagingTests(unittest.TestCase):
                 kernel_address = int(rows["kernel_addr_r"], 16)
                 self.assertEqual(kernel_address & ~(U32_LIMIT - 1), direct_base)
                 self.assertLessEqual(memory_end, kernel_address - direct_base)
+                # 2. 验证提供外部 DTB 且使用块设备根分区时，不生成 uInitrd 且保留原 DTB 的 chosen 属性
                 dtb = write_os_tree(directory)
                 original_dtb = dtb.read_bytes()
                 package_board_boot_images(architecture, platform, kernel, output, os_dtb_path=dtb)
@@ -287,6 +312,7 @@ class BoardPackagingTests(unittest.TestCase):
                 self.assertFalse((output / "root.uInitrd").exists())
                 self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-start"), 0x12340000)
                 self.assertEqual(read_fdt_address(output / "board.dtb", "linux,initrd-end"), 0x12341000)
+                # 3. 验证使用 /dev/ram0 内存盘根文件系统时，生成 root.uInitrd 并更新 DTB 中的 initrd 起止物理地址
                 root, root_bytes = write_root_payload(directory)
                 package_board_boot_images(architecture, platform, kernel, output,
                                           root, dtb, "/dev/ram0")
@@ -325,12 +351,13 @@ class BoardPackagingTests(unittest.TestCase):
                 self.assertEqual(kernel.read_bytes(), image)
                 self.assertEqual(root.read_bytes(), root_bytes)
                 self.assertEqual(dtb.read_bytes(), original_dtb)
+                # 4. 再次切换回块设备根分区打包时，验证输出目录中旧的 uInitrd 与 board.dtb 会被清理
                 package_board_boot_images(architecture, platform, kernel, output, root_device="/dev/sda1")
                 self.assertFalse((output / "root.uInitrd").exists())
                 self.assertFalse((output / "board.dtb").exists())
 
     def test_ram_root_creates_missing_chosen_node(self):
-        """无 chosen 的真实树由 fdtput 创建节点，地址覆盖完整的 RAM 根载荷。"""
+        """验证当输入设备树缺少 `/chosen` 节点时，打包器在 RAM 根模式下会自动创建该节点并写入正确的 initrd 地址范围。"""
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             kernel = directory / "kernel.elf"
@@ -351,7 +378,7 @@ class BoardPackagingTests(unittest.TestCase):
             self.assertEqual(dtb.read_bytes(), original_dtb)
 
     def test_failed_packaging_leaves_published_files_unchanged(self):
-        """输入或真实 FDT 工具失败不发表半成品，CLI 返回非零且源输入保持不变。"""
+        """验证当输入参数非法、DTB 损坏或宿主缺少 FDT 工具时，打包失败不会覆盖已发布的镜像文件且输入文件保持不变。"""
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             kernel = directory / "kernel.elf"
@@ -363,6 +390,7 @@ class BoardPackagingTests(unittest.TestCase):
             package_board_boot_images("riscv64", "visionfive2", kernel, output, root, dtb, "/dev/ram0")
             published = {path.name: path.read_bytes() for path in output.iterdir()}
             inputs = {path: path.read_bytes() for path in (kernel, root, dtb)}
+            # 测试各类非法参数组合与损坏输入文件，确认抛出 ValueError 且已发布产物完好无损
             invalid_input = directory / "invalid-input"
             invalid_input.write_bytes(b"invalid")
             for options in ({"root_device": "/dev/ram0"}, {"root_device": "/dev/sda1;bad"},
@@ -371,6 +399,7 @@ class BoardPackagingTests(unittest.TestCase):
                 with self.subTest(options=options), self.assertRaises(ValueError):
                     package_board_boot_images("riscv64", "visionfive2", kernel, output, **options)
                 self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, published)
+            # 测试损坏的 DTB 经 CLI 入口调用时返回退出码 1，且不破坏已有输出
             broken_dtb = directory / "broken tree.dtb"
             broken = bytearray(dtb.read_bytes())
             struct.pack_into(">I", broken, 8, len(broken) + 4)
@@ -396,10 +425,10 @@ class BoardPackagingTests(unittest.TestCase):
 
 
 class BootTrapTests(unittest.TestCase):
-    """真实故障事件之后必须有匹配架构的完整寄存器现场。"""
+    """验证内核陷入（trap）测试在触发致命事件后必须输出匹配架构与异常原因的完整寄存器现场。"""
 
     def test_boot_fatal_requires_actual_postevent_register_frame(self):
-        """正确kind不能洗掉缺现场、零PC/SP、错cause或只在fatal前出现的业务现场。"""
+        """验证 `verify_trap` 要求在 `KTEST fatal` 行之后存在唯一且 `pc`/`sp`/`cause` 均合法的寄存器诊断行。"""
         frames = (
             ("riscv64", "illegal_instruction", "illegal",
              "synchronous trap pc=0xffffffff802f317e sp=0xffffffff80593760 cause=0x2 bad=0x0", "0x2", "0x3"),

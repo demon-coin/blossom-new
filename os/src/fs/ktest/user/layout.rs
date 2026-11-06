@@ -1,4 +1,47 @@
-//! 从真实磁盘 ELF 验证未发表布局、私有写隔离与实际用户退出。
+//! 用户态 ELF64 程序加载器、初始用户栈布局（`argc`/`argv`/`envp`/`auxv`）与私有写隔离集成测试。
+//!
+//! # 模块定位与职责
+//! 本模块位于文件系统与用户态运行时集成测试层（`fs::ktest::user`），
+//! 负责在内核将 ELF 可执行映像加载为 [`LoadedImage`]（尚未发布给调度器运行前）以及实际启动运行后，
+//! 对用户地址空间（`Mm`）、页缓存（Page Cache）与初始用户栈进行全方位校验。
+//! 上游由用户态测试套件调度（涵盖 `run`、`direct_low`、`direct_sparse`、`direct_overlap` 等测试入口），
+//! 下游依赖 VFS 文件读写（`FileRef`）、内存文件系统（`MemoryFs`）、ELF 加载器（`LoadedImage`）
+//! 以及虚拟内存空间与页面回收接口（`Mm` / `FolioRef` / `ReclaimAttempt`）。
+//!
+//! # 核心内存与初始用户栈布局
+//! 64 位 Linux ABI 兼容的用户态初始栈（自栈指针 `sp` 向高地址生长）布局如下：
+//! ```text
+//! 低地址 (sp, 16 字节对齐)
+//! +---------------------------------------------------------------+
+//! | sp + 0   : argc = 2                                           |
+//! | sp + 8   : argv[0] 指针 -> "/test/bin/user-smoke\0"           |
+//! | sp + 16  : argv[1] 指针 -> "raw\0"                            |
+//! | sp + 24  : argv[2] = NULL (0)                                 |
+//! | sp + 32  : envp[0] 指针 -> "USER_SMOKE=1\0"                   |
+//! | sp + 40  : envp[1] = NULL (0)                                 |
+//! +---------------------------------------------------------------+
+//! | sp + 48  : auxv[0] (a_type, a_val) 辅助向量表起始             |
+//! |   ...    : AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_PAGESZ(6),|
+//! |            AT_ENTRY(9), AT_HWCAP(16), AT_CLKTCK(17),          |
+//! |            AT_RANDOM(25), AT_EXECFN(31) ...                   |
+//! |   ...    : AT_NULL (0, 0) 辅助向量终止项                      |
+//! +---------------------------------------------------------------+
+//! | 环境变量字符串、参数字符串与 16 字节随机数载荷区              |
+//! +---------------------------------------------------------------+
+//! 高地址 (USER_STACK_TOP)
+//! ```
+//!
+//! 此外，本模块还通过内联汇编模板（`user_elf_direct_start` ~ `user_elf_direct_end`）动态拼装
+//! 特殊边界的 ELF64 映像（写入 `tmpfs` 的 `/plain/direct`），验证：
+//! - 低地址入口（`0x0` 页零映射与 `0x100` 非页对齐入口）及跨页扩展程序头表；
+//! - 超大稀疏 BSS 段（`64 MiB + 4 KiB`）的按需缺页（Demand Paging）与未触碰页零驻留；
+//! - 多个重叠 `PT_LOAD` 段的文件数据与 BSS 清零按声明顺序的后段覆盖前段规则。
+//!
+//! # 锁顺序与并发契约
+//! - 访问用户地址空间一律通过 `mm.copyin` / `mm.copyout` / `mm.read_usize` 等安全访问接口完成，
+//!   不在内核中直接构造指向用户可写页面的 Rust 切片引用。
+//! - 验证私有写隔离（[`verify_private_write`]）时，先通过 `file_page` 获取底层文件页缓存的 `FolioRef`
+//!   强引用以防止测试期间被内存回收器驱逐，随后再调用 `mm.copyout` 触发写时复制或私有页写入，避免锁重入。
 
 use alloc::vec::Vec;
 use core::cmp::min;
@@ -16,21 +59,30 @@ use crate::task;
 use crate::task::exec::LoadedImage;
 use ::ktest::{TestContext, TestError, TestResult};
 
+/// 从磁盘 ELF 程序头表解析出的单个 `PT_LOAD` 可加载段描述符。
 #[derive(Clone, Copy)]
 struct Segment {
+    /// 段内容在 ELF 文件中的起始字节偏移（`p_offset`）。
     offset: u64,
+    /// 段在用户虚拟地址空间中的起始虚拟地址（`p_vaddr`）。
     start: usize,
+    /// 段在 ELF 文件中所占的字节长度（`p_filesz`）。
     filesz: usize,
+    /// 段在用户虚拟内存中映射的总字节长度（`p_memsz`，超出 `filesz` 的部分为清零的 BSS 区）。
     memsz: usize,
 }
 
+/// 受测三程序头 ELF 可执行文件的关键布局元数据。
 struct Layout {
+    /// 程序入口虚拟地址（`e_entry`）。
     entry: usize,
+    /// 程序头表在用户虚拟地址空间中的映射地址（`AT_PHDR`）。
     phdr: usize,
+    /// 两个 `PT_LOAD` 段描述符：依次为只读可执行代码段（`segments[0]`）与可读写数据/BSS 段（`segments[1]`）。
     segments: [Segment; 2],
 }
 
-/// 保留底层具体错误及消费地址，框架失败消息只标识当前检查边界。
+/// 包装底层 `Result`，在出错时向测试上下文输出包含操作名称、目标地址和具体错误的诊断日志，并转换为 [`TestError`]。
 fn checked<T, E: Debug>(
     context: &TestContext<'_>,
     operation: &'static str,
@@ -46,7 +98,7 @@ fn checked<T, E: Debug>(
     })
 }
 
-/// 单次按位置读取必须交付完整请求，短读保留文件位置与实际长度。
+/// 从文件指定偏移 `offset` 处精确读取 `dst.len()` 字节，若发生错误或短读（Short Read）则触发测试失败。
 fn read_file(context: &TestContext<'_>, file: &FileRef, offset: u64, dst: &mut [u8]) -> TestResult {
     let count = checked(
         context,
@@ -62,7 +114,7 @@ fn read_file(context: &TestContext<'_>, file: &FileRef, offset: u64, dst: &mut [
     Ok(())
 }
 
-/// 经正式 uaccess 读取未 Ready 的 Mm，不创建用户内存的 Rust 切片。
+/// 通过 `Mm::copyin` 从尚未投入运行的用户地址空间 `address` 处读取指定长度字节到内核缓冲区 `dst`。
 fn read_mm(context: &TestContext<'_>, mm: &Mm, address: usize, dst: &mut [u8]) -> TestResult {
     let progress = mm.copyin(dst, address);
     if progress.error.is_some() || progress.copied != dst.len() {
@@ -83,13 +135,14 @@ fn read_mm(context: &TestContext<'_>, mm: &Mm, address: usize, dst: &mut [u8]) -
     Ok(())
 }
 
-/// 解码完整 ELF64 元数据的固定小端字段，调用位置均位于已读完的头表内。
+/// 从已读入内存的 ELF 元数据字节切片 `bytes` 的 `offset` 偏移处解码一个 64 位小端无符号整数。
 fn elf_word(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// 只读取本真实三程序头夹具的元数据，段边界和入口均来自磁盘。
+/// 读取并校验磁盘上受测 ELF64 可执行文件的 ELF 头与程序头表（包含 1 个 `PT_PHDR` 和 2 个 `PT_LOAD`），提取 [`Layout`] 元数据。
 fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError> {
+    // Step 1: 读取 64 字节 ELF64 文件头，校验魔数、64 位小端标识以及程序头表项大小（56）和数量（3）。
     let mut header = [0; 64];
     read_file(context, file, 0, &mut header)?;
     assert_eq!(
@@ -108,6 +161,7 @@ fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError
         "disk ELF PHNUM"
     );
 
+    // Step 2: 读取全部 3 个程序头表项，校验第 0 项为 PT_PHDR，后 2 项依次为 R-X 代码段与 RW- 数据段。
     let phoff = elf_word(&header, 32);
     let mut table = [0; 168];
     read_file(context, file, phoff, &mut table)?;
@@ -135,6 +189,7 @@ fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError
             memsz: elf_word(bytes, 40) as usize,
         }
     });
+    // Step 3: 校验 PT_PHDR 位于代码段文件映射范围内，且数据段具备非页对齐边界及跨越多页的初始化数据与 BSS。
     let text = segments[0];
     let phdr = text.start
         + usize::try_from(
@@ -190,7 +245,7 @@ fn layout(context: &TestContext<'_>, file: &FileRef) -> Result<Layout, TestError
     })
 }
 
-/// 逐字节消费全部 LOAD 文件前缀和零尾，块读取同样覆盖非页齐及跨页边缘。
+/// 逐块比对已加载映像（`image.mm`）中所有 `PT_LOAD` 段的虚拟内存字节与磁盘文件对应字节（以及 BSS 段的零填充字节）是否完全一致。
 fn verify_segments(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -240,7 +295,7 @@ fn verify_segments(
     Ok(())
 }
 
-/// 读取本 64 位用户 ABI 的一个机器字，错误保留原 Mm 访问诊断。
+/// 从 64 位用户地址空间的指定虚拟地址 `address` 处读取一个机器字（`usize`）。
 fn stack_word(context: &TestContext<'_>, mm: &Mm, address: usize) -> Result<usize, TestError> {
     checked(
         context,
@@ -250,7 +305,7 @@ fn stack_word(context: &TestContext<'_>, mm: &Mm, address: usize) -> Result<usiz
     )
 }
 
-/// 比较参数的完整字节与唯一结尾 NUL，不保留任何用户页借用。
+/// 验证用户栈地址 `address` 处的以 NUL 结尾的字节串与 `expected` 完全一致。
 fn stack_string(context: &TestContext<'_>, mm: &Mm, address: usize, expected: &[u8]) -> TestResult {
     let mut bytes = [0; 32];
     assert!(
@@ -272,8 +327,9 @@ fn stack_string(context: &TestContext<'_>, mm: &Mm, address: usize, expected: &[
     Ok(())
 }
 
-/// 按真实消费者栈位置检查必要 auxv、完整初始化字节区及实际硬件能力，保留参数与文件派生地址核对。
+/// 校验已加载映像的初始用户栈指针（`sp`）对齐、`argc`/`argv`/`envp` 布局以及辅助向量表（`auxv`）各项键值与硬件能力标志。
 fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout) -> TestResult {
+    // Step 1: 获取架构相关的初始用户栈指针寄存器，验证 16 字节对齐以及 argc、argv 和 envp 内容。
     #[cfg(target_arch = "riscv64")]
     let sp = image.context.gpr[2];
     #[cfg(target_arch = "loongarch64")]
@@ -309,17 +365,19 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
         "envp terminator"
     );
 
+    // Step 2: 根据当前架构独立计算预期的 AT_HWCAP 硬件能力掩码（LoongArch64 直接读取硬件 CPUCFG2 寄存器）。
     #[cfg(target_arch = "riscv64")]
     let hwcap = (1 << 8) | (1 << 12) | 1 | (1 << 5) | (1 << 3) | (1 << 2);
     #[cfg(target_arch = "loongarch64")]
     let hwcap = {
-        // CPUCFG2 是独立硬件事实；按扩展依赖核对用户 ABI，不回读 exec 的能力计算结果。
+        // 直接读取 CPUCFG2 硬件配置字并按扩展依赖链（FP -> LSX -> LASX）推导预期的用户态 HWCAP 位。
         let config = crate::arch::cpucfg(2);
         let fp = config & 1 != 0;
         let lsx = fp && config & (1 << 6) != 0;
         let lasx = lsx && config & (1 << 7) != 0;
         1 | (usize::from(fp) << 3) | (usize::from(lsx) << 4) | (usize::from(lasx) << 5)
     };
+    // Step 3: 扫描栈上的辅助向量表（auxv），验证所有必需项、AT_RANDOM 栈内范围、AT_EXECFN 路径以及 AT_NULL 终止符。
     let required = [
         (3, layout.phdr),
         (4, 56),
@@ -378,7 +436,7 @@ fn verify_stack(context: &TestContext<'_>, image: &LoadedImage, layout: &Layout)
     Err(TestError("initial auxv lacks bounded AT_NULL terminator"))
 }
 
-/// 保活数据首尾及中间的真实缓存页，并按位置保存该文件余下字节供私有写后比较；页快照共用一次回收预算。
+/// 对可执行文件中数据段起始页至文件末尾的全部内容建立字节快照，并持有所涉页缓存 [`FolioRef`] 强引用以防止测试期间被回收。
 fn snapshot(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -416,13 +474,14 @@ fn snapshot(
     Ok((start, bytes, folios))
 }
 
-/// 对未发表映像的全部 data/BSS 私有写并读回，再逐字节检查仍保活的文件缓存。
+/// 验证对已加载映像的数据段与 BSS 段执行用户空间写入（`copyout`）时具备私有写隔离性，不会污染底层文件页缓存。
 fn verify_private_write(
     context: &TestContext<'_>,
     file: &FileRef,
     image: &LoadedImage,
     data: Segment,
 ) -> TestResult {
+    // Step 1: 获取底层文件数据区的字节快照并锁定对应的页缓存 Folio。
     let (file_start, before, folios) = snapshot(context, file, data)?;
     let pattern = [0xa5; 512];
     let mut observed = [0; 512];
@@ -457,6 +516,7 @@ fn verify_private_write(
         cursor += count;
     }
 
+    // Step 2: 重新通过文件系统接口读取底层文件，确认刚才对用户地址空间的写入未污染任何文件缓存字节。
     for (block, expected) in before.chunks(observed.len()).enumerate() {
         let offset = file_start + (block * observed.len()) as u64;
         read_file(context, file, offset, &mut observed[..expected.len()])?;
@@ -473,7 +533,14 @@ fn verify_private_write(
     Ok(())
 }
 
-/// 从真实盘正式装载，检查私有布局后丢弃修改映像，再运行重新装载的普通用户程序。
+/// 运行标准磁盘 ELF 映像布局、初始栈、私有写隔离与用户态进程执行退出的综合测试。
+///
+/// - **测试目标**：验证 ELF 加载器正确映射代码段/数据段/BSS 段与初始栈，私有段写入与底层文件页缓存完全隔离，
+///   且重新加载的干净映像可在独立用户任务中正常运行、经历硬件时钟中断并以状态码 `0` 退出。
+/// - **场景步骤（Given-When-Then）**：
+///   1. 加载受测 ELF 映像，依次校验段内容（[`verify_segments`]）、初始栈与 `auxv`（[`verify_stack`]）以及私有写隔离（[`verify_private_write`]），随后丢弃被写过的映像；
+///   2. 重新加载干净映像并启动为用户进程，等待其退出；
+///   3. 断言退出码为 `0`、执行期间观测到用户态中断与时钟中断计数大于 `0`，且用户任务 ID 与内核协调器任务不同。
 pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
     fixture.prepare(context)?;
     let file = fixture.file(context, PROGRAM)?;
@@ -513,6 +580,7 @@ pub(super) fn run(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> Tes
     Ok(())
 }
 
+// 嵌入各架构用于直接构造裸 ELF 测试映像的汇编代码片段（定义符号 `user_elf_direct_start` 与 `user_elf_direct_end`）。
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!(
     "../../../../../tests/user/elf/direct-riscv64.S"
@@ -523,36 +591,55 @@ core::arch::global_asm!(include_str!(
 ));
 
 extern "C" {
+    /// 内联汇编裸测试程序机器码的起始字节符号。
     static user_elf_direct_start: u8;
+    /// 内联汇编裸测试程序机器码的结束字节符号（紧随最后一条指令之后）。
     static user_elf_direct_end: u8;
 }
 
+/// 用于在内存中动态拼装自定义 ELF64 文件的单个 `PT_LOAD` 段规格。
 struct DirectSegment<'a> {
+    /// 段在用户虚拟地址空间中的起始地址（`p_vaddr`）。
     start: usize,
+    /// 段的 ELF 程序头权限与扩展标志（`p_flags`）。
     flags: u32,
+    /// 写入 ELF 文件的段初始化字节切片（长度即 `p_filesz`）。
     bytes: &'a [u8],
+    /// 段在用户虚拟内存中的总字节长度（`p_memsz`）。
     memsz: usize,
 }
 
+/// 传递给内联汇编裸测试程序的单字节内存读写校验项。
 #[derive(Clone, Copy)]
 struct ByteCheck {
+    /// 待校验的用户虚拟地址。
     address: usize,
+    /// 裸测试程序在覆写为 `0x7e` 之前预期在该地址读到的初始字节值。
     expected: u8,
 }
 
+/// 动态构造的裸 ELF 测试文件在 `tmpfs` 中的存放路径。
 const DIRECT_PATH: &[u8] = b"/plain/direct";
+/// 裸测试程序全部校验通过后调用 `exit(37)` 对应的 `wait` 状态字（`37 << 8`）。
 const DIRECT_STATUS: i32 = 37 << 8;
 
+/// 稀疏与重叠段测试中数据/BSS 段的默认起始虚拟地址。
 const DIRECT_DATA: usize = 0x20000;
+/// 稀疏段测试中超大 BSS 段的虚拟内存字节长度（`64 MiB + 1 页`）。
 const LARGE_BSS: usize = 64 * 1024 * 1024 + PAGE_SIZE;
+/// 稀疏段测试中远端可写数据段的起始虚拟地址。
 const DISTANT_DATA: usize = 0x12000000;
 
-/// 把普通裸程序及其字节检查表写入映像，程序检查旧值、写入0x7e并读回后才退出37。
+/// 将内联汇编裸测试程序的机器码与末尾追加的 [`ByteCheck`] 校验表拼装为完整的段载荷字节序列。
+///
+/// 裸程序启动后会遍历该校验表：逐项检查 `address` 处的初始字节是否等于 `expected`，
+/// 随后向该地址写入 `0x7e` 并读回确认，全部通过后以退出码 `37` 退出。
 fn direct_payload(checks: &[ByteCheck]) -> Result<Vec<u8>, TestError> {
     let start = core::ptr::addr_of!(user_elf_direct_start);
     let end = core::ptr::addr_of!(user_elf_direct_end) as usize;
-    // SAFETY: 两个汇编链接符号界定同一永久只读片段，片段内字节已初始化，且end在start之后；
-    // 这里只读取内核静态字节，随后复制到真实文件，不借用用户映射内容。
+    // SAFETY:
+    // 1. `user_elf_direct_start` 与 `user_elf_direct_end` 由上方 `global_asm!` 在同一只读代码节中相邻定义，`end >= start`；
+    // 2. 该区间属于内核只读静态镜像，在整个内核生命周期内有效、对齐且不会被并发修改。
     let code = unsafe { core::slice::from_raw_parts(start, end - start as usize) };
     let mut bytes = Vec::new();
     bytes
@@ -567,7 +654,10 @@ fn direct_payload(checks: &[ByteCheck]) -> Result<Vec<u8>, TestError> {
     Ok(bytes)
 }
 
-/// 生成实际ELF64文件；扩展实例的程序头跨页，vendor头与节表字段均不参与LOAD。
+/// 根据给定的入口地址、可加载段列表与扩展头标志，在内存中生成合法的 ELF64 可执行文件字节流。
+///
+/// 当 `extended` 为 `true` 时，构造 `p_hentsize = 64`、`e_phnum = 80`（跨页程序头表）以及额外的非 `PT_LOAD` 厂商段头和节表字段，
+/// 用于验证加载器忽略无关扩展头与未映射 `PT_PHDR` 的能力。
 fn direct_elf(
     entry: usize,
     segments: &[DirectSegment<'_>],
@@ -633,7 +723,7 @@ fn direct_elf(
     Ok(bytes)
 }
 
-/// 沿已有内存文件测试的挂载与写入方式准备0644文件，写OFD关闭后才调用正式exec入口。
+/// 在 `/plain` 上挂载读写 `tmpfs`，将构造好的 ELF 字节写入 `0644` 权限的 `/plain/direct` 文件，关闭写入句柄后调用 ELF 加载器返回 [`LoadedImage`]。
 fn prepare_direct(
     context: &TestContext<'_>,
     fixture: &mut UserOwner,
@@ -695,7 +785,7 @@ fn prepare_direct(
     fixture.load_named(context, DIRECT_PATH, b"raw")
 }
 
-/// 从真实初始栈遍历argv/envp后消费auxv，不使用旧三程序头夹具的布局解析器。
+/// 从已加载裸 ELF 映像的初始用户栈指针出发，跳过 `argc`、`argv` 和 `envp`，校验辅助向量表中的 `AT_PHDR`、`AT_PHENT`、`AT_PHNUM` 和 `AT_ENTRY`。
 fn verify_direct_auxv(
     context: &TestContext<'_>,
     image: &LoadedImage,
@@ -733,7 +823,7 @@ fn verify_direct_auxv(
     Err(TestError("direct ELF auxv lacks AT_NULL"))
 }
 
-/// 发表普通用户Task并消费真实wait及离栈join；用户检查过的每个字节须仍保留写入结果。
+/// 启动已加载的裸 ELF 映像并等待其退出，断言退出状态为 [`DIRECT_STATUS`]，且所有受检地址处均保留了用户态写入的 `0x7e`。
 fn execute_direct(
     context: &mut TestContext<'_>,
     fixture: &mut UserOwner,
@@ -757,7 +847,14 @@ fn execute_direct(
     Ok(())
 }
 
-/// 页零与0x100入口由0644文件实际执行；扩展实例同时消费跨页PHDR和未映射PHDR的auxv。
+/// 验证低虚拟地址入口（`0x0` 零页或 `0x100` 非页对齐入口）及跨页扩展程序头表的 ELF 加载与执行。
+///
+/// - **测试目标**：确认 ELF 加载器允许映射虚拟地址 `0x0` 及页内偏移入口 `0x100`，且在程序头表跨页、未包含在任何 `PT_LOAD` 段中时，
+///   能正确将 `AT_PHDR` 置为 `0` 并正常执行用户指令直至退出。
+/// - **场景步骤（Given-When-Then）**：
+///   1. 生成入口为 `entry`（`0x0` 或 `0x100`）的裸 ELF 文件并写入 `tmpfs` 加载；
+///   2. 校验入口 PC、指令字节与初始栈 `auxv` 元数据；
+///   3. 运行该用户进程并断言以状态码 `37`（[`DIRECT_STATUS`]）正常退出。
 pub(super) fn direct_low(
     context: &mut TestContext<'_>,
     fixture: &mut UserOwner,
@@ -791,7 +888,7 @@ pub(super) fn direct_low(
     execute_direct(context, fixture, image, &[])
 }
 
-/// 只检查硬件叶而不触发缺页，统计大BSS的实际驻留页。
+/// 在不触发缺页分配的前提下遍历页表，统计超大 BSS 段虚拟地址区间内当前已实际建立物理页映射的驻留页数。
 fn bss_resident(mm: &Mm) -> usize {
     (DIRECT_DATA..DIRECT_DATA + LARGE_BSS)
         .step_by(PAGE_SIZE)
@@ -799,7 +896,14 @@ fn bss_resident(mm: &Mm) -> usize {
         .count()
 }
 
-/// 超过旧加载量与跨度的正常映像只访问三个BSS页和一个远端文件页，未触页必须保持不驻留。
+/// 验证超大稀疏 BSS 段（`64 MiB + 4 KiB`）与大跨度虚拟地址空洞的按需缺页（Demand Paging）加载行为。
+///
+/// - **测试目标**：确认 ELF 加载器对超大 BSS 段采用惰性按需映射而非在 `execve` 时一次性分配全部物理页，
+///   且用户程序运行期间仅对实际访问过的 3 个 BSS 页面建立物理映射，段间地址空洞始终保持未映射。
+/// - **场景步骤（Given-When-Then）**：
+///   1. 构造包含 `64 MiB + 4 KiB` 纯 BSS 段与远端数据段的 ELF 文件并完成加载，断言初始 BSS 驻留页数为 `0` 且中间空洞未映射；
+///   2. 运行用户程序，仅访问 BSS 首字节、中间 32 MiB 处、末字节及远端数据段首字节；
+///   3. 进程退出后断言 BSS 驻留页数精确等于 `3`，且段间空洞仍无映射。
 pub(super) fn direct_sparse(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
     let checks = [
         ByteCheck {
@@ -865,7 +969,13 @@ pub(super) fn direct_sparse(context: &mut TestContext<'_>, fixture: &mut UserOwn
     Ok(())
 }
 
-/// 后段文件和BSS覆盖都按原声明顺序生成独立预期，并逐字节核对跨页结果。
+/// 验证多个虚拟地址范围相互重叠的 `PT_LOAD` 段在加载与运行时的字节覆盖优先级。
+///
+/// - **测试目标**：确认当多个 `PT_LOAD` 段在相同页或跨页区域发生重叠时，加载器严格按照程序头声明顺序依次应用每个段的文件内容与 BSS 清零区域（后声明的段覆盖先声明的段）。
+/// - **场景步骤（Given-When-Then）**：
+///   1. 构造 3 个在 `DIRECT_DATA` 区域存在多层部分重叠与 BSS 尾覆盖的数据段并加载映像；
+///   2. 在启动前直接读取用户地址空间，断言整个重叠区域的所有字节与按序覆盖预期完全一致；
+///   3. 启动用户程序校验各边界点初始值并覆写为 `0x7e`，退出后确认仅受检边界字节变为 `0x7e`，其余字节未受破坏。
 pub(super) fn direct_overlap(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
     let addresses = [
         0x207ff, 0x20800, 0x2100f, 0x21010, 0x2102f, 0x21030, 0x2104f, 0x21050, 0x2181f, 0x21820,

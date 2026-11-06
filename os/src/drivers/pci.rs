@@ -1,4 +1,46 @@
-//! 单次 root-bus 资源发现，配置访问与 BAR 地址域由同一个 owner 保存。
+//! PCI / PCIe 根总线（Root Bus）单次枚举、BAR 地址空间分配与配置空间访问管理。
+//!
+//! ## 模块职责与架构定位
+//! 本模块由顶层 [`crate::drivers::discover`] 在普通初始化任务中调用，负责根据 [`boot::BootInfo`]
+//! 提供的 PCI 主桥资源描述（标准 ECAM 或龙芯 LS2K/LS7A 扩展配置空间 CFG0/CFG1），
+//! 对根总线（`bus = 0`）执行单次全功能扫描、BAR 尺寸探测与物理地址分配，并产出不可变的
+//! [`PciInventory`] 供后续 VirtIO-PCI、AHCI 与 GMAC 驱动查询使用。
+//!
+//! ## 核心设计与地址/配置空间布局
+//! 1. **双配置访问机制（[`HostCam`]）**：
+//!    - `Ecam`：标准 PCIe ECAM 线性内存映射配置空间。
+//!    - `Loongson`：龙芯桥片专用配置空间（CFG0/CFG1），其扩展配置偏移（`extended = true`）位域编码如下：
+//!
+//! ```text
+//!  28         24 27       16 15     11 10     8 7               0
+//! +-------------+-----------+---------+--------+-----------------+
+//! | Type1(1<<28)| ExtOffset |  Device |  Func  |  BaseRegister   |
+//! | (bus != 0)  |  [11:8]   |  [4:0]  | [2:0]  |      [7:0]      |
+//! +-------------+-----------+---------+--------+-----------------+
+//!               (注: bus != 0 时 bits[23:16] 还会或上 bus << 16)
+//! ```
+//!
+//! 2. **BAR 探测、分配与回滚状态机（[`PciInventory::discover`]）**：
+//!
+//! ```text
+//! collect_devices (扫描 Bus 0，读取身份、Capability 链、中断路由与原始 BAR/Command)
+//!    │
+//!    ▼
+//! configure_resources
+//!    ├─► Step 1: 关闭所有候选功能的 IO_SPACE / MEMORY_SPACE / BUS_MASTER 解码并回读确认
+//!    ├─► Step 2: 探测各功能 BAR 的类型与尺寸 (root.bars)
+//!    ├─► Step 3: 校验并登记固件已分配且落在主桥窗口内的非零 BAR 区间 (reserve)
+//!    ├─► Step 4: 为未分配或越界的内存 BAR 在 MEM32 窗口内按 2^n 对齐寻找空闲区间 (allocate)
+//!    ├─► Step 5: 预先校验板级原生 AHCI / GMAC 的 BAR 与中断路由一致性 (resolve_registers)
+//!    ├─► Step 6: 将最终 BAR 总线地址写回硬件寄存器并回读核对，随后开启 MEMORY_SPACE | BUS_MASTER
+//!    │
+//!    └─► 若中途任何一步返回 Err ──► restore_configuration (恢复原始 BAR 与 Command)
+//! ```
+//!
+//! ## 锁顺序与并发契约
+//! - 全局原子标志 [`DISCOVERED`]（`AcqRel`）保证 [`PciInventory::discover`] 在整个内核生命周期内至多成功执行一次。
+//! - 所有对 PCI 配置空间的可写操作（BAR 尺寸探测、地址编程、Command 启停）均在 [`PciInventory::discover`]
+//!   独占持有 `&mut PciRoot<HostCam>` 期间完成；枚举结束后，`PciInventory` 仅对外暴露只读切片与受限的只读配置字查询。
 
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -61,10 +103,15 @@ const LOONGSON_CFG1_TYPE1: usize = 1 << 28;
 const IO_DOMAIN: u8 = 1;
 const MEMORY_DOMAIN: u8 = 2;
 
-/// 内存 BAR 的总线地址和已验证 CPU 物理窗口；64 位配对的高槽保留为空。
+/// 已完成地址分配与 CPU 物理地址换算的 PCI 内存基址寄存器（Memory BAR）描述。
+///
+/// 若某 64 位内存 BAR 占用相邻两个 32 位寄存器槽位（`BAR[i]` 与 `BAR[i+1]`），
+/// 则完整信息保存在低槽 `bars[i]` 中，高槽 `bars[i+1]` 保持为 `None`。
 #[derive(Clone, Copy, Debug)]
 pub struct PciBar {
+    /// 写入 PCI BAR 寄存器的 PCI 总线域起始地址（字节单位）。
     pub bus_address: u64,
+    /// 经主桥 `ranges` 窗口换算后的 CPU 物理地址区间（字节单位）。
     pub physical: Region,
     #[cfg_attr(
         feature = "ktest",
@@ -73,24 +120,33 @@ pub struct PciBar {
             reason = "普通 init 的 PCI BAR 资源日志读取预取属性，ktest 不运行该初始化入口"
         )
     )]
+    /// 该内存 BAR 是否支持预取（Prefetchable）。
     pub prefetchable: bool,
 }
 
-/// 有界 capability 链中的原始头，后续 transport 只读取此选定功能。
+/// PCI 配置空间 Capability 链表中的单个能力项头部快照。
 #[derive(Clone, Copy, Debug)]
 pub struct PciCapability {
+    /// 该 Capability 在 256 字节标准配置空间内的字节偏移量。
     pub offset: u8,
+    /// PCI SIG 定义的 Capability ID（如 `0x09` 为 Vendor-Specific / VirtIO）。
     pub id: u8,
+    /// 紧随 `id` 与 `next` 指针之后的 16 位能力私有头部字段。
     pub private_header: u16,
 }
 
-/// root bus 上一个实际功能的不可变资源，不以全局当前设备传递身份。
+/// PCI 根总线上单个已枚举并完成 BAR 配置的功能（Function）不可变资源快照。
 #[derive(Debug)]
 pub struct PciDevice {
+    /// PCI 总线号（根总线固定为 `0`）。
     pub bus: u8,
+    /// PCI 设备号（Slot / Device，`0..32`）。
     pub device: u8,
+    /// PCI 功能号（Function，`0..8`）。
     pub function: u8,
+    /// 硬件厂商标识（Vendor ID）。
     pub vendor_id: u16,
+    /// 硬件设备标识（Device ID）。
     pub device_id: u16,
     #[cfg_attr(
         feature = "ktest",
@@ -99,17 +155,22 @@ pub struct PciDevice {
             reason = "普通 init 的 PCI 功能资源日志读取原始头类型，ktest 不运行该初始化入口"
         )
     )]
+    /// 配置空间 `0x0e` 字节处的原始 Header Type 字段（含多功能标志位 Bit 7）。
     pub header_type: u8,
-    /// 首次枚举读取的 class/subclass/progif，不保存未使用的 revision。
+    /// 24 位类别码（`(class << 16) | (subclass << 8) | prog_if`），用于按标准类别匹配 AHCI 等控制器。
     class_code: u32,
+    /// 最多 6 个标准 32 位 BAR 槽位的内存映射信息（I/O BAR、未实现槽位或 64 位 BAR 高半槽为 `None`）。
     pub bars: [Option<PciBar>; PCI_BAR_COUNT],
+    /// 从配置空间 Capability 链表按序提取的能力项定长数组。
     pub capabilities: [Option<PciCapability>; PCI_CAPABILITY_CAPACITY],
+    /// `capabilities` 数组中有效能力项的数量。
     pub capability_count: usize,
+    /// 已映射至内核外部中断控制器域的 PCI INTx 中断号（不使用中断的功能为 `None`）。
     pub interrupt: Option<IrqNumber>,
 }
 
 impl PciDevice {
-    /// 返回此功能的配置地址，资源身份始终包含总线、设备与功能。
+    /// 构造 `virtio_drivers` 使用的 `(bus, device, function)` 配置空间地址标识。
     fn bdf(&self) -> DeviceFunction {
         DeviceFunction {
             bus: self.bus,
@@ -119,37 +180,56 @@ impl PciDevice {
     }
 }
 
-/// 唯一配置窗口 owner 与按 BDF 排序的资源快照。
+/// PCI 根总线唯一配置空间所有者与已枚举设备资源清单。
 pub struct PciInventory {
+    /// PCI 根总线配置空间访问句柄；当平台无 PCI 主桥（[`PciConfiguration::Absent`]）时为 `None`。
     root: Option<PciRoot<HostCam>>,
+    /// 按 `(bus, device, function)` 升序排列的已配置根总线设备列表。
     devices: Vec<PciDevice>,
 }
 
+/// BAR 探测与分配阶段暂存单个候选功能及其原始硬件寄存器状态的内部工作项。
 struct PendingDevice {
+    /// 正在构建的设备资源描述（其 `bars` 数组在 `configure_resources` 中填充）。
     device: PciDevice,
+    /// 枚举开始前读取的原始 PCI `Command` 寄存器值，用于配置失败时无损回滚。
     command: Command,
+    /// 枚举开始前读取的 6 个原始 32 位 BAR 寄存器字，用于配置失败时恢复固件地址。
     original_bars: [u32; PCI_BAR_COUNT],
+    /// 关闭地址解码后通过 `virtio_drivers` 探测到的各槽位 BAR 类型与尺寸信息。
     bar_info: [Option<BarInfo>; PCI_BAR_COUNT],
 }
 
+/// 记录 PCI I/O 域或内存域中已被现有或新分配 BAR 占用的总线地址半开区间 `[start, end)`。
 #[derive(Clone, Copy)]
 struct Occupied {
+    /// 地址空间域标识（[`IO_DOMAIN`] 表示 I/O 空间，[`MEMORY_DOMAIN`] 表示 32/64 位内存空间）。
     domain: u8,
+    /// 已占用区间在 PCI 总线地址空间中的起始地址（字节单位，含）。
     start: u64,
+    /// 已占用区间在 PCI 总线地址空间中的结束地址（字节单位，不含）。
     end: u64,
 }
 
-/// 唯一 host 配置 owner；所选 LS2K 使用 CFG1，ECAM 保持独立地址公式。
+/// 底层 PCI 主桥配置空间访问机制封装。
 enum HostCam {
+    /// 标准 PCIe ECAM 内存映射配置空间访问器。
     Ecam(MmioCam<'static>),
+    /// 龙芯 LS2K/LS7A 桥片专用扩展配置空间（CFG1）访问器。
     Loongson {
+        /// 龙芯扩展配置窗口在内核强序 MMIO 区域中的虚拟基地址。
         base: usize,
+        /// 龙芯扩展配置窗口的总字节长度。
         length: usize,
+        /// 主桥支持的最大有效总线号（含）。
         bus_end: u8,
     },
 }
 
-/// 计算 Loongson CFG0/CFG1 的字偏移，包含真实硬件禁止访问的根功能。
+/// 计算龙芯 CFG0（`extended = false`）或 CFG1（`extended = true`）配置空间中指定 `(bdf, offset)` 的字节偏移量。
+///
+/// 若设备/功能号越界、`offset` 未按 4 字节对齐、超出配置空间上限，或命中了龙芯根总线上硬件禁止访问的
+/// Root Port 非零功能（`bus == 0 && device in 9..=20 && function != 0`），则返回 `None`。
 fn loongson_offset(bdf: DeviceFunction, offset: u16, extended: bool) -> Option<usize> {
     if PCI_DEVICE_COUNT <= bdf.device
         || PCI_FUNCTION_COUNT <= bdf.function
@@ -183,7 +263,7 @@ fn loongson_offset(bdf: DeviceFunction, offset: u16, extended: bool) -> Option<u
 }
 
 impl ConfigurationAccess for HostCam {
-    /// 配置只读字段由 PciRoot 借用访问，越过 host 窗口按 PCI 无设备语义返回。
+    /// 从配置空间读取 `bdf` 功能在 `offset` 处的 32 位寄存器字；若超出主桥窗口或命中隐藏功能则按 PCI 空槽语义返回 `u32::MAX`。
     fn read_word(&self, bdf: DeviceFunction, offset: u8) -> u32 {
         match self {
             Self::Ecam(cam) => cam.read_word(bdf, offset),
@@ -201,13 +281,15 @@ impl ConfigurationAccess for HostCam {
                 if *length < at + PCI_REGISTER_BYTES {
                     return u32::MAX;
                 }
-                // SAFETY: 唯一库存持有永久强序 CFG1 映射；对齐偏移和完整 u32 已验证在窗口内。
+                // SAFETY:
+                // 1. `PciInventory::discover` 已通过 `mmio_region_address` 验证 `[base, base + length)` 拥有永久强序 MMIO 映射；
+                // 2. `loongson_offset` 已校验 `offset` 按 4 字节对齐且 `at + 4 <= length` 已在上方确认，目标 32 位字完全处于映射窗口内。
                 unsafe { ((*base + at) as *const u32).read_volatile() }
             }
         }
     }
 
-    /// 独占配置写保持唯一库存所有权，不产生可复制的可写 CAM。
+    /// 向配置空间中 `bdf` 功能的 `offset` 处写入 32 位寄存器字（仅在持有 `&mut self` 期间调用）。
     fn write_word(&mut self, bdf: DeviceFunction, offset: u8, data: u32) {
         match self {
             Self::Ecam(cam) => cam.write_word(bdf, offset, data),
@@ -223,19 +305,22 @@ impl ConfigurationAccess for HostCam {
                     at + PCI_REGISTER_BYTES <= *length,
                     "Loongson configuration write exceeds CFG1"
                 );
-                // SAFETY: &mut CAM 保证配置写独占；对齐完整 u32 位于永久强序 CFG1 窗口内。
+                // SAFETY:
+                // 1. 调用方独占持有 `&mut self`，保证当前没有并发配置空间写入；
+                // 2. `loongson_offset` 与上方 `assert!` 已确认 `at` 按 4 字节对齐且 `[at, at + 4)` 完全位于永久强序映射 `[base, base + length)` 内。
                 unsafe { ((*base + at) as *mut u32).write_volatile(data) };
             }
         }
     }
 
-    /// 为 PciRoot 的只读枚举创建同一映射的借用副本。
+    /// 为 `PciRoot` 内部只读枚举器创建指向同一配置空间映射的轻量级副本。
     ///
     /// # Safety
-    /// 调用者只能通过副本读取无副作用配置字段，且不得与原 owner 的配置写并发。
+    /// 1. 调用方只能通过克隆出的副本执行无副作用的只读配置空间访问；
+    /// 2. 在副本存活期间，不得与原 [`HostCam`] 所有者的配置空间写入操作并发执行。
     unsafe fn unsafe_clone(&self) -> Self {
         match self {
-            // SAFETY: 调用者继承 ConfigurationAccess 的只读与不并发写约束，原映射永久有效。
+            // SAFETY: 外层调用方已承诺遵守 `ConfigurationAccess::unsafe_clone` 的只读且无并发写契约，且底层 ECAM 映射在内核生命周期内永久有效。
             Self::Ecam(cam) => Self::Ecam(unsafe { cam.unsafe_clone() }),
             Self::Loongson {
                 base,
@@ -251,8 +336,11 @@ impl ConfigurationAccess for HostCam {
 }
 
 impl PciInventory {
-    /// 普通 Task 一次枚举已发布 host，锁外 fallible 准备全部资源后才配置设备。
+    /// 在普通初始化任务中单次枚举全局启动信息发布的 PCI 主桥，完成 BAR 分配并返回设备库存。
+    ///
+    /// 若配置过程中任何设备的 BAR、中断或原生窗口校验失败，会自动回滚所有已扫描设备的原始 BAR 与 `Command` 寄存器。
     pub fn discover(info: &'static BootInfo) -> Result<Self, ProbeError> {
+        // Step 1: 确认处于普通任务上下文，校验全局唯一的 BootInfo 引用并通过 DISCOVERED 原子标志防止重复枚举。
         drop(task::current_task());
         if !core::ptr::eq(info, boot::info()) {
             return Err(ProbeError::Resource(
@@ -272,6 +360,7 @@ impl PciInventory {
             return Err(ProbeError::Resource("PCI root bus must start at zero"));
         }
 
+        // Step 2: 根据主桥类型（标准 ECAM 或龙芯扩展 CFG1）转换配置空间虚拟基址并构造 HostCam。
         let configuration = match info.pci.kind {
             PciConfiguration::Ecam => info.pci.configuration,
             PciConfiguration::Loongson => info.pci.configuration_extended,
@@ -280,7 +369,9 @@ impl PciInventory {
         let virtual_address = mmio_region_address(configuration)?;
         let cam = match info.pci.kind {
             PciConfiguration::Ecam => {
-                // SAFETY: 已发布的真实 ECAM 在 AP 前永久映射，唯一库存持配置写拥有到停止尾部。
+                // SAFETY:
+                // 1. `mmio_region_address` 已验证 `configuration` 非空且映射到内核永久强序 MMIO 虚拟地址 `virtual_address`；
+                // 2. `DISCOVERED` 原子标志保证全局仅构造唯一一个 `PciInventory`，独占管理该 ECAM 窗口直至关机。
                 HostCam::Ecam(unsafe {
                     MmioCam::new(
                         virtual_address as *mut u8,
@@ -297,6 +388,7 @@ impl PciInventory {
             PciConfiguration::Absent => unreachable!(),
         };
 
+        // Step 3: 扫描根总线收集候选功能，并在修改硬件 BAR 前预先分配好结果向量与地址占用表的堆内存。
         let mut root = PciRoot::new(cam);
         let mut pending = collect_devices(&root, info)?;
         let mut devices = Vec::new();
@@ -312,6 +404,7 @@ impl PciInventory {
             .try_reserve_exact(capacity)
             .map_err(|_| ProbeError::NoMemory)?;
 
+        // Step 4: 执行全量 BAR 探测、地址分配与 Command 使能；若中途出错则完整恢复原始配置状态。
         if let Err(error) = configure_resources(&mut root, &mut pending, &mut occupied, info) {
             restore_configuration(&mut root, &pending);
             return Err(error);
@@ -326,12 +419,12 @@ impl PciInventory {
         })
     }
 
-    /// 借用稳定 BDF 顺序的所有 root-bus 功能，不重新枚举 host。
+    /// 返回按 `(bus, device, function)` 升序排列的根总线已配置设备只读切片。
     pub fn devices(&self) -> &[PciDevice] {
         &self.devices
     }
 
-    /// 从唯一已配置库存解析所选 AHCI；只读快照，不重新探测或修改 command。
+    /// 在已配置的 PCI 库存中核对并解析板级 AHCI 控制器的寄存器物理区间与中断路由。
     pub fn resolve_ahci(&self, resources: &AhciResources) -> Result<AhciResources, ProbeError> {
         let mut resolved = *resources;
         resolved.registers = resolve_registers(
@@ -345,7 +438,7 @@ impl PciInventory {
         Ok(resolved)
     }
 
-    /// 从唯一已配置库存解析所选 GMAC，保留直接 MMIO 的身份与 PHY 配置。
+    /// 在已配置的 PCI 库存中核对并解析板级 GMAC 网卡的寄存器物理区间与中断路由。
     pub fn resolve_gmac(&self, resources: &GmacResources) -> Result<GmacResources, ProbeError> {
         let mut resolved = *resources;
         resolved.registers = resolve_registers(
@@ -359,7 +452,10 @@ impl PciInventory {
         Ok(resolved)
     }
 
-    /// 读取本 inventory 中选定功能的只读配置字，拒绝越界、未对齐与外来身份。
+    /// 读取归属于本库存的指定 `device` 在 `offset` 处的 32 位只读配置空间字。
+    ///
+    /// 仅允许访问 4 字节对齐的身份、Capability 链表指针、中断字段及 `0x40` 之后的 Capability 数据区，
+    /// 拒绝访问外来 `PciDevice` 引用或可能带有读清零（Read-to-Clear）副作用的控制/状态字。
     pub fn read_config_word(&self, device: &PciDevice, offset: u8) -> Result<u32, ProbeError> {
         if offset & (PCI_REGISTER_BYTES as u8 - 1) != 0
             || !self
@@ -371,7 +467,7 @@ impl PciInventory {
                 "invalid selected PCI configuration access",
             ));
         }
-        // 不暴露可能 read-to-clear 或可写字段的可复制 CAM；此入口仅服务身份与 cap。
+        // 限制标准配置头（0x00..0x40）内仅可读取无副作用的身份与元数据字，防止外部误触状态或控制寄存器。
         if !matches!(
             offset,
             PCI_VENDOR_WORD
@@ -394,7 +490,7 @@ impl PciInventory {
     }
 }
 
-/// Loongson AHCI 使用 BAR0；其他已明确指定 BDF 的标准 AHCI 功能使用 BAR5。
+/// 根据 PCI 厂商、设备 ID 与类别码确定 AHCI 控制器使用的内存 BAR 槽位索引（龙芯集成 AHCI 使用 BAR0，标准 AHCI 1.0 使用 BAR5）。
 fn ahci_bar(vendor: u16, device: u16, class_code: u32) -> Result<usize, ProbeError> {
     if vendor == PCI_VENDOR_LOONGSON && device == PCI_DEVICE_LOONGSON_AHCI {
         return Ok(0);
@@ -407,7 +503,7 @@ fn ahci_bar(vendor: u16, device: u16, class_code: u32) -> Result<usize, ProbeErr
     ))
 }
 
-/// 两种单通道 Loongson GMAC 均使用 BAR0，不接受具有不同 DMA 格式的 GNET。
+/// 根据 PCI 厂商与设备 ID 确定龙芯单通道 GMAC 控制器使用的内存 BAR 槽位索引（固定使用 BAR0）。
 fn gmac_bar(vendor: u16, device: u16, _class_code: u32) -> Result<usize, ProbeError> {
     if vendor == PCI_VENDOR_LOONGSON
         && matches!(device, PCI_DEVICE_LOONGSON_GMAC | PCI_DEVICE_LOONGSON_GMAC2)
@@ -419,7 +515,7 @@ fn gmac_bar(vendor: u16, device: u16, _class_code: u32) -> Result<usize, ProbeEr
     ))
 }
 
-/// 直接窗口必须从寄存器零偏移开始且完全位于 BAR 内；结果总是完整 CPU 物理 BAR。
+/// 校验固件直接描述的寄存器窗口 `described` 与 PCI `bar` 物理窗口的一致性，并返回完整的 `bar` 物理区间。
 fn normalize_window(bar: Region, described: Region, pci: bool) -> Result<Region, ProbeError> {
     if bar.end <= bar.start
         || (!(pci && described == Region::default())
@@ -434,7 +530,7 @@ fn normalize_window(bar: Region, described: Region, pci: bool) -> Result<Region,
     Ok(bar)
 }
 
-/// 按完整 BDF 或直接物理窗口找唯一功能，核对 IRQ 与整个映射；没有 PCI 的 MMIO 保持独立。
+/// 在已枚举的 PCI 设备列表中按显式 BDF 或寄存器物理窗口匹配唯一个原生外设（AHCI/GMAC），并校验其中断路由与 MMIO 可访问性；纯非 PCI 的直连 MMIO 外设则原样返回其寄存器区间。
 fn resolve_registers<'a>(
     devices: impl Iterator<Item = &'a PciDevice>,
     selected: Option<PciFunctionResource>,
@@ -504,7 +600,7 @@ fn resolve_registers<'a>(
     Ok(physical)
 }
 
-/// 在修改配置之前完成身份、cap 与 IRQ 映射，增长只发生于普通 Task。
+/// 扫描根总线（`bus = 0`）上的所有功能，在修改硬件配置前收集设备身份、Capability 链表、中断映射以及原始 BAR/`Command` 寄存器快照。
 fn collect_devices(
     root: &PciRoot<HostCam>,
     info: &BootInfo,
@@ -600,11 +696,11 @@ fn collect_devices(
             }
         }
     }
-    // 枚举器天然按 BDF 前进，保持此顺序避免发现完成时间改变设备编号。
+    // 枚举迭代器天然按 BDF 升序前进，保留此顺序以保证设备发现编号的确定性。
     Ok(pending)
 }
 
-/// Loongson 只接管显式 BDF 或已知功能 BAR 与直接窗口精确同址的设备，保留其他集成功能。
+/// 在龙芯平台上判断根总线功能 `bdf` 是否属于启动信息选定的板载 AHCI 或 GMAC 外设，并在匹配时返回其中断源编号。
 fn selected_native(
     root: &PciRoot<HostCam>,
     info: &BootInfo,
@@ -640,7 +736,7 @@ fn selected_native(
                 continue;
             }
             bar?;
-            // 仅已知集成 AHCI/GMAC 的错误 pin 按功能号修正，其他功能使用配置声明。
+            // 龙芯集成 AHCI/GMAC 配置空间的 Interrupt Pin 寄存器可能未按多功能规范报告，此处按 `1 + (function % 4)` 计算实际路由引脚。
             let pin = if identity.vendor_id == PCI_VENDOR_LOONGSON
                 && matches!(
                     identity.device_id,
@@ -694,7 +790,7 @@ fn selected_native(
     Ok(source)
 }
 
-/// 一次探测与分配全部 BAR，原生窗口和 IRQ 验证成功后才写入地址并启用 DMA。
+/// 对所有候选功能统一执行 BAR 尺寸探测、总线地址分配与原生外设窗口核对，全部验证通过后才将 BAR 地址写回硬件并开启地址解码与总线主控（DMA）。
 fn configure_resources(
     root: &mut PciRoot<HostCam>,
     pending: &mut [PendingDevice],
@@ -703,7 +799,7 @@ fn configure_resources(
 ) -> Result<(), ProbeError> {
     let host = &info.pci;
     let decode = Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER;
-    // 保存的原始配置覆盖全部函数；确认关闭以后才允许尺寸探测。
+    // Step 1: 暂时关闭所有候选功能的 I/O、Memory 地址解码与 Bus Master DMA，并回读确认硬件已关闭解码，以便安全地写全 1 探测 BAR 尺寸。
     for entry in pending.iter() {
         root.set_command(entry.device.bdf(), entry.command & !decode);
         if root
@@ -717,10 +813,12 @@ fn configure_resources(
         }
     }
 
+    // Step 2: 探测每个候选功能的 6 个 BAR 槽位类型与所需空间大小。
     for entry in pending.iter_mut() {
         entry.bar_info = root.bars(entry.device.bdf())?;
     }
 
+    // Step 3: 扫描固件已预设的非零 BAR 地址，若合法且落在主桥窗口内则率先登记到地址占用表 `occupied` 中，避免后续新分配与之冲突。
     for entry in pending.iter() {
         for bar in entry.bar_info.iter().flatten() {
             let (domain, address, size) = bar_address(bar);
@@ -732,11 +830,12 @@ fn configure_resources(
                 } else if translate(host, domain, address, size).is_ok() {
                     reserve(occupied, domain, address, size)?;
                 }
-                // 内存 BAR 的固件地址若不在 host 窗口，由下一轮清零后按窗口重分配。
+                // 若内存 BAR 的固件预设地址不在主桥允许窗口内，此处暂不登记，留待 Step 4 清零并重新分配。
             }
         }
     }
 
+    // Step 4: 为每个内存 BAR 确定最终总线地址（保留合法的固件地址，或清零寄存器后从主桥 MEM32 窗口分配新区间）并换算 CPU 物理地址。
     for entry in pending.iter_mut() {
         for (index, bar) in entry.bar_info.iter().enumerate() {
             let Some(bar) = bar else { continue };
@@ -756,7 +855,7 @@ fn configure_resources(
             {
                 existing
             } else {
-                // 固件留下的地址不在 host 窗口（或为零）时，清零后按窗口重新分配。
+                // 当固件未分配地址（0）或原地址超出主桥窗口时，先将硬件 BAR 清零，再在 MEM32 窗口内分配对齐的空闲区间。
                 match address_type {
                     MemoryBarType::Width64 => root.set_bar_64(entry.device.bdf(), index as u8, 0),
                     _ => root.set_bar_32(entry.device.bdf(), index as u8, 0),
@@ -773,6 +872,7 @@ fn configure_resources(
         }
     }
 
+    // Step 5: 在真正向硬件写入新 BAR 地址前，校验板级 AHCI 与 GMAC 原生外设的 BAR 映射及中断号是否完全匹配。
     if let Some(resources) = info.board.ahci {
         resolve_registers(
             pending.iter().map(|entry| &entry.device),
@@ -794,7 +894,7 @@ fn configure_resources(
         )?;
     }
 
-    // 全部地址和占用已成功验证，之后的配置写入不分配。
+    // Step 6: 所有地址与占用校验均已通过，将最终 BAR 总线地址写入硬件配置空间并回读核对，随后开启 MEMORY_SPACE 与 BUS_MASTER。
     for entry in pending.iter() {
         for (index, selected) in entry.device.bars.iter().enumerate() {
             let Some(selected) = selected else { continue };
@@ -841,7 +941,7 @@ fn configure_resources(
     Ok(())
 }
 
-/// 配置失败恢复原地址后再恢复 command，不在部分配置状态启用 decode。
+/// 当 BAR 分配或校验失败时，先关闭所有候选功能的地址解码，再将全部 BAR 与 `Command` 寄存器恢复为枚举前的原始固件值。
 fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice]) {
     for entry in pending {
         root.set_command(
@@ -873,7 +973,7 @@ fn restore_configuration(root: &mut PciRoot<HostCam>, pending: &[PendingDevice])
     }
 }
 
-/// 把 BAR 类型转换为占用地址域；32/64 位内存 BAR 共享同一内存地址域。
+/// 提取 `BarInfo` 所属的地址空间域（[`IO_DOMAIN`] 或 [`MEMORY_DOMAIN`]）、当前总线地址及字节大小。
 fn bar_address(bar: &BarInfo) -> (u8, u64, u64) {
     match bar {
         BarInfo::IO { address, size } => (IO_DOMAIN, u64::from(*address), u64::from(*size)),
@@ -881,7 +981,7 @@ fn bar_address(bar: &BarInfo) -> (u8, u64, u64) {
     }
 }
 
-/// 检查对齐、大小和 BAR 编码的可寻址上限，不截断真实总线地址。
+/// 校验给定 BAR 的尺寸是否为 2 的幂、总线地址是否按尺寸自然对齐，以及区间末尾是否未超出该 BAR 位宽类型的可寻址上限。
 fn validate_bar_address(bar: &BarInfo, address: u64) -> Result<(), ProbeError> {
     let (_, _, size) = bar_address(bar);
     let end = address
@@ -906,7 +1006,7 @@ fn validate_bar_address(bar: &BarInfo, address: u64) -> Result<(), ProbeError> {
     Ok(())
 }
 
-/// 返回 PCI range 所属 IO 或内存地址域，属性位不改变地址域身份。
+/// 根据主桥地址转换窗口（`PciRange`）的标志位返回其所属的地址空间域（I/O 域或内存域）。
 fn range_domain(range: &PciRange) -> u8 {
     match range.flags & PCI_SPACE_CODE_MASK {
         PCI_SPACE_IO => IO_DOMAIN,
@@ -915,7 +1015,7 @@ fn range_domain(range: &PciRange) -> u8 {
     }
 }
 
-/// checked bus→CPU PA 换算，只接受 host 实际提供的完整窗口。
+/// 将 PCI 总线域 `domain` 内的区间 `[address, address + size)` 通过主桥 `ranges` 表换算为 CPU 物理地址区间 [`Region`]。
 fn translate(
     host: &PciResources,
     domain: u8,
@@ -953,7 +1053,7 @@ fn translate(
     ))
 }
 
-/// 保存既存或新分配 BAR 的占用，拒绝同域重叠；容量在探测前已经准备。
+/// 在已占用地址表 `occupied` 中登记区间 `[start, start + size)`，若与同一地址域内的既有区间重叠则返回 [`ProbeError::Resource`]。
 fn reserve(
     occupied: &mut Vec<Occupied>,
     domain: u8,
@@ -973,7 +1073,7 @@ fn reserve(
     Ok(())
 }
 
-/// 所有未配置内存 BAR 固定在 MEM32 窗口找空洞；64 位 BAR 也合法使用低地址。
+/// 在主桥 `MEM32` 地址窗口中按 `size` 自然对齐要求搜寻第一块未占用的空闲总线地址区间，并在登记占用后返回其起始总线地址。
 fn allocate(
     host: &PciResources,
     occupied: &mut Vec<Occupied>,
@@ -1031,7 +1131,9 @@ fn allocate(
 mod configuration_checks {
     use super::*;
 
-    /// 两种 Loongson 配置空间与隐藏功能边界保持硬件绑定的独立地址公式。
+    /// 测试目标：验证龙芯 CFG0（标准 256B）与 CFG1（扩展 4096B）配置空间偏移计算公式，以及根总线 Root Port 非零隐藏功能的拦截逻辑。
+    /// 场景步骤：分别计算 Bus 0 SATA 设备、Bus 2 下游设备在标准/扩展偏移处的地址，并查询 Bus 0 Device 9 Function 1 隐藏功能。
+    /// 预期结果：标准与扩展偏移均精确匹配龙芯硬件位域公式（含 Type 1 标志位），越界偏移或隐藏功能返回 `None`。
     #[test]
     fn loongson_configuration_offsets() {
         let sata = DeviceFunction {
@@ -1059,7 +1161,9 @@ mod configuration_checks {
         assert_eq!(loongson_offset(hidden, 0, false), None);
     }
 
-    /// BAR 规则由实际设备身份或显式 AHCI 类别确定，不随其他非空 BAR 改变。
+    /// 测试目标：验证原生 AHCI 与 GMAC 控制器对应 BAR 槽位索引的选择规则。
+    /// 场景步骤：分别传入龙芯集成 AHCI、标准 PCI 类别 AHCI、龙芯两代单通道 GMAC 以及不匹配的厂商/设备 ID。
+    /// 预期结果：龙芯 AHCI/GMAC 返回 BAR0，标准 AHCI 返回 BAR5，其余不支持的设备组合均返回 `Err`。
     #[test]
     fn native_device_bar_rules() {
         assert_eq!(ahci_bar(0x0014, 0x7a08, 0).unwrap(), 0);
@@ -1073,7 +1177,9 @@ mod configuration_checks {
         assert!(gmac_bar(0x1234, 0x7a03, 0x020000).is_err());
     }
 
-    /// 配置身份不充当 MMIO；直接窗口只允许同起点的有界描述并返回完整 BAR。
+    /// 测试目标：验证原生外设直接描述的寄存器区间与 PCI BAR 物理区间的对齐与包含关系校验（`normalize_window`）。
+    /// 场景步骤：传入缺省区间、完整匹配的 BAR 区间、同起点的子区间，以及起点偏移、超出 BAR 长度或空的异常区间。
+    /// 预期结果：合法配置返回完整的 PCI BAR 物理区间，起点不一致、越界或非 PCI 空区间均返回 `Err`。
     #[test]
     fn native_complete_register_windows() {
         let bar = Region::from_size(0x400e_0000, 0x10000).unwrap();

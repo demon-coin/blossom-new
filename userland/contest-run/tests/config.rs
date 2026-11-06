@@ -1,3 +1,26 @@
+//! `contest-run` 测试计划配置加载（`config`）与用例选择展开（`selection`）集成测试集。
+//!
+//! # 模块职责与架构定位
+//! 本文件作为 `contest-run` 的外部集成测试，针对 [`contest_run::config::load`] 与 [`contest_run::selection::resolve`] 构成的完整输入与选择流水线进行端到端验证，覆盖：
+//! 1. 多文件引入顺序、目标根目录（`roots`）迭代顺序、通配符（Glob）匹配与排除（`exclude`）规则；
+//! 2. 命令行显式子配置文件列表覆盖与防递归引入保护；
+//! 3. `Exec`、Shell 与 LTP `runtest` 清单命令的参数原样保留语义；
+//! 4. 多级环境变量合并、`override` 精确覆盖、重复 ID 去重与冲突检测；
+//! 5. 目标根目录下的相对/绝对符号链接（Symlink）受限解析行为。
+//!
+//! # 测试夹具与隔离布局（[`Tree`]）
+//! ```text
+//! $TMPDIR/contest-config-<pid>-<seq>/    <-- Tree(PathBuf) 独立临时目录（Drop 时自动清理）
+//! ├── plan.toml                          <-- 顶层测试计划文件
+//! ├── sets/*.toml / override.toml        <-- 子步骤文件与覆盖规则文件
+//! └── root/                              <-- 模拟的目标系统根目录 (roots.a / roots.b)
+//!     ├── catalog / run-dynamic.sh       <-- 文本测试清单
+//!     └── cases/* / basic/*              <-- 具有 0o755 权限的可执行脚本或符号链接
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! 各测试用例通过全局原子计数器 [`NEXT`] 生成互不冲突的临时子目录，支持 `cargo test` 多线程并行运行，无需共享互斥锁。
+
 use contest_run::config;
 use contest_run::model::{CommandSpec, Protocol};
 use contest_run::selection;
@@ -8,12 +31,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// 用于为每个测试实例分配唯一临时目录序号的全局原子递增计数器。
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// 单个测试用例独占的临时目录夹具（RAII 守卫，在析构时自动递归删除整个目录）。
 struct Tree(PathBuf);
 
 impl Tree {
-    /// 每例拥有独立临时目录，不读取开发者比赛盘。
+    /// 在系统临时目录下创建一个带进程号与递增序号的独立测试目录。
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "contest-config-{}-{}",
@@ -24,25 +49,25 @@ impl Tree {
         Self(path)
     }
 
-    /// 返回测试树内的实际文件路径。
+    /// 将相对路径拼接到当前测试临时目录根路径下，返回完整路径。
     fn path(&self, relative: &str) -> PathBuf {
         self.0.join(relative)
     }
 
-    /// 建立真实清单和计划文件，文件内容通过生产代码读取。
+    /// 在测试临时目录内创建指定相对路径的文件（自动创建缺失的父目录）并写入文本内容。
     fn put(&self, relative: &str, contents: &str) {
         let path = self.path(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
     }
 
-    /// 可执行目录使用真实脚本和权限，数据文件保持不可执行。
+    /// 在测试临时目录内创建一个最小可执行 Shell 脚本，并将其权限位设置为 `0o755`。
     fn executable(&self, relative: &str) {
         self.put(relative, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(self.path(relative), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// 两个名称不同的 root 共享内容，便于核对显式 roots 顺序。
+    /// 生成指向同一个 `root` 子目录的两个根目录（`roots.a` 与 `roots.b`）的 TOML 配置片段，用于测试多 `roots` 展开顺序。
     fn roots(&self) -> String {
         format!(
             "[roots.a]\npath = {:?}\ncwd = '/'\n[roots.b]\npath = {:?}\ncwd = '/'\n",
@@ -51,7 +76,7 @@ impl Tree {
         )
     }
 
-    /// 从同一生产入口加载并展开指定计划。
+    /// 加载指定相对路径的测试计划文件，并按 `"riscv64"` 架构解析展开为 [`contest_run::model::ResolvedCase`] 列表。
     fn resolve(&self, plan: &str) -> Result<Vec<contest_run::model::ResolvedCase>, String> {
         let config = config::load(&self.path(plan), &[])?;
         selection::resolve(&config, "riscv64")
@@ -59,13 +84,17 @@ impl Tree {
 }
 
 impl Drop for Tree {
-    /// 仅删除本例临时输入，不触及仓库构建或报告目录。
+    /// 测试结束时递归清理当前测试实例创建的临时目录。
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
 
-/// 多文件、roots、include、标准 glob 与 catalog 的顺序分别得到保留。
+/// 验证多配置文件、`roots` 列表、`include` 精确名与通配符（Glob）、`exclude` 排除项的展开顺序及源文件行号溯源。
+///
+/// - **测试目标**：确认 `selection::resolve` 严格按照文件顺序 -> `roots` 顺序 -> `include` 顺序 -> 清单行顺序生成用例，并准确记录清单文件路径与行号。
+/// - **场景步骤**：构造包含两个子文件、两个 root（`['b', 'a']`）、多条 `include` 模式与 `exclude` 过滤的测试计划并解析。
+/// - **预期结果**：返回的 ID 序列与预期顺序完全一致，且 `source` 元数据准确指向 `/catalog` 第 2 行。
 #[test]
 fn multifile_order_globs_exclude_and_locations() {
     let tree = Tree::new();
@@ -108,7 +137,11 @@ fn multifile_order_globs_exclude_and_locations() {
     assert_eq!(cases[1].source.line, Some(2));
 }
 
-/// CLI 文件列表只替换入口 files，根和 defaults 仍属于入口。
+/// 验证命令行显式传入的子文件列表会替换顶层 `files` 字段，且子文件不允许再次嵌套声明 `files`。
+///
+/// - **测试目标**：确保 CLI 文件覆盖只替换步骤文件列表而不丢失顶层 `defaults` 与 `roots`，同时拒绝递归包含。
+/// - **场景步骤**：先用 `chosen.toml` 替换不存在的默认 `files` 并验证解析结果；再向 `chosen.toml` 写入嵌套 `files` 字段。
+/// - **预期结果**：首次解析继承了顶层 `timeout_sec = 17`；二次加载因检测到子文件中的 `files` 字段而报错。
 #[test]
 fn cli_files_replace_without_recursive_loading() {
     let tree = Tree::new();
@@ -134,7 +167,11 @@ fn cli_files_replace_without_recursive_loading() {
     assert!(error.contains("chosen.toml") && error.contains("files"));
 }
 
-/// 关闭或架构不适用的选择不读取清单，也不运行任何准备或 Hook。
+/// 验证被禁用（`enabled = false`）或架构不匹配的测试步骤不会读取清单文件，且解析阶段不执行任何 `prepare`、`setup` 或 `cleanup` 命令。
+///
+/// - **测试目标**：保证配置解析与选择阶段无任何外部命令执行副作用，且未启用的步骤不要求其清单路径存在。
+/// - **场景步骤**：配置带 `touch` 副作用的 `prepare`/`setup`/`cleanup` 命令，以及指向不存在清单的禁用步骤和非当前架构步骤，调用 `resolve`。
+/// - **预期结果**：仅选中当前架构下启用的 `active` 步骤，且文件系统上未产生 `must-not-exist` 标记文件。
 #[test]
 fn disabled_arch_and_list_have_no_side_effects() {
     let tree = Tree::new();
@@ -154,7 +191,11 @@ fn disabled_arch_and_list_have_no_side_effects() {
     assert!(!marker.exists());
 }
 
-/// exec 与 Shell 交错不改变 argv，LTP 原文也不被拆词重建。
+/// 验证 `exec`、LTP `runtest` 与 `shell` 步骤混合出现时，空参数、含空格/Unicode 参数及原始 Shell 命令行文本均原样保留。
+///
+/// - **测试目标**：确保 `exec` 参数不被拆词，且 LTP 清单中的命令尾部空白、引号与管道符号不被破坏。
+/// - **场景步骤**：构造包含空字符串与多字节字符的 `exec` 步骤、带管道与尾部空格的 LTP 步骤及 `shell` 步骤并解析。
+/// - **预期结果**：各用例的 `CommandSpec` 与输入完全吻合。
 #[test]
 fn mixed_commands_preserve_empty_arguments_and_shell_text() {
     let tree = Tree::new();
@@ -185,7 +226,11 @@ fn mixed_commands_preserve_empty_arguments_and_shell_text() {
     );
 }
 
-/// 原清单的环境赋值、引号、空参数和管道交给实际 Shell 执行。
+/// 验证从 LTP `runtest` 清单提取出的命令文本在交由 `/bin/sh -c` 执行时保持完整的 Shell 语法语义。
+///
+/// - **测试目标**：确认清单命令中的内联环境变量赋值、单双引号嵌套、空位置参数和管道可由 Shell 正常解析执行。
+/// - **场景步骤**：解析包含复杂 Shell 表达式的 LTP 条目，并实际调用 `Command::new(shell).args(["-c", command])` 运行。
+/// - **预期结果**：子进程成功退出，标准输出精确匹配 `"<two words><>"`。
 #[test]
 fn runtest_tail_runs_with_original_shell_semantics() {
     let tree = Tree::new();
@@ -203,7 +248,11 @@ fn runtest_tail_runs_with_original_shell_semantics() {
     assert_eq!(output.stdout, b"<two words><>");
 }
 
-/// 各层环境按 key 合并，覆盖中的 argv、setup、cleanup 整字段替换。
+/// 验证精确 ID 覆盖（`[[override]]`）按层级合并环境变量，并对 `args`、`setup`、`cleanup` 等数组字段执行整体替换。
+///
+/// - **测试目标**：确认 `defaults` -> `root` -> `step` -> `override` 四层配置的合并与覆盖优先级符合设计规范。
+/// - **场景步骤**：在四层配置中分别设置同名与异名环境变量及 `setup`/`cleanup` 数组，解析并检查最终生成的 `ResolvedCase`。
+/// - **预期结果**：环境变量保留各层非冲突键且同名键取最高优先级值；数组字段完全被 `override` 中的新数组替换。
 #[test]
 fn exact_override_merges_environment_and_replaces_arrays() {
     let tree = Tree::new();
@@ -233,7 +282,11 @@ fn exact_override_merges_environment_and_replaces_arrays() {
     assert!(case.hooks);
 }
 
-/// 重复命中保留第一次来源；真正冲突必须由精确覆盖或新 ID 解决。
+/// 验证重复命中同一用例 ID 时的幂等去重、语义冲突报错以及通过 `[[override]]` 统一冲突字段的行为。
+///
+/// - **测试目标**：确保完全相同的重复定义保留首次来源，存在差异的重复定义显式报错，且可通过 `override` 消解冲突。
+/// - **场景步骤**：先在两个子文件中定义完全相同的 `same` 步骤；再将第二个改为不同程序路径触发冲突；最后添加 `fix.toml` 覆盖 `program`。
+/// - **预期结果**：语义相同时去重保留 `one.toml` 来源；语义不同时报错指出两个来源文件；添加覆盖后两者收敛为同一语义并通过解析。
 #[test]
 fn duplicate_semantics_conflict_and_explicit_override() {
     let tree = Tree::new();
@@ -273,7 +326,11 @@ fn duplicate_semantics_conflict_and_explicit_override() {
     );
 }
 
-/// 覆盖不复活未选择项，冲突覆盖不采用最后一个值。
+/// 验证 `[[override]]` 拒绝未选中的目标 ID，并拒绝同一 ID 的多条覆盖规则在同一字段或环境变量上设置不同值。
+///
+/// - **测试目标**：防止拼写错误的覆盖 ID 被静默忽略，并杜绝多条覆盖规则之间的隐式先后覆盖歧义。
+/// - **场景步骤**：依次测试指向未选中 ID 的覆盖、同一字段赋予不同值的两条覆盖、同一环境变量赋予不同值的两条覆盖，以及补充不同字段（或相同值）的两条合法覆盖。
+/// - **预期结果**：前三者均返回包含具体位置与冲突字段名的错误，最后一种合法组合成功合并。
 #[test]
 fn overrides_reject_unselected_ids_and_field_conflicts() {
     let tree = Tree::new();
@@ -303,7 +360,11 @@ fn overrides_reject_unselected_ids_and_field_conflicts() {
     assert_eq!((cases[0].repeat, cases[0].timeout_sec), (2, 23));
 }
 
-/// 缺名、空模式与全排除分别保留具体来源、root 和原目录。
+/// 验证清单名称未命中、通配符未命中、排除后为空以及全局无选中用例时的错误定位信息。
+///
+/// - **测试目标**：确保选择阶段的所有空结果错误都准确报告对应的步骤位置、目标 `root` 名称与清单路径。
+/// - **场景步骤**：分别使用不存在的精确名、不匹配的通配符、将唯一匹配项排除的配置以及全部禁用的步骤调用 `resolve`。
+/// - **预期结果**：每次调用均返回包含预期错误分类关键词与源文件位置的错误信息。
 #[test]
 fn selection_errors_report_the_actual_source() {
     let tree = Tree::new();
@@ -337,7 +398,11 @@ fn selection_errors_report_the_actual_source() {
         .contains("empty selection"));
 }
 
-/// 所有 typed 输入层拒绝未知字段；被引用文件不能再次声明 include 树。
+/// 验证所有 TOML 配置层级均拒绝未知拼写错误字段，且被引入的子文件禁止再次声明 `files` 或 `override_files`。
+///
+/// - **测试目标**：确保配置反序列化启用严格字段校验（`deny_unknown_fields`），并限制文件包含关系为单层树结构。
+/// - **场景步骤**：依次向顶层、`[defaults]`、`[roots]`、`[[step]]`、`[[override]]` 注入拼写错误的字段名，并在子文件中声明 `override_files`。
+/// - **预期结果**：所有非法输入均在 `config::load` 阶段立即报错并指出具体文件名。
 #[test]
 fn unknown_fields_and_nested_files_are_rejected_at_input() {
     let tree = Tree::new();
@@ -372,7 +437,11 @@ fn unknown_fields_and_nested_files_are_rejected_at_input() {
         .contains("unknown field"));
 }
 
-/// 根名、路径、期限和命令形状的错误在输入处失败，不等到执行时吞掉。
+/// 验证缺失必填字段、未知 `root` 引用、零超时/零重复次数、路径穿越 `cwd`、命令类型混用及非法通配符在加载阶段被拦截。
+///
+/// - **测试目标**：确保配置语义校验在 `config::load` 阶段完成，不将非法参数留到执行阶段。
+/// - **场景步骤**：遍历 9 种典型的非法 `[[step]]` 配置片段并调用 `config::load`。
+/// - **预期结果**：所有用例均返回包含 `"plan.toml:entry 1"` 的校验错误。
 #[test]
 fn invalid_fields_and_missing_required_values_are_rejected() {
     let tree = Tree::new();
@@ -394,7 +463,11 @@ fn invalid_fields_and_missing_required_values_are_rejected() {
     }
 }
 
-/// 目录来源只选择真实可执行项并排序，basic 命令使用实际 basic 目录。
+/// 验证基于目录扫描的测试步骤（`source = 'executables'` 与 `kind = 'basic'`）仅选取具有可执行权限的普通文件并按字典序排列。
+///
+/// - **测试目标**：确认目录扫描自动跳过不可执行的数据文件与子目录，且 `basic` 步骤默认将工作目录设为该可执行目录。
+/// - **场景步骤**：在测试根目录下创建两个可执行脚本、一个普通文本文件和一个子目录，解析 `ltp`（`executables` 模式）与 `basic` 步骤。
+/// - **预期结果**：仅 `alpha`、`zeta` 与 `mmap` 被选中并按字母序排列，`basic` 用例的 `cwd` 为 `/basic` 且协议为 `Protocol::Basic`。
 #[test]
 fn executable_source_and_basic_use_actual_root_directories() {
     let tree = Tree::new();
@@ -431,7 +504,11 @@ fn executable_source_and_basic_use_actual_root_directories() {
     assert!(error.contains("runtest-missing") && error.contains("No such file"));
 }
 
-/// libctest 的可选名称来自原脚本，不生成缺失项，也不猜测聚合程序 selector。
+/// 验证 `libctest` 步骤严格解析 `./runtest.exe -w entry-<variant>.exe <SELECTOR>` 格式的清单行，并拒绝变体名称不匹配的条目。
+///
+/// - **测试目标**：确保 `libctest` 清单解析器按行序提取测试选择器（Selector），保留原始参数并校验 `entry-<variant>.exe` 一致性。
+/// - **场景步骤**：构造 `run-dynamic.sh` 与 `run-static.sh` 清单并解析；随后将 `run-dynamic.sh` 中的入口程序篡改为 `entry-static.exe` 再次解析。
+/// - **预期结果**：合法清单按序生成 `Pre2025Libctest` 协议用例；篡改后的清单在报告第 1 行位置后返回解析错误。
 #[test]
 fn fixed_libctest_preserves_variant_selector_and_original_argv() {
     let tree = Tree::new();
@@ -478,7 +555,11 @@ fn fixed_libctest_preserves_variant_selector_and_original_argv() {
         .contains("run-dynamic.sh:1"));
 }
 
-/// 千项实际清单有序展开，精确选一项后只执行该原命令并留下唯一标记。
+/// 验证包含 1000 个条目的大型测试清单能够保序展开，且单条精确选择后仅执行目标命令。
+///
+/// - **测试目标**：检验清单解析器在千级条目规模下的顺序稳定性与精确筛选隔离性。
+/// - **场景步骤**：生成含 1000 条命令的清单，先用通配符全选验证数量与首尾 ID，再精确选择 `case0591` 并通过 Shell 实际运行该条命令。
+/// - **预期结果**：全选阶段不产生任何执行副作用文件；单选并运行后仅生成 `marker-0591` 一个标记文件。
 #[test]
 fn thousand_entry_catalog_and_single_selected_execution() {
     let tree = Tree::new();
@@ -521,7 +602,11 @@ fn thousand_entry_catalog_and_single_selected_execution() {
     assert_eq!(markers, vec![std::ffi::OsString::from("marker-0591")]);
 }
 
-/// root 覆盖只修正已选 ID 的运行视图，环境和缺省 cwd 来自明确的新 root。
+/// 验证通过 `[[override]]` 修改 `root` 字段可消解两个步骤在不同 `root` 下定义相同 ID 的冲突，并自动继承新 `root` 的默认工作目录与环境变量。
+///
+/// - **测试目标**：确认 `override` 中的 `root` 覆盖在构造 `ResolvedCase` 的环境与默认 `cwd` 之前生效。
+/// - **场景步骤**：在两个子文件中定义同名步骤 `same`（分别指向 `a` 和 `b`），通过 `override` 将 `same` 的 `root` 统一指定为 `b`；随后测试指向未声明 `root` 的覆盖。
+/// - **预期结果**：`same` 的最终 `root` 为 `b`、`cwd` 为 `/second`、环境变量仅包含 `roots.b` 的 `VIEW=b`（不含 `roots.a` 的 `OLD`）；未声明的 `root` 触发报错。
 #[test]
 fn root_override_resolves_duplicate_root_semantics_without_reselection() {
     let tree = Tree::new();
@@ -547,7 +632,11 @@ fn root_override_resolves_duplicate_root_semantics_without_reselection() {
         .contains("unknown root"));
 }
 
-/// directory 与 catalog 分属不同来源，禁用条目也不能带矛盾的配置字段。
+/// 验证 LTP 步骤的 `source = 'executables'` 与 `source = 'runtest'` 严格区分 `directory` 与 `catalog` 字段，即便步骤被禁用也不允许混用。
+///
+/// - **测试目标**：确保配置 schema 校验在步骤禁用时依然生效，防止 `directory` 与 `catalog` 混填或同时填写。
+/// - **场景步骤**：在 `enabled = false` 的 LTP 步骤中遍历 4 种 `source`/`directory`/`catalog` 的非法组合并调用 `config::load`；最后测试合法的禁用配置。
+/// - **预期结果**：4 种矛盾组合均在加载阶段报错；合法的禁用步骤不访问缺失目录并正常返回其余启用步骤。
 #[test]
 fn directory_and_catalog_are_not_implicit_aliases() {
     let tree = Tree::new();
@@ -566,7 +655,11 @@ fn directory_and_catalog_are_not_implicit_aliases() {
     assert_eq!(tree.resolve("plan.toml").unwrap()[0].id, "active");
 }
 
-/// basic 的原始选择名不受自定义 root 名和后续 program 覆盖影响。
+/// 验证 `basic` 类型测试在被 `[[override]]` 覆盖 `program` 路径后，其结果判定协议（`Protocol::Basic`）仍保留原始测试名称。
+///
+/// - **测试目标**：确保输出协议中的期望测试名与用例初始选择名绑定，不因执行程序路径被覆盖而改变。
+/// - **场景步骤**：选择 `basic:unusual:mkdir_` 并通过 `override` 将其 `program` 替换为 `/other/program`。
+/// - **预期结果**：生成的用例命令变为 `/other/program`，但 `protocol` 仍为 `Protocol::Basic { name: "mkdir_" }`。
 #[test]
 fn basic_protocol_keeps_original_name_after_command_override() {
     let tree = Tree::new();
@@ -592,7 +685,11 @@ fn basic_protocol_keeps_original_name_after_command_override() {
     );
 }
 
-/// 相对链接的可执行目标参与目录选择，稳定 ID 和执行路径保留原别名。
+/// 验证可执行目录下的相对符号链接（Symlink）在指向有效可执行文件时可被正常选中，且用例 ID 与执行路径保留符号链接别名。
+///
+/// - **测试目标**：确认目录扫描跟随符号链接检查目标文件可执行权限，同时保留链接本身的名称与路径供子进程调用。
+/// - **场景步骤**：在 `root/cases/alias` 创建指向 `../bin/probe` 可执行文件的相对符号链接，并在 LTP `executables` 模式下选择 `alias`。
+/// - **预期结果**：生成 ID 为 `ltp:a:elf:alias`，执行程序路径为 `/cases/alias`。
 #[test]
 fn executable_relative_symlink_preserves_alias_program_and_id() {
     let tree = Tree::new();
@@ -616,7 +713,11 @@ fn executable_relative_symlink_preserves_alias_program_and_id() {
     );
 }
 
-/// 清单的绝对链接从指定 root 解析，来源和命令仍保存原输入。
+/// 验证指向目标根目录内部路径的绝对符号链接清单（如 `/catalog -> /sources/catalog`）会相对于目标根目录解析，而非穿透到宿主机根目录。
+///
+/// - **测试目标**：确保 `rooted_path` 在遇到绝对符号链接时将其重定根到当前选择的 `root` 下，同时 `source.catalog` 保留配置中的原始路径。
+/// - **场景步骤**：在 `root/catalog` 创建指向 `"/sources/catalog"` 的绝对符号链接，解析引用 `/catalog` 的 LTP 步骤。
+/// - **预期结果**：成功从 `root/sources/catalog` 读取到命令内容，且 `source.catalog` 仍记录为 `/catalog`。
 #[test]
 fn absolute_catalog_symlink_reads_from_selected_root() {
     let tree = Tree::new();
@@ -640,7 +741,11 @@ fn absolute_catalog_symlink_reads_from_selected_root() {
     assert_eq!(cases[0].source.line, Some(1));
 }
 
-/// 目录与清单来源的中间绝对链接都留在指定 root，执行路径不展开链接。
+/// 验证包含中间目录绝对符号链接的路径（如 `/linked/cases` 与 `/linked/catalog`，其中 `/linked -> /sources`）在目标根内正确解析且不改写执行路径。
+///
+/// - **测试目标**：确认路径中间组件为绝对符号链接时，无论是目录扫描还是文本清单读取都能限制在目标根目录内完成。
+/// - **场景步骤**：将 `root/linked` 设为指向 `"/sources"` 的绝对符号链接，分别通过 `/linked/cases` 和 `/linked/catalog` 选择测试。
+/// - **预期结果**：两个步骤均成功解析，且可执行路径与 `source.catalog` 均保留未展开前的 `/linked/...` 原始路径。
 #[test]
 fn intermediate_directory_symlink_sources_read_from_selected_root() {
     let tree = Tree::new();
@@ -680,7 +785,11 @@ fn intermediate_directory_symlink_sources_read_from_selected_root() {
     );
 }
 
-/// libctest 的原相对 runtest 命令继承显式 root cwd，不强制切回根目录。
+/// 验证 `libctest` 步骤未显式指定 `cwd` 时，自动继承所属 `root` 配置的默认工作目录（如 `cwd = '/libc-test'`），使 `./runtest.exe` 相对路径得以正确定位。
+///
+/// - **测试目标**：确保 `libctest` 条目自身不强制覆盖 `cwd`，从而允许通过 `root.cwd` 或 `step.cwd` 指定 `runtest.exe` 所在的实际目录。
+/// - **场景步骤**：在 `[roots.a]` 中设置 `cwd = '/libc-test'`，并在 `root/libc-test/run-dynamic.sh` 中放置相对路径命令，解析该步骤。
+/// - **预期结果**：生成的用例 `cwd` 为 `/libc-test`，命令保持 `./runtest.exe -w entry-dynamic.exe argv`。
 #[test]
 fn libctest_inherits_explicit_root_cwd_and_original_command() {
     let tree = Tree::new();

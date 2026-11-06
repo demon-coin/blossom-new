@@ -1,4 +1,52 @@
-//! 固定 Sv39/QEMU virt 后端；SBI 只使用 TIME、IPI、HSM、SRST。
+//! RISC-V 64 位（Sv39）架构核心支持模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块作为 `riscv64` 架构层的根模块（通过 `crate::arch` 导出），向上层内核子系统（引导、内存管理、
+//! 进程调度、中断与定时器、设备驱动）提供统一的硬件抽象接口，并协调 `entry`、`mmu`、`trap`、`switch`、
+//! `user`、`signal`、`uaccess`、`rtc` 等子模块。支持 QEMU `virt` 虚拟机与 StarFive VisionFive 2
+//! （JH7110）真实开发板两类平台。
+//!
+//! # 核心机制与硬件位域布局
+//! 1. **Sv39 页表项（PTE）与 `satp` 寄存器格式**：
+//!    采用三级页表（L2 1GiB、L1 2MiB、L0 4KiB），虚拟地址有效位宽 39 位（高半核高 25 位全为 1）：
+//!    ```text
+//!    Sv39 PTE (64-bit):
+//!    +-------+-------+-+---+-+---+-+-+-+-+-+-+-+-+
+//!    | 63:54 | 53:10 |9| 8 |7| 6 |5|4|3|2|1|0|
+//!    +-------+-------+-+---+-+---+-+-+-+-+-+-+-+-+
+//!    | Rsrvd |  PPN  | RSW |D| A |G|U|X|W|R|V|
+//!    +-------+-------+-+---+-+---+-+-+-+-+-+-+-+-+
+//!      - V (bit 0): 有效位
+//!      - R/W/X (bits 1..=3): 读/写/执行权限；全 0 表示指向下一级页表的非叶节点
+//!      - U (bit 4): 用户态可访问
+//!      - A/D (bits 6..=7): 访问位（Accessed）与脏位（Dirty）
+//!      - PPN (bits 53:10): 44 位物理页号（等于物理地址右移 12 位后再左移 10 位）
+//!
+//!    satp CSR (64-bit):
+//!    +---------------+------------------+----------------------------+
+//!    | 63:60 (MODE)  | 59:44 (ASID)     | 43:0 (PPN)                 |
+//!    +---------------+------------------+----------------------------+
+//!    | 8 = Sv39      | 0 (未使用)       | 根页表 4KiB 物理页号       |
+//!    +---------------+------------------+----------------------------+
+//!    ```
+//! 2. **最终内核页表（`FINAL_TABLES`）静态预算与 `no-map` 扣除**：
+//!    主核在 `finish_boot_mappings` 中根据设备树（DTB）解析出的真实 RAM 区间、保留的 `no-map` 空洞以及
+//!    板载外设（UART、PLIC、RTC、SiFive ccache、时钟/复位/引脚控制器、MMC、GMAC、AHCI、VirtIO、PCI）
+//!    构建最终内核页表。满足 2MiB 对齐且跨度不少于 2MiB 的区间优先采用 L1 2MiB 大页，其余拆分为 L0 4KiB 小页。
+//! 3. **PLIC 外部中断控制器固定路由与掩码策略**：
+//!    `external_init` 将所有合法外部中断源的使能位固定绑定到主核（CPU 0）的 S-mode context，并将阈值设为 0。
+//!    运行期的中断屏蔽（`external_mask`）与解屏蔽（`external_unmask`）通过将对应中断源的 `priority` 设为 `0` 或 `1`
+//!    实现，从而在不改动使能路由位图的前提下保留已完成 `claim` 的中断源执行 `complete` 的资格。
+//! 4. **SBI 固件调用边界**：
+//!    仅使用标准 SBI v0.2+ 的四个扩展：`TIME`（定时器编程）、`IPI`（核间软件中断）、`HSM`（从核唤醒）与
+//!    `SRST`（整机关机与冷重启）。
+//!
+//! # 锁获取顺序与并发契约
+//! - `FINAL_TABLES` 与 `RV_FINAL_SATP` 仅在主核关中断且从核尚未通过 HSM 唤醒前由主核独占构建并发布；
+//!   发布后在内核生命周期内只读。
+//! - PLIC 的每个外部中断源 `priority` 寄存器由上层 `crate::irq` 中对应中断号描述符的自旋锁串行化保护；
+//!   PLIC 的 S-mode `claim/complete` 寄存器按 CPU 分离，仅由本核在关中断的硬中断上下文（`HardIrqGuard`）中访问。
+//! - `tp` 寄存器在 `install_cpu_local` 完成后恒指向当前物理核的 `CpuLocal`，严禁跨核共享或修改。
 use crate::{
     boot::{
         BootInfo, Region, MAX_DEVICE_CLOCKS, MAX_DEVICE_PINS, MAX_DEVICE_RESETS,
@@ -46,7 +94,7 @@ pub use uaccess::{copy_user_bytes, load_user_u32, store_user_u32};
 pub use user::{exit_offset, fault_offset, loop_offset, loop_spin_offset, user_code};
 pub use user::{run_user, signal_return_code, UserContext};
 
-// Sv39 每级索引占 9 位，PTE 的 PPN 从位 10 开始，物理页号从基本页边界开始。
+// Sv39 页表几何参数与页表项（PTE）位域掩码：每级索引占 9 位（512 项），PPN 从 bit 10 开始。
 pub(crate) const PT_INDEX_BITS: usize = 9;
 const PT_ENTRIES: usize = PAGE_SIZE / size_of::<usize>();
 pub(crate) const PT_INDEX_MASK: usize = PT_ENTRIES - 1;
@@ -128,7 +176,7 @@ const SBI_SRST_SHUTDOWN: usize = 0;
 const SBI_SRST_COLD_REBOOT: usize = 1;
 const SBI_SRST_REASON_NONE: usize = 0;
 
-/// 当前唯一编译目标的架构名称。
+/// 当前编译目标的架构名称常量。
 pub const NAME: &str = "riscv64";
 
 extern "C" {
@@ -136,11 +184,14 @@ extern "C" {
     static __secondary_entry_phys: u8;
 }
 
-// medany 的 PC 相对取址不能直接到达物理/直映绝对符号；从本地 literal 读取地址值。
+// RISC-V medany 代码模型的 PC 相对寻址范围（±2GiB）无法直接跨越虚拟高半核与物理低地址；
+// 此宏将符号绝对值放入当前代码段的 8 字节对齐文字池（literal pool）并通过 `ld` 读出。
 macro_rules! address {
     ($name:ident) => {{
         let value: usize;
-        // SAFETY: literal 与指令同处内核只读映射，链接器填入符号值，汇编只读取该对齐 literal。
+        // SAFETY:
+        // 1. 文字池标签 `2f` 与指令同处已映射的内核只读代码段，且通过 `.balign 8` 保证 8 字节对齐。
+        // 2. 链接器负责将 `$name` 的符号地址填入 `.quad`，汇编随后立即 `j 3f` 跳过该数据字，不会将其作为指令执行。
         unsafe {
             asm!("lla {value}, 2f", "ld {value}, 0({value})", "j 3f",
                  ".balign 8", "2: .quad {symbol}", "3:",
@@ -151,6 +202,7 @@ macro_rules! address {
     }};
 }
 
+/// 4KiB 对齐的 Sv39 单级页表结构（内部元组字段 `0` 为按虚拟地址 9 位索引排列的 512 个 64 位 PTE 数组）。
 #[repr(C, align(4096))]
 struct PageTable([usize; PT_ENTRIES]);
 #[no_mangle]
@@ -165,65 +217,81 @@ static mut FINAL_TABLES: [PageTable; MAX_BOOT_TABLES] =
 #[no_mangle]
 static mut RV_FINAL_SATP: usize = 0;
 
+/// 内核态陷入（S-mode Trap）时在当前内核栈上保存的完整寄存器现场。
+///
+/// 由 `trap::rv_trap_entry` 汇编入口按固定偏移填充，并作为可变引用传递给 [`rv_handle_trap`]。
 #[repr(C, align(16))]
 struct KernelTrapFrame {
+    /// 32 个通用整数寄存器 `x0`–`x31`（其中 `gpr[0]` 恒写 0，`gpr[2]` 保存陷入前的内核栈指针 `sp`）。
     gpr: [usize; 32],
+    /// 陷入发生时的程序计数器（`sepc` CSR）。
     sepc: usize,
+    /// 陷入发生时的处理器状态寄存器（`sstatus` CSR）。
     sstatus: usize,
+    /// 陷入原因寄存器（`scause` CSR，最高位区分异步中断与同步异常）。
     scause: usize,
+    /// 陷入附加值寄存器（`stval` CSR，如缺页地址或非法指令内容）。
     stval: usize,
-    // FS 为 Off 时汇编不写入这些字段；Rust 不读取未保存的浮点现场。
+    /// 32 个 64 位双精度浮点寄存器 `f0`–`f31`。
+    /// 当陷入前 `sstatus.FS` 为 `Off` 时汇编跳过保存，因此使用 `MaybeUninit` 避免 Rust 侧产生未初始化读取。
     fpr: MaybeUninit<[u64; 32]>,
+    /// 浮点控制与状态寄存器（`fcsr`）。同样仅在陷入前 `sstatus.FS != Off` 时由汇编保存。
     fcsr: MaybeUninit<usize>,
 }
 
-/// 在 IRQ 关闭的调度交接段切换整数调用现场，恢复后使用目的 CPU 的 CpuLocal。
+/// 在本地中断关闭的调度切换临界区内切换整数调用现场，恢复后继续使用目标 CPU 的 `CpuLocal`。
 ///
 /// # Safety
-/// 当前执行拥有者必须独占两个有效、对齐且不重叠的上下文；prev 可写，next 已初始化。
-/// next 的栈与返回地址必须有效且按 16 字节对齐，两个执行栈均须存活到各自恢复或退出。
-/// 调用者必须已关闭 IRQ，不能持普通 IRQ/锁/preempt guard 跨此调用；
-/// 普通内核 FS 必须为 Off，受控浮点测试不得调用此接口。
+/// 1. 调用方必须已关闭本地中断（`!irq_enabled()`），且不得持有普通自旋锁、`IrqSaveGuard` 或抢占守卫跨越此调用。
+/// 2. 当前 CPU 的 `sstatus.FS` 必须为 `Off`（普通内核任务不持有未保存的浮点寄存器状态）。
+/// 3. `prev` 与 `next` 必须指向有效、对齐且互不重叠的 [`TaskContext`]：`prev` 由当前切出任务独占可写，
+///    `next` 已完成初始化且其保存的栈指针按 16 字节对齐、返回地址有效；两个任务的内核栈必须在各自恢复或退出前保持存活。
 pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
     assert!(!irq_enabled(), "task switch requires IRQ disabled");
     let status: usize;
-    // SAFETY: S-mode 可读取本核 sstatus；只检查普通内核不持有浮点现场的调用约束。
+    // SAFETY: 当前运行在 S-mode，`csrr sstatus` 仅读取本核状态寄存器以断言浮点单元处于关闭状态，不读写内存或栈。
     unsafe { asm!("csrr {0}, sstatus", out(reg) status, options(nomem, nostack)) };
     assert_eq!(status & SR_FS, 0, "task switch requires FS Off");
-    // SAFETY: 调用者保证上下文独占、栈/返回地址有效和交接生命周期；上面已检查 IRQ 与 FS。
+    // SAFETY: 前置 `assert!` 已确认本地中断关闭且 `sstatus.FS == Off`；其余指针有效性、栈对齐与生命周期由调用方契约保证。
     unsafe { rv_switch_context(prev, next) };
 }
 
-/// 在可调度的普通 Task 中跨真实 yield 检验全部 callee-saved、SP 与返回地址。
+/// 在可调度的普通内核任务中跨越一次真实的 `yield_now` 验证全部被调用者保存寄存器、`sp` 与返回地址完整性。
 #[cfg(feature = "ktest")]
 pub fn test_task_context_preservation() -> bool {
-    // SAFETY: Rust 入口提供对齐普通调用栈；生产 yield 统一检查 Task、IRQ 和原子上下文，
-    // switch_context 检查 FS Off；汇编恢复调用者 callee-saved，并始终保留目的 CPU 的 tp。
+    // SAFETY:
+    // 1. 当前由 `ktest` 在可调度的普通内核任务上下文中调用，Rust 函数入口保证当前栈满足 16 字节 ABI 对齐。
+    // 2. 内部调用的 `yield_now` 与 `switch_context` 会验证任务状态、中断开关与 `sstatus.FS == Off`。
+    // 3. `rv_task_context_roundtrip` 在返回前会完整恢复本函数的被调用者保存寄存器，并保持当前 CPU 的 `tp` 不变。
     unsafe { rv_task_context_roundtrip() != 0 }
 }
 
-/// 排序 coherent DMA 内存写入；通知设备 MMIO 时还须使用完整设备屏障。
+/// 执行一致性 DMA（Coherent DMA）写内存屏障，确保 CPU 先前对 DMA 缓冲区的写入在后续描述符发布前全局可见。
+///
+/// 若后续操作涉及通知外设 MMIO 寄存器，还须配合完整的 [`dma_barrier`]。
 pub(super) fn dma_write_barrier() {
-    // SAFETY: 当前内核在 S-mode 执行，fence w,w 仅排序内存写入，不改变寄存器
-    // 或地址空间；不声明 nomem/readonly，使编译器同样保留内存排序约束。
+    // SAFETY: S-mode 下执行 `fence w, w` 仅对内存写操作排序，不修改寄存器或地址空间；
+    // 省略 `nomem`/`readonly` 选项可同时充当编译器内存屏障。
     unsafe { asm!("fence w, w", options(nostack)) };
 }
 
-/// 在观察设备写入的完成标记后，排序随后 coherent 内存读取。
+/// 执行一致性 DMA（Coherent DMA）读内存屏障，确保在观察到设备完成标志后再读取 DMA 缓冲区负载数据。
 pub(super) fn dma_read_barrier() {
-    // SAFETY: S-mode 可执行 fence r,r；指令不解引用额外地址，汇编保留 memory 副作用。
+    // SAFETY: S-mode 下执行 `fence r, r` 仅对内存读操作排序；省略 `nomem`/`readonly` 同时阻止编译器重排读访存。
     unsafe { asm!("fence r, r", options(nostack)) };
 }
 
-/// 对 coherent 内存及设备 MMIO 执行完整双向排序。
+/// 对普通内存（`rw`）与外设 MMIO（`io`）执行全序双向屏障（`fence iorw, iorw`）。
 pub(super) fn dma_barrier() {
-    // SAFETY: S-mode 可执行 fence iorw,iorw，覆盖 CPU 内存及设备输入输出访问；
-    // 汇编不声明 nomem/readonly，编译器也不能跨该指令移动内存访问。
+    // SAFETY: S-mode 下执行 `fence iorw, iorw` 强制排序屏障前后的全部内存与 MMIO 读写，同时阻止编译器跨屏障重排访存。
     unsafe { asm!("fence iorw, iorw", options(nostack)) };
 }
 
-/// 对完整隔离的 64B 物理行执行 ccache clean+invalidate，未知机制不返回成功。
+/// 对非一致性 DMA 缓冲区关联的 64 字节对齐物理缓存行执行 SiFive L2 Composable Cache（ccache）写回并失效（Clean + Invalidate）。
+///
+/// 仅在 VisionFive 2（JH7110）平台上受支持；若平台不匹配、物理区间未按缓存行对齐或超出有效 RAM 范围则返回 `Err`。
 pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static str> {
+    // Step 1: 校验当前平台为 VisionFive 2，且物理区间满足 64 字节缓存行对齐、FLUSH64 窗口可用并完全落在有效 RAM 内。
     let info = crate::boot::info();
     if info.platform != crate::boot::Platform::VisionFive2 {
         return Err("RISC-V noncoherent DMA cache maintenance is unsupported");
@@ -249,10 +317,13 @@ pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static st
         return Err("ccache DMA range is outside RAM");
     }
 
+    // Step 2: 在写回缓存行前后各执行一次全序 I/O 屏障，并按 64 字节步长向 ccache FLUSH64 寄存器写入物理地址。
     dma_barrier();
     for line in (physical..end).step_by(SIFIVE_CCACHE_LINE_SIZE) {
-        // SAFETY: 已验证完整 FLUSH64 窗口和八字节对齐，最终页表永久映射 ccache；
-        // 每次写入 RV64 完整 PA，调用者的 DMA owner 已隔离整行并串行 CPU/设备访问。
+        // SAFETY:
+        // 1. 前置检查已确认当前平台为 VisionFive 2，`resource` 包含完整的 `FLUSH64` 寄存器窗口且起始地址 8 字节对齐。
+        // 2. `finish_boot_mappings` 已在最终内核页表中永久映射 `board.ccache` 的 MMIO 窗口。
+        // 3. `physical..end` 已验证落在有效物理 RAM 内且按 64 字节缓存行对齐，向 `FLUSH64` 写入物理地址仅触发硬件缓存刷回与失效。
         unsafe {
             ((mmio_address(resource.start) + SIFIVE_CCACHE_FLUSH64) as *mut u64)
                 .write_volatile(line as u64)
@@ -262,18 +333,20 @@ pub fn dma_cache_flush(physical: usize, length: usize) -> Result<(), &'static st
     Ok(())
 }
 
-/// 从固件原始参数取得真实 BSP hart ID。
+/// 从固件传入的原始启动参数数组（`a0`–`a3`）中提取主核（BSP）的硬件 hart ID（位于 `a0`）。
 pub fn boot_hardware_id(args: [usize; 4]) -> usize {
     args[0]
 }
 
-/// 将实际 RAM 物理地址转换成直映地址；只计算地址，不证明该地址已经映射。
+/// 将物理 RAM 地址转换为高半核线性直映区（Direct Map）虚拟地址。
+///
+/// 仅执行常数偏移算术换算，调用方在解引用前需确保目标物理页属于已建立直映的有效 RAM（且不在 `no-map` 保留区内）。
 pub fn phys_to_virt(pa: usize) -> usize {
     (LINK_LAYOUT.direct_map_virt_base as usize)
         .wrapping_add(pa.wrapping_sub(LINK_LAYOUT.ram_phys_base as usize))
 }
 
-/// 转换内核镜像或 RAM 直映地址为物理地址。
+/// 将内核镜像高地址或高半核 RAM 线性直映区虚拟地址转换为对应的物理地址。
 pub fn virt_to_phys(va: usize) -> usize {
     if LINK_LAYOUT.kernel_link_virt as usize <= va {
         va - LINK_LAYOUT.kernel_link_virt as usize + LINK_LAYOUT.kernel_load_phys as usize
@@ -283,17 +356,20 @@ pub fn virt_to_phys(va: usize) -> usize {
     }
 }
 
-/// 计算物理设备地址在 MMIO 窗口中的位置；解引用者必须保证设备范围已映射。
+/// 将外设寄存器物理地址转换为高半核 MMIO 虚拟地址窗口中的对应地址。
+///
+/// 仅执行地址加偏计算，调用方在解引用前需确保该外设区间已由 `finish_boot_mappings` 映射。
 pub fn mmio_address(pa: usize) -> usize {
     (LINK_LAYOUT.mmio_virt_base as usize).wrapping_add(pa)
 }
 
-/// 取得最终页表池中的一张表，不创建可别名的 Rust 引用。
+/// 获取静态最终页表池 `FINAL_TABLES` 中第 `index` 张页表的首元素裸指针（不创建 Rust 引用以避免别名冲突）。
 ///
 /// # Safety
-/// `index` 必须小于 MAX_BOOT_TABLES；调用者必须独占尚未激活的最终表池。
+/// 1. `index` 必须严格小于 [`MAX_BOOT_TABLES`]。
+/// 2. 调用方（主核引导阶段）必须独占尚未激活或正在构建的 `FINAL_TABLES` 池。
 unsafe fn table(index: usize) -> *mut usize {
-    // SAFETY: 调用者保证索引落在完整的静态 PageTable 池内。
+    // SAFETY: 调用方契约保证 `index < MAX_BOOT_TABLES` 且当前主核独占 `FINAL_TABLES` 静态数组。
     unsafe {
         ptr::addr_of_mut!(FINAL_TABLES)
             .cast::<PageTable>()
@@ -302,15 +378,20 @@ unsafe fn table(index: usize) -> *mut usize {
     }
 }
 
-/// 将页对齐物理区间映射到连续 Sv39 虚拟地址，按需消耗最终表池。
+/// 将页对齐的物理地址区间 `[pa, end)` 映射到以 `va` 起始的连续 Sv39 高半核虚拟地址区间，按需从 `FINAL_TABLES` 分配子页表。
+///
+/// 若当前 2MiB 边界满足大页条件（见 [`huge_leaf`]），则直接写入 L1 2MiB 大页叶表项；否则向下分配 L0 页表并写入 4KiB 叶表项。
 ///
 /// # Safety
-/// BSP 必须独占未激活的表池；va/pa/end 必须页对齐、无地址溢出且位于实际映射窗口。
-/// va 必须为 Sv39 canonical 地址；已有非叶 PTE 必须仅指向该池，
-/// 映射不得覆盖既有叶项；next 必须是 1..=MAX_BOOT_TABLES 中首张未使用表的索引。
+/// 1. 只能由主核在 `FINAL_TABLES` 尚未写入 `satp` 前独占调用。
+/// 2. `va`、`pa`、`end` 必须按 4KiB 页对齐，满足 `pa <= end`，且 `[va, va + (end - pa))` 属于合法的 Sv39 高半核规范（canonical）虚拟地址。
+/// 3. 根表 `FINAL_TABLES[0]` 及已分配的各级非叶表项必须全部指向 `FINAL_TABLES` 池内的页表，且本次映射不得与已有叶表项重叠。
+/// 4. `*next` 必须为 `1..=MAX_BOOT_TABLES` 中第一张尚未分配的页表索引。
 unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next: &mut usize) {
-    // SAFETY: 调用者保证表池独占、地址范围有效；槽索引被限制到 512 项内，
-    // 新表的容量在取址前检查，非叶项只由本函数写入池中表的物理地址。
+    // SAFETY:
+    // 1. 调用方契约保证主核独占 `FINAL_TABLES`，且 `va`/`pa`/`end` 页对齐、不与既有叶表项重叠。
+    // 2. 各级索引通过 `& PT_INDEX_MASK` 限制在 `0..512` 内；分配新子表前通过 `assert!(*next < MAX_BOOT_TABLES)` 检查容量。
+    // 3. 非叶表项中的物理页号均由本函数从 `FINAL_TABLES` 池内页表换算写入，启动阶段的临时页表已覆盖整个镜像与表池的线性直映访问。
     unsafe {
         while pa < end {
             let huge = huge_leaf(va, pa, end);
@@ -343,24 +424,31 @@ unsafe fn map_range(mut va: usize, mut pa: usize, end: usize, flags: usize, next
     }
 }
 
-/// 判断当前真实映射前缀能否采用 2MiB 叶项，预算与 PTE 写入共用此规则。
+/// 判断当前映射游标 `(va, pa)` 到终点 `end` 的剩余前缀是否满足 L1 2MiB 大页映射条件。
+///
+/// 页表池容量预算（[`mapping_table_count`]）与实际写入页表项（[`map_range`]）共用此判定规则。
 fn huge_leaf(va: usize, pa: usize, end: usize) -> bool {
     (va | pa) & (PMD_SIZE - 1) == 0 && PMD_SIZE <= end - pa
 }
 
+/// 启动阶段待写入最终内核页表的单段连续虚拟到物理映射描述符。
 #[derive(Clone, Copy)]
 struct BootMapping {
+    /// 映射起始的 Sv39 高半核虚拟地址（按 4KiB 页对齐）。
     virtual_start: usize,
+    /// 映射对应的半开物理地址区间 `[start, end)`（按 4KiB 页对齐）。
     physical: Region,
+    /// 页表叶项权限与状态标志位（如 `KERNEL_DATA_FLAGS` 或叠加 `PTE_EXEC`）。
     flags: usize,
 }
 
-// 每套 setup 最多引用两组各八个时钟及其父源、三个复位和十六个引脚 provider。
-// UART 只有时钟，RTC、MMC、GMAC 各有完整 setup；重复 provider 在加入映射时合并。
-// MMC 卡检测 GPIO 单独保留一个 provider 位置，不能依赖它恰好与总线引脚同源。
+// 每个外设初始化配置（DeviceSetup）最多引用两组（entries 与 assigned）各 8 个时钟及其父时钟源、
+// 3 个复位控制器和 16 个引脚复用（pinctrl）控制器窗口。
+// UART 仅包含时钟配置，而 RTC、MMC、GMAC 各自拥有完整的 DeviceSetup；重复的控制器窗口在加入映射表时会自动合并。
+// MMC 卡检测 GPIO 额外预留 1 个独立的控制器窗口配额。
 const MAX_CLOCK_MAPPINGS: usize = 2 * (MAX_DEVICE_CLOCKS + MAX_DEVICE_CLOCKS);
 const MAX_SETUP_MAPPINGS: usize = MAX_CLOCK_MAPPINGS + MAX_DEVICE_RESETS + MAX_DEVICE_PINS;
-// 固定窗口为 UART、PLIC、RTC、ccache、PMC、PLL；原生设备另有 MMC/GMAC 各两窗与 AHCI 一窗。
+// 固定板级外设窗口共 6 个（UART、PLIC、RTC、ccache、PMC、PLL）；板载原生外设另含 MMC/GMAC 各 2 个窗口与 AHCI 1 个窗口。
 const MAX_FIXED_DEVICE_MAPPINGS: usize = 6;
 const MAX_NATIVE_DEVICE_MAPPINGS: usize = 2 + 2 + 1;
 const MAX_SETUP_DEVICES: usize = 3;
@@ -375,15 +463,17 @@ const MAX_BOOT_MAPPINGS: usize = 1
     + MAX_CLOCK_MAPPINGS
     + MAX_SETUP_DEVICES * MAX_SETUP_MAPPINGS
     + 1;
-// 不相交的 RAM bank 扣除 no-map 并集后，每个禁映射区间至多新增一个片段，
-// 总片段数不超过 RAM 数加 no-map 数。每个片段继续满足 VA/PA 的 2MiB 页内偏移相同。
-// Sv39 高半最多 256 张 L1；每段首尾至多各一张 L0，分裂后的片段也计入上界。
+// 互不重叠的物理 RAM 区间在扣除 no-map 保留区并集后，每段 no-map 空洞至多将一个连续 RAM 区间一分为二，
+// 因此分裂后的总片段数不超过 `MAX_MEMORY_REGIONS + MAX_RESERVED_REGIONS`，且每段仍保持 VA 与 PA 的 2MiB 页内偏移一致。
+// Sv39 高半核最多使用 256 张 L1 页表；每个映射片段的首尾非 2MiB 对齐边界至多各消耗 1 张 L0 页表。
 const MAX_BOOT_BRANCHES: usize = PT_HALF_ENTRIES + 2 * MAX_BOOT_MAPPINGS;
 const MAX_BOOT_TABLES: usize = 1 + MAX_BOOT_BRANCHES;
-// L0 与 L1 的预算键共享一个数组，高位标签只区分层级，不属于硬件 PTE。
+// 页表预算统计时，L0 与 L1 的去重键共用同一个数组；最高位标签仅用于区分 L0 与 L1 层级，不会写入硬件 PTE。
 const BOOT_BRANCH_L0_TAG: usize = 1 << (usize::BITS - 1);
 
-/// 从同一保留表读取 no-map 区间，向外取整以禁止映射任何相交页。
+/// 遍历 [`BootInfo`] 中标记为 `no-map` 的保留内存区，并将每段区间向外扩展到 4KiB 页边界。
+///
+/// 向外取整可确保任何与 `no-map` 保留区存在部分重叠的物理页都不会被映射到内核线性直映区。
 fn no_map_regions(info: &BootInfo) -> impl Iterator<Item = Region> + '_ {
     info.reserved[..info.reserved_count]
         .iter()
@@ -402,8 +492,10 @@ fn no_map_regions(info: &BootInfo) -> impl Iterator<Item = Region> + '_ {
         })
 }
 
-/// 在写入最终表前拒绝禁映射页覆盖仍存活的完整镜像、DTB 或 initrd。
-/// 镜像区间包含静态启动表池、BSP 栈及全部 BSS；普通保留区可以与 no-map 相交。
+/// 在构建最终页表前校验所有 `no-map` 物理区间是否与正在使用的内核镜像、DTB 或 initrd 发生冲突。
+///
+/// 内核镜像区间包含静态页表池、主核启动栈及全部 `.bss` 段；一旦被 `no-map` 挖空会导致切换页表后立即缺页崩溃。
+/// 未标记 `no-map` 的普通保留区仍保留线性直映，仅由物理页分配器跳过。
 pub(crate) fn validate_boot_no_map(info: &BootInfo, kernel: Region) -> Result<(), &'static str> {
     for region in no_map_regions(info) {
         if region.overlaps(kernel) {
@@ -419,7 +511,9 @@ pub(crate) fn validate_boot_no_map(info: &BootInfo, kernel: Region) -> Result<()
     Ok(())
 }
 
-/// 顺序产生单个 RAM bank 扣除无序 no-map 并集后的直映片段，不复制保留表。
+/// 按地址升序生成单个物理 `ram` 区间扣除全部 `no-map` 保留区并集后的可直映子区间迭代器。
+///
+/// 算法直接在无序的 `no-map` 列表上推进游标，无需额外分配缓冲区或对保留区数组排序。
 pub(crate) fn direct_map_regions(
     info: &BootInfo,
     mut ram: Region,
@@ -433,7 +527,7 @@ pub(crate) fn direct_map_regions(
             let start = ram.start;
             let mut end = ram.end;
             let mut covered_end = start;
-            // 每轮跨过一个覆盖游标的禁映射并集，或返回下一个空隙；重叠和相邻区间无需排序。
+            // 扫描所有与剩余 RAM 相交的 no-map 区间：若覆盖当前起点则推进 covered_end，否则收紧下一个可用片段的终点 end。
             for hole in no_map_regions(info) {
                 if hole.end <= start || ram.end <= hole.start {
                     continue;
@@ -455,7 +549,7 @@ pub(crate) fn direct_map_regions(
     })
 }
 
-/// 在建表之前核对页边界、canonical VA 和所有实际映射的虚拟范围不重叠。
+/// 校验单段映射的页对齐、2MiB 同余性、Sv39 高半核规范地址格式及虚拟区间不重叠性，并追加到 `mappings` 数组。
 fn add_mapping(
     mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
     count: &mut usize,
@@ -500,7 +594,7 @@ fn add_mapping(
     *count += 1;
 }
 
-/// 将全部真实 RAM bank 的剩余片段加入同一预检映射表，普通保留区仍保持直映。
+/// 将 [`BootInfo`] 中所有物理 RAM 区间（扣除 `no-map` 空洞后）加入待建表的映射数组。
 fn add_ram_mappings(
     info: &BootInfo,
     mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
@@ -519,7 +613,7 @@ fn add_ram_mappings(
     }
 }
 
-/// 将已验证设备范围向外取页边界，仅映射真实 CPU 物理窗口。
+/// 将外设物理寄存器范围向外扩展到 4KiB 页边界并加入 MMIO 映射表；若已被既有 MMIO 映射完全覆盖则跳过。
 fn add_device_mapping(
     mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
     count: &mut usize,
@@ -552,7 +646,7 @@ fn add_device_mapping(
     );
 }
 
-/// 设备使用的时钟、复位与引脚控制器只按真实 provider 建立 MMIO，不生成虚构窗口。
+/// 将外设所需的时钟、复位与引脚控制器（pinctrl）寄存器窗口加入 MMIO 映射表。
 fn add_setup_mappings(
     mappings: &mut [BootMapping; MAX_BOOT_MAPPINGS],
     count: &mut usize,
@@ -576,7 +670,9 @@ fn add_setup_mappings(
     }
 }
 
-/// 按真实映射所触及的唯一 L1/L0 计算表数，在写表前拒绝超出同源静态池的输入。
+/// 统计给定的映射集合总共需要消耗多少张 Sv39 页表（含 1 张 L2 根表以及所有触及的唯一 L1/L0 子页表）。
+///
+/// 在真正修改 `FINAL_TABLES` 前预检所需的页表总数，若超出静态池容量则触发 `assert!`。
 fn mapping_table_count(mappings: &[BootMapping]) -> usize {
     let mut branches = [usize::MAX; MAX_BOOT_BRANCHES];
     let mut count = 0;
@@ -596,7 +692,7 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
                     count += 1;
                 }
             }
-            // 同一 2MiB 槽内的后续小页共用这张 L0，无需为预算逐页重复查找。
+            // 同一个 2MiB 虚拟槽位内的后续 4KiB 小页共享同一张 L0 页表，游标可直接跨到当前 2MiB 边界或区间终点。
             let step = (PMD_SIZE - (va & (PMD_SIZE - 1))).min(mapping.physical.end - pa);
             va += step;
             pa += step;
@@ -605,7 +701,7 @@ fn mapping_table_count(mappings: &[BootMapping]) -> usize {
     1 + count
 }
 
-/// 在独占测试快照上执行正式 RAM 分裂和表池预检，不写入或安装任何页表。
+/// 在 `ktest` 测试的独立 [`BootInfo`] 快照上执行 RAM `no-map` 分裂与页表池容量预检，返回 `(映射片段数, 所需页表总数)`。
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_ram_mapping_budget(info: &BootInfo) -> (usize, usize) {
     let empty = BootMapping {
@@ -619,13 +715,14 @@ pub(crate) fn ktest_ram_mapping_budget(info: &BootInfo) -> (usize, usize) {
     (count, mapping_table_count(&mappings[..count]))
 }
 
-/// 在 AP 释放前为实际 RAM、UART、RTC、控制器、MMIO 槽和 PCI 资源安装最终 PTE。
+/// 在唤醒从核（AP）前构建并激活最终的 Sv39 内核页表（涵盖内核镜像、RAM 直映区以及全部板载/总线外设 MMIO 窗口）。
 ///
 /// # Safety
-/// 只能由关闭 IRQ 的 BSP 在使用 bootstrap 表且 AP 尚未释放时调用一次。
-/// info 描述真实 RAM/设备，RAM 覆盖当前栈、CpuLocal、页表池及全部内核资源；
-/// 不得与其他页表访问并发。IO ranges 不作为内存或 DMA RAM 映射。
+/// 1. 只能由主核（BSP）在本地中断已关闭、当前仍运行在临时启动页表（`RV_BOOT_ROOT`）上且从核尚未启动时调用一次。
+/// 2. `info` 必须准确描述当前平台的物理 RAM 与外设布局，且有效 RAM 区间必须完整覆盖当前栈、`CpuLocal`、`FINAL_TABLES` 及内核镜像。
+/// 3. 调用期间不得有任何其他执行流并发访问 `FINAL_TABLES` 或 `RV_FINAL_SATP`。
 pub unsafe fn finish_boot_mappings(info: &BootInfo) {
+    // Step 1: 校验 no-map 保留区不会挖空存活的内核镜像、DTB 或 initrd。
     let kernel = Region {
         start: LINK_LAYOUT.kernel_load_phys as usize,
         end: address!(__kernel_phys_end)
@@ -635,6 +732,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     };
     validate_boot_no_map(info, kernel).expect("Sv39 boot no-map conflict");
 
+    // Step 2: 收集内核高地址镜像映射与扣除 no-map 后的物理 RAM 线性直映区间。
     let empty = BootMapping {
         virtual_start: 0,
         physical: Region { start: 0, end: 0 },
@@ -651,6 +749,7 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
     );
     add_ram_mappings(info, &mut mappings, &mut count);
 
+    // Step 3: 收集固定板级外设（UART、PLIC、RTC、ccache、PMC、PLL）以及 MMC、GMAC、AHCI、VirtIO、PCI 的 MMIO 窗口。
     for region in [
         info.interrupts.uart,
         info.interrupts.controller,
@@ -709,9 +808,12 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         }
     }
 
+    // Step 4: 预算页表池需求，清零并填写 FINAL_TABLES，发布 RV_FINAL_SATP 并切换当前主核的 satp。
     let required = mapping_table_count(&mappings[..count]);
-    // SAFETY: BSP 独占未激活表池，全部 VA/PA 范围及准确表数已经核对；
-    // 内核与 RAM 直映保证切表后取指、栈和表遍历有效，AP 只消费完成发布的 SATP。
+    // SAFETY:
+    // 1. 当前主核在关中断且从核未启动的状态下独占 `FINAL_TABLES` 与 `RV_FINAL_SATP`。
+    // 2. `add_mapping` 与 `mapping_table_count` 已完成虚拟区间不重叠校验与页表池容量核对（`required <= MAX_BOOT_TABLES`）。
+    // 3. 新页表完整包含当前正在执行的内核高地址镜像段与主核栈所在的 RAM 直映区，因此 `csrw satp` 与 `sfence.vma` 后取指与访存平滑衔接。
     unsafe {
         ptr::write_bytes(
             ptr::addr_of_mut!(FINAL_TABLES).cast::<u8>(),
@@ -733,35 +835,38 @@ pub unsafe fn finish_boot_mappings(info: &BootInfo) {
         asm!("fence rw, rw", "csrw satp, {0}", "sfence.vma", in(reg) RV_FINAL_SATP, options(nostack));
     }
 
+    // Step 5: 最终 MMIO 映射生效后，通知控制台子系统绑定串口与复位资源。
     crate::console::configure_resources(info);
 }
 
-/// 安装本核唯一 CpuLocal 基址，随后 trap 与普通代码共享该对象。
+/// 将当前物理核的 [`CpuLocal`] 基地址写入 `tp`（`x4`）寄存器，供后续普通内核代码与中断处理路径读取。
 ///
 /// # Safety
-/// local 必须非空、对齐且指向已初始化、永久存活的本核 CpuLocal；
-/// 本核必须关闭 IRQ，且不得把同一个对象安装给其他 CPU。
+/// 1. `local` 必须非空、满足 `CpuLocal` 对齐要求，且指向已完成初始化、在内核整个生命周期内永久存活的本核专属 `CpuLocal` 实例。
+/// 2. 调用时本核必须处于本地中断关闭状态，且严禁将同一个 `CpuLocal` 实例安装给多个不同的 CPU。
 pub unsafe fn install_cpu_local(local: *const CpuLocal) {
-    // SAFETY: 调用者保证 local 的本核归属与永久生命周期；tp 是内核专用基址寄存器。
+    // SAFETY: 调用方契约保证 `local` 独占且永久有效；内核约定 `tp` 寄存器专用于存放本核 `CpuLocal` 指针。
     unsafe {
         asm!("mv tp, {0}", in(reg) local, options(nostack));
     }
 }
 
-/// 读取本核 CpuLocal 基址。
+/// 读取当前物理核 `tp` 寄存器中保存的 [`CpuLocal`] 裸指针。
 pub fn cpu_local() -> *const CpuLocal {
     let value;
-    // SAFETY: 只读取内核专用 tp，不解引用；未安装时由 cpu::current 拒绝空指针。
+    // SAFETY: 仅读取 `tp` 寄存器数值而不解引用；若尚未安装（值为 0），上层 `cpu::current` 会拦截空指针。
     unsafe {
         asm!("mv {0}, tp", out(reg) value, options(nomem, nostack));
     }
     value
 }
 
-/// 关闭本核旧事件并安装可恢复 kernel trap。
+/// 初始化当前 CPU 的 S-mode 陷阱向量与中断使能掩码：安装 [`rv_trap_entry`]、清零 `sscratch`、关闭浮点单元并开启软件/定时器/外部中断源。
 pub fn init_current_cpu() {
-    // SAFETY: Rust 引导入口保证 S-mode、内核代码映射及专用栈；stvec 指向
-    // 按 KernelTrapFrame 布局保存现场的入口，关闭 FS 后 Rust 不使用浮点寄存器。
+    // SAFETY:
+    // 1. 主从核引导入口保证调用时处于 S-mode，内核镜像与本核栈已建立有效映射。
+    // 2. `stvec` 指向遵循 `KernelTrapFrame` 协议的 `rv_trap_entry`，`sscratch` 置 0 表示当前处于 S-mode 内核态。
+    // 3. 清除 `sstatus.FS` 确保普通内核代码不使用浮点寄存器；写入 `sie` 仅开放具体中断源，全局中断仍受 `sstatus.SIE` 控制。
     unsafe {
         asm!(
             "csrw stvec, {trap}", "csrw sscratch, zero", "csrci sip, {ssip}",
@@ -773,23 +878,25 @@ pub fn init_current_cpu() {
     disable_timer();
 }
 
-/// 保存并关闭本地中断；memory clobber 阻止临界区内存访问越过关 IRQ 边界。
+/// 原子地读取当前 `sstatus` 并清除 `SIE` 位以关闭本核中断，返回关闭前的完整 `sstatus` 值。
+///
+/// 内联汇编默认带编译器内存屏障（未声明 `nomem`），可防止临界区内的内存读写被编译器重排到关中断指令之前。
 pub fn irq_save() -> usize {
     let saved;
-    // SAFETY: 内核运行于 S-mode；仅清除本核 SIE，并返回原状态供同核恢复。
+    // SAFETY: 内核运行于 S-mode，`csrrci` 原子清除本核 `sstatus.SIE` 并返回原值供配对的 `irq_restore` 使用。
     unsafe {
         asm!("csrrci {saved}, sstatus, {sie}", saved = out(reg) saved, sie = const SR_SIE, options(nostack));
     }
     saved
 }
 
-/// 仅恢复保存的 SIE 位；memory clobber 阻止受保护访问越过恢复边界。
+/// 根据配对 [`irq_save`] 保存的状态值恢复本核 `sstatus.SIE` 中断使能位。
 ///
 /// # Safety
-/// saved 必须来自本核对应的 irq_save；所有受保护访问和锁释放必须已经完成，
-/// 嵌套保存必须按逆序恢复，不能借此在原本关闭 IRQ 的上下文中开启 IRQ。
+/// 1. `saved` 必须来自当前同一物理核上配对的 [`irq_save`] 返回值。
+/// 2. 临界区内的受保护内存访问与自旋锁释放必须已完成；嵌套保存必须严格按后进先出（LIFO）逆序恢复。
 pub unsafe fn irq_restore(saved: usize) {
-    // SAFETY: 调用者保证同核、逆序恢复及临界区结束，只恢复 SIE，不覆盖其他状态位。
+    // SAFETY: 调用方契约保证在同一 CPU 上按逆序恢复且临界区已结束；分支仅修改 `sstatus.SIE` 位，不篡改其他状态位。
     unsafe {
         if saved & SR_SIE != 0 {
             asm!("csrsi sstatus, {sie}", sie = const SR_SIE, options(nostack));
@@ -799,39 +906,41 @@ pub unsafe fn irq_restore(saved: usize) {
     }
 }
 
-/// 查询本地中断是否使能。
+/// 查询当前 CPU 的本地中断是否处于开启状态（即 `sstatus.SIE != 0`）。
 pub fn irq_enabled() -> bool {
     let s: usize;
-    // SAFETY: S-mode 可读取本核 sstatus，本操作不改变 IRQ 状态或内存。
+    // SAFETY: S-mode 下读取 `sstatus` CSR 无任何内存或状态副作用。
     unsafe {
         asm!("csrr {0}, sstatus", out(reg) s, options(nomem, nostack));
     }
     s & SR_SIE != 0
 }
 
-/// 开启本地中断；memory clobber 保持初始化写入和后续 online 发布位于正确边界。
+/// 开启当前 CPU 的本地中断（置位 `sstatus.SIE`）。
+///
+/// 内联汇编隐含编译器内存屏障，保证此前完成的初始化写入在中断开启前全部落地。
 pub fn enable_interrupts() {
-    // SAFETY: 两种 Rust 引导入口在允许调用此接口前安装本核现场、trap 与 IRQ 处理资源。
+    // SAFETY: 调用本函数前，主从核引导流程均已完成 `CpuLocal`、`stvec` 陷阱入口与中断控制器初始化。
     unsafe {
         asm!("csrsi sstatus, {sie}", sie = const SR_SIE, options(nostack));
     }
 }
 
-/// 等待本地硬件事件。
+/// 执行 `wfi`（Wait for Interrupt）指令使当前 CPU 进入低功耗等待，直到本地有待处理中断事件唤醒。
 pub fn wait_for_interrupt() {
-    // SAFETY: S-mode 的 wfi 仅等待事件，trap 使用已经安装的本核栈与入口。
+    // SAFETY: S-mode 下执行 `wfi` 仅挂起流水线等待中断事件，本核栈与 `stvec` 陷阱入口已在引导阶段就绪。
     unsafe {
         asm!("wfi", options(nomem, nostack));
     }
 }
 
-/// 关闭全局 SIE 时复查提示并执行 WFI，随后临时服务 IRQ，返回保持 IRQ 关闭。
+/// 在本地中断关闭（`sstatus.SIE == 0`）的状态下原子检查唤醒标志并执行一次无丢失唤醒的 `wfi` 休眠，随后短暂开启中断响应挂起事件。
 ///
 /// # Safety
-/// 仅允许本核永久 boot/scheduler 栈上的最终等待边界调用：IRQ 关闭、无普通任务、
-/// 锁或 IRQ/BH/preempt guard，允许临时服务 IRQ，栈不得迁移或回收。
-/// kick_pending 与测试计数是本核永久字段；wake_pending 在本次调用期间地址稳定，
-/// 所有原子只能原子访问，唤醒方按所属协议发表条件并通知本核；trap 与独立 IRQ 源已使能。
+/// 1. 仅允许在当前 CPU 专属的引导栈或调度器空闲栈（Idle Stack）顶层循环中调用：调用时必须满足 `!irq_enabled()`，
+///    且未持有任何自旋锁、下半部（Bottom Half）守卫或抢占守卫。
+/// 2. `kick_pending`（及 `ktest` 下的 `wait_completions`）必须为当前 CPU 的永久原子字段，`wake_pending` 在本次调用期间必须保持有效。
+/// 3. 当前 CPU 的 `stvec` 陷阱入口及 `sie` 中的具体中断源（IPI、Timer、External）必须已使能。
 pub(crate) unsafe fn idle_once(
     kick_pending: &AtomicUsize,
     wake_pending: &AtomicBool,
@@ -839,15 +948,18 @@ pub(crate) unsafe fn idle_once(
 ) {
     assert!(!irq_enabled(), "idle entry requires IRQ off");
     if kick_pending.load(Ordering::Acquire) == 0 && !wake_pending.load(Ordering::Acquire) {
-        // SAFETY: 调用者保证 S-mode、本核有效 trap 栈与独立使能的 IRQ 源。
-        // WFI 在全局 SIE 关闭时仍由独立使能源的 pending 唤醒，通知不会在检查与等待间被消费。
+        // SAFETY:
+        // 1. 前置 `assert!` 确认 `sstatus.SIE == 0`，因此在检查 `kick_pending`/`wake_pending` 到执行 `wfi` 之间不会被本核中断抢占。
+        // 2. 根据 RISC-V 特权架构规范，当 `sstatus.SIE == 0` 但 `sie` 中对应中断源已使能时，新到达的 IPI/定时器中断会使 `sip`
+        //    挂起并直接唤醒或跳过 `wfi`，从而消除“检查标志后、休眠前”的唤醒丢失竞态（Lost Wakeup）。
         unsafe { asm!("wfi", options(nostack)) };
         #[cfg(feature = "ktest")]
         wait_completions.fetch_add(1, Ordering::Release);
     }
 
-    // SAFETY: 调用者保证无锁且可服务 IRQ；无论是否执行 WFI 都开放一次处理 pending，
-    // 再关闭 SIE 返回本核等待边界，不恢复任何旧 CPU 的 IRQ 状态。
+    // SAFETY:
+    // 1. 调用方契约保证当前未持有任何锁且栈允许响应中断。
+    // 2. 置位 `sstatus.SIE` 执行一条 `nop` 后立即清除 `SIE`，让硬件立刻陷入并处理刚才唤醒 `wfi` 的挂起中断，处理返回后恢复关中断状态。
     unsafe {
         asm!(
             "csrsi sstatus, {sie}",
@@ -859,32 +971,39 @@ pub(crate) unsafe fn idle_once(
     };
 }
 
-/// 读取真实硬件时间计数器。
-/// RISC-V 的 `time` 是系统级共享计数器，不存在每核补偿寄存器。
+/// 建立硬件时间计数器的基准纪元（Epoch）。
+///
+/// RISC-V 的 `time` CSR 由平台级统一时钟源（CLINT / ACLINT mtime）驱动，所有物理核天生共享同一时间轴，因此无需校准每核偏移。
 pub fn establish_counter_epoch() {}
 
-/// RISC-V 的 `time` 已由平台共享，各核无需写入补偿。
+/// 将时间基准纪元补偿值应用到当前 CPU。
+///
+/// RISC-V 各核共享统一的 `time` 计数器，无需写入每核偏移寄存器。
 ///
 /// # Safety
-/// 无架构前置条件；保留为与 LoongArch 启动顺序一致的接口。
+/// 仅作为与多架构（如 LoongArch64）统一启动流程的空操作接口，无硬件前置要求。
 pub unsafe fn apply_counter_epoch() {}
 
+/// 读取当前硬件时间计数器（`time` CSR，通过 `rdtime` 伪指令获取）。
 pub fn read_counter() -> u64 {
     let value;
-    // SAFETY: 固件已向 S-mode 开放 time 计数器；读取不涉及内存或修改计时状态。
+    // SAFETY: OpenSBI 固件已在启动时向 S-mode 开放 `time` CSR 读取权限（`mcounteren.TM = 1`），`rdtime` 不访问内存也不改变处理器状态。
     unsafe {
         asm!("rdtime {0}", out(reg) value, options(nomem, nostack));
     }
     value
 }
 
-/// 返回启动时解析的 timebase-frequency。
+/// 返回设备树（DTB）中解析出的硬件时间计数器频率（`timebase-frequency`，单位：Hz）。
 #[cfg(feature = "ktest")]
 pub fn counter_frequency() -> u64 {
     crate::boot::info().counter_frequency
 }
 
-/// 按 SBI ABI 发起固件调用；仅本模块选择无借用指针的 TIME/IPI/HSM/SRST 参数。
+/// 按照 RISC-V SBI v0.2+ 二进制调用规范触发 `ecall` 请求 M-mode 固件服务。
+///
+/// 寄存器约定：`a7` 为扩展 ID（EID），`a6` 为功能 ID（FID），`a0`–`a2` 为输入参数；
+/// 返回时 `a0` 为错误码（`0` 表示 `SBI_SUCCESS`），`a1` 为返回值。
 fn sbi(
     extension: usize,
     function: usize,
@@ -892,8 +1011,9 @@ fn sbi(
     mut a1: usize,
     a2: usize,
 ) -> Result<usize, isize> {
-    // SAFETY: S-mode 通过 ecall 进入固件，参数/返回值使用 SBI 指定的 a0–a7；
-    // 本模块仅 HSM 传入物理记录，其生命周期由 start_cpu 的调用者保证。
+    // SAFETY:
+    // 1. 当前运行在 S-mode，`ecall` 陷入 M-mode OpenSBI 固件，寄存器输入输出严格遵循 SBI v0.2+ ABI。
+    // 2. 本模块仅对 `TIME`、`IPI`、`HSM`、`SRST` 四个扩展发起调用；其中仅 `HSM` 传入物理地址，其有效性由 `start_cpu` 调用方契约保证。
     unsafe {
         asm!("ecall", inlateout("a0") a0, inlateout("a1") a1, in("a2") a2, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, in("a6") function, in("a7") extension, options(nostack));
     }
@@ -904,7 +1024,7 @@ fn sbi(
     }
 }
 
-/// 用 SBI TIME 编程一次绝对期限；固件错误直接报告。
+/// 通过 SBI `TIME` 扩展编程当前 CPU 的下一次定时器中断绝对到期时刻（`time` 计数值）。
 pub fn program_timer(deadline: u64) {
     sbi(
         SBI_EXT_TIME,
@@ -916,19 +1036,20 @@ pub fn program_timer(deadline: u64) {
     .expect("SBI TIME failed");
 }
 
-/// 关闭本核 timer pending 和下一次事件。
+/// 将定时器比较值设为 `u64::MAX`，从而清除当前 CPU 的 `sip.STIP` 挂起位并屏蔽下一次定时器中断。
 pub fn disable_timer() {
     program_timer(u64::MAX);
 }
 
-/// 通过 HSM 启动真实物理 AP 入口并传递静态启动记录。
+/// 通过 SBI `HSM`（Hart State Management）扩展唤醒指定的从核（AP），使其跳转到 [`__secondary_entry_phys`] 并传入 [`CpuBoot`] 的物理地址。
 ///
 /// # Safety
-/// BSP 必须串行启动尚未运行的目标 hart；物理记录必须对齐、已初始化并永久存活。
-/// 记录内的独占栈必须满足 16 字节 ABI 对齐，CpuLocal 必须属于目标核并永久有效；
-/// bootstrap/最终表必须已发布并映射记录、栈、CpuLocal 及 AP 内核代码。
+/// 1. 必须由主核串行唤醒当前处于 `STOPPED` 状态的目标物理核（`hardware_id`）。
+/// 2. `boot_record_physical` 必须按 `CpuBoot` 对齐、已完成初始化且在内核生命周期内永久有效。
+/// 3. `CpuBoot` 内记录的从核栈顶必须按 16 字节对齐，且栈与 `CpuLocal` 由该目标核独占。
+/// 4. 临时启动页表（`RV_BOOT_ROOT`）与最终内核页表（`RV_FINAL_SATP`）均已构建完毕并映射了目标核的代码、栈与 `CpuLocal`。
 pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Result<(), isize> {
-    // SAFETY: 调用者保证启动记录、栈与页表已初始化；fence 在 HSM 唤醒前发布这些写入。
+    // SAFETY: 调用方契约已初始化 `CpuBoot` 记录、从核栈与页表；此处的 `fence rw, rw` 确保这些内存写入在固件唤醒目标核前全局可见。
     unsafe {
         asm!("fence rw, rw", options(nostack));
     }
@@ -942,43 +1063,43 @@ pub unsafe fn start_cpu(hardware_id: usize, boot_record_physical: usize) -> Resu
     .map(|_| ())
 }
 
-/// 发布软件队列后通知指定 hart；错误不丢弃。
+/// 在发布核间软件队列数据后，通过 SBI `IPI` 扩展向目标物理核（`hardware_id`）发送核间软件中断。
 pub fn send_ipi(hardware_id: usize) {
-    // SAFETY: fence 只发布本核先前队列写入，目标 hart 由公共 CPU 表选择。
+    // SAFETY: `fence rw, rw` 仅排序内存读写，确保当前 CPU 先前写入软件队列的数据在目标核收到 IPI 中断后可见。
     unsafe {
         asm!("fence rw, rw", options(nostack));
     }
     sbi(SBI_EXT_IPI, SBI_EXT_IPI_SEND_IPI, 1, hardware_id, 0).expect("SBI IPI failed");
 }
 
-/// 读取已发布 PLIC 窗口中的一个 32 位寄存器。
+/// 从已映射的 PLIC（平台级中断控制器）MMIO 窗口读取偏移 `offset` 处的 32 位寄存器。
 ///
 /// # Safety
-/// 引导入口必须已映射实际 PLIC；offset 必须四字节对齐且完整落在已验证窗口的可读寄存器内。
-/// claim 只能由对应本核读取。
+/// 1. 必须在 `finish_boot_mappings` 完成 PLIC MMIO 映射之后调用。
+/// 2. `offset` 必须按 4 字节对齐，且 `[offset, offset + 4)` 完整落在设备树描述的 PLIC 有效寄存器窗口内。
+/// 3. 若读取的是 `claim` 寄存器，必须由该 context 对应的所属 CPU 调用，防止跨核争抢同一个 context 的中断声明。
 unsafe fn mmio_read(offset: usize) -> u32 {
     let region = crate::boot::info().interrupts.controller;
-    // SAFETY: 调用者保证实际设备映射、窗口内完整的对齐 32 位访问和寄存器读语义。
+    // SAFETY: 调用方契约保证 PLIC MMIO 已映射且 `offset` 为窗口内 4 字节对齐的合法 32 位寄存器偏移。
     unsafe { ptr::read_volatile((mmio_address(region.start) + offset) as *const u32) }
 }
 
-/// 写入已发布 PLIC 窗口中的一个 32 位寄存器并同步设备访问。
+/// 向已映射的 PLIC MMIO 窗口偏移 `offset` 处写入一个 32 位寄存器值，并执行 `fence iorw, iorw` 同步设备状态。
 ///
 /// # Safety
-/// 引导入口必须已映射实际 PLIC；offset 必须四字节对齐且完整落在已验证窗口内，
-/// value 必须符合寄存器写语义；共享 priority 由 IRQ 描述符锁串行化，
-/// enable 只在 IRQ 关闭、AP 未释放的初始化过程写入。
+/// 1. 必须在 `finish_boot_mappings` 完成 PLIC MMIO 映射之后调用。
+/// 2. `offset` 必须按 4 字节对齐且完整落在 PLIC 有效寄存器窗口内，`value` 必须符合目标寄存器的硬件语义。
+/// 3. 对共享中断源 `priority` 寄存器的写入必须由上层对应中断描述符的自旋锁串行化；对 `enable` 位图的写入仅限主核单核初始化阶段执行。
 unsafe fn mmio_write(offset: usize, value: u32) {
     let region = crate::boot::info().interrupts.controller;
-    // SAFETY: 调用者保证窗口内完整的对齐 32 位访问、寄存器写语义和共享状态串行化；
-    // fence 在返回前完成设备访问排序。
+    // SAFETY: 调用方契约保证 PLIC 窗口已映射、`offset` 4 字节对齐且并发访问已受锁或初始化阶段独占保护；写后 `fence` 保证 MMIO 立即生效。
     unsafe {
         ptr::write_volatile((mmio_address(region.start) + offset) as *mut u32, value);
         asm!("fence iorw, iorw", options(nostack));
     }
 }
 
-/// 从已安装的本核对象选择 FDT 对应的 S-mode claim/complete 寄存器。
+/// 计算当前 CPU 对应的 PLIC S-mode `claim/complete` 寄存器在 PLIC 窗口内的字节偏移。
 fn claim_offset() -> usize {
     PLIC_CONTEXT_BASE
         + crate::boot::info().interrupts.plic_contexts[crate::cpu::current().id]
@@ -986,18 +1107,21 @@ fn claim_offset() -> usize {
         + PLIC_CLAIM_OFFSET
 }
 
-/// 初始化所有合法源的 priority，并将固定路由只保留在实际 BSP 的 S context。
+/// 初始化 PLIC 外部中断控制器：清零全部 CPU 的使能位与阈值，将所有中断源初始优先级置 0（屏蔽），并仅在主核（CPU 0）S-mode context 上使能合法中断源路由。
 ///
 /// # Safety
-/// info 是已发布的实际 PLIC 描述，设备窗口已映射；source_count 不超过 1024，
-/// 所有 S context 的 enable/threshold/claim 槽完整落在窗口内。
-/// BSP 必须关闭 IRQ 且 AP 尚未释放，不能与 claim/complete 或 enable 访问并发。
+/// 1. `info` 必须包含已验证的 PLIC 控制器范围与各核 S-mode context 编号，且 PLIC MMIO 窗口已完成映射。
+/// 2. `info.interrupts.source_count` 必须落在 `2..=PLIC_MAX_SOURCES`（1024）范围内，所有 context 的 `enable`/`threshold`/`claim` 寄存器均落在映射窗口内。
+/// 3. 只能由主核在本地中断关闭且从核尚未启动时调用一次，调用期间不得与任何 `external_claim`/`external_complete`/`external_mask` 并发。
 pub unsafe fn external_init(info: &BootInfo) {
     assert!(1 < info.interrupts.source_count && info.interrupts.source_count <= PLIC_MAX_SOURCES);
     let words = (info.interrupts.source_count as usize).div_ceil(PLIC_ENABLE_BITS);
-    // SAFETY: 调用者保证实际 context 和已映射窗口；此时独占 enable/threshold/priority，
-    // 固定路由中只使用实际合法非零源，屏蔽只改 priority 不撤 enable。
+    // SAFETY:
+    // 1. 前置 `assert!` 确认中断源数量不超过 `PLIC_MAX_SOURCES`，且调用方契约保证主核此时独占整个 PLIC 寄存器窗口。
+    // 2. 先清空所有 CPU S-mode context 的 `enable` 位图并将 `threshold` 设为 0，再将 `1..source_count` 的 `priority` 置 0，
+    //    最后仅在 `plic_contexts[0]`（主核）开启 `1..source_count` 的使能位（跳过恒为 0 的保留源 0）。
     unsafe {
+        // Step 1: 清零所有在线 CPU S-mode context 的中断使能位图，并将优先级阈值（threshold）设为 0。
         for &context in &info.interrupts.plic_contexts[..info.cpu_count] {
             for word in 0..PLIC_ENABLE_WORDS {
                 mmio_write(
@@ -1008,10 +1132,12 @@ pub unsafe fn external_init(info: &BootInfo) {
             mmio_write(PLIC_CONTEXT_BASE + context * PLIC_CONTEXT_STRIDE, 0);
         }
 
+        // Step 2: 将所有合法外部中断源（1..source_count）的初始优先级（priority）设为 0（默认处于屏蔽状态）。
         for source in 1..info.interrupts.source_count {
             mmio_write(source as usize * PLIC_REGISTER_BYTES, 0);
         }
 
+        // Step 3: 将所有合法非零中断源固定使能到主核（CPU 0）的 S-mode context；后续掩码开关仅调整各源的 priority。
         for word in 0..words {
             let remaining = info.interrupts.source_count as usize - word * PLIC_ENABLE_BITS;
             let mut bits = if PLIC_ENABLE_BITS <= remaining {
@@ -1032,24 +1158,27 @@ pub unsafe fn external_init(info: &BootInfo) {
     }
 }
 
-/// 将实际源优先级置零，保留固定路由、pending 与已 claim 的完成资格。
+/// 屏蔽指定的 PLIC 外部中断源 `source`：将其硬件优先级（`priority`）置为 `0`。
+///
+/// 只修改该中断源自身的 `priority` 寄存器而不撤销主核 context 的 `enable` 位，从而保证此前已被 `claim` 的同一中断源仍能正常执行 `complete`。
 pub fn external_mask(source: u32) {
     assert!(0 < source && source < crate::boot::info().interrupts.source_count);
-    // SAFETY: 源号与实际窗口已验证，源 descriptor 锁串行化对应独立 priority word。
+    // SAFETY: 前置 `assert!` 保证 `source` 落在有效范围内，每个中断源拥有独立的 4 字节 `priority` 寄存器并由上层 IRQ 描述符锁串行化。
     unsafe { mmio_write(source as usize * PLIC_REGISTER_BYTES, 0) };
 }
 
-/// 恢复实际源 priority=1，让屏蔽期间已有 pending 重新参与通知。
+/// 解除对指定 PLIC 外部中断源 `source` 的屏蔽：将其硬件优先级（`priority`）恢复为 `1`。
+///
+/// 由于主核 S-mode context 的 `threshold` 为 `0` 且 `enable` 位常开，优先级设为 `1` 后任何待处理中断都会立即向主核发起通知。
 pub fn external_unmask(source: u32) {
     assert!(0 < source && source < crate::boot::info().interrupts.source_count);
-    // SAFETY: 源 descriptor 锁串行化独立 priority，BSP enable 路由在初始化后保持不变。
+    // SAFETY: 前置 `assert!` 保证 `source` 合法，独立的 `priority` 寄存器访问由上层 IRQ 描述符锁串行化保护。
     unsafe { mmio_write(source as usize * PLIC_REGISTER_BYTES, 1) };
 }
 
-/// 从本核真实 PLIC context claim；零表示无待处理源。
+/// 从当前 CPU 的 PLIC S-mode context 读取 `claim` 寄存器以获取最高优先级的待处理外部中断源号；若返回 `0`（无待处理中断）则返回 `None`。
 pub fn external_claim() -> Option<u32> {
-    // SAFETY: 启动入口初始化实际 PLIC，永久 CpuLocal 选择本核 S context；
-    // 该 claim 寄存器只由本核 IRQ 流读取。
+    // SAFETY: PLIC 已在引导阶段完成映射与初始化，`claim_offset()` 根据本核 `CpuLocal.id` 唯一定位当前 CPU 的 S-mode `claim` 寄存器。
     let source = unsafe { mmio_read(claim_offset()) };
     if source == 0 {
         None
@@ -1058,19 +1187,20 @@ pub fn external_claim() -> Option<u32> {
     }
 }
 
-/// 完成本核已 claim 的实际源，不改变 priority 或固定路由。
+/// 向当前 CPU 的 PLIC S-mode `complete` 寄存器写回中断源号 `source`，通知硬件该外部中断已处理完毕。
 ///
 /// # Safety
-/// source 必须来自本核尚未完成的真实 claim；调用者持对应 descriptor 锁，
-/// 不能跨核、迁移或重复 complete；源号完整落在实际 PLIC 范围内。
+/// 1. `source` 必须来自当前同一 CPU 上尚未完成（Complete）的一次真实 [`external_claim`] 返回值。
+/// 2. 调用方必须持有对应中断描述符的锁，严禁跨核完成或对同一次 `claim` 重复调用 `external_complete`。
 pub unsafe fn external_complete(source: u32) {
     assert!(0 < source && source < crate::boot::info().interrupts.source_count);
-    // SAFETY: 本核真实 claim 与已验证 S context 对应，固定 enable 保留其完成资格。
+    // SAFETY: 前置 `assert!` 验证了 `source` 范围，调用方契约保证 `source` 来自本核尚未完成的 `claim`，且主核固定 `enable` 路由始终保持开启。
     unsafe { mmio_write(claim_offset(), source) };
 }
 
-/// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST poweroff。
-/// 仅限能服务 IRQ/IPI、无业务锁及待完成 CSD 责任的普通执行上下文。
+/// 正常关机流程：通知并等待所有其他在线 CPU 停止后，排空控制台并调用 SBI `SRST` 执行整机断电（Shutdown）。
+///
+/// 仅限在可响应中断/IPI、未持有业务锁且无挂起跨核调用（CSD）责任的普通任务上下文中调用。
 #[cfg(not(feature = "ktest"))]
 pub fn shutdown() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
@@ -1081,7 +1211,7 @@ pub fn shutdown() -> ! {
     system_reset(SBI_SRST_SHUTDOWN)
 }
 
-/// 板 HALT 在其它核确认停止后永久等待；QEMU 保留原 SBI 整机停止行为。
+/// 整机挂起（Halt）流程：在 QEMU `virt` 平台上直接执行关机断电；在真实开发板上等待其他在线核停止并关闭本地中断源后进入无限 `wfi` 休眠。
 #[cfg(not(feature = "ktest"))]
 pub fn halt() -> ! {
     if crate::platform::current() == crate::boot::Platform::QemuVirt {
@@ -1095,8 +1225,7 @@ pub fn halt() -> ! {
     }
 }
 
-/// 用户与 FS 生命周期已停稳后，逐核确认其它在线核停止，再请求 SBI SRST cold restart。
-/// 调用环境与 shutdown 相同，停核 guard 持有至固件执行整机动作。
+/// 整机冷重启（Cold Reboot）流程：等待所有其他在线 CPU 停止并完成控制台收尾后，调用 SBI `SRST` 请求硬件冷重启。
 #[cfg(not(feature = "ktest"))]
 pub fn restart() -> ! {
     let _stop = crate::cpu::stop_other_online_cpus();
@@ -1107,7 +1236,7 @@ pub fn restart() -> ! {
     system_reset(SBI_SRST_COLD_REBOOT)
 }
 
-/// 板致命错误关闭当前核事件后永久停核，只发布 current-cpu 终点，不等待故障 AP/CSD。
+/// 致命错误下的紧急停机：在 VisionFive 2 开发板上关闭当前核中断源并输出当前核终止标记后进入死循环休眠（避免在从核故障时跨核等待死锁）；在 QEMU 上直接请求 SBI 关机。
 #[cfg(feature = "ktest")]
 pub fn emergency_shutdown() -> ! {
     if crate::platform::current() == crate::boot::Platform::VisionFive2 {
@@ -1120,14 +1249,13 @@ pub fn emergency_shutdown() -> ! {
     system_reset(SBI_SRST_SHUTDOWN)
 }
 
-/// QEMU 的 catalog、Boot 或 Thread 测试结束后直接请求 SBI 断电。
-/// 测试构建只允许 QEMU；早期退出不要求其它核上线或生产服务初始化。
+/// `ktest` 测试套件执行完毕后的退出入口：直接调用 SBI `SRST` 关闭 QEMU 虚拟机。
 #[cfg(feature = "ktest")]
 pub fn test_shutdown() -> ! {
     system_reset(SBI_SRST_SHUTDOWN)
 }
 
-/// 永久停核确认发生在本核事件已关闭以后；确认对象仅承载一次停止事实。
+/// 响应跨核停机请求：关闭当前 CPU 的全部中断与定时器事件，以 `Release` 内存序将 `stopped` 置为 `true` 后永久进入 `wfi` 循环。
 pub(crate) fn stop_current_cpu(stopped: &AtomicBool) -> ! {
     disable_stop_sources();
     stopped.store(true, Ordering::Release);
@@ -1136,16 +1264,16 @@ pub(crate) fn stop_current_cpu(stopped: &AtomicBool) -> ! {
     }
 }
 
-/// 永久停止前关闭本核 timer、全局 IRQ 和中断使能源，不再恢复执行上下文。
+/// 在 CPU 永久停机前关闭本地全局中断、定时器及 `sie` 中断使能掩码，并执行全序 I/O 屏障。
 fn disable_stop_sources() {
     irq_save();
     disable_timer();
-    // SAFETY: S-mode 可清本核 sie；调用者决定永久停止，不再依赖 IRQ 返回或调度。
+    // SAFETY: 当前运行在 S-mode 且调用方即将永久停止本核执行，清零 `sie` 可阻止任何中断源再次唤醒后的中断陷入。
     unsafe { asm!("csrw sie, zero", options(nostack)) };
     dma_barrier();
 }
 
-/// 使用 SRST 的明确 reset type 和无故障 reason；成功动作不得返回内核。
+/// 调用 SBI `SRST`（System Reset）扩展执行指定类型（`reset_type`）的整机复位或关机；若固件意外返回则触发 `panic!`。
 fn system_reset(reset_type: usize) -> ! {
     sbi(
         SBI_EXT_SRST,
@@ -1159,15 +1287,17 @@ fn system_reset(reset_type: usize) -> ! {
 }
 
 #[cfg(feature = "ktest")]
-/// 触发真实非法指令异常供现场诊断。
+/// 执行全零非法指令（`.word 0`）以主动触发 S-mode 非法指令同步异常，供 `ktest` 异常诊断路径测试使用。
 pub fn trigger_fault() -> ! {
-    // SAFETY: 内核 trap 已安装；非法指令进入诊断入口并终止执行，不返回 Rust。
+    // SAFETY: 调用前内核 `stvec` 陷阱入口已安装；`.word 0` 在 RISC-V 中恒为非法指令，陷入 `rv_kernel_fault` 后终止执行且永不返回。
     unsafe {
         asm!(".word 0", options(noreturn));
     }
 }
 
-/// 处理汇编构造的本核独占 trap frame；FS 为 Off 时不访问未保存的浮点字段。
+/// S-mode 内核态陷阱的 Rust 总入口（由 `trap::rv_trap_entry` 汇编直接调用）。
+///
+/// 根据 `scause` 最高位区分同步异常（进入 [`rv_kernel_fault`]）与异步硬件中断（进入 [`rv_dispatch_interrupt`]）。
 #[no_mangle]
 extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     if frame.scause & CAUSE_IRQ_FLAG == 0 {
@@ -1176,7 +1306,7 @@ extern "C" fn rv_handle_trap(frame: &mut KernelTrapFrame) {
     rv_dispatch_interrupt(frame.scause, frame.sepc, frame.gpr[2], frame.stval);
 }
 
-/// 以真实 S 来源现场保持同步异常的原致命性质，不把内核故障转换成用户 trap。
+/// 处理 S-mode 内核态同步异常：输出故障寄存器现场（`pc`、`sp`、`cause`、`stval`）并终止系统运行。
 extern "C" fn rv_kernel_fault(pc: usize, sp: usize, cause: usize, bad: usize) -> ! {
     #[cfg(feature = "ktest")]
     crate::ktest::fatal_event(
@@ -1194,7 +1324,9 @@ extern "C" fn rv_kernel_fault(pc: usize, sp: usize, cause: usize, bad: usize) ->
     crate::console::fatal(pc, sp, cause, bad);
 }
 
-/// 在当前本核 IRQ-off 栈分派真实硬件中断，返回前释放 HardIrqGuard。
+/// 在本地中断关闭的内核陷阱栈上分派 S-mode 异步中断（定时器中断、核间软件中断、PLIC 外部中断）。
+///
+/// 进入时通过 [`crate::cpu::HardIrqGuard::enter`] 标记硬中断上下文，并在函数返回前自动退出并触发必要的下半部处理。
 fn rv_dispatch_interrupt(cause: usize, pc: usize, sp: usize, bad: usize) {
     let _hard_irq = crate::cpu::HardIrqGuard::enter();
     match cause {
@@ -1203,7 +1335,7 @@ fn rv_dispatch_interrupt(cause: usize, pc: usize, sp: usize, bad: usize) {
             crate::cpu::handle_timer();
         }
         value if value == CAUSE_IRQ_FLAG | IRQ_S_SOFT => {
-            // SAFETY: 当前为 S-mode 软件中断，清除本核 SSIP 后用 fence 获取发送方队列写入。
+            // SAFETY: 当前处于 S-mode 软件中断处理路径，清除 `sip.SSIP` 挂起位后执行 `fence rw, rw` 以配对发送方 `send_ipi` 的发布屏障。
             unsafe {
                 asm!("csrci sip, {ssip}", "fence rw, rw", ssip = const SIP_SSIP, options(nostack));
             }
@@ -1225,31 +1357,32 @@ fn rv_dispatch_interrupt(cause: usize, pc: usize, sp: usize, bad: usize) {
     }
 }
 
-/// 以一次真实本核 timer IRQ 检查指定 FP 模式的原始寄存器图样；RV 没有 FCC，忽略该参数。
+/// 在 `ktest` 中编程一次真实的本核定时器中断，验证陷阱入口对整数及可选双精度浮点（`fp = true`）寄存器特征值的保存与恢复。
+///
+/// `_fcc` 参数仅为兼容 LoongArch64 的浮点条件码接口而保留，RISC-V 无此寄存器故忽略。
 ///
 /// # Safety
-/// 本核 trap、timer IRQ 源、永久 CpuLocal 和当前栈必须已安装且可服务中断；调用期间
-/// 必须固定 CPU、禁止调度迁移，不能持有 IRQ-save 锁或中断处理器会取得的锁。
-/// CPU 必须支持 D，当前不得有活跃 FP 上下文：原汇编恢复 sstatus/FCSR 与整数 ABI
-/// 现场，但 fp=true 会覆盖 f0/f31。函数恢复进入时的 IRQ 位；调用者必须在同核
-/// IRQ-off 下用 time::reprogram_current 交还生产 deadline（包括断言失败后的清理）。
+/// 1. 当前 CPU 的 `stvec` 陷阱入口、定时器中断源、`CpuLocal` 与有效内核栈必须已就绪，且调用期间禁止任务迁移或持有中断处理路径会获取的锁。
+/// 2. CPU 必须支持双精度浮点扩展（`D`），且调用时无活跃的浮点上下文（当 `fp == true` 时汇编会改写 `f0`–`f31`）。
+/// 3. 调用方必须在同一 CPU 的关中断状态下调用 `time::reprogram_current()` 恢复生产环境的定时器到期时间。
 #[cfg(feature = "ktest")]
 pub(crate) unsafe fn ktest_register_pattern(fp: bool, _fcc: u8) -> bool {
     let _irq = crate::sync::IrqSaveGuard::new();
     let counter = &crate::cpu::current().timer_interrupts;
     let expected = counter.load(Ordering::Acquire) + 1;
     program_timer(read_counter() + counter_frequency() / 100);
-    // SAFETY: 调用者保证固定本核、真实 timer/trap 已安装、无活跃 FP 和持锁现场；
-    // counter 为永久对齐的本核原子，fp 转换仅取 0/1，汇编恢复进入时的 IRQ-off 状态。
+    // SAFETY:
+    // 1. 调用方契约保证当前固定在本核执行、陷阱与定时器已就绪且未持有冲突锁。
+    // 2. `counter` 指向本核 `CpuLocal` 中的永久 `AtomicUsize`，`usize::from(fp)` 仅传入 `0` 或 `1`，汇编在返回前会恢复进入时的关中断状态与 ABI 寄存器。
     let good = unsafe { rv_register_roundtrip(counter, expected, usize::from(fp)) } != 0;
     good && expected <= counter.load(Ordering::Acquire)
 }
 
-/// 在普通 Task 内以两次真实 timer trap 检验整数、SP、TP 与返回路径，不启用 FP。
+/// 在普通内核任务中连续触发两次真实的定时器中断，验证 `sstatus.FS = Off` 下全部通用整数寄存器、`sp`、`tp` 与陷阱返回路径的完整性。
 ///
 /// # Safety
-/// 本核 trap/timer/CpuLocal 已安装；不得持锁或 guard，不得有活跃 FP 现场。
-/// 测试临时打开 IRQ 且改写本核 timer，期间不得切换或迁移任务。
+/// 1. 当前 CPU 的陷阱入口、定时器与 `CpuLocal` 必须已安装，调用方不得持有自旋锁或抢占守卫，且当前无活跃浮点现场。
+/// 2. 测试过程中会临时开启本核中断并重编程本核定时器，在此期间当前任务不得被迁移到其他 CPU。
 #[cfg(feature = "ktest")]
 pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     let saved = irq_save();
@@ -1258,8 +1391,9 @@ pub(crate) unsafe fn test_integer_register_preservation() -> usize {
     for _ in 0..2 {
         let expected = counter.load(Ordering::Acquire) + 1;
         program_timer(read_counter() + counter_frequency() / 1000);
-        // SAFETY: 调用者保证已安装 trap/timer，无锁不调度；永久 counter 属于本核。
-        // fp=0 只保存并检查整数现场，汇编返回时恢复进入时的 IRQ-off 状态。
+        // SAFETY:
+        // 1. 调用方契约保证陷阱与定时器已就绪、未持锁且不发生跨核迁移；`counter` 为本核 `CpuLocal` 的永久原子计数器。
+        // 2. 第三个参数传 `0` 表示仅测试整数寄存器现场，汇编内部短暂开启中断等待定时器触发后恢复进入时的关中断状态。
         assert!(
             unsafe { rv_register_roundtrip(counter, expected, 0) } != 0,
             "integer timer trap register preservation failed"
@@ -1271,7 +1405,7 @@ pub(crate) unsafe fn test_integer_register_preservation() -> usize {
         rounds += 1;
     }
     crate::time::reprogram_current();
-    // SAFETY: saved 来自本函数同核保存；全部汇编已经返回、无持锁借用且未发生迁移。
+    // SAFETY: `saved` 来自本函数开头在同一 CPU 上保存的 `irq_save()`，此时测试汇编已返回且未持有任何锁。
     unsafe { irq_restore(saved) };
     rounds
 }

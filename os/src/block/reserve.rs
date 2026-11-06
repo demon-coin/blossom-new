@@ -1,4 +1,70 @@
-//! 同一请求核心的有限控制来源；原始存储只在真实分配器尾部结束后重用。
+//! 块 I/O 零堆分配预留内存池（Mempool）与元数据缓存基准槽位管理模块。
+//!
+//! ## 模块职责与架构定位
+//! 在系统物理内存耗尽（OOM）执行紧急脏页回收与后台回写时，若块 I/O 请求的 `Arc<BioInner>` 控制块、
+//! `Vec<MappedPages>` 载荷容器或元数据索引节点仍向全局堆（`Global`）动态申请内存，就会陷入
+//! “回收内存需要发起回写 I/O -> 发起 I/O 需要申请堆内存 -> 堆内存耗尽等待回收”的死锁。
+//! 本模块通过实现标准库 `core::alloc::Allocator` 接口的 `BioAllocator`，在读写卷启用前一次性向全局堆预分配
+//! 固定数量的原始内存块与元数据物理页。进入就绪态（`ready = true`）后，回写与元数据路径完全在预留池内循环借还，绝不触碰全局堆。
+//! - **上游调用者**：块请求核心与提交层（`crate::block::bio`、`crate::block::submit`）、元数据缓存与索引树
+//!   （`crate::cache`、`crate::cache::index`）以及文件系统后台回写域（`crate::fs::background`、`crate::fs::writeback`）。
+//! - **下游依赖**：Rust 全局分配器（`alloc::alloc::Global`）、物理页缓存句柄（`crate::mm::FolioRef`）、
+//!   DMA 映射段（`crate::mm::dma::MappedPages`）以及任务等待队列（`crate::wait::WaitQueue`）。
+//!
+//! ## 核心设计与槽位布局
+//!
+//! ### 1. `BioReserve` 内部槽位几何结构
+//! 每个 `BioReserve` 实例包含 **9 个 `BioSlot`**（8 个回写槽 + 1 个独立辅助槽）与 **`capacity` 个 `MetadataSlot`**：
+//!
+//! ```text
+//!   BioReserve 预留池布局
+//!  ┌─────────────────────────────────────────────────────────────────────────┐
+//!  │ bios: [BioSlot; 9] (BIO_SLOTS = MAX_BATCH + 1 = 9)                      │
+//!  │  ├─ Slot 0..8 (回写通道 WB):                                            │
+//!  │  │    ├─ control: Allocation -> 容纳 ArcInner<BioInner>                 │
+//!  │  │    └─ payload: Allocation -> 容纳 [MappedPages; 8] (WB_MAPPINGS = 8) │
+//!  │  └─ Slot 8 (AUX_SLOT 独立辅助槽, 供元数据读入与 Flush 专用):            │
+//!  │       ├─ control: Allocation -> 容纳 ArcInner<BioInner>                 │
+//!  │       └─ payload: Allocation -> 容纳 [MappedPages; 1]                   │
+//!  ├─────────────────────────────────────────────────────────────────────────┤
+//!  │ metadata: Vec<MetadataSlot> (长度 = capacity)                           │
+//!  │  └─ Slot 0..capacity:                                                   │
+//!  │       ├─ folio:   FolioRef   -> 预留的 4KiB 元数据缓存基准物理页        │
+//!  │       └─ control: Allocation -> 容纳元数据缓存树节点 ArcInner<Node>     │
+//!  └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### 2. `BioSlot` 双层预订/租借与分配器归还生命周期
+//! 预留槽位严格区分“业务通道预订（`booked`）”、“单次构造租借（`leased`）”与“底层 `Arc`/`Vec` 实际内存存活（`active`）”。
+//! 即使 `Bio` 已发出完成通知，只要外部仍有 `Weak` 弱引用或 `BioCompletion` 尚未释放导致 `Allocator::deallocate` 未被调用，
+//! `active` 就保持为 `true`，槽位绝不会被提前重用：
+//!
+//! ```text
+//!   [ 空闲可重用: !booked && !leased && !control.active && !payload.active ]
+//!         │
+//!         ▼ acquire_wb_lane() 批量预订通道 (仅 WB 槽 0..8; AUX 槽直接进入 leased)
+//!   [ 已预订: booked = true ]  (持有 BioLane 期间排斥其他回写波次抢占)
+//!         │
+//!         ▼ lane.lease_available() / try_lease() 租借单次构造权
+//!   [ 构造中: leased = true ]
+//!         │  1. lease.memory() 触发 payload.active = true
+//!         │  2. Bio::try_new() 触发 control.active = true
+//!         │  3. drop(lease)    恢复 leased = false
+//!         ▼
+//!   [ 在途运行: control.active / payload.active = true ]
+//!         │  - Vec<MappedPages> 析构 -> deallocate(Payload) -> payload.active = false
+//!         │  - 最后一个 Arc/Weak 释放 -> deallocate(Control) -> control.active = false
+//!         │  - drop(BioLane)         -> booked = false
+//!         ▼
+//!   [ 回到空闲可重用状态，通过 notify_available() 唤醒等待队列 ]
+//! ```
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **高层业务锁在后，通道预订在前**：回写任务必须在获取文件系统/Inode 业务锁之前调用 `acquire_wb_lane`；
+//!    元数据读入任务必须在获取元数据页内容锁（`CONTENT_LOCKED`）之前调用 `acquire_aux`，防止持锁睡眠死锁。
+//! 2. **`BioReserve::state` 自旋锁**：叶级短临界区自旋锁，仅保护槽位布尔状态位与指针元数据读写。
+//!    准备阶段的 `Global.allocate`、析构阶段的 `Global.deallocate` 以及唤醒等待者的 `available.wake_all()`
+//!    均严格在 `state` 自旋锁**外部**执行。
 
 use alloc::alloc::Global;
 use alloc::sync::Arc;
@@ -16,26 +82,34 @@ use crate::sched;
 use crate::sync::SpinLock;
 use crate::wait::{WaitNode, WaitQueue, Waiter};
 
-/// 每份 WB 父的映射数量同时限定其原始 Vec 存储。
+/// 单个回写（Writeback）父 `Bio` 在预留载荷槽中最多容纳的 `MappedPages` 映射段数（8 个）。
 pub(crate) const WB_MAPPINGS: usize = MAX_BATCH;
+/// `BioReserve` 管理的 `BioSlot` 总槽位数：8 个批量回写槽 + 1 个独立辅助（元数据读 / Flush）槽。
 const BIO_SLOTS: usize = MAX_BATCH + 1;
+/// 专供元数据单页读入与磁盘 `Flush` 请求使用的独立辅助槽下标（下标 `8`）。
 const AUX_SLOT: usize = MAX_BATCH;
 
-/// 普通与预留映射使用同一移动容器及分配器合同。
+/// 承载块请求 DMA 映射段列表的动态数组类型，通过 `BioAllocator` 统一兼容普通堆分配与预留池分配。
 pub(crate) type BioMemory = Vec<MappedPages, BioAllocator>;
 
-/// 一份真实 Global 分配的释放权；借用视图不复制释放责任。
+/// 由全局堆（`Global`）一次性分配并由预留池独占释放权的原始内存块。
+///
+/// 预留池运行期间通过 `view()` 将裸字节区间借给 `Arc` 或 `Vec` 使用，但绝不转移全局堆的最终释放所有权；
+/// 仅当整个 `BioReserve` 销毁时才在 `Drop` 中统一归还给 `Global`。
 struct RawBlock {
+    /// 全局堆返回的非空内存块起始指针。
     pointer: NonNull<u8>,
+    /// 申请该内存块时使用的精确大小与对齐布局（归还给 `Global::deallocate` 时必须原样匹配）。
     layout: Layout,
 }
 
-// SAFETY: raw 块始终由所属源独占释放；分配状态由源短锁保护，
-// 已借出的块只由其真实 Arc/Vec 访问，源不解引用其中的用户值。
+// SAFETY:
+// 1. `RawBlock` 的最终释放权由所属 `BioReserve` 唯一持有，不存在跨线程双重释放；
+// 2. 内存块的借出与归还状态由 `BioReserve::state` 自旋锁同步，借出期间仅由对应的 `Arc`/`Vec` 按各自并发契约访问，`BioReserve` 自身从不解引用其中的业务数据。
 unsafe impl Send for RawBlock {}
 
 impl RawBlock {
-    /// 启用前在全部源锁外准备一份真实非零布局。
+    /// 在准备阶段（未持预留池自旋锁时）按指定 `layout` 向全局堆申请一块原始内存。
     fn allocate(layout: Layout) -> Result<Self, AllocError> {
         let memory = Global.allocate(layout)?;
         Ok(Self {
@@ -44,30 +118,36 @@ impl RawBlock {
         })
     }
 
-    /// 借出与真实请求布局一致的原始字节，不改变释放权。
+    /// 生成与预分配布局大小一致的裸字节切片指针供 `Allocator::allocate` 返回，不转移底层内存的最终释放权。
     fn view(&self) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(self.pointer, self.layout.size())
     }
 }
 
 impl Drop for RawBlock {
-    /// 最后源拥有在锁外按原布局归还唯一 Global。
+    /// 在 `BioReserve` 整体销毁时，将预分配的原始内存块按原始布局归还给全局堆。
     fn drop(&mut self) {
-        // SAFETY: 源末次拥有保证全部 Arc/Vec/lease 已结束；原首址及原布局
-        // 从同一 Global.allocate 保存，raw 表没有第二份释放拥有。
+        // SAFETY:
+        // 1. `BioReserve::drop` 已断言所有槽位的 `booked`、`leased` 与 `active` 均为 `false`，证明借用该内存块的所有 `Arc`/`Vec` 均已彻底析构；
+        // 2. `self.pointer` 与 `self.layout` 原样保存自 `RawBlock::allocate` 中的同一次 `Global.allocate` 调用，且无任何其他所有者会对其调用 `Global.deallocate`。
         unsafe { Global.deallocate(self.pointer, self.layout) };
     }
 }
 
-/// 原块与真实 allocator 在途责任分开，不以对象 ready 推断归还。
+/// 单个预留原始内存块的分配状态记录。
+///
+/// 严格依据 `Allocator::deallocate` 的实际调用来清除 `active` 标志，而不以高层业务请求完成（Ready）推断内存已空闲。
 struct Allocation {
+    /// 准备阶段向全局堆申请好的原始内存块；尚未分配时为 `None`。
     block: Option<RawBlock>,
+    /// 当前是否有尚未调用 `deallocate` 归还的 `Arc`（含 `Weak` 控制块）或 `Vec` 正在占用该内存块。
     active: bool,
+    /// 标记该槽位在准备阶段是否已完成至少一次真实的“分配 -> 释放”预热循环（用于在 `mark_ready` 时校验精确 `Layout` 已被捕获）。
     retired_once: bool,
 }
 
 impl Allocation {
-    /// 初始化尚未取得原块、没有分配拥有的记录。
+    /// 创建尚未绑定原始内存块、处于未占用状态的初始分配记录。
     const fn new() -> Self {
         Self {
             block: None,
@@ -76,22 +156,26 @@ impl Allocation {
         }
     }
 
-    /// 检查原块已经准备且没有仍活的 allocator 拥有。
+    /// 判断原始内存块是否已预分配完毕，且当前无任何存活的 `Arc`/`Vec` 占用。
     fn available(&self) -> bool {
         self.block.is_some() && !self.active
     }
 }
 
-/// 整体准入 book 不含 Bio/Vec 借用；每次构造另有短 lease。
+/// 单个预留 `Bio` 槽位，成对管理 `Arc<BioInner>` 控制块与 `Vec<MappedPages>` 载荷数组的内存状态。
 struct BioSlot {
+    /// 承载 `Arc<BioInner, BioAllocator>` 引用计数头与 `BioInner` 本体的控制块分配记录。
     control: Allocation,
+    /// 承载 `Vec<MappedPages, BioAllocator>` 连续元素缓冲区的载荷分配记录。
     payload: Allocation,
+    /// 是否已被某个后台回写通道（`BioLane`）批量预订。
     booked: bool,
+    /// 是否正处于单次 `Bio` 构造租借期（持有 `BioLease` 期间为 `true`）。
     leased: bool,
 }
 
 impl BioSlot {
-    /// 初始化没有任何借出责任的完整单元。
+    /// 创建无内存块且未预订、未租借的初始 `BioSlot`。
     const fn new() -> Self {
         Self {
             control: Allocation::new(),
@@ -101,42 +185,59 @@ impl BioSlot {
         }
     }
 
-    /// 两份分配器责任与构造 lease 均结束后才可再次构造。
+    /// 判断槽位的单次构造租约是否已结束，且控制块与载荷块均已归还就绪、可供构造下一个 `Bio`。
     fn reusable(&self) -> bool {
         !self.leased && self.control.available() && self.payload.available()
     }
 }
 
-/// metadata 原页的基准拥有与不可变 Node 控制存储属于同一个单元。
+/// 元数据缓存的单个预留槽位，绑定一张常驻基准物理页与一份缓存树节点（`Node`）控制块内存。
 struct MetadataSlot {
+    /// 预留给元数据缓存使用的 4KiB 物理页基准强引用（确保极端内存压力下元数据页不会被彻底回收耗尽）。
     folio: FolioRef,
+    /// 承载元数据缓存索引节点 `Arc<Node, IndexAllocator>` 的控制块分配记录。
     control: Allocation,
+    /// 是否正被 `MetadataLease` 租借用于初始化新缓存节点。
     leased: bool,
 }
 
+/// 受 `BioReserve::state` 自旋锁保护的预留池内部可变状态。
 struct ReserveState {
+    /// 固定 9 个 `Bio` 预留槽位（前 8 个用于数据/元数据回写批次，第 9 个用于元数据读入与 Flush）。
     bios: [BioSlot; BIO_SLOTS],
+    /// 容量在初始化时固定的元数据页及索引节点控制块槽位数组。
     metadata: Vec<MetadataSlot>,
+    /// 预留池是否已完成全部控制块精确布局预热并正式对外开放（置为 `true` 后禁止再向全局堆扩容或补申请）。
     ready: bool,
+    /// 预留池自身的单调停止序号，用于在缓存源停用时使旧批次捕获的 `MetadataIoContext` 失效。
     stop_sequence: u64,
 }
 
-/// 有限 IO 原始存储不反向拥有请求、节点、缓存、卷或工作对象。
+/// 面向块回写与元数据缓存的零堆分配预留内存池。
+///
+/// 仅持有底层原始内存块与基准 `FolioRef`，不反向持有上层 `Bio`、缓存节点、卷对象或工作队列引用，避免循环引用。
 pub(crate) struct BioReserve {
+    /// 保护槽位预订、租借及分配位状态的短临界区自旋锁。
     state: SpinLock<ReserveState>,
+    /// 当回写槽或辅助槽暂时耗尽时，供任务睡眠等待槽位归还的等待队列。
     available: WaitQueue,
 }
 
-/// 元数据 IO 保留本次业务进入前的真实来源边界，借用不制造另一份源拥有。
+/// 元数据 I/O 操作入口捕获的预留池与所属挂载卷停止边界上下文。
+///
+/// 采用轻量级借用传递，用于在正式获取辅助槽或发起元数据页读入前校验所属预留池与挂载卷是否已进入停机退役阶段。
 #[derive(Clone, Copy)]
 pub(crate) struct MetadataIoContext<'a> {
+    /// 目标元数据缓存绑定的预留内存池借用。
     reserve: &'a Arc<BioReserve>,
+    /// 业务入口处采样的 `ReserveState::stop_sequence` 快照。
     boundary: u64,
+    /// 可选的挂载卷级单调停止序列引用及其入口快照 `(sequence_ref, sampled_boundary)`，用于隔离同盘多卷的独立退役。
     view: Option<(&'a AtomicU64, u64)>,
 }
 
 impl<'a> MetadataIoContext<'a> {
-    /// 已捕获的轮边界可由同一 storage 重建借用，禁止改采后继 activate 的当前值。
+    /// 使用已提前采样的预留池停止边界 `boundary` 构造上下文（供同一回写波次跨阶段延续初始边界，避免误采后续重激活的新序号）。
     pub(crate) fn from_boundary(reserve: &'a Arc<BioReserve>, boundary: u64) -> Self {
         Self {
             reserve,
@@ -145,7 +246,7 @@ impl<'a> MetadataIoContext<'a> {
         }
     }
 
-    /// 保留本卷的单调停止边界，另一卷退休不会取消同物理来源上的当前业务。
+    /// 绑定指定挂载卷的独立停止序列 `sequence` 与快照值 `boundary` 构造上下文，使同盘另一卷的退役不会误取消当前卷的元数据操作。
     pub(crate) fn for_view(
         reserve: &'a Arc<BioReserve>,
         sequence: &'a AtomicU64,
@@ -158,12 +259,12 @@ impl<'a> MetadataIoContext<'a> {
         }
     }
 
-    /// 核同一真实源，跨 cache 的数值相同不能替代身份。
+    /// 通过 `Arc::ptr_eq` 校验当前上下文是否指向同一个 `BioReserve` 实例（防止跨缓存实例因序列号数值巧合相同而误判）。
     pub(crate) fn belongs_to(self, reserve: &Arc<BioReserve>) -> bool {
         Arc::ptr_eq(self.reserve, reserve)
     }
 
-    /// 开始内容读入前重查旧边界；已接受 IO 不由此检查撤销。
+    /// 在发起新的元数据内容读入前校验预留池已就绪且停止边界未推进；若已停机则返回 `BlockError::NotReady`（不影响已准入的在途 I/O）。
     pub(crate) fn check(self) -> Result<(), BlockError> {
         let state = self.reserve.state.lock();
         if !state.ready
@@ -179,26 +280,33 @@ impl<'a> MetadataIoContext<'a> {
     }
 }
 
-/// 两种具体块只用于同一 Bio 控制与其映射 Vec。
+/// 标识单个 `BioSlot` 内部的两类独立预留内存块。
 #[derive(Clone, Copy)]
 pub(crate) enum BioBlock {
+    /// 存放 `Arc<BioInner, BioAllocator>` 控制头与 `BioInner` 对象的内存块。
     Control,
+    /// 存放 `Vec<MappedPages, BioAllocator>` 连续元素数组的内存块。
     Payload,
 }
 
-/// Heap 与有限来源共同实现标准 Arc/Vec 的真实 allocator 合同。
+/// 块请求与载荷列表统一使用的内存分配器，同时支持常规全局堆与零堆分配预留槽。
 #[derive(Clone)]
 pub(crate) enum BioAllocator {
+    /// 常规路径：直接转发给全局堆分配器 `Global`（允许按需分配与扩缩容）。
     Heap,
+    /// 受限预留路径：绑定特定 `BioReserve` 的指定槽位与块类型（大小固定、禁止重分配扩容）。
     Reserved {
+        /// 所属预留内存池的强引用（确保所有派生的 `Arc`/`Weak`/`Vec` 彻底析构前预留池不会提前释放底层 `RawBlock`）。
         reserve: Arc<BioReserve>,
+        /// 绑定的 `BioSlot` 下标（`0..BIO_SLOTS`）。
         slot: usize,
+        /// 本分配器实例负责的块种类（`Control` 或 `Payload`）。
         block: BioBlock,
     },
 }
 
 impl BioAllocator {
-    /// 从映射来源派生同一完整单元的控制来源，不增加另一个池。
+    /// 从载荷容器的分配器派生出指向同一个 `BioSlot` 的 `Control` 控制块分配器（若原为 `Heap` 则仍保持 `Heap`）。
     pub(super) fn control(&self) -> Self {
         match self {
             Self::Heap => Self::Heap,
@@ -210,7 +318,7 @@ impl BioAllocator {
         }
     }
 
-    /// 返回具体来源的有限映射上限；普通 Heap 仍按需构造。
+    /// 返回当前分配器单次允许容纳的最大 `MappedPages` 段数（`Heap` 无上限；预留回写槽为 8，辅助槽为 1）。
     pub(super) fn mapping_limit(&self) -> usize {
         match self {
             Self::Heap => usize::MAX,
@@ -219,10 +327,11 @@ impl BioAllocator {
     }
 }
 
-// SAFETY: Heap 完整转发同一 Global；Reserved 仅交对应单元的原布局块，
-// 每个块只有一份真实分配拥有，最后 deallocate 在源仍活时归还状态。
+// SAFETY:
+// 1. `Heap` 分支直接委托给标准库已验证满足 `Allocator` 契约的 `Global`；
+// 2. `Reserved` 分支仅在槽位未被占用且请求 `Layout` 与预分配 `RawBlock` 完全一致时返回有效非空切片，并在 `reserve` 强引用保活下直到 `deallocate` 才解除占用。
 unsafe impl Allocator for BioAllocator {
-    /// 分配只消费已经授予的单元；ready 后绝不向堆补池。
+    /// 申请匹配 `layout` 的内存块：`Heap` 委托给全局堆，`Reserved` 直接消费当前已租借槽位中的预分配块（就绪态下容量固定，不再向全局堆动态申请）。
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         match self {
             Self::Heap => Global.allocate(layout),
@@ -234,11 +343,15 @@ unsafe impl Allocator for BioAllocator {
         }
     }
 
-    /// 仅消费此前从本来源得到的同一首址与布局。
+    /// 归还此前由同一 `BioAllocator` 分配的内存块。
+    ///
+    /// # Safety
+    /// 1. `pointer` 必须是由当前分配器实例（相同 `Heap` 或相同 `reserve`/`slot`/`block`）此前成功分配且尚未释放的起始地址；
+    /// 2. `layout` 必须与分配该内存块时传入的 `Layout` 完全一致，且调用后不得再访问该内存区域。
     unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
         match self {
             Self::Heap => {
-                // SAFETY: 调用者交出同一 Global 分配的真实首址和原布局。
+                // SAFETY: 调用方遵守 `Allocator::deallocate` 契约，且当前分支为 `Self::Heap`，证明 `pointer` 与 `layout` 来自 `Global::allocate`。
                 unsafe { Global.deallocate(pointer, layout) };
             }
             Self::Reserved {
@@ -251,7 +364,10 @@ unsafe impl Allocator for BioAllocator {
         }
     }
 
-    /// 普通 Vec 保留 Global realloc；固定单元不允许扩容。
+    /// 扩容已分配内存块：`Heap` 转发给全局堆，`Reserved` 预留块容量固定，始终返回 `Err(AllocError)`。
+    ///
+    /// # Safety
+    /// 调用方必须满足标准库 `Allocator::grow` 契约：`pointer` 与 `old_layout` 来自当前分配器的有效分配，且 `new_layout.size() >= old_layout.size()`。
     unsafe fn grow(
         &self,
         pointer: NonNull<u8>,
@@ -260,14 +376,17 @@ unsafe impl Allocator for BioAllocator {
     ) -> Result<NonNull<[u8]>, AllocError> {
         match self {
             Self::Heap => {
-                // SAFETY: 原拥有及新布局沿标准 Allocator::grow 合同移交 Global。
+                // SAFETY: 调用方已满足 `Allocator::grow` 的指针有效性、旧布局匹配与新尺寸不小于旧尺寸契约，直接委托给 `Global::grow`。
                 unsafe { Global.grow(pointer, old_layout, new_layout) }
             }
             Self::Reserved { .. } => Err(AllocError),
         }
     }
 
-    /// 普通清零增长仍走 Global，预留映射容量保持固定。
+    /// 扩容并将新增尾部字节清零：`Heap` 转发给全局堆，`Reserved` 预留块容量固定，始终返回 `Err(AllocError)`。
+    ///
+    /// # Safety
+    /// 调用方必须满足标准库 `Allocator::grow_zeroed` 契约：`pointer` 与 `old_layout` 来自当前分配器的有效分配，且 `new_layout.size() >= old_layout.size()`。
     unsafe fn grow_zeroed(
         &self,
         pointer: NonNull<u8>,
@@ -276,14 +395,17 @@ unsafe impl Allocator for BioAllocator {
     ) -> Result<NonNull<[u8]>, AllocError> {
         match self {
             Self::Heap => {
-                // SAFETY: 参数和移交的唯一拥有满足标准 grow_zeroed 合同。
+                // SAFETY: 调用方已满足 `Allocator::grow_zeroed` 的前置契约，且当前分支对应由 `Global` 管理的堆块。
                 unsafe { Global.grow_zeroed(pointer, old_layout, new_layout) }
             }
             Self::Reserved { .. } => Err(AllocError),
         }
     }
 
-    /// 普通缩容转发原 Global；预留单元不改变容量或原布局。
+    /// 缩容已分配内存块：`Heap` 转发给全局堆，`Reserved` 预留块保持原始固定布局不变，返回 `Err(AllocError)`。
+    ///
+    /// # Safety
+    /// 调用方必须满足标准库 `Allocator::shrink` 契约：`pointer` 与 `old_layout` 来自当前分配器的有效分配，且 `new_layout.size() <= old_layout.size()`。
     unsafe fn shrink(
         &self,
         pointer: NonNull<u8>,
@@ -292,7 +414,7 @@ unsafe impl Allocator for BioAllocator {
     ) -> Result<NonNull<[u8]>, AllocError> {
         match self {
             Self::Heap => {
-                // SAFETY: 参数和移交的唯一拥有满足标准 shrink 合同。
+                // SAFETY: 调用方已满足 `Allocator::shrink` 的前置契约，且当前分支对应由 `Global` 管理的堆块。
                 unsafe { Global.shrink(pointer, old_layout, new_layout) }
             }
             Self::Reserved { .. } => Err(AllocError),
@@ -301,7 +423,7 @@ unsafe impl Allocator for BioAllocator {
 }
 
 impl BioReserve {
-    /// 启用前准备九份 Bio 存储及容量内 metadata 基准；Node 布局由实际 Arc 请求提供。
+    /// 在普通可睡眠任务上下文中创建预留池：准备 `capacity` 个元数据基准页槽位与 9 个 `BioSlot`（此时尚未标记为 `ready`，元数据节点控制块布局待后续 `Node::prime` 预热填充）。
     pub(crate) fn try_new(
         capacity: usize,
         hot: impl IntoIterator<Item = FolioRef>,
@@ -311,6 +433,7 @@ impl BioReserve {
             return Err(BlockError::InvalidRange);
         }
 
+        // Step 1: 构建容量为 capacity 的元数据槽数组，优先复用已有的热元数据页 hot，不足部分新分配元数据物理页。
         let mut metadata = Vec::new();
         metadata
             .try_reserve_exact(capacity)
@@ -330,6 +453,7 @@ impl BioReserve {
             return Err(BlockError::InvalidRange);
         }
 
+        // Step 2: 分配 BioReserve 主体，初始处于未就绪（ready = false）准备阶段。
         let reserve = Arc::try_new(Self {
             state: SpinLock::new(ReserveState {
                 bios: core::array::from_fn(|_| BioSlot::new()),
@@ -341,6 +465,7 @@ impl BioReserve {
         })
         .map_err(|_| BlockError::NoMemory)?;
 
+        // Step 3: 逐槽试构造并释放一次 Arc<BioInner> 以捕获精确控制块布局，并预分配对应容量的 MappedPages 数组载荷块。
         for slot in 0..BIO_SLOTS {
             let allocator = BioAllocator::Reserved {
                 reserve: reserve.clone(),
@@ -358,18 +483,18 @@ impl BioReserve {
         Ok(reserve)
     }
 
-    /// 返回原 cache 已选定的真实 metadata 页容量。
+    /// 返回本预留池配置的元数据基准页槽位总数。
     #[cfg(feature = "ktest")]
     pub(crate) fn capacity(&self) -> usize {
         self.state.lock().metadata.len()
     }
 
-    /// 克隆原基准页；克隆只增加真实引用，不重新申请物理页。
+    /// 克隆指定元数据槽位 `slot` 持有的基准物理页 `FolioRef`（仅增加引用计数，不分配新物理页）。
     pub(crate) fn metadata_folio(&self, slot: usize) -> FolioRef {
         self.state.lock().metadata[slot].folio.clone()
     }
 
-    /// 按真实原页身份查本 cache 的库存，不恢复任何 raw Arc 来源。
+    /// 按物理页地址查找 `folio` 在本预留池元数据槽数组中的下标；若不属于本池基准页则返回 `None`。
     pub(crate) fn metadata_slot_for(&self, folio: &FolioRef) -> Option<usize> {
         let physical = folio.phys_addr();
         self.state
@@ -379,12 +504,12 @@ impl BioReserve {
             .position(|slot| slot.folio.phys_addr() == physical)
     }
 
-    /// 明确该页是否有本源基准；这不是单独的回收资格。
+    /// 判断给定 `folio` 是否属于本预留池常驻持有的元数据基准页。
     pub(crate) fn metadata_has_baseline(&self, folio: &FolioRef) -> bool {
         self.metadata_slot_for(folio).is_some()
     }
 
-    /// 所有 genuine 控制准备和 bootstrap 票尾结束后一次开放来源。
+    /// 在全部 `BioSlot` 与 `MetadataSlot` 控制块完成预热分配且无任何在途租用后，将预留池切换为就绪态（`ready = true`），此后禁止任何堆补分配。
     pub(crate) fn mark_ready(&self) {
         let mut state = self.state.lock();
         assert!(!state.ready, "reserve published twice");
@@ -399,7 +524,9 @@ impl BioReserve {
         state.ready = true;
     }
 
-    /// Node allocator 的实际 Layout 首次请求仅能发生在未发表准备期。
+    /// 为指定元数据槽位 `slot` 分配缓存树节点（`Node`）的控制块内存。
+    ///
+    /// 准备期（`!ready`）首次调用时在自旋锁外向全局堆申请并缓存精确 `layout`；就绪期（`ready`）仅在持有 `MetadataLease` 且控制块空闲时复用已有块。
     pub(crate) fn allocate_metadata_control(
         &self,
         slot: usize,
@@ -438,10 +565,11 @@ impl BioReserve {
         }
     }
 
-    /// 最后 Node Weak 才归还控制块，原页 reset 由 cache 的独占协议另行完成。
+    /// 在元数据缓存节点（`Arc<Node>`）及其最后一个 `Weak` 弱引用彻底析构时，将控制块标记为空闲并唤醒等待队列。
     ///
     /// # Safety
-    /// pointer/layout 必须是本 slot 此前真实 allocate 返回且尚未归还的同一分配。
+    /// 1. `pointer` 与 `layout` 必须原样来自本预留池同一 `slot` 此前 `allocate_metadata_control` 返回且尚未归还的分配；
+    /// 2. 调用后调用方不得再读写 `pointer` 指向的控制块内存。
     pub(crate) unsafe fn deallocate_metadata_control(
         &self,
         slot: usize,
@@ -455,7 +583,7 @@ impl BioReserve {
         self.notify_available();
     }
 
-    /// 无空单元时保真实 NoMemory，不等待自己仍持的 Node/Buffer。
+    /// 非阻塞尝试租借一个空闲的元数据槽位（需同时满足未租借、节点控制块已归还、且基准物理页无外部活跃占用）；若全部忙碌则立即返回 `BlockError::NoMemory`，避免持缓存引用睡眠自锁。
     pub(crate) fn try_metadata_slot(self: &Arc<Self>) -> Result<MetadataLease, BlockError> {
         let mut state = self.state.lock();
         if !state.ready {
@@ -485,17 +613,17 @@ impl BioReserve {
         })
     }
 
-    /// 普通新业务只在自身入口捕获一次真实源边界，受限轮从原 storage 延续它。
+    /// 采样当前预留池的 `stop_sequence` 构造常规元数据 I/O 上下文。
     pub(crate) fn metadata_io_context(self: &Arc<Self>) -> MetadataIoContext<'_> {
         MetadataIoContext::from_boundary(self, self.state.lock().stop_sequence)
     }
 
-    /// 锁外唤醒控制归还或原页回到基准的等待者；通知不代替重查。
+    /// 在自旋锁外唤醒所有等待预留槽位或元数据资源归还的任务（被唤醒方仍须重新加锁复查条件）。
     pub(crate) fn notify_available(&self) {
         self.available.wake_all();
     }
 
-    /// 在 FS 业务锁外预定至少一份完整 WB 单元，不为凑满而保未提交对象。
+    /// 在获取文件系统业务锁之前阻塞等待并批量预订至少 1 个（最多 `MAX_BATCH = 8` 个）空闲回写 `BioSlot`，返回通道守卫 `BioLane`；若 `stopped()` 为真则返回 `BlockError::QueueStopped`。
     pub(crate) fn acquire_wb_lane(
         self: &Arc<Self>,
         stopped: impl Fn() -> bool,
@@ -525,7 +653,7 @@ impl BioReserve {
         })
     }
 
-    /// 独立读取/FLUSH 单元先取得，再允许认领 metadata 内容锁。
+    /// 在获取元数据页内容锁之前阻塞等待并租借专用的辅助槽（`AUX_SLOT`），用于发起元数据读入或 `Flush` 请求；等待期间若 `context` 停止边界失效则返回 `BlockError::NotReady`。
     pub(crate) fn acquire_aux(
         self: &Arc<Self>,
         context: MetadataIoContext<'_>,
@@ -555,7 +683,7 @@ impl BioReserve {
         })
     }
 
-    /// 原等待源和栈登记覆盖重查窗口，不申请等待对象或使用 timeout 轮询。
+    /// 使用栈上固定的等待节点在 `self.available` 队列上执行无堆分配的“检查 -> 注册等待 -> 二次复查 -> 睡眠挂起”循环，消除唤醒丢失窗口。
     fn wait_available<T>(
         &self,
         mut check: impl FnMut() -> Result<Option<T>, BlockError>,
@@ -567,7 +695,9 @@ impl BioReserve {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: 调用者保持源拥有；pin 固定栈节点，所有返回都先撤登记。
+            // SAFETY:
+            // 1. `&self` 在整个循环期间保持 `BioReserve` 及内嵌 `self.available` 等待队列有效；
+            // 2. `node` 已通过 `pin!` 固定在当前栈帧上不会移动，且每次循环迭代结束或提前 `return` 时 `_registration` 析构都会先将节点从队列安全摘除。
             let _registration = unsafe { self.available.register(node.as_mut()) };
             if let Some(value) = check()? {
                 return Ok(value);
@@ -576,7 +706,7 @@ impl BioReserve {
         }
     }
 
-    /// 只消费已准备原块；初始控制分配在全部源锁外进行。
+    /// 从指定 `BioSlot` 的 `Control` 或 `Payload` 槽位分配匹配 `layout` 的内存块；仅在未就绪准备期（`!ready`）首次缺失时才在自旋锁外向全局堆申请。
     fn allocate_bio(
         &self,
         slot: usize,
@@ -616,7 +746,7 @@ impl BioReserve {
         }
     }
 
-    /// 每个真实 Arc/Vec deallocate 只归自身责任，book 与 lease 另行结束。
+    /// 在 `Arc<BioInner>`（含最后一个 `Weak`）或 `Vec<MappedPages>` 析构时归还对应槽位的控制块或载荷块占用，并唤醒等待者。
     fn release_bio(&self, slot: usize, block: BioBlock, pointer: NonNull<u8>, layout: Layout) {
         {
             let mut state = self.state.lock();
@@ -629,7 +759,7 @@ impl BioReserve {
         self.notify_available();
     }
 
-    /// 读取真实存储布局与占用，不将 observer 尚活的控制算作空单元。
+    /// 获取预留池当前各槽位状态、存活分配计数及内存块精确布局的快照（供内核测试诊断使用）。
     #[cfg(feature = "ktest")]
     pub(crate) fn snapshot(&self) -> ReserveSnapshot {
         let state = self.state.lock();
@@ -673,7 +803,7 @@ impl BioReserve {
         }
     }
 
-    /// 只观察原来源等待队列的实际成员，不创建另一份等待账。
+    /// 返回当前正在 `available` 等待队列上睡眠等待预留资源的任务数量（供内核测试验证阻塞行为）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_waiting(&self) -> usize {
         self.available.test_members()
@@ -681,7 +811,7 @@ impl BioReserve {
 }
 
 impl Drop for BioReserve {
-    /// 最后源拥有只核尾部并析构原块与基准页，不发起 FS/IO 或同步停止。
+    /// 在最后一个 `Arc<BioReserve>` 强引用释放时校验所有 `BioSlot` 与 `MetadataSlot` 的预订、租借及分配器占用均已彻底清零，随后自动析构底层 `RawBlock` 与基准页。
     fn drop(&mut self) {
         let state = self.state.lock();
         assert!(state.bios.iter().all(|slot| !slot.booked
@@ -695,20 +825,25 @@ impl Drop for BioReserve {
     }
 }
 
-/// 业务锁前授予的整体准入，不保存任何活 Bio/Vec 或页内容借用。
+/// 回写波次在进入文件系统业务锁前批量预订的 `BioSlot` 通道守卫（RAII）。
+///
+/// 仅持有已预订槽位的下标集合（将对应槽位置为 `booked = true`），本身不持有任何活跃的 `Bio`、`Vec` 或页面借用。
 pub(crate) struct BioLane {
+    /// 所属预留内存池的强引用。
     reserve: Arc<BioReserve>,
+    /// 本次成功预订的回写槽位下标数组，仅前 `count` 项有效（每个下标范围 `0..MAX_BATCH`）。
     slots: [usize; MAX_BATCH],
+    /// 本次通道实际预订到的槽位数量（范围 `1..=MAX_BATCH`）。
     count: usize,
 }
 
 impl BioLane {
-    /// 返回本次真正取得的完整单元数，未取得的份额不伪装成八份。
+    /// 返回本通道实际成功预订到的回写槽位数量（`1..=MAX_BATCH`）。
     pub(crate) fn len(&self) -> usize {
         self.count
     }
 
-    /// 非阻塞探测本 book 的一个单元；已有未提交父时绝不能为了凑满而等待。
+    /// 非阻塞尝试租借本通道内第 `index` 个槽位的单次构造权；当调用方手上已持有本波未提交的父 `Bio` 时，使用非阻塞探测避免为凑满批次而睡眠阻塞。
     pub(crate) fn try_lease(
         &self,
         index: usize,
@@ -733,7 +868,7 @@ impl BioLane {
         }))
     }
 
-    /// 仅在本波零父时等待任一已 book 单元，真实 weak 尾不阻塞其他已可用份额前进。
+    /// 在当前波次尚未构造任何未提交 `Bio` 时，阻塞等待本通道内任意一个已预订槽位完成底层内存归还并返回其 `(通道内序号, BioLease)`。
     pub(crate) fn lease_available(
         &self,
         stopped: impl Fn() -> bool,
@@ -763,7 +898,7 @@ impl BioLane {
 }
 
 impl Drop for BioLane {
-    /// 开放准入不清真实分配责任；未 deallocate 的单元仍不可借。
+    /// 释放通道对所有槽位的预订标记（`booked = false`）并唤醒等待者；若个别槽位的底层 `Arc`/`Vec` 尚未彻底析构，其 `active` 标志仍会阻止该槽被立即重用。
     fn drop(&mut self) {
         {
             let mut state = self.reserve.state.lock();
@@ -776,14 +911,18 @@ impl Drop for BioLane {
     }
 }
 
-/// 每次构造的短拥有，只允许从一个完整单元取得原映射存储。
+/// 单个 `BioSlot` 的单次 `Bio` 构造租约守卫（RAII）。
+///
+/// 在构造 `BioMemory` 与 `Bio` 的短暂窗口内持有（置 `leased = true`），构造完成后即可提前释放，底层内存继续由 `active` 标志保护至 `deallocate`。
 pub(crate) struct BioLease {
+    /// 所属预留内存池的强引用。
     reserve: Arc<BioReserve>,
+    /// 当前租借的 `BioSlot` 槽位下标（`0..BIO_SLOTS`）。
     slot: usize,
 }
 
 impl BioLease {
-    /// 以实际 allocator 建立已有块的 Vec 拥有，不复制 payload。
+    /// 使用当前租借槽位的 `Payload` 预留块创建并预分配固定容量的空 `BioMemory` 容器。
     pub(crate) fn memory(&self) -> Result<BioMemory, BlockError> {
         let mut memory = Vec::new_in(BioAllocator::Reserved {
             reserve: self.reserve.clone(),
@@ -798,7 +937,7 @@ impl BioLease {
 }
 
 impl Drop for BioLease {
-    /// 仅结束构造 lease；所有实际 Arc/Vec owning 仍阻止物理重用。
+    /// 解除槽位的单次构造租借标记（`leased = false`）并通知等待队列；已分配出的 `Arc<BioInner>` 与 `BioMemory` 在各自析构前仍保持 `active = true` 防止重用。
     fn drop(&mut self) {
         {
             let mut state = self.reserve.state.lock();
@@ -809,26 +948,28 @@ impl Drop for BioLease {
     }
 }
 
-/// Node 构造前的单元借用；不在 guard 中保存 Node 或有效内容别名。
+/// 元数据缓存替换或新建索引节点（`Node`）前的单槽租约守卫（RAII）。
 pub(crate) struct MetadataLease {
+    /// 所属预留内存池的强引用。
     reserve: Arc<BioReserve>,
+    /// 当前租借的 `MetadataSlot` 槽位下标（`0..capacity`）。
     slot: usize,
 }
 
 impl MetadataLease {
-    /// 返回实际单元号供同一 IndexAllocator 保留来源。
+    /// 返回租借的元数据槽位下标，供 `IndexAllocator::Metadata` 绑定对应的节点控制块。
     pub(crate) fn slot(&self) -> usize {
         self.slot
     }
 
-    /// 借出原基准的真实克隆；caller 在 Node 发表前完成独占 reset。
+    /// 克隆并返回该元数据槽位绑定的基准物理页 `FolioRef`（调用方需在发布新缓存节点前独占重置页面状态）。
     pub(crate) fn folio(&self) -> FolioRef {
         self.reserve.metadata_folio(self.slot)
     }
 }
 
 impl Drop for MetadataLease {
-    /// 构造成功或失败都结束借出，控制及原页占用仍分别真实重查。
+    /// 解除元数据槽位的构造租借标记（`leased = false`）并唤醒等待队列；节点控制块与物理页的实际空闲状态仍由各自引用计数独立把关。
     fn drop(&mut self) {
         {
             let mut state = self.reserve.state.lock();
@@ -839,42 +980,55 @@ impl Drop for MetadataLease {
     }
 }
 
-/// 验收读取的真实 Layout/责任；统计本身不提供 IO 停止或重用许可。
+/// 内核测试（`ktest`）读取的预留内存池状态与内存块布局诊断快照。
 #[cfg(feature = "ktest")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReserveSnapshot {
+    /// 预留池是否已完成预热并进入就绪态（`ready`）。
     pub ready: bool,
+    /// 元数据缓存基准槽位的总容量。
     pub metadata_capacity: usize,
+    /// 当前未被预订（`!booked`）且立即可重用的回写 `BioSlot` 数量（范围 `0..=8`）。
     pub free_wb: usize,
+    /// 独立辅助槽（`AUX_SLOT`）当前是否处于空闲可重用状态。
     pub aux_free: bool,
+    /// 当前处于通道预订状态（`booked == true`）的 `BioSlot` 数量。
     pub booked: usize,
+    /// 当前处于单次构造租借状态（`leased == true`）的 `BioSlot` 数量。
     pub leased: usize,
+    /// 当前底层 `Arc<BioInner>` 控制块尚未归还（`control.active == true`）的 `BioSlot` 数量。
     pub control_live: usize,
+    /// 当前底层 `Vec<MappedPages>` 载荷块尚未归还（`payload.active == true`）的 `BioSlot` 数量。
     pub payload_live: usize,
+    /// 0 号槽捕获的 `Arc<BioInner>` 控制块内存布局（用于测试校验退役前后布局恒定）。
     #[expect(
         dead_code,
         reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 Bio 控制布局"
     )]
     pub bio_control: Option<Layout>,
+    /// 0 号回写槽预分配的 8 段 `MappedPages` 载荷数组内存布局。
     #[expect(
         dead_code,
         reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 WB payload 布局"
     )]
     pub wb_payload: Option<Layout>,
+    /// 独立辅助槽（`AUX_SLOT`）预分配的单段 `MappedPages` 载荷数组内存布局。
     #[expect(
         dead_code,
         reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出 aux payload 布局"
     )]
     pub aux_payload: Option<Layout>,
+    /// 0 号元数据槽捕获的缓存索引节点（`Arc<Node>`）控制块内存布局。
     #[expect(
         dead_code,
         reason = "后台退休测试的 layout-held 和 layout-after 整值 Debug 诊断输出元数据节点控制布局"
     )]
     pub node_control: Option<Layout>,
+    /// 当前底层 `Arc<Node>` 控制块尚未归还（`control.active == true`）的元数据槽数量。
     pub metadata_control_live: usize,
 }
 
-/// 单元几何只有 WB 八映射与 aux 一映射两种具体取值。
+/// 返回指定 `BioSlot` 下标对应的载荷数组最大映射段数：辅助槽 `AUX_SLOT` 为 `1`，其余回写槽均为 `WB_MAPPINGS`（`8`）。
 fn slot_mappings(slot: usize) -> usize {
     if slot == AUX_SLOT {
         1
@@ -883,7 +1037,7 @@ fn slot_mappings(slot: usize) -> usize {
     }
 }
 
-/// 选择完整单元内的一份真实分配事实，不复制块拥有。
+/// 根据 `BioBlock` 类型选取 `BioSlot` 内部对应的控制块或载荷块分配记录可变引用。
 fn bio_allocation(slot: &mut BioSlot, block: BioBlock) -> &mut Allocation {
     match block {
         BioBlock::Control => &mut slot.control,
@@ -891,7 +1045,7 @@ fn bio_allocation(slot: &mut BioSlot, block: BioBlock) -> &mut Allocation {
     }
 }
 
-/// 已准备块只允许原布局及一份实际分配拥有。
+/// 尝试占用已预分配的 `RawBlock`：若当前已被占用或请求 `layout` 与预分配布局不一致则返回 `Err(AllocError)`；若尚未分配过内存块则返回 `Ok(None)`。
 fn use_prepared(
     allocation: &mut Allocation,
     layout: Layout,
@@ -909,7 +1063,7 @@ fn use_prepared(
     Ok(Some(block.view()))
 }
 
-/// allocator 调用已经证明最后拥有结束，源另核原首址/布局恰好归还一次。
+/// 校验归还的 `pointer` 与 `layout` 与预分配块严格一致且当前确实处于占用状态，随后清除 `active` 占用位并标记已完成过预热回收（`retired_once = true`）。
 fn release_allocation(allocation: &mut Allocation, pointer: NonNull<u8>, layout: Layout) {
     assert!(allocation.active, "reserve allocation ended twice");
     let block = allocation.block.as_ref().expect("reserve block missing");

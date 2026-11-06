@@ -1,4 +1,19 @@
-//! 反射 Castagnoli 表与逐字节更新不包含最终取反，便于连续元数据种子计算。
+//! ext4 元数据校验和算法（CRC32C 与 CRC16）。
+//!
+//! # 模块职责与定位
+//! 本模块位于 `fs::ext4` 底层，为 `codec` 和 `allocation` 提供纯计算的字节流循环冗余校验（CRC），
+//! 不涉及任何锁、I/O 或缓存状态。
+//!
+//! # 核心设计
+//! - **增量式 CRC32C（Castagnoli，反射多项式 `0x82F63B78`）**：
+//!   ext4 启用 `METADATA_CSUM` 时，元数据校验和不是对单一连续缓冲区独立做完整 CRC32C，
+//!   而是先以文件系统 `uuid`（或超级块预存的 `s_checksum_seed`）计算基础种子，再把 inode 编号、
+//!   代数（generation）以及分段元数据字节依次串接进同一条校验链。因此 [`crc32c`] 保留未最终取反的
+//!   中间寄存器值，由调用方以 `u32::MAX`（`~0`）初始化并在链式计算中直接传递 `seed`。
+//! - **反射 CRC16（多项式 `0x8005`，反射值 `0xA001`）**：
+//!   供仅启用旧式 `GDT_CSUM`（未启用 `METADATA_CSUM`）的卷计算块组描述符校验和。
+
+/// 反射 Castagnoli 多项式（`0x82F63B78`）的 256 项逐字节查找表。
 pub const CRC32C_TAB: [u32; 256] = [
     0x00000000, 0xF26B8303, 0xE13B70F7, 0x1350F3F4, 0xC79A971F, 0x35F1141C, 0x26A1E7E8, 0xD4CA64EB,
     0x8AD958CF, 0x78B2DBCC, 0x6BE22838, 0x9989AB3B, 0x4D43CFD0, 0xBF284CD3, 0xAC78BF27, 0x5E133C24,
@@ -34,7 +49,10 @@ pub const CRC32C_TAB: [u32; 256] = [
     0x79B737BA, 0x8BDCB4B9, 0x988C474D, 0x6AE7C44E, 0xBE2DA0A5, 0x4C4623A6, 0x5F16D052, 0xAD7D5351,
 ];
 
-/// 计算不带最终取反的 CRC32C，切片本身限定全部输入长度。
+/// 以 `seed` 为当前寄存器初值，逐字节增量更新反射 CRC32C 状态并返回未最终取反的结果。
+///
+/// 无睡眠、无锁纯函数，可在任意上下文调用。ext4 元数据校验链通常以 `u32::MAX` 作为首个种子，
+/// 连续灌入 UUID、编号及各段结构字节后直接按 ext4 盘面约定截断或写入对应校验和字段。
 pub fn crc32c(mut seed: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
         seed = CRC32C_TAB[usize::from(seed as u8 ^ byte)] ^ (seed >> 8);
@@ -42,7 +60,9 @@ pub fn crc32c(mut seed: u32, bytes: &[u8]) -> u32 {
     seed
 }
 
-/// 计算旧组描述符采用的反射 CRC16，生成多项式为 0x8005。
+/// 以 `seed` 为初值逐位计算反射 CRC16（生成多项式 `0x8005`，反射掩码 `0xa001`）。
+///
+/// 无睡眠、无锁纯函数，用于旧式 `FEATURE_RO_COMPAT_GDT_CSUM` 块组描述符校验和。
 pub fn crc16(mut seed: u16, bytes: &[u8]) -> u16 {
     for &byte in bytes {
         seed ^= u16::from(byte);

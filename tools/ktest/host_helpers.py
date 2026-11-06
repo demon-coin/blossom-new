@@ -1,4 +1,10 @@
-"""宿主回归共用的目录、协议输入和最小会话／UART 状态。"""
+"""宿主机侧 `ktest` 单元测试共用的目录构造、命令行配置及轻量会话夹具。
+
+本模块为宿主机回归测试提供免 QEMU 启动的辅助构造函数，包括：
+- 标准化的测试套件（`suite_record`）、参数化用例（`case_record`）及完整 `Catalog` 实例；
+- 默认命令行选项命名空间（`options`）与不拉起子进程的 `QemuTestSession` / `UartChannel` 内存桩（`session_fixture`）；
+- 已完成前置套件级握手的 `KtapParser` 实例（`parser_for`）及标准用例 KTAP 输出行序列生成（`case_lines`）。
+"""
 
 import importlib.util
 import io
@@ -21,13 +27,13 @@ CONFIG = dict(arch="riscv64", cpus=2, mode="debug", panic="unwind")
 
 
 def suite_record(sid=0):
-    """构造协议允许的 suite 目录记录。"""
+    """构造一条符合目录协议约束的默认测试套件（`suite`）JSONL 字典记录。"""
     return dict(type="suite", suite=sid, name=f"os::tests{sid}", context="Thread",
                 isolation="Suite", tags=[], min_cpus=1, timeout_ms=10000, resources=[])
 
 
 def case_record(cid=0, sid=0, **overrides):
-    """构造带完整参数身份的真实目录形状。"""
+    """构造一条带默认参数名与源码位置属性的测试用例（`case`）JSONL 字典记录，支持关键字参数覆盖字段。"""
     row = dict(type="case", suite=sid, case=cid, name=f"os::tests{sid}::case{cid}[one]",
                parameter="one", source="os/tests.rs", line=10, context="Thread", isolation="Suite",
                tags=[], ignore=None, min_cpus=1, timeout_ms=10000, resources=[], expected_fatal=None,
@@ -37,7 +43,7 @@ def case_record(cid=0, sid=0, **overrides):
 
 
 def catalog_of(cases):
-    """只通过 JSONL 接收接口构造目录，避免测试绕开目录边界。"""
+    """通过 `Catalog.feed` 接口依次喂入头部、套件、用例与结束记录，构造经过完整协议校验的 `Catalog` 对象。"""
     catalog = Catalog(CONFIG)
     catalog.feed(dict(type="catalog", version=1, **CONFIG))
     for sid in sorted({row["suite"] for row in cases}):
@@ -50,7 +56,7 @@ def catalog_of(cases):
 
 
 def options(**overrides):
-    """为纯行为回归提供明确选择和挂载模式，没有隐式机器资源。"""
+    """构造宿主机测试默认使用的命令行参数 `SimpleNamespace`，可通过关键字参数覆盖特定选项。"""
     args = SimpleNamespace(exact=[], include=[], parameter=[], tag=[], exclude=[], include_ignored=False,
                            shard=None, repeat=1, shuffle=False, seed=17, isolation="suite", jobs=2,
                            arch="riscv64", cpus=2, mode="debug", panic="unwind", disks={}, read_only=[],
@@ -64,7 +70,7 @@ def options(**overrides):
 
 
 def session_fixture():
-    """为真实 socket 与子进程回归准备组合状态，不启动或模拟 guest。"""
+    """构造不启动真实 QEMU 进程的 `QemuTestSession` 与内存态 `UartChannel` 组合桩，供串口与会话单元测试使用。"""
     session = QemuTestSession.__new__(QemuTestSession)
     session.debugger = None
     session.gdb_command = None
@@ -86,7 +92,7 @@ def session_fixture():
 
 
 def parser_for(cases):
-    """初始化一组实际期待项的 KTAP 状态。"""
+    """针对给定用例列表构造 `KtapParser`，并预先喂入直到 `suite-begin setup` 为止的头部协议行。"""
     items = [Invocation(row, 0, case_seed(17, 0, row["name"]), i) for i, row in enumerate(cases)]
     parser = KtapParser(suite_record(cases[0]["suite"]), items)
     for line in ("KTAP version 1", "1..1", f"  # Subtest: os::tests{cases[0]['suite']}",
@@ -96,7 +102,7 @@ def parser_for(cases):
 
 
 def case_lines(case, position=1, status="Pass"):
-    """输出经历完整清理后的最终记录。"""
+    """生成单个测试用例从 `case-begin`、`setup`、`body`、`cleanup` 到最终 `ok`/`not ok` 结果行的完整 KTAP 文本行列表。"""
     cid = case["case"]
     result = "ok" if status in ("Pass", "Skip") else "not ok"
     directive = " # SKIP insufficient CPUs" if status == "Skip" else (" # ERROR" if status == "Error" else "")

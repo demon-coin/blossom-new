@@ -1,18 +1,52 @@
-//! 文件间传输只提交目标实际接受量，位置锁先于原管道页环，同步在两者之外完成。
+//! 内核态跨文件零拷贝/直通传输模块（`copy_file_range` 与 `splice`）。
+//!
+//! # 模块职责与架构定位
+//! 本模块实现两个在内核态直接搬运文件数据的传输入口，避免调用方在用户态反复分配缓冲并来回拷贝：
+//! - **上游调用者**：系统调用层（`sys_copy_file_range`、`sys_splice`）以及内核测试。
+//! - **下游依赖**：普通文件打开实例（`InodeFile`）、匿名管道端点（`PipeEnd`）、文件回写同步与脏页节流机制。
+//!
+//! # 核心设计与数据流向
+//! ```text
+//!   copy_file_range (同一挂载文件系统内的普通文件 -> 普通文件):
+//!   +---------------+   read_at (4 KiB 栈缓冲)    +---------------+
+//!   | 源 InodeFile  | --------------------------> | 目标 InodeFile|
+//!   +---------------+                             +---------------+
+//!          |  1. 按对象地址序加锁隐式 cursor             |  2. 仅按目标实际接收字节数推进两端偏移
+//!          +---------------------------------------------+  3. 释放 cursor 锁后执行 O_DSYNC/O_SYNC 与脏页节流
+//!
+//!   splice (至少一端为匿名管道 PipeEnd):
+//!   - PipeEnd   -> PipeEnd   : 管道环形页缓冲之间直接搬运物理页槽
+//!   - PipeEnd   -> InodeFile : 锁住目标文件隐式 cursor -> 管道向文件写入 -> 更新偏移并放锁 -> 同步与脏页节流
+//!   - InodeFile -> PipeEnd   : 锁住源文件隐式 cursor   -> 文件读入管道页 -> 更新偏移并放锁
+//! ```
+//!
+//! # 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **调用前前提**：调用方必须在进程文件描述符表自旋锁（`FileTable`）之外持有源和目标的 `FileRef`。
+//! 2. **双普通文件位置锁顺序**：`copy_file_range` 若两端均使用打开文件描述（OFD）的隐式游标，必须按 `InodeFile` 实例指针地址从小到大依次获取 `cursor` 睡眠锁；若源和目标指向同一个 `InodeFile` 实例，则只加锁一次，防止自死锁。
+//! 3. **文件位置锁先于管道锁与 Inode I/O 锁**：`positioned_splice` 先获取普通文件的 `cursor` 睡眠锁，再进入管道环形缓冲区的睡眠锁或底层 `Inode` 读写路径。
+//! 4. **同步回写位于位置锁之外**：`O_DSYNC`/`O_SYNC` 数据落盘与脏页平衡节流必须在释放 `cursor` 睡眠锁和管道锁之后执行，避免持位置锁长时间阻塞其他并发观察者。
 
 use crate::fs::file::{FileIoContext, FileLike, FileRef, InodeFile};
 use crate::fs::{FsError, InodeKind, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY};
 use crate::wait::WaitMode;
 
+/// `splice` 非阻塞标志（对应 `SPLICE_F_NONBLOCK`）：管道无数据或无空间时立即返回 `WouldBlock` 而非睡眠等待。
 const SPLICE_NONBLOCK: u32 = 2;
+/// `splice` 页面移动提示标志（对应 `SPLICE_F_MOVE`）：Linux ABI 兼容提示位，不影响数据语义。
 const SPLICE_F_MOVE: u32 = 1;
+/// `splice` 后续仍有更多数据提示标志（对应 `SPLICE_F_MORE`）：Linux ABI 兼容提示位。
 const SPLICE_F_MORE: u32 = 4;
+/// `splice` 赠予用户页提示标志（对应 `SPLICE_F_GIFT`）：Linux ABI 兼容提示位。
 const SPLICE_F_GIFT: u32 = 8;
+/// `splice` 允许传入的全部合法标志位掩码。
 const SPLICE_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 
+/// `copy_file_range` 在内核栈上单次中转读写的分块大小（字节，4 KiB）。
 const TRANSFER_CHUNK: usize = 4096;
 
-/// 核明确位置和完整请求可表示为非负 loff_t，不用截断掩盖溢出。
+/// 校验起始偏移 `offset` 与请求长度 `length` 之和未发生算术溢出，且可表示为非负有符号 64 位偏移（`loff_t`，不超过 `i64::MAX`）。
+///
+/// 在普通可睡眠任务上下文中调用；若越界则返回 `FsError::InvalidOperation`（对应 `EINVAL`）。
 fn check_range(offset: u64, length: usize) -> Result<(), FsError> {
     let end = offset
         .checked_add(length as u64)
@@ -23,7 +57,7 @@ fn check_range(offset: u64, length: usize) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 后续错误保留已经真实接受的正前缀，零进度才返回原错误。
+/// 处理分步传输中途遇到的错误：若此前已成功传输非零字节（Partial Progress），则优先返回已完成字节数；仅当零进度时才上报错误。
 fn progress(accepted: usize, error: FsError) -> Result<usize, FsError> {
     if accepted == 0 {
         Err(error)
@@ -32,7 +66,10 @@ fn progress(accepted: usize, error: FsError) -> Result<usize, FsError> {
     }
 }
 
-/// 持续有数据时仍观察本用户线程的真实可处理中断，不为内核调用创建信号等待。
+/// 检查当前调用者在持续传输循环间隙是否收到待响应的可中断信号。
+///
+/// 内核内部调用（`FileIoContext::Kernel`）不受用户态信号打断，始终返回 `false`；
+/// 用户线程调用（`FileIoContext::User`）在存在待处理非屏蔽信号时返回 `true`，以便及时返回短传输计数或 `EINTR`。
 pub(crate) fn interruption_pending(caller: FileIoContext<'_>) -> bool {
     match caller {
         FileIoContext::Kernel => false,
@@ -42,12 +79,17 @@ pub(crate) fn interruption_pending(caller: FileIoContext<'_>) -> bool {
     }
 }
 
-/// splice 的文件端必须提供实际普通文件能力，目录或其它流按 EINVAL 拒绝。
+/// 提取 `splice` 文件端对应的普通文件实例（`InodeFile`）；若传入目录、套接字或其他非普通文件对象则返回 `FsError::InvalidOperation`。
 fn regular(file: &FileRef) -> Result<&InodeFile, FsError> {
     file.inode_file().ok_or(FsError::InvalidOperation)
 }
 
-/// copy_file_range 只接受实际普通文件、合法访问模式及同一个真实文件系统后端。
+/// 在同一挂载文件系统的两个普通文件之间内核态拷贝最多 `length` 字节的数据（对应 `copy_file_range` 系统调用）。
+///
+/// # 调用上下文与参数
+/// - 必须在普通可睡眠任务上下文中调用，且不得持有描述符表锁。
+/// - `source_offset` / `target_offset` 为 `Some` 时使用并更新调用方显式给定的偏移，不触碰打开文件实例（OFD）自身的游标；为 `None` 时加锁推进对应 OFD 的共享游标。
+/// - 返回实际成功写入目标文件的字节数；若两个文件位于同一 `Inode` 且读写字节区间重叠，返回 `FsError::InvalidOperation`。
 pub(crate) fn copy_file_range(
     source: &FileRef,
     source_offset: Option<&mut u64>,
@@ -58,7 +100,8 @@ pub(crate) fn copy_file_range(
 ) -> Result<usize, FsError> {
     let input = source.inode_file();
     let output = target.inode_file();
-    // 两端目录检查先于其它对象和访问模式，实际普通对象不再采样无关属性。
+    // Step 1: 校验源与目标的对象类型、打开访问模式、追加标志以及是否属于同一个底层文件系统实例。
+    // 目录检查必须在常规能力提取之前完成，保证对目录描述符准确返回 EISDIR 而非 EINVAL。
     if (input.is_none() && source.stat()?.kind == InodeKind::Directory)
         || (output.is_none() && target.stat()?.kind == InodeKind::Directory)
     {
@@ -86,7 +129,7 @@ pub(crate) fn copy_file_range(
     let shared = core::ptr::eq(input, output);
     let lock_input = source_offset.is_none();
     let lock_output = target_offset.is_none() && !(shared && lock_input);
-    // 地址只用作 OFD 锁序；同一实例即使两端隐式位置也只取一个 guard。
+    // Step 2: 按 InodeFile 内存地址升序获取隐式位置睡眠锁；若源和目标是同一个 OFD 实例，仅获取一次锁以避免自死锁。
     let (mut input_cursor, mut output_cursor) =
         if (input as *const InodeFile) < (output as *const InodeFile) {
             let input_cursor = lock_input.then(|| input.transfer_cursor());
@@ -108,6 +151,7 @@ pub(crate) fn copy_file_range(
             **input_cursor.as_ref().unwrap()
         }
     });
+    // Step 3: 校验两端偏移与请求长度不超出 loff_t 上限，按源文件当前大小裁剪可拷贝长度，并拒绝同文件重叠区间拷贝。
     check_range(start_in, length)?;
     check_range(start_out, length)?;
     let size = input.mapping_inode().unwrap().metadata_snapshot()?.size;
@@ -122,6 +166,7 @@ pub(crate) fn copy_file_range(
         return Err(FsError::InvalidOperation);
     }
 
+    // Step 4: 执行分块读写传输，仅按目标文件实际接收的字节数更新显式偏移或隐式游标，随后立即释放位置锁。
     let result = copy_bytes(input, start_in, output, start_out, length, caller);
     if let Ok(accepted) = result {
         if let Some(offset) = source_offset {
@@ -140,10 +185,13 @@ pub(crate) fn copy_file_range(
     drop(output_cursor);
     drop(input_cursor);
 
+    // Step 5: 在位置锁释放后履行目标文件的 O_DSYNC/O_SYNC 落盘与脏页回写节流。
     finish_write(output, flags, start_out, result)
 }
 
-/// 一片栈缓冲只按位置观察源；目标拒绝的后缀从未推进源位置。
+/// 使用 4 KiB 栈上临时缓冲区循环从 `input` 指定偏移读取并写入 `output` 指定偏移。
+///
+/// 每次循环均检查用户线程是否有待处理信号；若目标发生短写或中途出错，仅累计目标已实际写入的字节数，不会多推进源偏移。
 fn copy_bytes(
     input: &InodeFile,
     start_in: u64,
@@ -183,7 +231,9 @@ fn copy_bytes(
     Ok(copied)
 }
 
-/// 数据和位置已经提交；同步失败仍返回原错误，不回滚已接受前缀。
+/// 在位置锁与管道锁释放后，对本次实际写入的非零字节范围执行同步落盘（若设置了 `O_DSYNC`/`O_SYNC`）与脏页节流。
+///
+/// 若数据已写入页缓存但后续同步刷盘失败，直接向上层返回该同步错误（已更新的文件内容和偏移不会回滚）。
 fn finish_write(
     file: &InodeFile,
     flags: u32,
@@ -197,7 +247,10 @@ fn finish_write(
     Ok(accepted)
 }
 
-/// 一端普通文件的位置跨原页环操作串行化，真实进度提交后放锁，再同步目标。
+/// 为涉及普通文件一端的 `splice` 操作统一管理文件偏移计算、位置锁串行化与写后同步。
+///
+/// 当 `offset` 为 `None` 时在整个 `operation` 期间持有文件的 `cursor` 睡眠锁，按返回的实际传输字节数更新偏移后先释放锁，
+/// 若为写入方向（`writing == true`）再在锁外触发 `finish_write` 执行同步与脏页节流。
 fn positioned_splice(
     file: &InodeFile,
     offset: Option<&mut u64>,
@@ -231,7 +284,12 @@ fn positioned_splice(
     }
 }
 
-/// 在原 pipe 与普通 inode 打开实例之间传输；提示位不改变数据或原页拥有结果。
+/// 在匿名管道与文件描述符之间（或两个管道之间）传输最多 `length` 字节数据（对应 `splice` 系统调用）。
+///
+/// # 调用上下文与参数
+/// - 在普通可睡眠任务上下文中调用，要求 `source` 与 `target` 至少有一端是匿名管道（`PipeEnd`），另一端可以是管道或普通文件（`InodeFile`）。
+/// - 管道端不允许指定显式偏移（否则返回 `FsError::IllegalSeek` / `ESPIPE`）；作为写入目标的普通文件不允许带有 `O_APPEND` 状态。
+/// - `SPLICE_F_MOVE`、`SPLICE_F_MORE`、`SPLICE_F_GIFT` 仅作为 ABI 兼容提示位接受，底层统一通过管道环形缓冲与页缓存安全传输。
 pub(crate) fn splice(
     source: &FileRef,
     source_offset: Option<&mut u64>,
@@ -241,6 +299,7 @@ pub(crate) fn splice(
     flags: u32,
     caller: FileIoContext<'_>,
 ) -> Result<usize, FsError> {
+    // Step 1: 校验标志位合法性、管道端偏移约束（管道不可携带显式 offset）以及源可读/目标可写访问模式。
     if flags & !SPLICE_FLAGS != 0 {
         return Err(FsError::InvalidOperation);
     }
@@ -255,6 +314,7 @@ pub(crate) fn splice(
         return Err(FsError::BadFd);
     }
 
+    // Step 2: 按两端具体文件类型分派至“管道->管道”、“管道->普通文件”或“普通文件->管道”传输路径。
     let nonblocking = flags & SPLICE_NONBLOCK != 0;
     match (input_pipe, output_pipe) {
         (Some(input), Some(output)) => input.splice_to_pipe(output, length, nonblocking, caller),

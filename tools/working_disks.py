@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""独占准备与清理生产 QEMU 的系统、比赛工作副本。"""
+"""管理生产模式 QEMU 启动所需的系统盘与比赛盘工作副本，提供基于文件锁的准备与清理能力。"""
 
 import argparse
 from contextlib import contextmanager
@@ -14,12 +14,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def default_working_disk_directory(architecture):
-    """生产启动和清理共用每架构唯一的默认工作目录。"""
+    """返回指定架构默认的 QEMU 工作盘目录路径（`build/qemu-<arch>`），供启动与清理流程共用。"""
     return REPOSITORY_ROOT / "build" / f"qemu-{architecture}"
 
 
 def working_disk_paths(working_disk_directory, include_contest):
-    """仅计算所选角色的路径，不读取目录或来源状态。"""
+    """根据工作盘目录拼接系统盘（`root.raw`）及可选比赛盘（`contest.raw`）路径，不访问文件系统。"""
     directory = Path(working_disk_directory)
     paths = {"system": directory / "root.raw"}
     if include_contest:
@@ -29,7 +29,7 @@ def working_disk_paths(working_disk_directory, include_contest):
 
 @contextmanager
 def _working_disk_lock(directory, create):
-    """准备和清理共用非阻塞独占锁，关闭句柄前保留原锁 inode。"""
+    """获取工作盘目录的非阻塞独占文件锁（`.lock`）；当 `create=False` 且目录不存在时产出 `None`。"""
     if create:
         directory.mkdir(parents=True, exist_ok=True)
     try:
@@ -51,7 +51,7 @@ def _working_disk_lock(directory, create):
 
 
 def _check_working_disk(path, required):
-    """工作盘必须独占普通文件，缺盘只在 fresh 或清理时允许。"""
+    """校验工作盘是否为无硬链接别名的独立普通文件；仅当 `required=False` 时允许文件不存在。"""
     try:
         status = path.lstat()
     except FileNotFoundError:
@@ -68,7 +68,7 @@ def _check_working_disk(path, required):
 @contextmanager
 def prepare_working_disks(working_disk_directory, system_image_path,
                           contest_image_path, working_disk_action):
-    """在持锁期间准备所选副本；调用者必须让锁覆盖整个 QEMU 使用期。"""
+    """在持有目录独占锁期间按动作（`fresh`/`reuse`/`refresh-system`）准备磁盘工作副本；调用方应在整个 QEMU 运行期保持该上下文。"""
     if working_disk_action not in ("fresh", "reuse", "refresh-system"):
         raise ValueError(f"unsupported working disk action: {working_disk_action}")
     directory = Path(working_disk_directory)
@@ -77,12 +77,14 @@ def prepare_working_disks(working_disk_directory, system_image_path,
     if contest_image_path is not None:
         sources["contest"] = Path(contest_image_path)
     with _working_disk_lock(directory, create=True) as lock_file:
+        # 校验目录中已有工作盘的状态；除 fresh 全新复制模式外，目标工作盘必须已存在。
         existing = {role: _check_working_disk(path, working_disk_action != "fresh")
                     for role, path in paths.items()}
-        # 未消费来源仅比较词法路径；reuse 不访问来源的目录项或内容。
+        # 先从词法路径层面拒绝将工作盘自身作为源镜像；reuse 模式下不访问源镜像文件。
         for source in sources.values():
             if any(os.path.abspath(source) == os.path.abspath(path) for path in paths.values()):
                 raise ValueError(f"source image names a working disk: {source}")
+        # 按动作筛选需要复制的磁盘角色，并确认源镜像为普通文件且未与现有工作盘指向同一 inode。
         copied_roles = (list(paths) if working_disk_action == "fresh" else
                         ["system"] if working_disk_action == "refresh-system" else [])
         for role in copied_roles:
@@ -92,7 +94,7 @@ def prepare_working_disks(working_disk_directory, system_image_path,
             if any(existing[name] and path.samefile(source) for name, path in paths.items()):
                 raise ValueError(f"source image aliases a working disk: {source}")
         if copied_roles:
-            # 所有副本写完后才逐盘替换；多盘替换不提供事务语义。
+            # 先将所有待更新镜像完整写入同目录的临时子目录，全部复制完成后再逐个原子替换目标文件。
             with tempfile.TemporaryDirectory(prefix="fresh-", dir=directory) as temporary:
                 prepared = []
                 for role in copied_roles:
@@ -106,7 +108,7 @@ def prepare_working_disks(working_disk_directory, system_image_path,
 
 
 def clean_working_disks(working_disk_directory):
-    """同锁检查后只删正式两角色文件，保留锁、目录与其他实验盘。"""
+    """在持有非阻塞独占锁的前提下删除 `root.raw` 和 `contest.raw` 工作副本，保留目录、锁文件与其他文件。"""
     directory = Path(working_disk_directory)
     with _working_disk_lock(directory, create=False) as lock_file:
         if lock_file is None:
@@ -118,7 +120,7 @@ def clean_working_disks(working_disk_directory):
 
 
 def main(argv=None):
-    """清理目录按项目根作词法绝对化，与启动使用同一工作盘路径。"""
+    """命令行入口：解析 `clean` 子命令参数，规范化工作盘目录路径并清理工作盘副本。"""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
     clean = commands.add_parser("clean", allow_abbrev=False)

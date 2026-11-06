@@ -1,4 +1,54 @@
-//! 有序用户范围与固定 PTE 域分责；mmap 变更和文件 rmap 都在同一短锁核实际叶。
+//! 用户进程虚拟地址空间（[`Mm`]）与硬件页表域（[`PteDomain`]）管理。
+//!
+//! # 模块职责与架构定位
+//! 本模块是用户态内存管理的核心，负责将上层的虚拟内存区域（[`Vma`]）与底层的架构硬件页表（[`UserPageTable`]）、
+//! 驻留物理页所有权（[`ResidentPages`]）以及文件系统页缓存（Page Cache）反向映射连接起来。
+//! - **上游调用者**：系统调用层（`mmap` / `munmap` / `mprotect` / `brk` / `msync` / `futex`）、
+//!   异常处理层（用户态缺页异常 `fault`）、进程管理层（`fork`、`execve` 与调度器上下文切换 `enter_current` / `leave_current`）。
+//! - **下游依赖**：[`crate::mm::vma`]（VMA 区间索引）、[`crate::mm::user_table`]（硬件多级页表操作）、
+//!   [`crate::cache`] 与 [`crate::fs`]（文件页缓存与反向映射注销）、[`crate::cpu`]（跨核 IPI 同步刷新 TLB / I-Cache）。
+//!
+//! # 核心设计：区间睡眠锁与页表自旋锁职责分离
+//! 为支持文件映射的后台脏页回写（Writeback）与文件截断（Truncate）在不获取进程 `mmap` 睡眠锁的情况下直接清理页表项，
+//! 每个地址空间被拆分为两个独立的同步域：
+//! 1. **虚拟区间域（`mmap: SleepRwLock<MmapState>`）**：可睡眠读写锁，保护有序 VMA 列表与堆边界（`heap_start` / `heap_end`）。
+//! 2. **页表与驻留页域（`table: Arc<PteDomain>`）**：自旋锁，同时保护架构硬件页表（`UserPageTable`）与驻留页链表（`ResidentPages`）。
+//!    任何时刻，硬件叶子 PTE 的物理页帧号（PFN）必须与 `ResidentPages` 中对应节点持有的物理页引用严格一致。
+//!
+//! ```text
+//!                        +-------------------------------+
+//!                        |              Mm               |
+//!                        +---------------+---------------+
+//!                                        |
+//!               +------------------------+------------------------+
+//!               v                                                 v
+//! +---------------------------+                     +---------------------------+
+//! |  mmap: SleepRwLock        |                     |  table: Arc<PteDomain>    |
+//! |  (保护有序 VMA 与堆边界)    |                     |  (SpinLock<PteState>)     |
+//! +-------------+-------------+                     +-------------+-------------+
+//!               |                                                 |
+//!               v                                   +-------------+-------------+
+//!       +---------------+                           |                           |
+//!       |      Vma      |                           v                           v
+//!       |  file_range --+--(强引用 Arc)--> +-----------------+         +-----------------+
+//!       +---------------+                  |  FileRangeData  |<--(Weak)|  ResidentPages  |
+//!                                          |  domain: Arc ---+--(强)-->|  & UserPageTable|
+//!                                          +-----------------+         +-----------------+
+//! ```
+//! 如上图所示，`Vma` 持有 `FileRangeRegistration`（内部强引用 `FileRangeData`），`FileRangeData` 强引用 `Arc<PteDomain>`，
+//! 而 `ResidentPage` 仅通过 `Weak<FileRangeData>` 弱引用文件范围来源，从而避免了引用计数循环，并允许页缓存通过
+//! `FileRangeData -> PteDomain` 直接定位并清理对应文件的页表项。
+//!
+//! # 锁获取顺序（Lock Ordering）与 TLB 同步契约
+//! 多锁嵌套时必须严格遵守以下从外到内的获取顺序（严禁反向获取）：
+//! 1. `Mm::mmap`（`SleepRwLock<MmapState>`，可睡眠读写锁）
+//! 2. `Inode::lock_invalidate`（文件截断/失效睡眠锁，仅 `mkwrite` 路径涉及）
+//! 3. `Folio::lock_content`（文件页缓存内容睡眠锁）
+//! 4. `AddressSpace::lock_ranges`（文件反向映射范围自旋锁）
+//! 5. `PteDomain::state`（`SpinLock<PteState>`，页表与驻留页自旋锁，不可睡眠）
+//!
+//! **TLB 与物理页回收铁律**：从 `PteState` 摘除或降权硬件 PTE 后，旧的 `ResidentPage` 和空中间页表必须暂存在退休链表中，
+//! **必须在释放所有自旋锁之后调用 [`sync_all`] 完成全核 TLB 与指令缓存刷新**，最后才能在锁外析构退休节点并归还物理页。
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -25,21 +75,31 @@ use crate::mm::{AnonPageRef, FolioRef, OwnedPages, PAGE_SIZE};
 use crate::sync::{IrqSaveGuard, ReadGuard, SleepRwLock, SpinLock, SpinLockGuard};
 use crate::task::{self, process::Resource};
 
-/// 用户映射失败保留范围、权限、实际文件和内存不足各自的原因。
+/// 用户虚拟内存操作错误类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmError {
+    /// 物理内存或内核堆分配不足（对应 `ENOMEM`）。
     NoMemory,
+    /// 目标文件描述符不支持内存映射，例如管道、套接字或缺少挂载路径（对应 `ENODEV` / `EACCES`）。
     NotMappable,
+    /// 虚拟地址区间、长度、对齐方式或文件偏移量不合法（对应 `EINVAL`）。
     InvalidRange,
+    /// `MAP_FIXED_NOREPLACE` 或固定插入时目标虚拟地址区间已被占用（对应 `EEXIST`）。
     Occupied,
+    /// 访问的地址未建立映射，或操作区间内包含未映射空洞（对应 `EFAULT` / `ENOMEM`）。
     Unmapped,
+    /// 访问方式违反 VMA 当前权限，或请求权限超出最大权限上限（对应 `EACCES` / `EPERM`）。
     Permission,
+    /// 文件映射缺页访问的位置已达到或超过文件当前字节大小 EOF（对应触发 `SIGBUS`）。
     BeyondEof,
+    /// 底层文件系统或块设备 I/O 错误。
     File(FsError),
 }
 
 impl From<PageTableError> for VmError {
-    /// 页表准备失败保持真实原因，缺准备表暴露为内部提交协议错误。
+    /// 将底层硬件页表操作错误转换为虚拟内存错误 [`VmError`]。
+    ///
+    /// 若出现 [`PageTableError::MissingTables`]，说明调用方违反了“先在锁外预分配中间页表、再持锁提交”的内部协议，直接触发 panic。
     fn from(error: PageTableError) -> Self {
         match error {
             PageTableError::NoMemory => Self::NoMemory,
@@ -52,43 +112,64 @@ impl From<PageTableError> for VmError {
     }
 }
 
-/// 用户选址将可移动 hint、固定覆盖和固定不覆盖明确区分。
+/// `mmap` 系统调用的虚拟地址选址策略。
 pub(crate) enum MmapAddress {
+    /// 启发式选址（未指定 `MAP_FIXED`）：优先尝试给定提示地址，若被占用或低于最小阈值则由内核自动寻找空闲区间。
     Hint(usize),
+    /// 强制固定地址并允许覆盖（`MAP_FIXED`）：精确映射到该地址，若与现有 VMA 重叠则自动拆分并解除被覆盖部分的旧映射。
     Fixed(usize),
+    /// 强制固定地址但禁止覆盖（`MAP_FIXED_NOREPLACE`）：精确映射到该地址，若与现有 VMA 存在任何重叠则直接返回 [`VmError::Occupied`]。
     FixedNoReplace(usize),
 }
 
-/// 映射源持真实打开实例；共享匿名对象在每次独立 mmap 时创建。
+/// `mmap` 系统调用的数据源类型。
 pub(crate) enum MmapSource {
+    /// 私有匿名映射（`MAP_PRIVATE | MAP_ANONYMOUS`）。
     PrivateAnonymous,
+    /// 共享匿名映射（`MAP_SHARED | MAP_ANONYMOUS`），每次 `mmap` 调用都会创建一个新的 [`SharedAnon`] 容器。
     SharedAnonymous,
+    /// 文件映射（`MAP_SHARED` 或 `MAP_PRIVATE`），直接持有文件打开实例与索引节点引用。
     File {
+        /// 被映射的文件打开实例。
         file: FileRef,
+        /// 被映射文件的索引节点引用。
         inode: InodeRef,
+        /// 映射起始位置在文件中的字节偏移量（需按 [`PAGE_SIZE`] 对齐）。
         offset: u64,
+        /// 为 `true` 表示私有写时复制映射（`MAP_PRIVATE`），为 `false` 表示共享回写映射（`MAP_SHARED`）。
         private: bool,
     },
 }
 
-/// 当前与最大权限由 ABI/OFD 边界决定，Mm 再守页范围和只读后备约束。
+/// 经过系统调用入口初步解析后的 `mmap` 请求参数包。
 pub(crate) struct MmapRequest {
+    /// 目标虚拟地址及选址模式。
     pub(crate) address: MmapAddress,
+    /// 请求映射的原始字节长度（尚未向上按页取整）。
     pub(crate) length: usize,
+    /// 初始页面访问权限（由 `prot` 参数转换而来）。
     pub(crate) permissions: PagePermissions,
+    /// 该映射允许通过 `mprotect` 提升到的最大访问权限（受打开文件描述符的读写模式限制）。
     pub(crate) maximum: PagePermissions,
+    /// 映射的数据源类型。
     pub(crate) source: MmapSource,
 }
 
-/// 已初始化的驻留原页；文件共享写须先完成原页脏准备，私有写复制匿名页。
+/// 已驻留在进程页表中的单页物理内存后备引用。
+///
+/// 持有该枚举即保证底层物理页已分配且数据已初始化完毕：
+/// - 对共享文件映射的写入必须先走 `mkwrite` 将页缓存标记为脏页；
+/// - 对私有映射的写入会触发写时复制（COW），分配新的匿名页替换原引用。
 #[derive(Clone)]
 enum ResidentBacking {
+    /// 匿名物理页引用（用于私有匿名页、共享匿名页以及私有文件映射发生 COW 后的独立副本页）。
     Anonymous(AnonPageRef),
+    /// 文件页缓存（Page Cache）物理页引用（用于尚未发生私有写复制的文件映射页）。
     File(FolioRef),
 }
 
 impl ResidentBacking {
-    /// 取得本引用保活的物理身份，不授予外部内容访问或再次归还权限。
+    /// 返回该驻留页持有的底层物理地址（字节地址，按页对齐）。
     fn physical(&self) -> usize {
         match self {
             Self::Anonymous(page) => page.phys_addr(),
@@ -97,16 +178,24 @@ impl ResidentBacking {
     }
 }
 
+/// 单个虚拟页在页表域（[`PteDomain`]）中的驻留所有权节点。
+///
+/// 每个已安装的硬件叶子 PTE 都必须有一个对应的 `ResidentPage` 节点来保持底层物理页的引用计数，防止物理页在硬件页表仍指向它时被提前释放。
 struct ResidentPage {
+    /// 该页对应的用户虚拟页起始地址（按 [`PAGE_SIZE`] 对齐）。
     address: usize,
+    /// 该虚拟页当前绑定的底层物理页引用（匿名页或文件缓存页）。
     backing: ResidentBacking,
+    /// 软件写时复制（Copy-on-Write）标志：为 `true` 时硬件 PTE 强制保持只读，写入时触发缺页复制。
     cow: bool,
+    /// 若该页位于文件映射 VMA 中，弱引用所属 VMA 的 [`FileRangeData`]，供反向映射（rmap）校验该页是否属于指定的文件映射区间。
     source: Weak<FileRangeData>,
+    /// 指向链表中下一个驻留页节点的指针。
     next: Option<Box<ResidentPage>>,
 }
 
 impl ResidentPage {
-    /// 在 PTE 锁外准备具体驻留拥有节点，失败只释放本次未发表引用。
+    /// 在页表自旋锁之外预分配并初始化一个未入链的 [`ResidentPage`] 节点。
     fn try_new(address: usize, backing: ResidentBacking, cow: bool) -> Result<Box<Self>, VmError> {
         Box::try_new(Self {
             address,
@@ -118,7 +207,10 @@ impl ResidentPage {
         .map_err(|_| VmError::NoMemory)
     }
 
-    /// 默认 COW 和文件叶保持只读，文件 W 只能由持内容锁的脏准备另行发表。
+    /// 根据所属 VMA 的软件权限 `permissions` 与当前页状态，计算允许写入硬件叶子 PTE 的实际权限。
+    ///
+    /// 若当前页带有 `cow` 标志，或后备为文件页缓存（[`ResidentBacking::File`]），则默认屏蔽硬件写权限（保持只读）；
+    /// 共享文件页的硬件写权限仅能由持有文件页内容锁的 [`Mm::mkwrite`] 路径在完成脏页登记后显式开启。
     fn permissions(&self, permissions: PagePermissions) -> PagePermissions {
         PagePermissions {
             write: permissions.write
@@ -129,14 +221,18 @@ impl ResidentPage {
     }
 }
 
-/// 具体链只在短锁内移动已准备节点，回收采用迭代析构，避免用户页数转化为内核栈深度。
+/// 进程页表域中的驻留物理页单向链表。
+///
+/// 节点分配与销毁均在页表自旋锁外进行，持锁期间仅做指针摘挂；
+/// 析构时采用循环迭代逐个释放节点，防止大量驻留页导致递归 Drop 撑爆内核栈。
 #[derive(Default)]
 pub(crate) struct ResidentPages {
+    /// 链表头节点指针。
     head: Option<Box<ResidentPage>>,
 }
 
 impl ResidentPages {
-    /// 查找实际 VA 的驻留责任；初版线性链不在短锁中建立额外分配索引。
+    /// 线性查找虚拟页基址为 `address` 的驻留页节点只读引用。
     fn find(&self, address: usize) -> Option<&ResidentPage> {
         let mut cursor = self.head.as_deref();
         while let Some(page) = cursor {
@@ -148,7 +244,7 @@ impl ResidentPages {
         None
     }
 
-    /// 在唯一 PTE 修改域定位可修改的 COW 标志，不借用或修改用户内容。
+    /// 线性查找虚拟页基址为 `address` 的驻留页节点可变引用（用于在页表自旋锁内更新 `cow` 或 `source` 字段）。
     fn find_mut(&mut self, address: usize) -> Option<&mut ResidentPage> {
         let mut cursor = self.head.as_deref_mut();
         while let Some(page) = cursor {
@@ -160,14 +256,14 @@ impl ResidentPages {
         None
     }
 
-    /// 移入已准备且未链接的具体节点，不分配、不释放旧页。
+    /// 将已在锁外分配好的独立节点 `page` 头插到链表中（持锁期间不触发内存分配或旧页释放）。
     fn push(&mut self, mut page: Box<ResidentPage>) {
         assert!(page.next.is_none(), "resident page is already linked");
         page.next = self.head.take();
         self.head = Some(page);
     }
 
-    /// 摘取真实节点并断开后继，返回拥有只能在失效完成后锁外释放。
+    /// 从链表中摘除并返回虚拟页基址为 `address` 的节点；调用方必须在完成全核 TLB 刷新且释放自旋锁后再将其析构。
     fn remove(&mut self, address: usize) -> Option<Box<ResidentPage>> {
         let mut link = &mut self.head;
         while link.is_some() {
@@ -181,7 +277,7 @@ impl ResidentPages {
         None
     }
 
-    /// 只计算当前范围的实际驻留数量，供写侧在短锁外准备结果容器。
+    /// 统计虚拟地址区间 `range` 内当前驻留页的数量，供调用方在自旋锁外预分配精确容量的 `Vec`。
     pub(crate) fn count(&self, range: &Range<usize>) -> usize {
         let mut count = 0;
         let mut cursor = self.head.as_deref();
@@ -192,7 +288,7 @@ impl ResidentPages {
         count
     }
 
-    /// 向已足额预留的容器写入实际 VA，不允许在 PTE 锁中扩容。
+    /// 将区间 `range` 内所有驻留页的虚拟基址收集到已预留足够容量的 `addresses` 向量中（严禁在持页表自旋锁期间触发 `Vec` 扩容分配）。
     fn addresses(&self, range: &Range<usize>, addresses: &mut Vec<usize>) {
         let mut cursor = self.head.as_deref();
         while let Some(page) = cursor {
@@ -206,7 +302,7 @@ impl ResidentPages {
 }
 
 impl Drop for ResidentPages {
-    /// 硬件使用结束或同步失效完成后逐个释放原节点，不递归析构整条链。
+    /// 迭代式摘除并释放链表中的所有驻留页节点，避免深层递归析构导致内核栈溢出。
     fn drop(&mut self) {
         while let Some(mut page) = self.head.take() {
             self.head = page.next.take();
@@ -215,13 +311,18 @@ impl Drop for ResidentPages {
     }
 }
 
+/// 受 [`PteDomain`] 自旋锁保护的硬件页表与驻留页联合状态。
 struct PteState {
+    /// 架构相关的用户多级硬件页表。
     table: UserPageTable,
+    /// 与硬件叶子 PTE 一一对应的物理页所有权链表。
     pages: ResidentPages,
 }
 
 impl PteState {
-    /// 当前驻留 PFN 与实际叶须同锁吻合，软件 COW 和硬件无许可均要求锁外 fault。
+    /// 检查虚拟页基址 `address` 在当前页表中是否已就绪且允许 `access` 类型的访问。
+    ///
+    /// 仅当驻留节点存在、硬件叶子 PTE 指向同一个物理页且具备相应硬件权限，并且不是触发写时复制（`cow && Write`）的写入时返回 `true`。
     fn allows(&self, address: usize, access: UserAccess) -> bool {
         self.pages.find(address).is_some_and(|page| {
             self.table.lookup(address).is_some_and(|leaf| {
@@ -231,18 +332,25 @@ impl PteState {
     }
 }
 
-/// 固定地址的唯一 PTE 修改域；范围登记强持域，驻留页弱持范围，不形成强环。
+/// 地址空间的硬件页表同步域（PTE Domain）。
+///
+/// 独立封装为 `Arc<PteDomain>`，使得文件页缓存反向映射（`FileRangeData`）可以持有该域的强引用，
+/// 在不获取进程 `Mm::mmap` 睡眠锁的情况下直接加自旋锁清理或撤除文件页映射。
 pub(crate) struct PteDomain {
+    /// 保护硬件页表与驻留页链表的自旋锁。
     state: SpinLock<PteState>,
 }
 
 impl PteDomain {
-    /// 所有驻留拥有和硬件叶修改沿原短锁串行，锁内不分配或最后释放来源。
+    /// 获取页表与驻留页状态的自旋锁守卫。
     fn lock(&self) -> SpinLockGuard<'_, PteState> {
         self.state.lock()
     }
 
-    /// 内容锁持有者只从固定来源检查重叠叶，不取得 Mm 的 mmap 锁。
+    /// 将文件映射区间 `source` 中文件偏移 `offset`、物理地址 `physical` 对应的硬件叶子 PTE 清除写权限与脏位（变为只读干净态）。
+    ///
+    /// 由页缓存脏页回写（Writeback）路径在持有文件页内容锁与反向映射范围锁时调用，无需获取进程的 `Mm::mmap` 锁。
+    /// 返回元组 `(是否观察到硬件脏位, 是否实际修改了页表项的计数 0 或 1)`；调用方负责在释放全部自旋锁后执行全核 TLB 同步。
     pub(crate) fn mkclean_range(
         &self,
         source: &Arc<FileRangeData>,
@@ -267,17 +375,22 @@ impl PteDomain {
         {
             return (false, 0);
         }
-        // SAFETY: 同一 PTE 锁核实当前来源和 PFN，page 与内容 guard 保活原页；
-        // 同 PFN 原子降权不释放数据或表，调用者在所有短锁外同步 CPU。
+        // SAFETY:
+        // 1. 当前持有 `self.state` 页表自旋锁，且上方已核实 `page` 的 `source` 指针、文件后备类型及物理地址均与参数 `physical` 完全一致；
+        // 2. `page` 节点与调用方持有的文件页内容锁共同保证底层物理页存活；
+        // 3. `mkclean` 仅原地移除同一个物理页的写权限，不释放任何数据页或页表页，调用方会在释放所有自旋锁后执行跨核 TLB 刷新。
         unsafe { state.table.mkclean(address, physical) }
             .map_or((false, 0), |(dirty, changed)| (dirty, usize::from(changed)))
     }
 
-    /// 原文件范围锁内只摘当前来源和 PFN 对应的叶，退休链交调用者锁外失效后释放。
+    /// 卸载文件映射区间 `source` 在文件字节偏移范围 `range` 内的所有匹配驻留页与硬件 PTE，并将摘下的节点移入退休链表。
+    ///
+    /// 当 `even_cows` 为 `false` 时，仅卸载仍直接引用文件页缓存（[`ResidentBacking::File`]）的页面；
+    /// 当 `even_cows` 为 `true` 时，连同该文件映射区间内已发生写时复制的私有匿名副本页一并卸载。
     ///
     /// # Safety
-    /// 调用者须持来源所属的原文件范围锁，并保活来源和域；
-    /// 传入的原退休页/表链须在全部短锁外同步全部 CPU 后才析构或复用。
+    /// 1. 调用方必须持有 `source` 所属文件 `AddressSpace` 的范围自旋锁（`lock_ranges`），并在调用期间保证 `source` 与 `self` 存活；
+    /// 2. 传入的 `retired_pages` 与 `retired_tables` 在收集被卸载的物理页和空页表后，**必须在释放全部自旋锁并完成全核 TLB 同步（[`sync_all`]）之后**才能析构释放。
     pub(crate) unsafe fn unmap_range(
         &self,
         source: &FileRangeData,
@@ -311,8 +424,9 @@ impl PteDomain {
                 link = &mut link.as_mut().unwrap().next;
                 continue;
             }
-            // SAFETY: 原范围锁排除来源换身份和 fork 提交；本 PTE 锁核当前来源/PFN。
-            // page 及下方原退休链保活旧页，表页只移入原退休链，调用者锁外 CSD 后才析构。
+            // SAFETY:
+            // 1. 调用方持有文件范围自旋锁，阻止了并发的 VMA 来源替换与 `fork` 映射提交；当前持有 `self.state` 自旋锁且已核实该页属于 `source` 且硬件叶子物理地址匹配；
+            // 2. 被卸载的物理页所有权随 `page` 节点移入 `retired_pages`，可能腾空的中间页表移入 `retired_tables`，两者均在释放全部自旋锁并完成全核 TLB 刷新后才真正释放。
             let (old, tables) = unsafe { table.unmap(page.address) };
             unmapped += usize::from(old.is_some());
             let mut page = link.take().unwrap();
@@ -323,11 +437,13 @@ impl PteDomain {
         unmapped
     }
 
-    /// 只撤当前文件页的同来源同 PFN 叶，私有匿名 COW 和其他文件页均保持。
+    /// 针对单个文件页缓存（`offset` 与 `physical`），从当前页表域中卸载匹配的共享或未写复制文件映射叶子 PTE。
+    ///
+    /// 已发生写时复制（COW）的私有匿名页或其他文件偏移的映射不受影响。返回实际卸载的页表项数量（`0` 或 `1`）。
     ///
     /// # Safety
-    /// 调用者须保活 source/folio 并持原文件范围锁；退休链在全部短锁外完成
-    /// 所有 CPU 的真实 CSD 后才析构，不能把页表摘离当作硬件已收权。
+    /// 1. 调用方必须持有 `source` 所属文件的范围自旋锁，并保证 `source` 及其对应的文件页 `Folio` 在调用期间存活；
+    /// 2. 移入 `retired_pages` 与 `retired_tables` 的节点必须在释放全部自旋锁并完成全核 TLB 同步（[`sync_all`]）之后才能析构，严禁将摘除页表项视为硬件已立即停止访问该物理页。
     pub(crate) unsafe fn unmap_file_folio(
         &self,
         source: &Arc<FileRangeData>,
@@ -358,8 +474,9 @@ impl PteDomain {
         {
             return 0;
         }
-        // SAFETY: 同一 PTE 锁核当前来源/File backing/PFN，原 resident 和退休链保页，
-        // 父表摘离只转移原拥有，调用者承诺退出所有短锁后 CSD 再结束退休拥有。
+        // SAFETY:
+        // 1. 当前持有 `self.state` 页表自旋锁，且已核实驻留节点的 `source`、文件后备类型及硬件叶子 PTE 的物理地址均等于 `physical`；
+        // 2. 摘除的 `ResidentPage` 与空中间页表立即移入 `retired_pages` 和 `retired_tables` 保活，调用方在锁外完成全核 TLB 刷新后才会释放。
         let (old, tables) = unsafe { state.table.unmap(address) };
         retired_pages.push(
             state
@@ -372,51 +489,74 @@ impl PteDomain {
     }
 }
 
+/// 缺页处理在锁外准备物理页时采集的当前映射快照。
+///
+/// 由 [`Mm::fault_source`] 在持有 `mmap` 读锁与 `PteDomain` 自旋锁时构造；
+/// 锁外完成物理页与页表分配后，通过比对 `vma` 指针、`observed` 物理地址和 `needed` 缺表数来检验期间是否发生并发修改。
 struct FaultSource {
+    /// 缺页地址所属的不可变 `Vma` 实例引用。
     vma: Arc<Vma>,
+    /// 采样时该虚拟页已存在的驻留后备页克隆（若当时尚未映射则为 `None`）。
     backing: Option<ResidentBacking>,
+    /// 采样时该虚拟页驻留后备的物理地址（用于提交阶段 CAS 式校验驻留页是否被并发替换或卸载）。
     observed: Option<usize>,
+    /// 采样时为映射该虚拟地址仍需分配的中间级页表页数量。
     needed: usize,
 }
 
-/// 缺页和 fork 停点共用的单地址测试回调。
+/// 缺页与 `fork` 测试注入点共用的单虚拟地址回调函数类型。
 #[cfg(feature = "ktest")]
 type AddressHook = Arc<dyn Fn(usize) + Send + Sync>;
 
-/// 范围撤叶停点使用的双整数测试回调。
+/// VMA 区间卸载测试注入点使用的 `(start, end)` 双地址回调函数类型。
 #[cfg(feature = "ktest")]
 type VmaUnmapHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
-/// 同一 Mm 的范围读写锁与 PTE 短锁分责；活动根由 CPU 强拥有到切回内核根后。
+/// 用户进程虚拟地址空间（Memory Descriptor）。
+///
+/// 内部将虚拟内存区域锁（`mmap` 睡眠读写锁）与硬件页表锁（`table` 自旋锁）分离；
+/// 当线程在某个 CPU 上运行时，该 CPU 的 `active_mm` 槽位也会持有一份 `Arc<Mm>` 强引用，直到上下文切换回内核根页表为止。
 pub struct Mm {
+    /// 硬件页表与驻留物理页同步域（与文件反向映射共享强引用）。
     table: Arc<PteDomain>,
+    /// 保护有序 VMA 列表与堆边界（`brk`）的可睡眠读写锁。
     mmap: SleepRwLock<MmapState>,
+    /// 绑定到该地址空间的活动用户线程数量（由 [`MmUser`] 维护，不含 CPU 活动槽位或 `FutexKey` 持有的 `Arc<Mm>`）。
     users: AtomicUsize,
-    /// 原执行文件与写排斥保留到此 Mm 最后实际拥有结束，普通私有映射不取得责任。
+    /// 主可执行文件引用及其执行期写互斥凭证（`ETXTBSY` 保护），保持到该 `Mm` 的最后一个强引用释放为止。
     executable: Option<(FileRef, ExecAccess)>,
-    /// 解释器独立保留文件与执行写排斥，不替换主执行文件身份。
+    /// 动态链接器（ELF `PT_INTERP` 解释器）文件引用及其执行期写互斥凭证。
     interpreter: Option<(FileRef, ExecAccess)>,
+    /// 测试专用钩子：在 `mkwrite` 完成文件页准备后、重新获取 `mmap` 写锁前触发。
     #[cfg(feature = "ktest")]
     mkwrite_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 测试专用钩子：在文件缺页持有页内容锁并核实 EOF 后、安装 PTE 前触发。
     #[cfg(feature = "ktest")]
     fault_hook: SpinLock<Option<AddressHook>>,
+    /// 测试专用钩子：在 `fork` 采样父进程驻留页后、向子进程页表映射前触发。
     #[cfg(feature = "ktest")]
     fork_hook: SpinLock<Option<AddressHook>>,
+    /// 测试专用钩子：在 `replace_range` 发布新 VMA 列表后、逐页摘除旧硬件 PTE 前触发。
     #[cfg(feature = "ktest")]
     vma_unmap_hook: SpinLock<Option<VmaUnmapHook>>,
+    /// 测试专用计数器：统计 `mkwrite` 成功将共享文件页授予硬件写权限的次数。
     #[cfg(feature = "ktest")]
     mkwrites: AtomicUsize,
 }
 
+/// 更新 VMA 列表后需要在锁外延迟析构的旧 VMA 列表与旧文件反向映射弱引用集合。
 type RetiredVmas = (Vec<Arc<Vma>>, Vec<(usize, Weak<FileRangeData>)>);
 
-/// 一份真实用户线程地址空间绑定；页表、CPU 和 futex key 的 Arc 不参与计数。
+/// 用户线程对地址空间 [`Mm`] 的绑定凭证（RAII 守卫）。
+///
+/// 仅代表真实用户线程对地址空间的拥有关系；CPU 活动页表槽位、页表反向映射与 `FutexKey` 持有的 `Arc<Mm>` 不计入 `users`。
 pub struct MmUser {
+    /// 被绑定的用户地址空间强引用。
     mm: Arc<Mm>,
 }
 
 impl MmUser {
-    /// 发表前取得一份绑定责任；失败路径和正常退出均由同一 Drop 归还。
+    /// 为新用户线程建立地址空间绑定并原子递增 `users` 计数；后续无论正常退出还是中途失败，均由 `Drop` 自动归还计数。
     pub fn new(mm: Arc<Mm>) -> Self {
         mm.users
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -426,40 +566,53 @@ impl MmUser {
         Self { mm }
     }
 
-    /// 借用本绑定保活的真实地址空间，不额外增加用户绑定计数。
+    /// 获取当前绑定持有的地址空间 [`Arc<Mm>`] 引用。
     pub fn mm(&self) -> &Arc<Mm> {
         &self.mm
     }
 }
 
 impl Drop for MmUser {
-    /// 先归还真实绑定；Arc 的最后析构发生在原调用者持有的锁之外。
+    /// 递减地址空间的绑定线程计数；`Arc<Mm>` 自身的引用递减与最终析构在随后自动完成。
     fn drop(&mut self) {
         let previous = self.mm.users.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "MM user count underflow");
     }
 }
 
-/// futex 保真实 Mm、共享匿名或 canonical inode 身份，不把可复用 PFN 当作长期 key。
+/// Futex 等待队列的全局唯一标识键（Futex Key）。
+///
+/// 依据映射类型直接绑定到地址空间 `Mm`、共享匿名对象 `SharedAnon` 或文件索引节点 `InodeRef` 的逻辑字节偏移，
+/// 绝不将可能被回收复用的物理页帧号（PFN）作为长期等待键。
 #[derive(Clone)]
 pub(crate) enum FutexKey {
+    /// 基于单个进程地址空间虚拟地址的等待键（用于 `FUTEX_PRIVATE_FLAG` 或匿名私有映射/已写时复制的私有文件页）。
     Mm {
+        /// 所属进程的地址空间。
         mm: Arc<Mm>,
+        /// 用户态 32 位 futex 字所在的精确虚拟地址（4 字节对齐）。
         address: usize,
+        /// 是否携带了 `FUTEX_PRIVATE_FLAG`（私有标志与非私有标志即使在同一 `Mm` 同一地址也互不匹配）。
         private: bool,
     },
+    /// 基于共享匿名映射（`MAP_SHARED | MAP_ANONYMOUS`）对象的跨进程等待键。
     Shared {
+        /// 共享匿名内存对象。
         owner: Arc<SharedAnon>,
+        /// futex 字在共享匿名对象内的精确字节偏移（含页内偏移）。
         offset: u64,
     },
+    /// 基于文件映射（`MAP_SHARED` 文件映射或尚未触发 COW 的只读 `MAP_PRIVATE` 文件映射）的跨进程等待键。
     File {
+        /// 被映射文件的规范索引节点（Inode）。
         inode: InodeRef,
+        /// futex 字在文件中的精确字节偏移（含页内偏移）。
         offset: u64,
     },
 }
 
 impl FutexKey {
-    /// 按真实对象及字节位置比较，包括共享对象页内偏移。
+    /// 判断两个 `FutexKey` 是否指向同一个底层同步对象与同一个精确字节偏移。
     pub(crate) fn matches(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -492,7 +645,7 @@ impl FutexKey {
         }
     }
 
-    /// 哈希只选择固定桶；相等性仍由完整的实际对象身份决定。
+    /// 计算用于选择全局 Futex 哈希桶的哈希值（桶内冲突仍通过 [`FutexKey::matches`] 精确比对）。
     pub(crate) fn hash(&self) -> usize {
         let (owner, position, kind) = match self {
             Self::Mm {
@@ -511,27 +664,36 @@ impl FutexKey {
     }
 }
 
-/// 实际来源辨别需要缺页或私有 COW 时，调用者须放开 mmap 读侧再 fault。
+/// 解析 Futex 地址或读取 Futex 字时可能出现的错误。
+///
+/// 当跨进程文件映射需要通过缺页或写时复制（COW）来确定最终后备对象时，返回 [`FutexAccessError::NeedsFault`]，
+/// 调用方必须先释放 `mmap` 读锁并调用 [`Mm::fault`]，随后重试。
 pub(crate) enum FutexAccessError {
+    /// 虚拟地址越界、未对齐、未映射或权限不足等常规虚拟内存错误。
     Vm(VmError),
+    /// 当前页尚未驻留或处于待写时复制状态，需要释放读锁后按指定访问类型执行一次缺页处理。
     NeedsFault(UserAccess),
 }
 
 impl From<VmError> for FutexAccessError {
-    /// 保留实际范围、权限或缺页准备失败的 VM 原因。
+    /// 将虚拟内存错误包装为 [`FutexAccessError::Vm`]。
     fn from(error: VmError) -> Self {
         Self::Vm(error)
     }
 }
 
-/// 先取得可睡眠 mmap 读侧，再建立唯一 Waiter；之后的字访问只取得 PTE 短锁。
+/// Futex 操作期间持有的地址空间 `mmap` 读锁会话守卫。
+///
+/// 保证从解析 [`FutexKey`]、读取用户态 32 位字到将等待者挂入哈希桶的整个过程中，目标虚拟地址对应的 VMA 不会被并发卸载或重映射。
 pub(crate) struct FutexRead<'a> {
+    /// 目标地址空间引用。
     mm: &'a Arc<Mm>,
+    /// 已获取的 `MmapState` 睡眠读锁守卫。
     mmap: ReadGuard<'a, MmapState>,
 }
 
 impl FutexRead<'_> {
-    /// 从同一稳定读侧解析当前 VMA 的具体 futex 身份。
+    /// 在持有 `mmap` 读锁的前提下，解析用户虚拟地址 `address` 对应的 [`FutexKey`]。
     pub(crate) fn key(&self, address: usize, private: bool) -> Result<FutexKey, FutexAccessError> {
         if address & (size_of::<u32>() - 1) != 0
             || address
@@ -613,8 +775,10 @@ impl FutexRead<'_> {
         })
     }
 
-    /// 在 mmap→PTE 保护下使用原始地址；缺页返回 None，准备必须放开此读侧后进行。
-    /// visit 只允许原始字访问及固定桶操作，不得分配、睡眠或保留可访问地址。
+    /// 在持有 `mmap` 读锁与 `PteDomain` 自旋锁的保护下，将用户态 32 位字地址转换为内核直接映射虚拟地址并调用 `visit`。
+    ///
+    /// 若该页尚未驻留或无读权限则返回 `None`（调用方需释放 `FutexRead` 后触发缺页）。
+    /// `visit` 闭包在自旋锁临界区内执行，仅允许执行原子的 32 位字读写与固定哈希桶操作，**严禁睡眠、动态内存分配或将裸地址逃逸到闭包外**。
     pub(crate) fn with_word<R>(&self, address: usize, visit: impl FnOnce(usize) -> R) -> Option<R> {
         if !self.mmap.find(address)?.allows(UserAccess::Read) {
             return None;
@@ -635,7 +799,7 @@ impl FutexRead<'_> {
 }
 
 impl Mm {
-    /// 在普通任务上下文准备独立页表，尚未发表给执行者或硬件。
+    /// 在普通可睡眠任务上下文中创建一个全新的空用户地址空间（含独立的根页表，尚未绑定到任何线程或 CPU）。
     pub fn try_new() -> Result<Self, PageTableError> {
         Ok(Self {
             table: Arc::try_new(PteDomain {
@@ -662,24 +826,24 @@ impl Mm {
         })
     }
 
-    /// 未发表 Mm 接受原执行文件及其写排斥，后续错误由 Mm 正常析构归还。
+    /// 为尚未发布的地址空间绑定主可执行文件及其执行期写互斥锁（`ExecAccess`）；当 `Mm` 最终析构时自动释放写互斥。
     pub(crate) fn bind_executable(&mut self, file: FileRef, access: ExecAccess) {
         assert!(self.executable.is_none(), "MM executable already bound");
         self.executable = Some((file, access));
     }
 
-    /// 未发表 Mm 接受唯一 ELF 解释器责任，末拥有析构与主文件遵守同一寿命边界。
+    /// 为尚未发布的地址空间绑定动态链接器（ELF 解释器）文件及其执行期写互斥锁（`ExecAccess`）。
     pub(crate) fn bind_interpreter(&mut self, file: FileRef, access: ExecAccess) {
         assert!(self.interpreter.is_none(), "MM interpreter already bound");
         self.interpreter = Some((file, access));
     }
 
-    /// 返回真实用户线程绑定数，不包含 CPU、诊断或同步 key 的拥有引用。
+    /// 返回当前绑定到该地址空间的活动用户线程数量（即存活的 [`MmUser`] 数量）。
     pub fn user_count(&self) -> usize {
         self.users.load(Ordering::Acquire)
     }
 
-    /// 在唯一 futex Waiter 建立前取得可睡眠范围读侧，排除后续比较登记期间的重映射。
+    /// 获取 `mmap` 睡眠读锁并构造 [`FutexRead`] 会话，用于在解析 `FutexKey` 与校验用户字期间阻止并发重映射。
     pub(crate) fn futex_read(self: &Arc<Self>) -> FutexRead<'_> {
         FutexRead {
             mm: self,
@@ -687,7 +851,7 @@ impl Mm {
         }
     }
 
-    /// 在当前共享匿名对象上安装真实额外别名，保留源 VMA；不接受文件或私有匿名。
+    /// 测试辅助函数：在同一个共享匿名对象（`SharedAnon`）上为 `[source, source + length)` 建立映射到 `destination` 的额外共享别名 VMA。
     #[cfg(feature = "ktest")]
     pub fn test_shared_alias(
         &self,
@@ -723,11 +887,11 @@ impl Mm {
         Ok(())
     }
 
-    /// 在尚未共享的地址空间安装完整初始化单页，保留当前与最大权限并转交匿名页归还责任。
+    /// 在尚未共享给其他线程或 CPU 的地址空间中直接映射一页已初始化完毕的独占物理页，并将物理页释放责任移交给 `Mm`。
     ///
     /// # Safety
-    /// 调用者必须完整初始化 pages 的全部字节，结束全部排他 Rust 引用及未受控原始访问；
-    /// 页面只能作为用户数据或代码，不能包含内核私有对象。成功后不得凭旧裸地址释放该页。
+    /// 1. 调用方必须已完整初始化 `pages`（阶数为 0 的单个物理页）的全部字节，且已结束对该页的所有可变 Rust 引用与外部裸指针访问；
+    /// 2. 该物理页只能存放用户态代码或数据，不得包含任何内核私有数据结构；调用成功后所有权归 `Mm` 管理，调用方不得再手动释放该物理页。
     pub unsafe fn map_owned(
         &mut self,
         address: usize,
@@ -742,8 +906,9 @@ impl Mm {
         let vma = Vma::try_new(range, permissions, maximum, VmaBacking::Anonymous, None)
             .map_err(table_error)?;
 
-        // SAFETY: 调用者保证完整初始化的独占 order0 页，无其他映射、设备或内容借用；
-        // 此处消费原归还权，后续访问仅沿本 Mm 的原始访问和硬件权限协议。
+        // SAFETY:
+        // 1. 前置检查已确认 `pages.order() == 0`，且调用方契约保证该物理页已完整初始化、无任何并发映射、DMA 或外部借用；
+        // 2. 此处将独占 `OwnedPages` 封装为引用计数的 `AnonPageRef`，后续生命周期完全由本 `Mm` 的 `ResidentPages` 管理。
         let backing = unsafe { AnonPageRef::from_owned(pages) };
         let page = ResidentPage::try_new(address, ResidentBacking::Anonymous(backing), false)
             .map_err(table_error)?;
@@ -754,8 +919,9 @@ impl Mm {
         let retired = self.insert_vma(&mut mmap, vma).map_err(table_error)?;
         {
             let mut state = self.table.lock();
-            // SAFETY: self 的唯一借用排除活动共享，page 完整初始化并保有原页；
-            // 中间表锁外准备，PTE 和驻留拥有在同一短锁内发表，离开全部 CPU 后才归还。
+            // SAFETY:
+            // 1. `&mut self` 排他借用保证了当前地址空间尚未在任何 CPU 上激活或被并发访问，`page` 已完整初始化并持有物理页强引用；
+            // 2. 所需的中间页表 `prepared` 已在锁外预分配完毕，硬件叶子 PTE 与 `ResidentPage` 节点在同一个页表自旋锁临界区内原子安装。
             let previous = unsafe {
                 state
                     .table
@@ -772,7 +938,7 @@ impl Mm {
         Ok(())
     }
 
-    /// 只发表私有匿名范围，首次实际访问在锁外申请清零基本页。
+    /// 在地址空间中注册一段私有匿名映射区间 `[address, address + length)`（按需分页，首次访问触发缺页时才分配零初始化物理页）。
     pub fn map_anonymous(
         &self,
         address: usize,
@@ -789,8 +955,9 @@ impl Mm {
         Ok(())
     }
 
-    /// 登记初始栈实际范围并允许当前绑定线程随后向下增长；不预留整个软限额。
-    /// 离线 exec 候选须先完整登记构栈所需页，首次触页仍沿普通 fault 准备原页。
+    /// 在地址空间中注册一段允许向下自动扩展的用户栈区间 `[address, address + length)`。
+    ///
+    /// 仅注册初始栈区间而非整个 `RLIMIT_STACK` 软限额；`execve` 构造初始栈帧的页面以及运行期压栈触发的缺页均通过常规 `fault` 按需分配物理页。
     pub fn map_stack(
         &self,
         address: usize,
@@ -807,7 +974,9 @@ impl Mm {
         Ok(())
     }
 
-    /// 映射持完整打开实例，属性检查与取页均不占 mmap/PTE 锁，关闭 fd 不撤销映射。
+    /// 在地址空间中建立文件映射区间 `[address, address + length)`。
+    ///
+    /// `Vma` 直接持有克隆的 [`FileRef`] 与 [`InodeRef`]，因此后续关闭文件描述符不会撤销该映射；文件读写模式校验与反向映射注册均在获取页表锁之外完成。
     #[expect(
         clippy::too_many_arguments,
         reason = "文件映射分别携带地址范围、当前和最大权限、打开实例及共享属性，保留 mmap 的原接口和拥有边界"
@@ -844,9 +1013,11 @@ impl Mm {
         Ok(())
     }
 
-    /// 逐个取得当前 VMA 的真实交集与原 OFD，放 mmap 读侧后同步准确文件范围。
-    /// 孔洞保留已完成进度并最终返回 Unmapped，后续真实同步错误优先；私有与匿名不写源。
-    /// 当前无锁定 VMA，invalidate 不撤 PTE；非同步请求只检查范围，不启动回写。
+    /// 将虚拟地址区间 `range` 内所有共享文件映射（`MAP_SHARED`）的脏页同步回写到底层文件（`msync` 系统调用实现）。
+    ///
+    /// - 逐段获取 `mmap` 读锁定位相交的 `Vma` 并克隆 [`FileRef`]，随后释放 `mmap` 读锁再执行耗时的文件范围同步，避免阻塞同进程缺页；
+    /// - 若区间内包含未映射空洞，仍会继续同步后续已映射子区间并最终返回 [`VmError::Unmapped`]（若发生底层文件系统 I/O 错误则优先返回文件错误）；
+    /// - 私有映射与匿名映射不回写底层文件；当 `synchronous` 为 `false`（`MS_ASYNC`）时仅校验映射范围存在性。
     pub fn sync_mapping_range(
         &self,
         range: Range<usize>,
@@ -905,7 +1076,9 @@ impl Mm {
         }
     }
 
-    /// 页上取整用户长度并在同一写侧选址与发表；固定覆盖先备齐候选再解除旧叶。
+    /// 执行 `mmap` 系统调用核心逻辑：向上按页取整请求长度、校验文件后备权限，并在 `mmap` 写锁下完成选址与 VMA 发布。
+    ///
+    /// 若为 `MAP_FIXED` 覆盖映射，会先在锁外准备好拆分/替换后的完整候选 VMA 列表，再摘除被覆盖区间的旧硬件页表项并刷新全核 TLB。
     pub(crate) fn mmap(&self, request: MmapRequest) -> Result<usize, VmError> {
         if request.length == 0 {
             return Err(VmError::InvalidRange);
@@ -977,7 +1150,9 @@ impl Mm {
         Ok(address)
     }
 
-    /// byte break 与页增删在单次 mmap 写侧完成；增长避开栈 guard，任何失败均保原 break。
+    /// 执行 `brk` 系统调用：在持有 `mmap` 写锁时调整用户堆顶（Program Break）字节边界，并按需映射新匿名页区间或卸载收缩区间。
+    ///
+    /// 堆向上增长时必须避开紧邻用户栈下方的防护间隙（[`STACK_GUARD_GAP`]）；任何参数越界、冲突或内存分配失败均保持原 `heap_end` 不变并返回旧值。
     pub(crate) fn brk(&self, request: usize) -> usize {
         let mut mmap = self.mmap.write();
         let old = mmap.heap_end;
@@ -1030,12 +1205,15 @@ impl Mm {
         request
     }
 
-    /// 按当前 VMA 与实际叶权限处理缺页、COW 或文件写准备；缺口仅允许当前绑定栈增长。
-    /// 限额快照、睡眠与原页准备均在短锁外，栈身份与页分别沿原 mmap/PTE 协议发表。
+    /// 处理用户态虚拟地址 `address` 上发生的 `access` 类型缺页异常（Page Fault）。
+    ///
+    /// 涵盖按需分配匿名页、读取文件页缓存、写时复制（COW）、共享文件首次写脏准备（`mkwrite`）以及用户栈自动向下扩展。
+    /// 物理页分配、磁盘读取与中间页表预分配均在页表自旋锁之外执行；提交前重新核实 VMA 身份与观测到的物理页是否发生并发变化。
     pub fn fault(&self, address: usize, access: UserAccess) -> Result<(), VmError> {
         let base = address & !(PAGE_SIZE - 1);
         let mut attempt = ReclaimAttempt::new();
         loop {
+            // Step 1: 在读锁下采样缺页位置的 VMA 与当前驻留页状态；若地址未映射则尝试作为用户栈向下扩展。
             let source = match self.fault_source(address, access) {
                 Ok(Some(source)) => source,
                 Ok(None) => return Ok(()),
@@ -1047,6 +1225,7 @@ impl Mm {
                 Err(error) => return Err(error),
             };
 
+            // Step 2: 若是共享文件映射（MAP_SHARED）的写入缺页，交由专门的 mkwrite 路径完成文件脏页准备与写权限授予。
             if access == UserAccess::Write && source.vma.is_shared_file() {
                 if self.mkwrite(&source, address, &mut attempt)? {
                     return Ok(());
@@ -1054,8 +1233,10 @@ impl Mm {
                 continue;
             }
 
+            // Step 3: 在不持有 mmap 锁和页表自旋锁的情况下，分配后备物理页、拷贝 COW 数据并预分配中间级页表。
             let preparation = prepare_fault(&source, base, access, &mut attempt);
 
+            // Step 4: 获取 mmap 写锁并核实当前地址处的 VMA 身份与访问权限在锁外准备期间未被并发修改。
             let mmap = self.mmap.write();
             let current = mmap.find(address).ok_or(VmError::Unmapped)?;
             if !current.allows(access) {
@@ -1100,6 +1281,7 @@ impl Mm {
                 }
             };
 
+            // Step 5: 若涉及文件页缓存，锁定文件页内容并校验该页仍在页缓存中且文件偏移未因并发 truncate 越过 EOF。
             let content = file.as_ref().map(|folio| folio.lock_content());
             if let Some(content) = &content {
                 let data = source
@@ -1134,6 +1316,7 @@ impl Mm {
                 }
             }
 
+            // Step 6: 若该虚拟页原本存在旧的只读/COW 叶子 PTE，先在文件范围锁与页表自旋锁下清除旧叶子 PTE，并在锁外完成全核 TLB 刷新。
             {
                 let _ranges = source
                     .vma
@@ -1151,8 +1334,9 @@ impl Mm {
                     continue;
                 }
                 if source.observed.is_some() {
-                    // SAFETY: 范围/PTE 短锁核当次来源和驻留，source 保活旧页；
-                    // 只清叶保留目录，锁外 CSD 后再次检查，不能假定文件失效未摘表。
+                    // SAFETY:
+                    // 1. 当前同时持有文件范围锁（若有）与 `self.table` 页表自旋锁，且已核实当前驻留页物理地址仍为 `source.observed`；
+                    // 2. `clear_leaf` 仅清除硬件叶子 PTE 而不释放中间页表或旧物理页（旧物理页仍由 `state.pages` 和 `source.backing` 保活），随后立即在锁外执行全核 TLB 同步。
                     let old = unsafe { state.table.clear_leaf(base) };
                     assert_eq!(old.map(|leaf| leaf.physical), source.observed);
                 }
@@ -1160,6 +1344,7 @@ impl Mm {
 
             sync_all();
 
+            // Step 7: 重新获取文件范围锁与页表自旋锁，确认期间无并发修改后安装新叶子 PTE 并替换 ResidentPages 节点。
             let old = {
                 let _ranges = source
                     .vma
@@ -1181,8 +1366,9 @@ impl Mm {
                     "fault publication found a live leaf"
                 );
                 let permissions = page.permissions(current.permissions);
-                // SAFETY: 旧叶已解除且真实 CSD 完成；同范围/PTE 锁重核旧驻留及缺表数。
-                // 新页完整初始化，原文件内容锁排除 detach，原叶和退休引用均仍保活。
+                // SAFETY:
+                // 1. 旧叶子 PTE（若存在）已在 Step 6 中清除且完成了全核 TLB 刷新；当前持文件范围锁与页表自旋锁再次确认驻留页与所需中间页表数未变，且硬件叶子槽位为空；
+                // 2. 新物理页已完成数据初始化，文件页内容锁阻止了并发截断卸载，预分配的中间页表 `prepared` 充足，且被替换的旧驻留节点 `old` 移出到锁外释放。
                 let previous = unsafe {
                     state
                         .table
@@ -1208,8 +1394,9 @@ impl Mm {
         }
     }
 
-    /// 只从合法普通 Task 的实际用户绑定取当前 STACK soft，离线或无关 Mm 不借用限额。
-    /// 所有拥有和值在独立短段取得，返回前释放短锁，调用者随后才取得 mmap 写侧。
+    /// 查询当前正在执行的普通用户线程的栈软限额（`RLIMIT_STACK`）。
+    ///
+    /// 仅当调用方是绑定到本 `Mm` 且当前 CPU 正在使用本 `Mm` 的活动用户线程时返回限额；内核离线操作或跨地址空间访问不会触发栈自动增长。
     fn current_stack_limit(&self) -> Option<u64> {
         task::current_task_id()?;
         let task = task::current_task();
@@ -1226,8 +1413,9 @@ impl Mm {
         Some(identity.group().resource_limit(Resource::Stack).current)
     }
 
-    /// 在 mmap 写侧重查真实缺口并准备完整替换索引；分配或边界失败不发表部分范围。
-    /// 原驻留页及叶不变，新缺页在返回后才沿 fault 的锁外准备和短锁提交处理。
+    /// 在持有 `mmap` 写锁下重新核实未映射缺页地址 `address`，并将上方紧邻的用户栈 VMA 向下扩展以覆盖该页。
+    ///
+    /// 本函数仅发布扩展后的新栈 VMA，不直接分配物理页；返回后由 [`Mm::fault`] 下一轮循环按常规匿名页缺页流程分配并映射物理页。
     fn grow_stack(&self, address: usize, access: UserAccess, limit: u64) -> Result<(), VmError> {
         let mut mmap = self.mmap.write();
         if mmap.find(address).is_some() {
@@ -1242,8 +1430,11 @@ impl Mm {
         Ok(())
     }
 
-    /// 文件写准备退出所有 FS guard 后重新检查范围；最终遵守 mmap→invalidate→folio→PTE。
-    /// coherent 原页允许在已有 WB 时再次标脏授 W；来源变化返回 false，仍重核真实准备事实。
+    /// 为共享文件映射（`MAP_SHARED`）的写入缺页准备可写页缓存，并将硬件叶子 PTE 升级为可写状态。
+    ///
+    /// 先在锁外调用文件系统 `prepare_mkwrite` 分配或锁定目标页缓存并等待可能正在进行的回写（Writeback）；
+    /// 随后严格按照 `mmap 写锁 -> inode 截断锁 -> 文件页内容锁 -> 页表自旋锁` 的顺序二次核实映射未被卸载或截断，将页缓存标记为脏页（Dirty）并授予硬件写权限。
+    /// 若锁外准备期间映射来源或驻留页发生变化，返回 `Ok(false)` 通知外层 `fault` 循环重试。
     fn mkwrite(
         &self,
         source: &FaultSource,
@@ -1263,6 +1454,7 @@ impl Mm {
             .ok_or(VmError::InvalidRange)?;
         let index = offset / PAGE_SIZE as u64;
 
+        // Step 1: 在不持有地址空间锁的情况下检查 EOF、调用文件系统准备可写页缓存，并预分配驻留节点与中间页表。
         let preparation = (|| {
             if data.inode.metadata_snapshot().map_err(VmError::File)?.size <= offset {
                 return Err(VmError::BeyondEof);
@@ -1293,6 +1485,7 @@ impl Mm {
             Ok((prepared, page, tables))
         })();
 
+        // Step 2: 获取 mmap 写锁与页表自旋锁，核实 VMA 身份未变且当前页未被其他线程抢先完成可写映射。
         let mmap = self.mmap.write();
         let current = mmap.find(address).ok_or(VmError::Unmapped)?;
         if !current.allows(UserAccess::Write) {
@@ -1322,6 +1515,7 @@ impl Mm {
             }
         }
 
+        // Step 3: 依次获取文件截断锁与页内容锁，将页缓存正式标记为脏页，并在页表自旋锁内安装或升级可写叶子 PTE。
         let (prepared, mut page, mut tables) = preparation?;
         let invalidate = data.inode.lock_invalidate().map_err(VmError::File)?;
         let mut content = prepared.folio().lock_content();
@@ -1342,8 +1536,9 @@ impl Mm {
                 {
                     return Ok(false);
                 }
-                // SAFETY: 同一短锁核实当前来源/PFN/叶；invalidate 和内容 guard 保准备事实，
-                // finish 已先置真实 Dirty，同 PFN 写授权不改变拥有，锁外再同步 CPU。
+                // SAFETY:
+                // 1. 当前持有 `invalidate` 截断锁、文件页 `content` 锁与 `self.table` 页表自旋锁，已核实驻留节点的 `source` 与物理地址 `physical` 完全匹配；
+                // 2. `finish_mkwrite` 已将底层文件页标记为脏页，`protect_leaf` 仅原地为同一个物理页开启硬件写权限，不改变物理页所有权，锁外随后执行全核 TLB 同步。
                 if !unsafe {
                     state
                         .table
@@ -1355,8 +1550,9 @@ impl Mm {
                 if state.table.lookup(base).is_some() || source.observed.is_some() {
                     return Ok(false);
                 }
-                // SAFETY: prepared 的 canonical 原页已完整初始化并先标 Dirty；真实源登记
-                // 在叶可见前存在，表页锁外准备，同一短锁发表硬件叶和驻留拥有。
+                // SAFETY:
+                // 1. `prepared` 对应的规范文件页缓存已完整初始化并由 `finish_mkwrite` 标记为脏页；当前持锁确认该虚拟地址尚无叶子 PTE 且中间页表 `tables` 已在锁外备齐；
+                // 2. 硬件叶子 PTE 与携带有效 `source` 弱引用的 `ResidentPage` 节点在同一个页表自旋锁临界区内原子发布。
                 let previous = unsafe {
                     state
                         .table
@@ -1379,41 +1575,43 @@ impl Mm {
         Ok(true)
     }
 
-    /// 受控准备停点只保当前 Mm 的 callback，替换与最后析构发生在短锁外。
+    /// 测试辅助函数：设置或清除 `mkwrite` 准备阶段的同步钩子（旧钩子的析构在自旋锁外完成）。
     #[cfg(feature = "ktest")]
     pub fn ktest_set_mkwrite_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         let previous = core::mem::replace(&mut *self.mkwrite_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 在原范围替换已发表新 VMA、旧叶仍待摘取时观察；callback 只暂停真实操作。
+    /// 测试辅助函数：设置或清除 VMA 范围卸载阶段（新 VMA 已发布、旧硬件 PTE 待摘除时）的观察钩子。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_vma_unmap_hook(&self, hook: Option<VmaUnmapHook>) {
         let previous = core::mem::replace(&mut *self.vma_unmap_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 在真实文件候选持源内容锁并重核 EOF 后暂停，只观察原 fault，不构造叶或页。
+    /// 测试辅助函数：设置或清除文件缺页在持有页内容锁并核实 EOF 后的暂停钩子。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_fault_hook(&self, hook: Option<AddressHook>) {
         let previous = core::mem::replace(&mut *self.fault_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 在真实 fork 取得原驻留引用后暂停，候选仍须通过当前父叶和来源的最终检查。
+    /// 测试辅助函数：设置或清除 `fork` 在采样父进程驻留页后的暂停钩子。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_set_fork_hook(&self, hook: Option<AddressHook>) {
         let previous = core::mem::replace(&mut *self.fork_hook.lock(), hook);
         drop(previous);
     }
 
-    /// 观察真实 Dirty 后的 W 发表次数，不把 VMA 最大权限或诊断读取计入授权。
+    /// 测试辅助函数：读取本地址空间通过 `mkwrite` 成功授予共享文件页写权限的累计次数。
     #[cfg(feature = "ktest")]
     pub fn ktest_mkwrite_count(&self) -> usize {
         self.mkwrites.load(Ordering::Relaxed)
     }
 
-    /// 取得锁外准备所需的具体身份和原页引用，权限命中不分配或等待文件。
+    /// 在持有 `mmap` 读锁与 `PteDomain` 自旋锁下检查缺页地址状态，若硬件页表尚未就绪则采集锁外准备所需的 [`FaultSource`] 快照。
+    ///
+    /// 若目标页已驻留且硬件 PTE 权限已满足本次 `access`（例如多线程并发缺页已被其他线程修复），则直接更新文件页访问位并返回 `Ok(None)`。
     fn fault_source(
         &self,
         address: usize,
@@ -1452,8 +1650,10 @@ impl Mm {
         }))
     }
 
-    /// 短页命中保持读侧及 PTE 拥有稳定；缺 VMA、缺页或 COW 返回 None，调用者放锁后 fault。
-    /// visit 不得分配、睡眠、调度、构造用户内容引用或保留可继续访问的原始地址。
+    /// 在持有 `mmap` 读锁与 `PteDomain` 自旋锁的保护下，获取虚拟地址 `address` 对应的内核直接映射地址并执行 `visit`。
+    ///
+    /// 若地址未映射、尚未驻留物理页、权限不满足或写入遇到待写时复制（COW）页，则返回 `Ok(None)`，由调用方释放锁后触发 [`Mm::fault`]。
+    /// `visit` 闭包在自旋锁临界区内运行，**严禁在闭包内睡眠、分配内存、触发调度，或将传入的内核虚拟地址保存到闭包外继续使用**。
     pub(crate) fn with_page<R>(
         &self,
         address: usize,
@@ -1492,7 +1692,10 @@ impl Mm {
         Ok(Some(result))
     }
 
-    /// 子 Mm 独立登记文件范围并保两映像写排斥，父 COW/TLB 同步完成后才返回。
+    /// 为 `fork` 系统调用完整复制当前进程的用户地址空间，生成独立的子进程 [`Mm`]。
+    ///
+    /// 子进程继承主可执行文件与动态链接器的写互斥凭证，并为所有文件 VMA 建立独立的反向映射登记；
+    /// 对所有私有映射（`MAP_PRIVATE`）的已驻留物理页，将父子双方的驻留节点均标记为写时复制（`cow = true`）并将硬件叶子 PTE 降权为只读，最后在返回前完成全核 TLB 同步。
     pub fn fork(&self) -> Result<Self, VmError> {
         let mut child = Self::try_new()?;
         child.executable = self.executable.clone();
@@ -1502,6 +1705,7 @@ impl Mm {
         let addresses = self.resident_addresses(&(0..arch::USER_ADDRESS_END))?;
         *child.mmap.write() = snapshot;
 
+        // Step 1: 遍历父进程当前驻留页，向子进程页表复制映射（文件页需持内容锁与范围锁核实未被并发截断）。
         for &address in &addresses {
             let vma = mmap.find(address).expect("resident page has no VMA");
             let (backing, cow, source) = {
@@ -1589,8 +1793,9 @@ impl Mm {
                     prepared = PreparedTables::try_new(needed)?;
                     continue;
                 }
-                // SAFETY: 原文件范围锁串行全部范围撤叶与子叶提交；父 PTE 锁重核当前来源/PFN，
-                // child 尚不可运行，已初始化原页引用保活，子私有叶只读，表页锁外准备。
+                // SAFETY:
+                // 1. 当前同时持有文件范围锁（若有）、父进程页表自旋锁 `parent` 与子进程页表自旋锁 `state`，已核实父进程该页物理地址与来源未变；
+                // 2. 子进程 `child` 尚未发布给任何线程或 CPU，物理页由父子 `ResidentPage` 共同持有强引用，私有映射页已通过 `page.permissions` 屏蔽写权限，且中间页表 `prepared` 充足。
                 let old = unsafe {
                     state.table.map(
                         address,
@@ -1607,6 +1812,7 @@ impl Mm {
             drop(prepared);
         }
 
+        // Step 2: 将父进程所有私有映射（MAP_PRIVATE）驻留页标记为 COW 并将硬件叶子 PTE 降权为只读，随后执行全核 TLB 刷新。
         for &address in &addresses {
             let vma = mmap.find(address).expect("fork resident has no VMA");
             if !vma.is_private() {
@@ -1619,8 +1825,9 @@ impl Mm {
             page.cow = true;
             let physical = page.backing.physical();
             let permissions = page.permissions(vma.permissions);
-            // SAFETY: 此短锁核实当次驻留 PFN，父子引用保活原页；同 PFN 只撤 W，
-            // 子尚未发表，全部 CPU 的旧父翻译在子可运行前同步失效。
+            // SAFETY:
+            // 1. 当前持有父进程 `self.table` 页表自旋锁，且 `physical` 直接取自当前驻留页节点 `page`，父子引用共同保证底层物理页存活；
+            // 2. `protect_leaf` 仅原地移除同一个物理页的硬件写权限，且在子进程可运行及释放 `mmap` 写锁前会调用 `sync_all()` 刷新全核 TLB。
             unsafe { state.table.protect_leaf(address, physical, permissions) }
                 .expect("fork protection is not representable");
         }
@@ -1630,7 +1837,10 @@ impl Mm {
         Ok(child)
     }
 
-    /// 按最大权限预检并发表独立范围登记，同 PFN 改权保 COW，shared file 从不直接升 W。
+    /// 修改虚拟地址区间 `[address, address + length)` 的页面访问权限（`mprotect` 系统调用实现）。
+    ///
+    /// 先校验区间是否全部已映射且不超过各 VMA 的最大权限 `maximum`，再发布拆分/合并后的新 VMA 列表；
+    /// 随后逐页更新已驻留页面的硬件叶子 PTE 权限（保留私有页的 `cow` 只读约束与共享文件页的只读约束），并在锁外完成全核 TLB 同步。
     pub fn protect(
         &self,
         address: usize,
@@ -1652,8 +1862,9 @@ impl Mm {
             };
             let physical = page.backing.physical();
             let permissions = page.permissions(vma.permissions);
-            // SAFETY: 当次驻留与实际叶在同一 PTE 锁核 PFN；旧页保持拥有，
-            // shared file 许可仍 RO，改权在所有短锁外完成真实全 CPU 失效。
+            // SAFETY:
+            // 1. 当前持有 `self.table` 页表自旋锁，`physical` 取自当前驻留节点 `page`，物理页所有权保持不变；
+            // 2. `page.permissions` 保证了 COW 页与文件缓存页不会被直接授予硬件写权限，且循环结束后会在自旋锁外调用 `sync_all()` 刷新全核 TLB。
             unsafe { state.table.protect_leaf(address, physical, permissions) }
                 .expect("protection is not representable");
         }
@@ -1666,7 +1877,9 @@ impl Mm {
         Ok(())
     }
 
-    /// 解除实际叶及空中间表，全部在线 CPU 的失效完成后才归还旧数据页和表页。
+    /// 解除虚拟地址区间 `[address, address + length)` 的内存映射（`munmap` 系统调用实现）。
+    ///
+    /// 摘除区间内的所有硬件叶子 PTE 与变空的中间页表，在完成全核 TLB 同步并释放 `mmap` 写锁后归还物理页与页表页。
     pub fn unmap(&self, address: usize, length: usize) -> Result<(), VmError> {
         let range = vma::checked_range(address, length)?;
         let mut mmap = self.mmap.write();
@@ -1676,7 +1889,7 @@ impl Mm {
         Ok(())
     }
 
-    /// 新映射先准备完整索引，合并可能改变相邻文件来源，发表统一更新所有驻留来源。
+    /// 在持有 `mmap` 写锁下向空闲区间插入新 `vma`（若相邻 VMA 可合并则一并更新受影响驻留页的文件范围弱引用）。
     fn insert_vma(&self, mmap: &mut MmapState, vma: Arc<Vma>) -> Result<RetiredVmas, VmError> {
         if !mmap.vacant(&vma.range) {
             return Err(VmError::Occupied);
@@ -1686,13 +1899,18 @@ impl Mm {
         self.publish_vmas(mmap, vmas, None)
     }
 
-    /// mmap 写侧预备保留叶的来源清单，再以原范围锁→PTE 换身份；待摘叶保旧来源直到撤叶/CSD。
+    /// 发布新的有序 VMA 列表 `vmas`，并同步更新所有非卸载驻留页的文件反向映射弱引用（`source`）。
+    ///
+    /// 当 VMA 因拆分、合并或权限修改而更换了 [`FileRangeData`] 实例时，必须按照 `文件范围自旋锁 -> 页表自旋锁` 的顺序
+    /// 将对应驻留页的硬件 PTE 重置为只读干净态（防止旧的脏页写授权跨 VMA 身份泄漏）并切换 `page.source`；
+    /// 处于即将卸载区间 `retiring` 内的驻留页保持原 `source` 不变，留给随后的 `replace_range` 摘除。
     fn publish_vmas(
         &self,
         mmap: &mut MmapState,
         vmas: Vec<Arc<Vma>>,
         retiring: Option<&Range<usize>>,
     ) -> Result<RetiredVmas, VmError> {
+        // Step 1: 统计因 VMA 拆分或合并而需要更新文件范围弱引用（source）的驻留页数量，并在锁外预分配缓冲向量。
         let count = {
             let state = self.table.lock();
             let mut cursor = state.pages.head.as_deref();
@@ -1744,6 +1962,7 @@ impl Mm {
             }
         }
 
+        // Step 2: 替换生效的 VMA 列表，并按锁顺序逐页将更换了文件范围身份的文件页置为只读干净态、更新其 source 弱引用。
         let old = core::mem::replace(&mut mmap.vmas, vmas);
         let mut changed = false;
         for (address, saved) in &mut sources {
@@ -1762,8 +1981,9 @@ impl Mm {
                 }
                 let next = mmap.find(*address).and_then(|vma| vma.file_range.as_ref());
                 if matches!(&page.backing, ResidentBacking::File(_)) {
-                    // SAFETY: 原范围锁排除全范围失效，PTE 短锁核驻留 PFN；来源换身份不继承 W。
-                    // 原页保活，全部改权在短锁外真实 CSD 后完成，Weak 不在此锁析构。
+                    // SAFETY:
+                    // 1. 当前持有旧文件范围自旋锁（若有）与 `self.table` 页表自旋锁，已核实驻留页 `page` 的 `source` 未变且后备为文件页；
+                    // 2. `mkclean` 仅原地清除硬件写权限以防写授权跨越不同的 `FileRangeData` 身份，底层物理页保持存活，且在锁外统一调用 `sync_all()` 刷新 TLB。
                     changed |= unsafe { table.mkclean(*address, page.backing.physical()) }
                         .is_some_and(|(_, changed)| changed);
                 }
@@ -1778,7 +1998,9 @@ impl Mm {
         Ok((old, sources))
     }
 
-    /// 写侧先备齐候选索引及退休容器，再撤叶并同步所有 CPU；旧拥有交回调用者锁外释放。
+    /// 在持有 `mmap` 写锁下移除区间 `range` 内的旧映射（可选替换为 `replacement`），摘除区间内的硬件 PTE 并刷新全核 TLB。
+    ///
+    /// 被卸载的旧 VMA、驻留物理页节点与空中间页表全部通过返回值交由调用方在释放 `mmap` 写锁后析构。
     fn replace_range(
         &self,
         mmap: &mut MmapState,
@@ -1804,8 +2026,9 @@ impl Mm {
                 let Some(page) = state.pages.remove(address) else {
                     continue;
                 };
-                // SAFETY: mmap 写侧阻止新叶提交，PTE 短锁核真实驻留；并发文件失效已移出的页跳过。
-                // 原页和表页只移入各自原退休链，全部 CPU 翻译与目录遍历失效后才归还。
+                // SAFETY:
+                // 1. 外层持有 `mmap` 写锁阻止了新缺页提交，当前持有 `self.table` 页表自旋锁并从 `state.pages` 取出了驻留节点 `page`（已被并发文件截断移除的页已跳过）；
+                // 2. `unmap` 摘下的物理页节点移入 `discarded`，变空的中间页表移入 `tables`，两者均在下方 `sync_all()` 完成全核 TLB 与页表遍历缓存刷新后才在锁外释放。
                 let (old, retired) = unsafe { state.table.unmap(address) };
                 assert_eq!(old.unwrap().physical, page.backing.physical());
                 discarded.push(page);
@@ -1820,7 +2043,9 @@ impl Mm {
         Ok((old_vmas, discarded, tables))
     }
 
-    /// mmap 写侧阻止新增驻留，以当前数量预留上界；文件范围失效可并发减少实际页数。
+    /// 在持有 `mmap` 写锁的前提下，收集区间 `range` 内所有当前驻留页的虚拟基址列表。
+    ///
+    /// `mmap` 写锁阻止了新驻留页的插入，因此首次计数的 `count` 是精确上界（期间并发的文件截断仅可能减少驻留页数量）。
     fn resident_addresses(&self, range: &Range<usize>) -> Result<Vec<usize>, VmError> {
         let count = self.table.lock().pages.count(range);
         let mut addresses = Vec::new();
@@ -1831,13 +2056,13 @@ impl Mm {
         Ok(addresses)
     }
 
-    /// 返回非拥有的硬件叶快照，仅用于诊断；不能凭物理整数继续访问或归页。
+    /// 测试诊断接口：查询虚拟地址 `address` 当前的硬件叶子 PTE 快照（不转移物理页所有权）。
     #[cfg(feature = "ktest")]
     pub fn mapping(&self, address: usize) -> Option<Mapping> {
         self.table.lock().table.lookup(address)
     }
 
-    /// 记录执行映像确定的堆起点与当前 byte break，不替代实际 VMA 映射操作。
+    /// 设置用户堆区的起始地址 `heap_start` 与初始堆顶 `heap_end`（由 ELF 加载器在初始化进程地址空间时调用）。
     pub(crate) fn set_heap(&self, start: usize, end: usize) -> Result<(), VmError> {
         if end < start || arch::USER_ADDRESS_END < end {
             return Err(VmError::InvalidRange);
@@ -1848,13 +2073,15 @@ impl Mm {
         Ok(())
     }
 
-    /// 返回由本对象保活的根物理地址，不移交页表或叶页的访问权。
+    /// 返回当前地址空间根页表的物理地址（供激活页表寄存器使用，生命周期由当前 `Mm` 保证）。
     pub(crate) fn root_phys(&self) -> usize {
         self.table.lock().table.root_phys()
     }
 }
 
-/// 锁外准备驻留节点、目录及原文件来源；匿名候选仍保源 folio，提交时同内容锁核 canonical 和 EOF。
+/// 在锁外为缺页异常准备新的 [`ResidentPage`] 节点、预分配中间级页表 [`PreparedTables`] 以及关联的文件页缓存引用。
+///
+/// 即使私有文件映射发生了写时复制（转为匿名页后备），仍通过返回值保留源 [`FolioRef`]，以便在提交阶段锁定文件页内容并校验该页仍在页缓存中且未越过文件 EOF。
 fn prepare_fault(
     source: &FaultSource,
     base: usize,
@@ -1870,7 +2097,9 @@ fn prepare_fault(
     Ok((page, tables, file))
 }
 
-/// 锁外准备具体驻留拥有；共享文件尾页保 canonical folio，私有 COW 不按引用数猜独占性。
+/// 在锁外为缺页异常分配或获取底层物理页后备（[`ResidentBacking`]），并完成写时复制（COW）或文件数据读取。
+///
+/// 返回元组 `(物理页后备, 是否标记为 COW 只读, 关联的文件页缓存引用)`。
 fn prepare_backing(
     source: &FaultSource,
     base: usize,
@@ -1878,14 +2107,14 @@ fn prepare_backing(
     attempt: &mut ReclaimAttempt,
 ) -> Result<(ResidentBacking, bool, Option<FolioRef>), VmError> {
     if let Some(backing) = &source.backing {
-        // ponytail: 私有 COW 总复制一页；有实际映射独占证明后才考虑原页复用。
+        // ponytail: 私有写时复制（COW）总是分配新页并拷贝；后续若引入页独占引用证明可优化为原地复用。
         let page = AnonPageRef::try_new_reclaim(attempt).ok_or(VmError::NoMemory)?;
         let mut file = None;
         match backing {
             ResidentBacking::Anonymous(source) => {
-                // SAFETY: source 克隆保活完整初始化原页，旧 COW 叶无硬件写权限；
-                // 原始汇编不建立源引用。新匿名页尚未映射或共享，独占接收复制，
-                // 原页仍被 source 持有，分配器返回的新页与其物理范围不重叠。
+                // SAFETY:
+                // 1. `source` 克隆强引用保证了源匿名物理页已完整初始化且存活，且该页处于 COW 只读状态、无硬件写权限或可变 Rust 引用；
+                // 2. `page` 是刚从物理页分配器获得并清零的全新独占物理页，尚未安装到任何页表，因此源页与目标页的物理内存区间绝不重叠且均在直接映射区有效。
                 unsafe {
                     arch::copy_user_bytes(
                         page.direct_address() as *mut u8,
@@ -1895,9 +2124,9 @@ fn prepare_backing(
                 };
             }
             ResidentBacking::File(folio) => {
-                // SAFETY: 新匿名页已完整清零，只有本地 page 引用且尚未映射或交给设备；
-                // folio 保活另一张真实原页，分配器不能返回仍被持有的源页。
-                // 短切片只独占匿名目标，copy_to 从已初始化源原始读取，不形成源切片。
+                // SAFETY:
+                // 1. `page` 是刚分配并清零的全新独占匿名页，尚未被映射或共享，当前函数持有其唯一访问权；
+                // 2. `page.direct_address()` 指向直接映射区内对齐且长度为 `PAGE_SIZE` 的有效物理页内存，构造的临时可变切片 `dst` 在 `copy_to` 返回后立即销毁，且与源 `folio` 物理页互不重叠。
                 let dst = unsafe {
                     slice::from_raw_parts_mut(page.direct_address() as *mut u8, PAGE_SIZE)
                 };
@@ -1952,9 +2181,9 @@ fn prepare_backing(
                 return Ok((ResidentBacking::File(folio.clone()), *private, Some(folio)));
             }
             let page = AnonPageRef::try_new_reclaim(attempt).ok_or(VmError::NoMemory)?;
-            // SAFETY: 新匿名页已完整清零，只有本地 page 引用，尚无映射、设备或其他访问；
-            // valid 不超过 PAGE_SIZE，folio 保活源原页，分配器返回的目标与其不重叠。
-            // 仅匿名目标形成短独占切片，copy_to 原始读取有效前缀，目标尾部保留零初始化。
+            // SAFETY:
+            // 1. `page` 是刚分配并清零的全新独占匿名页，尚未安装到任何页表或交给外部设备；
+            // 2. `valid` 已通过 `(size - offset).min(PAGE_SIZE as u64)` 限制为不超过 `PAGE_SIZE`，构造的临时可变切片 `dst` 仅覆盖目标页前 `valid` 个字节（尾部保持零初始化），且与源 `folio` 物理页不重叠。
             let dst = unsafe { slice::from_raw_parts_mut(page.direct_address() as *mut u8, valid) };
             folio
                 .copy_to(0, dst)
@@ -1964,7 +2193,11 @@ fn prepare_backing(
     }
 }
 
-/// 文件映射先核真实 OFD 读取能力；共享最大 W 还要求 RW OFD 与完整路径写能力。
+/// 校验文件映射（`mmap`）的文件描述符访问模式、偏移对齐以及常规文件类型约束。
+///
+/// - 任何文件映射都要求文件描述符具备读权限（拒绝 `O_WRONLY`）；
+/// - 若为共享文件映射（`!private`）且当前或最大权限包含写权限，则要求文件以读写模式（`O_RDWR`）打开且底层挂载路径允许写入；
+/// - 仅允许映射常规文件（[`InodeKind::Regular`]）。
 fn check_file(
     file: &FileRef,
     inode: &InodeRef,
@@ -1995,7 +2228,7 @@ fn check_file(
     Ok(())
 }
 
-/// 将字节边界 checked 上取整到基本页，用户长度和 raw break 共用此纯计算。
+/// 将字节地址或长度 `address` 向上按 [`PAGE_SIZE`] 取整；若发生算术溢出则返回 [`VmError::InvalidRange`]。
 fn page_end(address: usize) -> Result<usize, VmError> {
     address
         .checked_add(PAGE_SIZE - 1)
@@ -2003,7 +2236,7 @@ fn page_end(address: usize) -> Result<usize, VmError> {
         .ok_or(VmError::InvalidRange)
 }
 
-/// 尚未共享的旧单页入口保留原页表错误类别，不吞掉已经发表范围的错误。
+/// 将 [`VmError`] 转换为早期的 [`PageTableError`]（供 [`Mm::map_owned`] 接口使用）。
 fn table_error(error: VmError) -> PageTableError {
     match error {
         VmError::NoMemory | VmError::File(FsError::NoMemory) => PageTableError::NoMemory,
@@ -2012,45 +2245,58 @@ fn table_error(error: VmError) -> PageTableError {
     }
 }
 
-/// CSD 只执行本核架构失效，不反取 Mm、PTE 或文件锁。
+/// 跨核同步调用（IPI CSD）的回调函数：刷新当前 CPU 的用户态 TLB 翻译缓存与指令缓存（I-Cache）。
 ///
 /// # Safety
-/// 只能由在线 CPU 的同步 call 分派；参数不被读取，调用者保活旧页与表页到返回。
+/// 仅能作为 [`cpu::call`] 的跨核同步回调由在线 CPU 执行；不解引用入参指针，且在执行期间绝不获取任何 `Mm`、页表或文件系统锁。
 unsafe fn invalidate_cpu(_: *mut ()) {
     arch::flush_user_translations();
     arch::sync_user_icache();
 }
 
-/// 叶修改在 PTE/范围短锁外同步全部实际 CPU，固定 ASID0 不维护每个 Mm 的活跃集合。
+/// 向系统中所有在线 CPU 发送同步跨核调用（IPI），刷新全部 CPU 的用户态 TLB 与指令缓存。
+///
+/// 必须在释放页表自旋锁（`PteDomain`）和文件范围自旋锁之后、释放被卸载物理页或页表页之前调用。
 pub(crate) fn sync_all() {
     for target in cpu::actual_set().iter() {
-        // SAFETY: CPU 在线集合启动后固定，普通可切换任务能服务本地 IPI；
-        // 未持 PTE 或其他 callback 锁，回调只做架构动作，不读取空参数或递归 call。
+        // SAFETY:
+        // 1. 在线 CPU 集合在启动后固定不变，当前处于未持有页表自旋锁的普通任务上下文，可安全发起并等待跨核 IPI 同步；
+        // 2. `invalidate_cpu` 仅执行无参数的架构级 TLB / I-Cache 刷新指令，不访问空指针参数且不会重入获取任何锁。
         unsafe { cpu::call(target, invalidate_cpu, core::ptr::null_mut()) };
     }
 }
 
-/// 在所属CPU的IRQ-off调度交接或exec提交中安装根，硬件使用期间保留CPU拥有。
+/// 在调度器切换入新任务或 `execve` 激活新地址空间时，将 `mm` 安装为当前 CPU 的活动地址空间并切换硬件页表根寄存器。
+///
+/// 必须在本地中断关闭（IRQ-off）且前一个任务的活动 `Mm` 已通过 [`leave_current`] 卸载后调用；
+/// 激活期间当前 CPU 的 `active_mm` 槽位持有一份 `Arc<Mm>` 强引用，保证硬件正在使用的根页表与驻留页不会被释放。
 pub(crate) fn enter_current(mm: Option<Arc<Mm>>) {
     assert!(!arch::irq_enabled(), "MM switch requires disabled IRQ");
     let local = cpu::current();
-    // SAFETY: 仅所属 CPU 在 IRQ-off 段访问活动槽；上次任务已切回内核根并移出拥有。
+    // SAFETY:
+    // 1. 上方 `assert!` 已确认当前 CPU 本地中断已关闭，不会发生抢占或核间迁移；
+    // 2. `local.active_mm` 为当前 CPU 独占的 per-CPU 槽位，仅在关中断路径中访问，不存在并发可变借用。
     let active = unsafe { &mut *local.active_mm.get() };
     assert!(active.is_none(), "previous MM is still active");
     if let Some(mm) = mm {
-        // SAFETY: mm 拥有完整根和全部已安装页，内核静态映射由架构共享；
-        // IRQ 关闭且当前调度栈有效，随后把强拥有放入本 CPU 的活动槽。
+        // SAFETY:
+        // 1. `mm` 强引用保证了用户根页表及所有已映射叶子物理页有效且存活，且根页表中已包含完整的内核高半核共享映射；
+        // 2. 当前处于关中断状态且内核栈有效，切换根页表后立即将 `mm` 强引用存入 `active_mm` 槽位保持存活直到下次 `leave_current`。
         unsafe { arch::activate_user_root(mm.root_phys()) };
         arch::sync_user_icache();
         *active = Some(mm);
     }
 }
 
-/// 先安装内核根并完成本地失效，再移出旧拥有供调度器锁外释放。
+/// 在调度器切出当前任务或进程退出/替换映像时，将当前 CPU 切换回内核根页表并取出原活动地址空间引用。
+///
+/// 必须在本地中断关闭（IRQ-off）状态下调用；返回的 `Option<Arc<Mm>>` 由调用方在开中断或释放调度锁后安全析构。
 pub(crate) fn leave_current() -> Option<Arc<Mm>> {
     assert!(!arch::irq_enabled(), "MM detach requires disabled IRQ");
     let local = cpu::current();
-    // SAFETY: 只有所属CPU在IRQ-off交接或exec中访问槽，原用户现场已完整保存。
+    // SAFETY:
+    // 1. 上方 `assert!` 已确认当前 CPU 本地中断已关闭，当前执行流固定在本 CPU 上；
+    // 2. `local.active_mm` 仅由本 CPU 在关中断下访问，取出 `Option<Arc<Mm>>` 前已先切回内核根页表并刷新本地 TLB。
     let active = unsafe { &mut *local.active_mm.get() };
     if active.is_some() {
         arch::activate_kernel_root();
@@ -2058,10 +2304,14 @@ pub(crate) fn leave_current() -> Option<Arc<Mm>> {
     active.take()
 }
 
-/// 在本 CPU 不可迁移的短段取得活动 Mm 拥有，不借用会在交接中变化的槽。
+/// 获取当前 CPU 正在激活使用的用户地址空间 [`Arc<Mm>`] 克隆。
+///
+/// 内部通过临时关闭本地中断固定当前 CPU 并克隆 `Arc<Mm>`，避免直接借用可能在上下文切换时改变的 `active_mm` 槽位。
 pub(crate) fn current_mm() -> Option<Arc<Mm>> {
     let _irq = IrqSaveGuard::new();
     let local = cpu::current();
-    // SAFETY: IRQ guard 固定本 CPU，只有本 CPU 修改槽；克隆在保护段内完成。
+    // SAFETY:
+    // 1. `_irq` 守卫已关闭当前 CPU 本地中断，防止当前任务在读取期间被抢占迁移或触发调度切换修改 `active_mm`；
+    // 2. 在关中断保护段内对本 CPU 的 `local.active_mm` 执行只读引用并完成 `Arc::clone`，不会产生数据竞争。
     unsafe { (*local.active_mm.get()).clone() }
 }

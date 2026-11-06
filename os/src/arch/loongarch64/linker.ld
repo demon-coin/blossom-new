@@ -3,7 +3,14 @@ ENTRY(__primary_entry)
 INCLUDE platform-layout.ld
 HIDDEN(SECONDARY_ENTRY_ALIGNMENT = 64);
 HIDDEN(BOOT_CLEAR_WORD_BYTES = 8);
-/* FLAGS 在程序头解析阶段求值；这里直接保留 ELF 的 RX、R、RW 权限位。 */
+/*
+ * LoongArch64 内核链接脚本。
+ *
+ * 内存布局与硬件约定：
+ * - 内核运行在 PLV0 直接映射配置窗口（DMW，基址为 __direct_base），所有段的虚拟地址（VMA）均为物理地址（LMA）加上 __direct_base。
+ * - 异常入口（la_kernel_trap、la_user_trap）与 TLB 重填入口（la_kernel_refill）受硬件 CSR.EENTRY / CSR.TLBRENTRY 低 12 位为零的限制，必须按 4KiB（4096 字节）对齐。
+ * - PHDRS 中的 FLAGS 在链接器解析程序头阶段直接求值（尚未解析后续 HIDDEN 符号），因此直接使用 ELF 标准权限位常量：5 = PF_R|PF_X（可读可执行），4 = PF_R（只读），6 = PF_R|PF_W（可读写）。
+ */
 PHDRS {
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);

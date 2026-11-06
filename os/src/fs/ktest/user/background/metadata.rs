@@ -1,4 +1,32 @@
-//! 空闲元数据回写与真实慢完成下的普通 writer 节流行为。
+//! 空闲状态下元数据自动回写与脏页压力下写入者节流（Dirty Throttling）的集成测试。
+//!
+//! # 模块职责与架构定位
+//! 本模块隶属于 `fs::ktest::user::background` 测试套件，专门验证 `WritebackDomain` 的两类核心调度策略：
+//! 1. **空闲卷元数据定时回写**：当卷处于无数据写入的静止状态时，单纯修改 Inode 属性（如 `chmod`）或创建空文件所产生的脏元数据块（`MetadataCache`），能够在后台定时回写轮次中被自动选中并落盘，无需显式调用 `fsync` 或借由普通文件写入顺带触发。
+//! 2. **脏页上限节流与写回带宽统计**：当慢速块设备挂起写回完成事件、并发写入持续产生脏页并突破回写域上限（`dirty_limit`）时，验证普通写入线程在锁外被准确阻塞节流、无关 Inode/缓存页的并发 I/O 不受影响、写回完成后等待线程被及时唤醒、写回带宽（`bandwidth_bytes_per_sec`）按采样窗口准确计算，以及写回 I/O 错误通过独立打开文件描述（OFD）游标向 `sync_range` 正确报告。
+//!
+//! # 核心机制：脏页压力节流与锁外等待示意
+//! ```text
+//!   [并发写入线程 writer]               [WritebackDomain]               [无关探测线程 independent_io]
+//!           |                                   |                                   |
+//!   write() / write_at() 写入脏页               |                                   |
+//!   释放 Inode 写锁与页内容锁                   |                                   |
+//!           |                                   |                                   |
+//!   balance_dirty_pages() 检查水位:             |                                   |
+//!   dirty + writeback > domain_limit ---------> 进入 waiting_writers 队列睡眠       |
+//!                                               |                           seek() 读取 OFD 游标
+//!                                               |                           acquire_write() 写入第 1 页
+//!                                               |                           volume.claim().flush() 正常完成!
+//!                                               |                                   |
+//!   [块设备恢复完成: test_resume_completions()] |                                   |
+//!                                               |                                   |
+//!   挂起的第 0 页写回完成 --------------------> writeback_pages 下降 / 更新带宽采样 |
+//!   writer_wakes +1 <-------------------------- 唤醒阻塞的 writer 线程              |
+//! ```
+//!
+//! # 锁顺序与并发约束
+//! - **脏页节流必须在锁外执行**：普通文件写入路径在调用 `WritebackDomain` 节流等待前，必须已释放 `Inode` 写锁、页表/截断互斥锁以及文件偏移量游标锁；否则当回写线程或无关 I/O 线程尝试访问同一 Inode 时会发生死锁。
+//! - **轮次门控与设备完成挂起配合**：测试在持 `lock_writeback()` 期间写入初始页并挂起块设备完成（`test_hold_file_writeback`），释放 `lock_writeback` 后后台回写将第 0 页提交给块设备并停在设备完成前，从而制造稳定的在途写回（`writeback_pages >= 1`）窗口。
 
 use super::*;
 use crate::block::BioAllocator;
@@ -8,15 +36,19 @@ use crate::fs::SeekFrom;
 use crate::mm::reclaim::ReclaimAttempt;
 use crate::workqueue::testing::{metadata_stats, pool_stats};
 
+/// 用于触发回写域脏页上限（4096 页）压力测试的文件总页数（4097 页）。
 const PRESSURE_PAGES: usize = 4097;
+/// 脏页压力写入生产者填充的测试字节值。
 const PRESSURE_BYTE: u8 = 0x86;
 
-/// 每 CPU 原池累计创建数解释共享 worker 的实际分配，不用 live 差掩盖瞬时 Task。
+/// 汇总所有 CPU 核心工作队列池自启动以来累计创建的共享 Worker 线程总数。
+///
+/// 直接读取各 CPU 池的累计 `created` 计数器，避免因线程创建与销毁相互抵消而漏计瞬态创建的内核线程。
 fn worker_creations() -> usize {
     (0..cpu::count()).map(|id| pool_stats(id).created).sum()
 }
 
-/// 同一窗口没有其他测试 actor；manager 真正阻塞后读取原 ID 和原池累计创建事实。
+/// 等待所有 CPU 的工作队列管理线程（Manager）进入阻塞静止状态后，采集全局累计任务数与共享 Worker 创建数快照。
 fn creation_snapshot() -> Result<(usize, usize), TestError> {
     until(
         "worker manager did not finish actual Task preparation",
@@ -25,7 +57,11 @@ fn creation_snapshot() -> Result<(usize, usize), TestError> {
     Ok((task::test_created_tasks(), worker_creations()))
 }
 
-/// 控制 Task 保持就绪并让出 CPU，观察短于普通采样间隔的真实限速阻塞；期限不随写进度延长。
+/// 轮询等待并发写入线程因回写域脏页超限而进入节流阻塞状态，并返回阻塞时刻的回写域快照。
+///
+/// 在最长 60 秒的固定期限内反复检查回写域水位（`dirty_pages + writeback_pages > limit`）、
+/// 累计节流等待次数（`writer_waits > earlier_waits`）、当前等待写者数（`waiting_writers > 0`）以及写入线程的调度器阻塞状态；
+/// 每次未满足时调用 `sched::yield_now()` 让出 CPU，避免忙等饿死后台线程。
 fn throttled_writer(
     domain: &WritebackDomain,
     writer: &SyncObservation,
@@ -63,7 +99,12 @@ fn throttled_writer(
 pub(super) mod cases {
     use super::*;
 
-    /// 卷已静止后只修改 inode 属性，不借普通文件写或显式 sync 启动后台义务。
+    /// 测试目标：验证在静止的 Ext4 卷上仅修改 Inode 元数据属性时，后台定时回写能够自动启动并将脏元数据块落盘。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：准备 1 页大小的干净测试文件并等待回写域完全排空，注册仅拦截元数据回写轮次的 `WaveControl` 门控；
+    /// 2. When：直接调用 `inode.update_metadata` 翻转可执行权限位（`mode ^= 0o100`），不执行任何文件数据写入或显式 `sync`；
+    /// 3. Then：后台回写自动完成第 1 轮元数据回写（`round_selected_metadata == 1`），`MetadataCache` 中不再有脏页或在途写回页，且累计完成字节数递增。
     #[test]
     #[ktest(tags("W30", "fs-background-metadata"))]
     fn idle_metadata_update_starts_real_background_writeback(
@@ -99,7 +140,12 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 空文件创建只产生名字和 inode 元数据，静止卷仍须自行完成到期回写。
+    /// 测试目标：验证在静止的 Ext4 卷上创建空文件时，新分配的目录项与 Inode 元数据块能由后台定时回写自动落盘。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：预热测试目录并使卷处于干净静止状态，注册拦截元数据回写轮次的门控；
+    /// 2. When：通过 `vfs.open_with` 创建 `/test/background-empty` 空文件（文件大小为 0，仅产生目录项与 Inode 表脏元数据）；
+    /// 3. Then：后台回写自动触发并完成第 1 轮（选中数据页为 0，元数据缓存全部变干净，累计完成字节数增加）；随后删除测试文件并同步排空。
     #[test]
     #[ktest(tags("W30", "fs-background-metadata"))]
     fn idle_empty_create_starts_real_background_writeback(
@@ -153,7 +199,16 @@ pub(super) mod cases {
         result.and(removed).and(synced).and(quiescent)
     }
 
-    /// 在真实域压力下观察普通写阻塞、锁外并行 I/O、真实完成带宽和独立 OFD 错误游标。
+    /// 测试目标：验证在慢速块设备写回挂起与脏页超限压力下，普通文件写入者的阻塞节流、锁外并发 I/O 独立性、写回带宽采样以及写回错误的独立文件描述符报告。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：准备 4097 页文件，挂起第 0 页的块设备写回完成回调（当 `fail == true` 时预设下一次数据写返回 `BlockError::Io`），写入第 0 页使其进入在途写回（Writeback）状态；
+    /// 2. When：启动并发写入线程 `writer` 持续从第 1 页向后写入，直至脏页与写回页之和突破回写域上限并触发节流阻塞；在 `writer` 阻塞期间，启动 `independent_io` 线程读取文件游标、向第 1 页写入 1 字节并下发块设备 `flush`；随后恢复块设备完成回调并等待本轮回写与所有数据落盘；
+    /// 3. Then：
+    ///    - `writer` 阻塞期间未持有文件游标锁或 Inode 写锁，`independent_io` 顺利完成写入与设备冲刷；
+    ///    - 恢复块设备完成回调后，阻塞的 `writer` 被唤醒（`writer_wakes` 递增），回写域与全局快照均计算出非零写回带宽；
+    ///    - 若 `fail == true`（`accepted_eio_pwrite`），`error_seq` 递增，两个独立打开的文件句柄（`file` 与 `independent`）首次调用 `sync_range` 均捕获到 `FsError::Io(BlockError::Io)`，而共享同一底层 OFD 的克隆句柄（`duplicate`）及后续重试调用则返回 `Ok(())`；
+    ///    - 核对内核任务 ID 分配总数，确认除共享工作队列 Worker 与测试显式创建的 2 个消费者线程外，回写过程未泄露或额外创建任何隐式任务。
     #[test]
     #[case("completed_write", false)]
     #[case("accepted_eio_pwrite", true)]
@@ -187,6 +242,7 @@ pub(super) mod cases {
         let global_before = global_snapshot();
         let disk_before = disk.test_snapshot();
 
+        // Step 1: 挂起第 0 页的块设备写回完成事件（可选注入 I/O 错误），写入第 0 页并等待后台回写将其提交至块设备。
         disk.test_hold_file_writeback(&folio);
         if fail {
             disk.test_fail_next_data(BlockError::Io);
@@ -212,6 +268,7 @@ pub(super) mod cases {
             true,
         );
 
+        // Step 2: 启动并发写入生产者持续写入后续页面，直至回写域脏页超限并将该写入者阻塞节流。
         let writing = file.clone();
         let writer_control = control.clone();
         let writer_domain = volume.writeback_domain().clone();
@@ -270,6 +327,7 @@ pub(super) mod cases {
         context.expect_eq(pressured.sample_end_ns, held.sample_end_ns);
         context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
 
+        // Step 3: 在写入者处于节流睡眠期间，启动独立探测线程验证文件游标与 Inode 写锁均已释放，且无关块设备 I/O 不受阻塞。
         let observed_cursor = Arc::try_new(AtomicUsize::new(usize::MAX))
             .map_err(|_| TestError("pressure cursor observation OOM"))?;
         let cursor = observed_cursor.clone();
@@ -282,7 +340,7 @@ pub(super) mod cases {
                 probing.seek(SeekFrom::Current(0))? as usize,
                 Ordering::Release,
             );
-            // 仅用原写能力探测 inode/invalidate 独占已释放；压力主体始终经过 FileLike 节流。
+            // 直接获取 Inode 写访问权写入 1 字节，验证处于节流阻塞中的主写入线程未持有 Inode 独占写锁。
             let access = probe_inode.acquire_write()?;
             let mut input = WriteBuffer::kernel(&[PRESSURE_BYTE]);
             if access.write_from(PAGE_SIZE as u64, false, &mut input)? != (PAGE_SIZE as u64, 1) {
@@ -316,6 +374,7 @@ pub(super) mod cases {
         context.expect_eq(disk.test_file_writeback_is_held(&folio), true);
         context.expect_eq(folio.writeback_sectors() != 0, true);
 
+        // Step 4: 恢复块设备完成回调，验证写回完成事件唤醒被节流的写入线程，并核对错误游标或完成字节数。
         let waits_before_release =
             throttled_writer(volume.writeback_domain(), &writer, held.writer_waits)?;
         let release_at = time::now();
@@ -382,6 +441,7 @@ pub(super) mod cases {
             );
         }
 
+        // Step 5: 解除轮次门控并汇合并发线程，执行全文件同步，校验写回带宽采样公式与内核线程创建账目。
         fixture.release_rounds();
         fixture.write.join_consumers()?;
         context.expect_eq(writer.result(), Some(Ok(())));

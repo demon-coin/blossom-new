@@ -1,10 +1,40 @@
-//! 同源 codec 边界与真实镜像上的读取、目录、链接和错误分类。
+//! ext4 磁盘格式编解码（`codec`）、卷几何、块映射、目录索引、跨卷身份隔离与损坏镜像错误分类测试套件。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于文件系统内核测试子系统（`fs::ktest`）中，负责验证 `fs::ext4::codec` 与 `Ext4Volume`
+//! 对标准及损坏 ext4 镜像的解析行为。上游由 `fs::ktest` 测试注册表统一挂载，下游调用 `ext4::codec`、
+//! `Ext4Volume`、`InodeCache`、`MetadataCache` 以及块设备 `Bio` 接口。
+//!
+//! # 核心设计与测试卷布局
+//! 本模块包含两类测试：
+//! 1. **纯内存编解码边界测试（`codec`）**：构造最小超级块、Extent 头部、HTree（dx）目录尾与 CRC 向量，
+//!    验证长度高位未初始化标记（`ee_len`）、特性位分类与校验和契约。
+//! 2. **块设备卷与损坏镜像集成测试**：在块设备或扇区切片（`BlockView`）上验证稀疏文件、深层 Extent 树、
+//!    传统间接块、硬链接/符号链接、HTree 大目录游标、相邻分区缓存隔离、内存受限回收以及各类损坏镜像的错误返回码。
+//!
+//! 其中 `format_view_fixture` 在 `BlockView` 上构造的最小无日志 ext4 测试卷布局如下：
+//!
+//! ```text
+//! BlockView 偏移 (字节 / 逻辑块):
+//! +-----------------------+-----------------------+-----------------------+
+//! | 0..1024B              | 1024..2048B           | Group Descriptor      |
+//! | 引导扇区填充 (0x52)   | ext4 Superblock       | (块位图=5, Inode位图=6|
+//! |                       | (Magic = 0xef53)      |  Inode表起点=块 7)    |
+//! +-----------------------+-----------------------+-----------------------+
+//! | 块 7: Inode Table                             | 块 32: 数据块         |
+//! | Inode #12 (偏移 11*128B): 普通文件, 指向块 32 | 填充 0x61 + log_block |
+//! +-----------------------------------------------+-----------------------+
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 测试在独立内核线程中运行，遵循 VFS 与缓存层既有的锁顺序：`Inode` 元数据锁 -> `AddressSpace` / `MetadataCache` 锁 -> 块设备提交队列锁。
+//! - 直接提交 `Bio` 写入测试夹具数据（`write_view_fixture`）时，在 DMA 传输完成前不从 CPU 侧访问已移交的 `MappedPages`，待 `completion.wait()` 返回后才收回并释放物理页。
 
 use crate::fs::ext4::{codec as ext4_codec, BlockMapping};
 use crate::fs::ktest::*;
 use crate::fs::{InodeMetadata, InodeTime};
 
-/// 小输入只构造格式字段，解码、CRC、特性判定全部使用生产函数。
+/// 构造用于测试的 1024 字节最小合法 ext4 超级块字节数组，包含魔数 `0xef53`、1024B 块大小、128B Inode 大小及基础块组几何参数。
 fn super_bytes() -> [u8; 1024] {
     let mut bytes = [0u8; 1024];
     for (offset, value) in [
@@ -25,12 +55,13 @@ fn super_bytes() -> [u8; 1024] {
     bytes
 }
 
-/// 只向显式 scratch 的有界页片段写入格式输入，真实 Bio 完成后才释放原页。
+/// 向块设备 `disk` 的指定字节偏移 `byte` 同步写入测试夹具数据 `bytes`，等待 `Bio` DMA 传输完成后收回并释放物理页。
 fn write_view_fixture(disk: &DiskRef, byte: u64, bytes: &[u8]) -> Result<(), FsError> {
     use crate::block::{Bio, BioAllocator, BlkOperation};
     use crate::mm::dma::MappedPages;
     use virtio_drivers::BufferDirection;
 
+    // Step 1: 分配单个物理页并建立 `DriverToDevice` 方向的 DMA 映射缓冲区，拷入待写入的夹具字节。
     let pages = mm::alloc_pages(0, true).ok_or(FsError::NoMemory)?;
     let mut mapped = MappedPages::new(pages, 0, bytes.len(), BufferDirection::DriverToDevice)
         .map_err(|_| FsError::NoMemory)?;
@@ -40,8 +71,11 @@ fn write_view_fixture(disk: &DiskRef, byte: u64, bytes: &[u8]) -> Result<(), FsE
     let mut memory = Vec::new_in(BioAllocator::Heap);
     memory.try_reserve_exact(1).map_err(|_| FsError::NoMemory)?;
     memory.push(mapped);
-    // SAFETY: 独占页的完整映射范围已初始化，无裸别名或回调；memory 移入唯一 Bio，
-    // completion 全尾前没有 CPU 借用，真实设备收权后才领取并释放原页。
+    // Step 2: 构造写方向的 `Bio` 请求并提交到块设备，阻塞等待 I/O 完成再收回 DMA 页面所有权。
+    // SAFETY:
+    // 1. `mapped` 指向刚由 `mm::alloc_pages(0, true)` 分配的独占物理页，且前 `bytes.len()` 字节已在上方循环中完整初始化。
+    // 2. `memory` 容器的所有权完整移交至唯一构造的 `Bio` 实例，且未注册异步完成回调（`None`）。
+    // 3. 在下方 `completion.wait()` 阻塞等待设备完成 DMA 传输之前，CPU 侧不保留任何指向该物理页的裸指针或切片借用；待 I/O 完成后才通过 `take_memory()` 收回物理页并释放。
     let bio = unsafe {
         Bio::try_new(
             disk,
@@ -65,8 +99,9 @@ fn write_view_fixture(disk: &DiskRef, byte: u64, bytes: &[u8]) -> Result<(), FsE
     Ok(())
 }
 
-/// 建立无日志小卷的主元数据及单块普通文件，格式与文件内容均由生产路径读取。
+/// 在给定的块设备视图 `view` 上格式化一个块大小为 `1024 << log_block` 的最小无日志 ext4 卷，并写入含单块数据的 12 号普通文件 Inode。
 fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> {
+    // Step 1: 根据 `log_block` 计算块大小，构造超级块与块组描述符并写入视图起始位置。
     let size = 1024usize << log_block;
     let start = view.absolute_byte(0, 64 * size)?;
     let mut page = [0u8; mm::PAGE_SIZE];
@@ -98,6 +133,7 @@ fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> 
         write_view_fixture(view.disk(), start + descriptor, &page)?;
     }
 
+    // Step 2: 在块 7 的 Inode 表中初始化 12 号 Inode（索引 11），设为普通文件（`0x81a4`）并将首个直接块指针指向块 32。
     page.fill(0);
     let inode = 11 * 128;
     page[inode..inode + 2].copy_from_slice(&0x81a4u16.to_le_bytes());
@@ -107,12 +143,13 @@ fn format_view_fixture(view: &BlockView, log_block: u32) -> Result<(), FsError> 
     page[inode + 40..inode + 44].copy_from_slice(&32u32.to_le_bytes());
     write_view_fixture(view.disk(), start + 7 * size as u64, &page)?;
 
+    // Step 3: 在块 32 写入一整块重复填充字节（`0x61 + log_block`）作为文件数据。
     page.fill(0x61 + log_block as u8);
     write_view_fixture(view.disk(), start + 32 * size as u64, &page[..size])?;
     Ok(())
 }
 
-/// 只验证外部组件名，不把字节名转成 UTF-8 或造路径层。
+/// 根据十进制序号 `index` 生成长度为 191 字节的测试目录项名称（格式为 `item-XXXXX-nnn...`），用于大目录查找与游标遍历验证。
 fn indexed_name(index: usize) -> [u8; 191] {
     let mut name = [b'n'; 191];
     name[..5].copy_from_slice(b"item-");
@@ -125,7 +162,7 @@ fn indexed_name(index: usize) -> [u8; 191] {
     name
 }
 
-/// 被拒挂载仍由 typed fixture 保持原 Disk，原错误不落入假零或 NotFound。
+/// 辅助断言函数：以只读模式打开 `fixture` 中的整盘 ext4 卷，验证返回预期的格式或校验错误 `expected`。
 fn open_error(context: &mut TestContext<'_>, fixture: &Owner, expected: FsError) -> TestResult {
     let result = Ext4Volume::open(
         BlockView::whole(fixture.disk()?.clone()),
@@ -144,7 +181,7 @@ fn open_error(context: &mut TestContext<'_>, fixture: &Owner, expected: FsError)
 pub(crate) mod codec {
     use super::*;
 
-    /// initialized/unwritten 分界与零长度都消费同源解码，不复制 ee_len 判定。
+    /// 验证 ext4 Extent 长度字段（`ee_len`）的解码边界：区分已初始化区间（`1..=32768`）、未初始化（Unwritten）区间（`32769..=65535`）以及非法的零长度（返回 `FsError::Corrupt`）。
     #[test]
     #[ktest(tags("B13"))]
     fn extent_length_boundary(context: &mut TestContext<'_>) -> TestResult {
@@ -161,7 +198,7 @@ pub(crate) mod codec {
         Ok(())
     }
 
-    /// 短头、entries 越界及下降深度错误必须拒绝，不能作为 hole。
+    /// 验证 Extent 节点头部（`ext4_extent_header`）的边界检查：拒绝缓冲区过短、深度不匹配以及有效项数 `eh_entries` 超过容量上限 `eh_max` 的损坏头部。
     #[test]
     #[ktest(tags("B13"))]
     fn extent_header_bounds(context: &mut TestContext<'_>) -> TestResult {
@@ -188,7 +225,7 @@ pub(crate) mod codec {
         Ok(())
     }
 
-    /// 标准 CRC 向量覆盖算法，seed 与分段只由生产实现执行。
+    /// 使用标准测试向量 `"123456789"` 验证 `crc32c` 与 `crc16` 校验和算法以及分段增量计算的正确性。
     #[test]
     #[ktest(tags("B12"))]
     fn crc_vectors(context: &mut TestContext<'_>) -> TestResult {
@@ -201,10 +238,11 @@ pub(crate) mod codec {
         Ok(())
     }
 
-    /// 三类特性遵守只读类别语义，忽略日志提示位后仍校验真实几何和已拒格式。
+    /// 验证超级块解码对兼容（compat）、只读兼容（ro_compat）、不兼容（incompat）特性位以及日志恢复标志的分类判定与几何参数校验。
     #[test]
     #[ktest(tags("B12"))]
     fn features_layout_and_recovery(context: &mut TestContext<'_>) -> TestResult {
+        // Step 1: 验证未知 compat 特性位、日志 `needs_recovery` 提示位及受支持的只读特性组合均可正常解码出几何参数。
         let original = super_bytes();
         for (offset, value) in [
             (92, 0x80000000u32),
@@ -226,6 +264,7 @@ pub(crate) mod codec {
             );
         }
 
+        // Step 2: 验证不支持的 incompat/ro_compat 特性位返回 `FsError::Unsupported`，非法块大小或每组 Inode 数返回 `FsError::Corrupt`，以及缓冲区或磁盘容量过小返回 `FsError::Corrupt`。
         for (offset, value, expected) in [
             (96, 0x80000002u32, FsError::Unsupported),
             (96, 0x12, FsError::Unsupported),
@@ -255,7 +294,7 @@ pub(crate) mod codec {
         Ok(())
     }
 
-    /// root 与 index 的尾保留字节可以非零，修改它们仍必须通过完整 CRC 校验。
+    /// 验证 HTree（dx）索引目录根块与内部索引块尾部保留字节（`dt_reserved`）参与目录 CRC32C 校验：保留字节非零但校验和匹配时应通过校验，翻转保留字节任意位时必须返回 `FsError::Checksum`。
     #[test]
     #[ktest(tags("B12"))]
     fn dx_tail_reserved_bytes_keep_crc_contract(context: &mut TestContext<'_>) -> TestResult {
@@ -290,6 +329,7 @@ pub(crate) mod codec {
             extra_isize: 0,
         };
 
+        // 分别针对逻辑块 0（HTree Root 块）与逻辑块 2（HTree 内部 Index 块）构造带非零保留字段的目录尾并校验 CRC。
         for (logical, expected) in [
             (0, ext4_codec::DirectoryLayout::Root),
             (2, ext4_codec::DirectoryLayout::Index),
@@ -337,10 +377,16 @@ pub(crate) mod codec {
 pub(crate) mod volume {
     use super::*;
 
-    /// 实盘几何包括三种块大小、inode/descriptor 尺寸与 CRC seed，并核验文件内容和 EOF。
+    /// 验证 ext4 卷的几何参数（块大小、Inode 与块组描述符尺寸、特性位）以及普通文件读取、尾页零填充与 EOF 边界行为。
+    ///
+    /// # 测试目标
+    /// - 验证不同块大小（1024B/2048B/4096B）镜像的几何参数组合与特性标志符合预期。
+    /// - 验证 `/pattern` 文件的跨页读取、非对齐偏移读取及尾部不足一页的读取内容正确，且尾页超出 EOF 的部分在页缓存中被清零。
+    /// - 验证在 EOF、`u64::MAX` 偏移或空缓冲区处读取返回 0 且不额外分配缓存页，空文件读取同样保持零缓存页占用。
     #[test]
     #[ktest(tags("B12", "B22"))]
     fn geometry_and_pattern_eof(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
+        // Step 1: 打开测试卷并校验块大小、Inode 大小、块组描述符大小与特性标志组合。
         let volume = fixture.open(context)?;
         let g = volume.geometry();
         context.expect_eq(
@@ -359,6 +405,7 @@ pub(crate) mod volume {
             context.expect_eq(g.features_incompat & 0x2000 != 0, g.block_size == 4096);
         }
 
+        // Step 2: 读取 `pattern` 文件在不同偏移处的内容并校验图样，检查最后一页超出 EOF 区域的字节是否全部清零。
         let file = fixture.file(context, &volume, b"pattern")?;
         let metadata = checked(context, file.metadata_snapshot())?;
         context.expect_eq(metadata.kind, InodeKind::Regular);
@@ -389,6 +436,7 @@ pub(crate) mod volume {
             bytes[..mm::PAGE_SIZE - 37].iter().all(|byte| *byte == 0),
             true,
         );
+        // Step 3: 验证 EOF 处、`u64::MAX` 偏移及空文件的读取返回 0 且不会污染页缓存计数。
         let before = file.mapping().len();
         context.expect_eq(checked(context, file.read_at(PATTERN_SIZE, &mut bytes))?, 0);
         context.expect_eq(checked(context, file.read_at(u64::MAX, &mut bytes))?, 0);
@@ -402,7 +450,12 @@ pub(crate) mod volume {
         Ok(())
     }
 
-    /// 非连续实盘映射、合法 hole 与 unwritten 都以原文件页完成真实内容。
+    /// 验证稀疏文件空洞（Hole）、未初始化 Extent（Unwritten）、多层深树 Extent 以及传统多级间接块（Indirect Blocks）的逻辑块映射与读取结果。
+    ///
+    /// # 测试目标
+    /// - 验证稀疏文件空洞区间与未初始化 Extent 区间读取均返回全零字节，且 `map_block` 返回对应的 `Hole` 或 `Unwritten` 映射状态。
+    /// - 验证深度不小于 2 的多层 Extent 树在已映射块与交替空洞块处均能正确读取预期图样或全零数据。
+    /// - 验证 1024B 块大小下传统直接块、一级/二级/三级间接块的映射与内容读取，以及超出文件末尾时返回 `BlockMapping::Eof`。
     #[test]
     #[ktest(tags("B13"))]
     fn sparse_unwritten_and_deep_mapping(
@@ -411,6 +464,7 @@ pub(crate) mod volume {
     ) -> TestResult {
         let volume = fixture.open(context)?;
         let bs = volume.geometry().block_size as u64;
+        // Step 1: 验证 `sparse` 稀疏文件在空洞偏移处读出全零、在末尾数据块处读出预期图样。
         let sparse = fixture.file(context, &volume, b"sparse")?;
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         for offset in [4096, 8192] {
@@ -424,6 +478,7 @@ pub(crate) mod volume {
         context.expect_eq(patterned(&bytes[..37], 12288), true);
         context.expect_eq(matches!(checked(context, sparse.map_block(4096 / bs))?, BlockMapping::Hole { len } if 0 < len), true);
 
+        // Step 2: 验证 `unwritten` 文件的块映射类型（Extent 卷为 `Unwritten`，传统卷为 `Hole`），且读取返回全零。
         let unwritten = fixture.file(context, &volume, b"unwritten")?;
         let mapped = checked(context, unwritten.map_block(0))?;
         context.expect_eq(
@@ -440,6 +495,7 @@ pub(crate) mod volume {
         );
         context.expect_eq(bytes.iter().all(|byte| *byte == 0), true);
 
+        // Step 3: 验证 `deep` 多层 Extent 树文件的树深、交替分布的数据块与空洞块读取结果。
         let deep = fixture.file(context, &volume, b"deep")?;
         if volume.geometry().features_incompat & 0x40 != 0 {
             let header = checked(
@@ -468,6 +524,7 @@ pub(crate) mod volume {
             }
         }
 
+        // Step 4: 在 1024B 块大小镜像上验证传统直接块与一级/二级/三级间接块映射，并检查 EOF 边界映射。
         if bs == 1024 {
             let traditional = fixture.file(context, &volume, b"indirect")?;
             for logical in [0, 12, 268, 65804] {
@@ -489,13 +546,14 @@ pub(crate) mod volume {
         Ok(())
     }
 
-    /// 原始字节名、硬链接、fast 与块 symlink 直接消费 canonical inode。
+    /// 验证硬链接共享唯一 Inode 实例、内联（Fast）与数据块符号链接读取、非 UTF-8 原始字节文件名枚举，以及非法目录查找与非法 Inode 号的错误码。
     #[test]
     #[ktest(tags("B16", "B19"))]
     fn links_names_and_lookup_errors(
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
+        // Step 1: 验证指向同一文件的两个硬链接目录项解析出同一个 `Inode` 与 `AddressSpace` 实例。
         let volume = fixture.open(context)?;
         let root = checked(context, fixture.cache().iget(&volume, 2))?;
         let first = fixture.file(context, &volume, b"pattern")?;
@@ -503,6 +561,7 @@ pub(crate) mod volume {
         context.expect_eq(first.ptr_eq(&hard), true);
         context.expect_eq(core::ptr::eq(first.mapping(), hard.mapping()), true);
 
+        // Step 2: 验证内联符号链接（`fastlink`）与外置数据块符号链接（`blocklink`）的标志位及目标路径读取。
         let fast = fixture.file(context, &volume, b"fastlink")?;
         context.expect_eq(
             checked(context, fast.metadata_snapshot())?.fast_symlink,
@@ -516,6 +575,7 @@ pub(crate) mod volume {
         );
         context.expect_eq(checked(context, long.read_link())?.as_slice(), &[b't'; 180]);
 
+        // Step 3: 验证包含非 UTF-8 字节（`0xff, 0xfe`）的文件名可通过查找和目录游标遍历正常访问。
         let raw = fixture.file(context, &volume, b"name-\xff\xfe")?;
         let mut bytes = [0xa7; 9];
         context.expect_eq(checked(context, raw.read_at(0, &mut bytes))?, 9);
@@ -532,6 +592,7 @@ pub(crate) mod volume {
         }
         context.expect_eq(raw_entries, 1);
 
+        // Step 4: 验证不存在的名称、含 `/` 或 `\0` 的非法名称、在普通文件上查找目录项、对普通文件调用 `read_link` 以及越界 Inode 号返回的错误类型。
         context.expect_eq(
             root.lookup(fixture.cache(), b"absent").err(),
             Some(FsError::NotFound),
@@ -560,13 +621,14 @@ pub(crate) mod volume {
         Ok(())
     }
 
-    /// 跨块与真实 dx 多层目录枚举不得返回 unused、tail 或 index 伪项。
+    /// 验证跨块目录与 HTree（dx）哈希索引目录的游标遍历及按名查找：游标只返回有效目录项（过滤未使用的空闲槽、校验尾与 HTree 索引伪项），且所有条目无遗漏、无重复。
     #[test]
     #[ktest(tags("B19"))]
     fn indexed_directory_bytes_and_cursor(
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
+        // Step 1: 遍历开启了 HTree 索引（`EXT4_INDEX_FL = 0x1000`）的大目录 `indexed`，验证 `.`、`..` 与全部 `DIRECTORY_ENTRIES` 个条目均被精确枚举一次。
         let volume = fixture.open(context)?;
         let directory = fixture.file(context, &volume, b"indexed")?;
         context.expect_eq(
@@ -605,6 +667,7 @@ pub(crate) mod volume {
         context.expect_eq(dots, 2);
         context.expect_eq(seen.iter().all(|present| *present), true);
 
+        // Step 2: 验证大目录的首、中、尾条目按名查找命中，不存在的条目返回 `FsError::NotFound`，并校验普通线性目录 `plain` 的总条目数。
         for index in [0, 5999, DIRECTORY_ENTRIES - 1] {
             let item = checked(
                 context,
@@ -636,7 +699,7 @@ pub(crate) mod volume {
 pub(crate) mod identity {
     use super::*;
 
-    /// 同卷硬链接同 inode/mapping，两个真实卷的同号 inode 必须各自拥有身份。
+    /// 验证同一卷内的硬链接共享唯一 `Inode` 与 `AddressSpace` 实例，而不同卷上具有相同 Inode 编号的文件拥有各自独立的 `Inode`、`AddressSpace` 和卷引用。
     #[test]
     #[ktest(tags("B16"))]
     fn canonical_hardlink_and_cross_volume(
@@ -673,7 +736,7 @@ pub(crate) mod identity {
         Ok(())
     }
 
-    /// 同盘相邻非页对齐卷共用物理预算，独立 canonical、脏范围、扫描、授权和 WB 错误。
+    /// 验证同一块设备上两个相邻且扇区非页对齐的分片视图（`BlockView`）共享底层物理页缓存预算，同时保持各自独立的卷实例、Inode 身份、脏页范围掩码、写权限令牌（`Claim`）、写回域及写回错误状态。
     #[test]
     #[ktest(
         tags("block-view", "fs-sync"),
@@ -684,6 +747,7 @@ pub(crate) mod identity {
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
+        // Step 1: 在可写测试盘上划分两个相邻但非 4KiB 页对齐的 `BlockView`（扇区 1..129 与 129..641），分别格式化为 1024B 块和 4096B 块的 ext4 卷并打开。
         fixture.disk()?;
         let disk = fixture
             .disks
@@ -727,6 +791,7 @@ pub(crate) mod identity {
         second.writeback_domain().stop_sync();
 
         let result = (|| {
+            // Step 2: 验证重复打开同一视图返回同一 `Ext4Volume` 实例，而两个相邻视图拥有不同的设备号、Inode 实例与文件内容。
             let reopened = checked(
                 context,
                 Ext4Volume::open(first_view.clone(), AccessMode::ReadWrite, 64),
@@ -747,6 +812,7 @@ pub(crate) mod identity {
             context.expect_eq(checked(context, second_inode.read_at(0, &mut data))?, 4096);
             context.expect_eq(data.iter().all(|byte| *byte == 0x63), true);
 
+            // Step 3: 验证两个卷的 `MetadataCache` 实例独立但共享同一个底层物理页预算池，且拒绝使用对方的 `Claim` 令牌越权更新元数据。
             let first_cache = first.metadata_cache();
             let second_cache = second.metadata_cache();
             context.expect_eq(Arc::ptr_eq(first_cache, second_cache), false);
@@ -799,6 +865,7 @@ pub(crate) mod identity {
                 Some(FsError::InvalidOperation),
             );
 
+            // Step 4: 修改两个视图在物理页边界 `boundary`（65536 字节）两侧的元数据块，验证两者共享同一个底层物理页帧但持有互不重叠的页内子块掩码（`0x01` 与 `0xfe`）和独立的 `ToWrite` 标记。
             checked(
                 context,
                 last.update(first.claim(), |bytes| bytes.fill(0xa1))
@@ -852,6 +919,7 @@ pub(crate) mod identity {
             context.expect_eq(from_first[0].is_none(), true);
             context.expect_eq(from_second[0].is_some(), true);
 
+            // Step 5: 验证两个卷的写回域（`WritebackDomain`）生命周期与元数据写回错误（`WritebackError`）彼此隔离：向第一个卷注入 I/O 失败不会污染第二个卷的写回状态。
             let first_domain = first.writeback_domain();
             let second_domain = second.writeback_domain();
             let first_context =
@@ -912,13 +980,19 @@ pub(crate) mod identity {
 pub(crate) mod bounded {
     use super::*;
 
-    /// inode 全活预算明确 NoMemory；稀疏文件页可增长，clean 回收保留外部拥有与 canonical 身份。
+    /// 验证 `InodeCache` 与文件页缓存在容量上限下的淘汰回收（`prune_unused`）与对象身份保持语义。
+    ///
+    /// # 测试目标
+    /// - 验证 `InodeCache` 达到容量上限且所有槽位均被外部引用持有时，加载新 Inode 返回 `FsError::NoMemory`，而查找已有 Inode 的硬链接仍命中同一实例。
+    /// - 验证文件页缓存（`AddressSpace`）仅回收未被外部持有的干净页（Clean Folio），被持有的页在释放后方可被回收。
+    /// - 验证通过 `with_file_owner` 绑定了所属文件强引用的独立 `Folio`（`detached`）在外部 `InodeRef` 全部释放后仍能保活所属 `Inode` 与 `AddressSpace`；直到该 `Folio` 最后一个强引用被释放后，`prune_unused` 才能回收该 Inode。
     #[test]
     #[ktest(tags("B23"))]
     fn inode_and_file_budget_clean_prune(
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
+        // Step 1: 创建容量为 2 的 `InodeCache`，加载根目录与 `pattern` 文件占满槽位，验证加载第 3 个 Inode 返回 `FsError::NoMemory`，而硬链接查找仍复用已有 Inode。
         let volume = fixture.open(context)?;
         let cache = InodeCache::try_new(2).map_err(|_| TestError("bounded inode cache failed"))?;
         let root = checked(context, cache.iget(&volume, 2))?;
@@ -930,6 +1004,7 @@ pub(crate) mod bounded {
         let hard = checked(context, root.lookup(&cache, b"hardlink"))?;
         context.expect_eq(file.ptr_eq(&hard), true);
 
+        // Step 2: 读取 `pattern` 文件的前 3 页并持有前 2 页的 `Folio` 引用，验证 `prune_unused` 仅回收未被外部持有的页，释放引用后其余页可被正常回收。
         let mut bytes = [0xa7; mm::PAGE_SIZE];
         let mut held = [const { None }; 2];
         for (page, slot) in held.iter_mut().enumerate() {
@@ -954,6 +1029,7 @@ pub(crate) mod bounded {
         drop(held);
         context.expect_eq(file.mapping().prune_unused(), 2);
 
+        // Step 3: 逐一释放 `root`、`file` 与 `hard` 引用，验证未被引用的 Inode 可被 `prune_unused` 回收并腾出槽位加载 `empty` 文件。
         drop(root);
         context.expect_eq(cache.prune_unused(), 1);
         let again = checked(context, cache.iget(&volume, file.number()))?;
@@ -972,6 +1048,7 @@ pub(crate) mod bounded {
         drop(root);
         cache.prune_unused();
 
+        // Step 4: 构造绑定了所属文件引用的 `detached` 页面并丢弃直接持有的 `InodeRef`，验证 `detached` 存活期间 Inode 与首页物理地址保持不变，待 `detached` 释放后 Inode 才被最终回收。
         let only = checked(context, cache.iget(&volume, number))?;
         context.expect_eq(checked(context, only.read_at(0, &mut bytes))?, 4096);
         let detached = only
@@ -1018,13 +1095,14 @@ pub(crate) mod bounded {
 pub(crate) mod oom {
     use super::*;
 
-    /// 真实页与堆 NULL 下已有 inode/页仍读，新 miss 原 NoMemory，放压后恢复真实加载。
+    /// 验证在物理页分配器与内核堆分配器同时耗尽（OOM）的压力下，已缓存的 Inode 与文件页仍可正常命中读取，未命中的新 Inode 或新缓存页加载返回 `FsError::NoMemory` 且不发起多余块 I/O，解除内存压力后恢复正常加载。
     #[test]
     #[ktest(tags("B23"))]
     fn live_hits_and_new_misses_under_allocator_oom(
         context: &mut TestContext<'_>,
         fixture: &mut Owner,
     ) -> TestResult {
+        // Step 1: 预先加载根目录与 `pattern` 文件的第 0 页到缓存中，并解析出尚未加载的 `empty` 文件 Inode 编号。
         let volume = fixture.open(context)?;
         let root = checked(context, fixture.cache().iget(&volume, 2))?;
         let inode = fixture.file(context, &volume, b"pattern")?;
@@ -1040,6 +1118,7 @@ pub(crate) mod oom {
             .cached_folio(0)
             .ok_or(TestError("OOM live page missing"))?;
 
+        // Step 2: 将预分配的内存压力容器移交给工作线程，在页分配器与堆分配器均耗尽的条件下执行缓存命中读取与未命中加载测试。
         let pressure = fixture
             .pressure
             .take()
@@ -1056,6 +1135,7 @@ pub(crate) mod oom {
         );
         fixture.join_tasks()?;
 
+        // Step 3: 校验工作线程返回结果：已缓存的第 0 页读取成功且物理页地址不变，未命中的 `empty` Inode 与第 1 页读取均返回 `FsError::NoMemory` 且未提交块设备 I/O。
         let result = fixture.observer().results.lock()[0]
             .take()
             .ok_or(TestError("OOM native result absent"))?;
@@ -1089,6 +1169,7 @@ pub(crate) mod oom {
         checked(context, folio.copy_to(0, &mut bytes).map_err(FsError::from))?;
         context.expect_eq(patterned(&bytes, 0), true);
 
+        // Step 4: 验证内存压力释放后，`empty` Inode 与 `pattern` 文件的第 1 页均可正常从磁盘加载，且第 0 页依然保持原有物理页帧。
         let empty = checked(context, fixture.cache().iget(&volume, empty_number))?;
         context.expect_eq(checked(context, empty.metadata_snapshot())?.size, 0);
         context.expect_eq(checked(context, inode.read_at(4096, &mut bytes))?, 4096);
@@ -1109,7 +1190,7 @@ macro_rules! rejected_volume {
         pub(crate) mod $name {
             use super::*;
 
-            /// 独立受控镜像的挂载错误必须保持原因，不能映射到硬件 EIO。
+            /// 验证打开损坏或特性不受支持的 ext4 镜像时，挂载入口准确返回预期的格式或校验和错误码（而非笼统的硬件 `Io` 错误）。
             #[test]
             #[ktest(tags("B12"))]
             fn preserves_open_error(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1127,7 +1208,7 @@ rejected_volume!(bad_features, "ext4-bad-features", FsError::Unsupported);
 pub(crate) mod bad_group {
     use super::*;
 
-    /// descriptor CRC 在实际 open 或首次 inode 加载的负责层保持 Checksum。
+    /// 验证块组描述符（Group Descriptor）CRC 校验失败时，在卷打开阶段或首次加载根目录 Inode 阶段准确返回 `FsError::Checksum`。
     #[test]
     #[ktest(tags("B12"))]
     fn group_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1153,7 +1234,7 @@ pub(crate) mod bad_group {
 pub(crate) mod bad_inode {
     use super::*;
 
-    /// inode 自身 CRC 错误不误报目录 NotFound，失败 iget 不留 Loading 占位。
+    /// 验证目标 Inode 自身 CRC 校验失败时，`iget` 返回 `FsError::Checksum`（而非误报 `FsError::NotFound`），且不会在 `InodeCache` 中残留 `Loading` 占位项，后续重试仍触发实际加载并报告相同错误。
     #[test]
     #[ktest(tags("B12"))]
     fn inode_checksum_and_retry(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1185,7 +1266,7 @@ pub(crate) mod bad_inode {
 pub(crate) mod bad_extent {
     use super::*;
 
-    /// 外部 extent node 的 CRC 实际失败，读页发布原 Checksum 而非假零。
+    /// 验证深层 Extent 树的外部节点（Extent Index/Leaf Block）CRC 校验失败时，`map_block` 与 `read_at` 均返回 `FsError::Checksum`，且对应缓存页记录 `BlockError::Checksum` 错误状态。
     #[test]
     #[ktest(tags("B13"))]
     fn external_extent_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1208,7 +1289,7 @@ pub(crate) mod bad_extent {
 pub(crate) mod bad_directory {
     use super::*;
 
-    /// 普通目录 tail CRC 失败传播到 lookup 和 dir_next。
+    /// 验证普通线性目录数据块尾部（Directory Tail）CRC 校验失败时，目录游标遍历（`dir_next`）与按名查找（`lookup`）均返回 `FsError::Checksum`。
     #[test]
     #[ktest(tags("B19"))]
     fn leaf_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1233,7 +1314,7 @@ pub(crate) mod bad_directory {
 pub(crate) mod bad_dx {
     use super::*;
 
-    /// dx 根 CRC 与普通 leaf 的覆盖范围不同，索引伪项不能绕过实际校验。
+    /// 验证 HTree（dx）索引目录根块尾部 CRC 校验失败时，目录游标遍历（`dir_next`）与按名查找（`lookup`）均返回 `FsError::Checksum`。
     #[test]
     #[ktest(tags("B19"))]
     fn index_checksum(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1258,7 +1339,7 @@ pub(crate) mod bad_dx {
 pub(crate) mod bad_directory_layout {
     use super::*;
 
-    /// 无目录 CRC 时零 rec_len 仍须拒绝，不能无限枚举或假 NotFound。
+    /// 验证未启用目录 CRC 的镜像中遇到 `rec_len == 0` 的损坏目录项时，`dir_next` 与 `lookup` 立即拒绝并返回 `FsError::Corrupt`，防止死循环或误报 `NotFound`。
     #[test]
     #[ktest(tags("B19"))]
     fn rejects_zero_record_length(
@@ -1286,7 +1367,7 @@ pub(crate) mod bad_directory_layout {
 pub(crate) mod bad_dx_layout {
     use super::*;
 
-    /// 无 CRC 的 dx 空索引计数有独立 Corrupt，不能被跳过当作 unused。
+    /// 验证未启用目录 CRC 的 HTree（dx）索引目录中遇到 `count == 0` 的非法空索引头时，`dir_next` 与 `lookup` 均返回 `FsError::Corrupt`。
     #[test]
     #[ktest(tags("B19"))]
     fn rejects_empty_index(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1311,7 +1392,7 @@ pub(crate) mod bad_dx_layout {
 pub(crate) mod bad_mapping {
     use super::*;
 
-    /// 坏 root 可在 inode 层提前拒绝；合法 root 下的 IND data 指针由实际映射层拒绝。
+    /// 验证损坏的块映射指针（根 Extent 头非法或间接块数据指针越界）在 Inode 加载阶段或块映射（`map_block` / `read_at`）阶段被拦截并返回 `FsError::Corrupt`。
     #[test]
     #[ktest(tags("B13"))]
     fn format_mapping_error(context: &mut TestContext<'_>, fixture: &mut Owner) -> TestResult {
@@ -1355,7 +1436,7 @@ pub(crate) mod bad_mapping {
 pub(crate) mod prefix {
     use super::*;
 
-    /// 合法 direct root 实际交付前三页，下一页在真实 IND 节点解析时失败并返回正前缀。
+    /// 验证文件前 3 页（直接块映射合法）与第 4 页（一级间接块映射损坏）连续读取时的部分进度（Partial Progress）语义：首次跨 4 页读取成功交付已完成的 12288 字节有效前缀且不覆盖后续缓冲区，紧接着从偏移 12288 处再次读取时返回 `FsError::Corrupt`。
     #[test]
     #[ktest(tags("B22"))]
     fn successful_prefix_before_corrupt_mapping(

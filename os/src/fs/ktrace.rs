@@ -1,4 +1,32 @@
-//! 每个打开实例在停止后首次读取时保存自己的文本，后继捕获不替换旧快照。
+//! 内核跟踪快照字符设备（`/dev/ktrace`）的文件操作实现。
+//!
+//! # 模块职责与架构定位
+//! 本模块为内核运行时跟踪子系统（`crate::trace`）提供用户态文件接口。
+//! - **上游调用者**：VFS 特殊设备打开入口（`crate::fs`）及系统调用层（`read`、`pread`、`lseek`、`ioctl`、`fstat`）。
+//! - **下游依赖**：`crate::trace` 提供的全局跟踪启停控制（`start`、`stop`、`enabled`）与文本导出（`snapshot`）。
+//!
+//! # 核心设计与快照生命周期
+//! 每个通过 `open` 创建的打开文件描述（Open File Description, `TraceFile`）维护独立的快照缓存与读取游标：
+//!
+//! ```text
+//!   open("/dev/ktrace", O_RDONLY)
+//!         │
+//!         ▼
+//! ┌──────────────────────────┐
+//! │ bytes: None, cursor: 0   │ ── ioctl(BLOSSOM_TRACE_START / STOP) ──► 控制全局 trace 状态
+//! └──────────────────────────┘
+//!         │
+//!         │ 首次 read / pread（要求 trace::enabled() == false，否则返回 EBUSY）
+//!         ▼
+//! ┌──────────────────────────┐
+//! │ bytes: Some(Vec<u8>)     │ ── 后续 read / pread / lseek / fstat 均访问该固定文本快照，
+//! │ cursor: 随顺序读取推进    │    即使全局再次启动新一轮捕获，也不会覆盖本实例已固定的快照
+//! └──────────────────────────┘
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - `TraceFile::snapshot`（`SleepMutex<TraceSnapshot>`）：保护本打开实例的快照字节数组与顺序读取游标。
+//! - 持 `snapshot` 睡眠锁期间仅执行内存拷贝或调用 `trace::snapshot()` 生成文本，不获取其他文件锁或任务图锁。
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -13,23 +41,38 @@ use crate::fs::{
 use crate::sync::SleepMutex;
 use crate::trace;
 
+/// 启动全局内核跟踪捕获的 `ioctl` 命令字。
 const BLOSSOM_TRACE_START: u32 = 0x4201;
+/// 停止全局内核跟踪捕获的 `ioctl` 命令字。
 const BLOSSOM_TRACE_STOP: u32 = 0x4202;
 
-/// 本 OFD 的快照和字节位置一起串行，未读取与已取得空文本保持可区分。
+/// 单个打开文件描述（OFD）持有的跟踪文本快照与读取游标状态。
+///
+/// 由 `TraceFile::snapshot` 睡眠锁保护，使延迟快照生成与游标推进保持串行化。
 struct TraceSnapshot {
+    /// 停止跟踪后首次读取时捕获的完整格式化文本（单位：字节）。
+    /// `None` 表示尚未执行过读取，`Some`（含空 `Vec`）表示已固定快照。
     bytes: Option<Vec<u8>>,
+    /// 当前顺序读取的字节偏移量（单位：字节）。
     cursor: u64,
 }
 
-/// 停止后的拥有文本只归本打开实例，复制描述符共享它和读取位置。
+/// `/dev/ktrace` 跟踪设备的打开文件实例。
+///
+/// 停止跟踪后首次读取生成的文本归本实例独占；通过 `dup` 或 `fork` 共享同一打开文件描述的描述符共用该快照与游标。
 pub struct TraceFile {
+    /// 打开时对应的设备节点路径，用于 `fstat` 和路径查询。
     path: Path,
+    /// 打开文件状态标志（如 `O_RDONLY`、`O_NONBLOCK`，不含文件描述符级的 `FD_CLOEXEC`）。
     flags: AtomicU32,
+    /// 保护快照缓冲区与顺序读取游标的睡眠互斥锁。
     snapshot: SleepMutex<TraceSnapshot>,
 }
 
-/// 普通可睡眠任务准备只读实例，打开本身不启动捕获或取得新快照。
+/// 打开 `/dev/ktrace` 设备并返回只读文件实例。
+///
+/// 在普通可睡眠任务上下文中调用。仅接受只读且非截断模式（`O_RDONLY` 且未设置 `O_TRUNC`），
+/// 打开操作本身不会启动或停止全局跟踪，也不会立即抓取快照。
 pub(crate) fn open(path: Path, flags: u32) -> Result<FileRef, FsError> {
     if flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0 {
         return Err(FsError::ReadOnly);
@@ -46,15 +89,22 @@ pub(crate) fn open(path: Path, flags: u32) -> Result<FileRef, FsError> {
 }
 
 impl TraceFile {
-    /// 采中一律返回 Busy；停稳后首次取得完整文本，用户故障保留实际交付前缀。
+    /// 从指定字节偏移读取跟踪快照内容到目标缓冲区。
+    ///
+    /// 调用方必须已持有 `snapshot` 睡眠锁。
+    /// - 若全局跟踪仍在运行（`trace::enabled()` 为真），返回 `FsError::Busy`。
+    /// - 若当前打开实例尚未生成快照，则在首次读取时调用 `trace::snapshot()` 抓取并固定文本。
+    /// - 向用户缓冲区拷贝中途若发生缺页错误，只要已成功拷贝了部分字节（Partial Progress），就返回已拷贝的字节数。
     fn read_snapshot(
         snapshot: &mut TraceSnapshot,
         offset: u64,
         target: &mut ReadBuffer<'_>,
     ) -> Result<usize, FsError> {
+        // Step 1: 检查全局跟踪是否已停止，运行期间禁止导出快照。
         if trace::enabled() {
             return Err(FsError::Busy);
         }
+        // Step 2: 首次读取时抓取全局跟踪缓冲区并冻结为本实例的私有文本。
         if snapshot.bytes.is_none() {
             snapshot.bytes = Some(trace::snapshot()?);
         }
@@ -63,10 +113,12 @@ impl TraceFile {
             .bytes
             .as_ref()
             .expect("trace snapshot missing after capture");
+        // Step 3: 检查读取偏移是否已越过快照末尾，或目标缓冲区已满。
         if bytes.len() as u64 <= offset || target.copied() == target.len() {
             return Ok(0);
         }
 
+        // Step 4: 将快照字节写入目标缓冲区；若发生错误但已有成功写入的前缀字节，则返回已写入长度。
         let start = target.copied();
         match target.push(&bytes[offset as usize..]) {
             Ok(count) => Ok(count),
@@ -77,12 +129,12 @@ impl TraceFile {
 }
 
 impl FileLike for TraceFile {
-    /// 稳定文本允许显式字节位置读取，不授予只读实例写权限。
+    /// 标识该文件支持显式偏移量读取（`pread`）与 `lseek` 定位。
     fn positioned_io(&self) -> bool {
         true
     }
 
-    /// 读取和复制描述符共享位置，只按实际交付量推进。
+    /// 从当前游标位置顺序读取跟踪快照，并按实际交付的字节数推进游标。
     fn read_into(
         &self,
         target: &mut ReadBuffer<'_>,
@@ -96,7 +148,7 @@ impl FileLike for TraceFile {
         Ok(count)
     }
 
-    /// 显式位置读取同一本 OFD 的文本，但不改变顺序读取位置。
+    /// 从指定字节偏移 `offset` 处读取跟踪快照（`pread`），不修改顺序读取游标。
     fn read_at_into(
         &self,
         offset: u64,
@@ -107,17 +159,19 @@ impl FileLike for TraceFile {
         Self::read_snapshot(&mut self.snapshot.lock(), offset, target)
     }
 
-    /// 保留真实设备节点路径及原挂载寿命。
+    /// 返回打开该设备时的挂载路径。
     fn path(&self) -> Option<&Path> {
         Some(&self.path)
     }
 
-    /// 拥有文本不提供普通文件页映射来源。
+    /// 跟踪快照保存在内核堆缓冲区中，不支持 `mmap` 页缓存映射。
     fn mapping_inode(&self) -> Option<&InodeRef> {
         None
     }
 
-    /// 无指针控制只核本次调用者的真实 uid，命令不保存到 OFD 快照状态。
+    /// 处理 `/dev/ktrace` 专用的跟踪启停控制命令（`BLOSSOM_TRACE_START` / `BLOSSOM_TRACE_STOP`）。
+    ///
+    /// 若调用方来自用户态任务，必须具备 root 权限（`uid == 0`），否则返回 `FsError::NotPermitted`。
     fn ioctl(
         &self,
         command: u32,
@@ -142,32 +196,35 @@ impl FileLike for TraceFile {
         Ok(0)
     }
 
-    /// 原子状态属于打开实例，不包含描述符 CLOEXEC。
+    /// 读取当前打开文件描述的状态标志（原子读取，不含描述符级标志）。
     fn flags(&self) -> u32 {
         self.flags.load(Ordering::Relaxed)
     }
 
-    /// 只改变公共协议允许的状态，不改变只读模式。
+    /// 更新打开文件描述的可变状态标志（如 `F_SETFL`）。
     fn set_status_flags(&self, raw: u32) -> Result<(), FsError> {
         set_status_flags(&self.flags, raw)
     }
 
-    /// 只原子修改本快照 OFD 的非阻塞位，不改变快照内容和追加状态。
+    /// 原子设置或清除本打开文件实例的非阻塞标志（`O_NONBLOCK`）。
     fn set_nonblocking(&self, enabled: bool) -> Result<(), FsError> {
         set_nonblocking(&self.flags, enabled)
     }
 
-    /// 只读快照不能截断生产记录或本实例文本。
+    /// 跟踪快照为只读设备，拒绝截断操作并返回 `FsError::ReadOnly`。
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 
-    /// 快照没有可提交的持久化操作。
+    /// 内存跟踪快照无底层持久化存储，不支持 `fsync` / `fdatasync`。
     fn sync_range(&self, _range: Range<u64>, _data_only: bool) -> Result<(), FsError> {
         Err(FsError::InvalidOperation)
     }
 
-    /// 已有文本按非负 loff_t 定位；首次读取前只允许 rewind，不查询未知捕获长度。
+    /// 调整顺序读取游标位置（`lseek`）。
+    ///
+    /// - 若尚未读取并生成快照，仅允许重置到文件开头（`SeekFrom::Start(0)`），其余定位方式返回 `FsError::IllegalSeek`。
+    /// - 若已生成快照，则按快照字节长度计算目标偏移，并校验结果在非负 `loff_t`（`0..=i64::MAX`）范围内。
     fn seek(&self, from: SeekFrom) -> Result<u64, FsError> {
         let mut snapshot = self.snapshot.lock();
         let Some(bytes) = &snapshot.bytes else {
@@ -191,7 +248,7 @@ impl FileLike for TraceFile {
         Ok(position)
     }
 
-    /// 原节点提供身份及 rdev，长度只反映本实例已经拥有的文本。
+    /// 获取设备状态信息（`fstat`），其中 `size` 字段反映本实例已抓取的快照字节数（未抓取时为 0）。
     fn stat(&self) -> Result<FileStat, FsError> {
         let mut stat = stat_path(&self.path)?;
         let snapshot = self.snapshot.lock();
@@ -203,12 +260,12 @@ impl FileLike for TraceFile {
         Ok(stat)
     }
 
-    /// 文本快照不提供目录枚举。
+    /// 字符设备非目录，不支持读取目录项。
     fn readdir(&self) -> Result<Option<DirectoryEntry>, FsError> {
         Err(FsError::NotDirectory)
     }
 
-    /// 快照 OFD 没有目录交付能力。
+    /// 字符设备非目录，不支持遍历目录项。
     fn for_each_dirent(
         &self,
         _emit: &mut dyn FnMut(&DirectoryEntry) -> Result<bool, FsError>,
@@ -216,7 +273,7 @@ impl FileLike for TraceFile {
         Err(FsError::NotDirectory)
     }
 
-    /// 只读实例即使空写也拒绝描述符写模式，不访问输入字节。
+    /// 跟踪快照固定以只读模式打开，写入操作一律按描述符不可写返回 `FsError::BadFd`。
     fn write_from(
         &self,
         _source: &mut WriteBuffer<'_>,
@@ -225,7 +282,7 @@ impl FileLike for TraceFile {
         Err(FsError::BadFd)
     }
 
-    /// 显式位置写同样不消费输入端。
+    /// 跟踪快照固定以只读模式打开，指定偏移写入（`pwrite`）一律返回 `FsError::BadFd`。
     fn write_at_from(
         &self,
         _offset: u64,

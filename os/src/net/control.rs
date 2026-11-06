@@ -1,4 +1,37 @@
-//! 接口与默认路由控制先复制目标 ABI 字节，再以内核小值修改同一网络域。
+//! 网络接口与默认路由的 `ioctl` 控制入口。
+//!
+//! # 模块职责与架构定位
+//! 本模块负责处理绑定在网络套接字（Socket）上的接口与路由控制命令（`SIOC*`）。
+//! 上游调用者为套接字文件描述符的 `ioctl` 分发层（`crate::net::socket`），
+//! 下游委托网络协议栈根实例 [`NetStackRef`]（`crate::net`）查询或更新接口状态与路由表。
+//!
+//! # 核心设计与 ABI 内存布局
+//! 为避免在持有网络栈内部锁期间直接访问用户态页表，本模块采用两阶段处理：
+//! 1. **边界拷贝与校验**：先将用户态传入的固定长度 ABI 结构体（`ifreq` 或 `rtentry`）一次性完整拷贝到内核栈缓冲区，并在内核态解析和校验所有参数；
+//! 2. **提交或回写**：调用 [`NetStackRef`] 完成状态变更或快照读取；若是查询类命令（Getter），仅修改缓冲区中的输出联合体字段，最后一次性写回用户空间。
+//!
+//! 在小端 LP64 架构（RISC-V 64 / LoongArch 64）下，两个核心 ABI 结构的字节布局如下：
+//!
+//! ```text
+//! struct ifreq (40 bytes):
+//! +-------------------+-----------------------------------------------+
+//! | 0..16             | 16..40                                        |
+//! | ifr_name (16B)    | ifr_ifru union (24B):                         |
+//! | NUL-terminated    | - ifr_flags: u16 at [16..18]                  |
+//! | ("lo" / "eth0")   | - ifr_addr / ifr_netmask: sockaddr at [16..32]|
+//! +-------------------+-----------------------------------------------+
+//!
+//! struct rtentry (120 bytes, LP64):
+//! +--------+------------+---------------+---------------+--------+----+--------+--------+--------+
+//! | 0..8   | 8..24      | 24..40        | 40..56        | 56..58 | .. | 80..82 | 88..96 | 96..120|
+//! | rt_pad | rt_dst     | rt_gateway    | rt_genmask    | flags  |    | metric | rt_dev | mtu/win|
+//! | (u64)  | (sockaddr) | (sockaddr)    | (sockaddr)    | (u16)  |    | (i16)  | (*char)| /irtt  |
+//! +--------+------------+---------------+---------------+--------+----+--------+--------+--------+
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 本模块自身不持有任何锁。
+//! - 所有用户态内存拷贝（[`Mm::copyin`] / [`Mm::copyout`]）必须在调用 [`NetStackRef`] 的方法**之前或之后**执行，严禁在持有网络栈接口锁或自旋锁时触发用户页表访问。
 
 use core::convert::TryInto;
 
@@ -27,7 +60,7 @@ const IFREQ_LEN: usize = 40;
 const RTENTRY_LEN: usize = 120;
 const IFNAME_LEN: usize = 16;
 
-// 两目标均为小端 LP64，rtentry 的地址字段紧随首个机器字，尾部机器字按八字节对齐。
+// RISC-V 64 与 LoongArch 64 均为小端 LP64 架构，`rtentry` 的三个 `sockaddr` 字段紧随首个 8 字节机器字之后，尾部指针与长整型字段按 8 字节对齐。
 const RT_DST_OFFSET: usize = core::mem::size_of::<u64>();
 const RT_GATEWAY_OFFSET: usize = RT_DST_OFFSET + INET_ADDRESS_LEN;
 const RT_GENMASK_OFFSET: usize = RT_GATEWAY_OFFSET + INET_ADDRESS_LEN;
@@ -38,8 +71,12 @@ const RT_MTU_OFFSET: usize = RT_DEVICE_OFFSET + core::mem::size_of::<u64>();
 const RT_WINDOW_OFFSET: usize = RT_MTU_OFFSET + core::mem::size_of::<u64>();
 const RT_IRTT_OFFSET: usize = RT_WINDOW_OFFSET + core::mem::size_of::<u64>();
 
-/// 普通任务以本次调用者权限配置 socket 所属网络域；全部用户访问发生在 Root 调用之前或之后。
-/// 未知命令返回 ENOTTY，Kernel 的已知指针命令不解引用裸地址。
+/// 处理网络套接字上的接口与路由控制 `ioctl` 请求。
+///
+/// 在普通可睡眠的用户任务上下文中调用。所有修改类命令（Setter）要求调用者具备 `uid == 0`（root 权限）。
+/// 未知的请求码返回 [`FsError::NotTty`]（`ENOTTY`）；内核态调用上下文（`FileIoContext::Kernel`）不提供用户地址空间，直接拒绝并返回 [`FsError::InvalidOperation`]。
+///
+/// 全部用户态内存读写均在进入 [`NetStackRef`] 内部锁之前或退出之后完成。
 pub(crate) fn ioctl(
     net: &NetStackRef,
     request: u32,
@@ -72,7 +109,11 @@ pub(crate) fn ioctl(
     }
 }
 
-/// 一次复制完整 ifreq；getter 只改所选输出字段，setter 只提交完整解析后的内核值。
+/// 处理网络接口相关的 `ioctl` 命令（`SIOCGIF*` / `SIOCSIF*`）。
+///
+/// 一次性从用户空间拷贝完整的 40 字节 `ifreq` 结构并解析接口名：
+/// - 查询命令（Getter）仅覆写 `ifreq` 偏移 16 字节处的输出字段，随后将完整结构写回用户空间；
+/// - 配置命令（Setter）在完成地址族、标志位或掩码前缀校验后，将解析出的内核值提交给 [`NetStackRef`]。
 fn interface_ioctl(
     net: &NetStackRef,
     mm: &Mm,
@@ -80,10 +121,11 @@ fn interface_ioctl(
     argument: usize,
 ) -> Result<usize, FsError> {
     let mut bytes = copyin::<IFREQ_LEN>(mm, argument)?;
-    // LP64 ifreq 名称最多十五字节，最后一字节由内核终止；union 在偏移十六处。
+    // Step 1: LP64 下 `ifreq.ifr_name` 占前 16 字节（最多 15 个有效字符），强制将第 16 字节置零以保证 NUL 结尾；偏移 16 字节处为联合体载荷。
     bytes[IFNAME_LEN - 1] = 0;
     let id = interface_name(&bytes[..IFNAME_LEN])?;
 
+    // Step 2: 按具体命令分发读取接口快照或提交配置变更。
     match request {
         SIOCGIFFLAGS => {
             let interface = net.interface_snapshot(id)?;
@@ -109,7 +151,7 @@ fn interface_ioctl(
                 prefix_mask(interface.prefix_len)
             };
 
-            // sockaddr 的端口及 padding 明确初始化，地址保持网络字节序。
+            // 显式清零整个 16 字节 `sockaddr_in` 区域（含端口号与尾随填充字节），仅填入地址族与网络字节序的 IPv4 地址。
             bytes[16..32].fill(0);
             bytes[16..18].copy_from_slice(&AF_INET.to_le_bytes());
             bytes[20..24].copy_from_slice(&value);
@@ -138,14 +180,17 @@ fn interface_ioctl(
     }
 }
 
-/// 完整 rtentry 与可选设备名复制完成后，才管理库 Routes 中唯一默认项。
+/// 处理路由表相关的 `ioctl` 命令（`SIOCADDRT` / `SIOCDELRT`）。
+///
+/// 一次性从用户空间拷贝 120 字节的 `rtentry` 结构及可选的 `rt_dev` 设备名字符串，
+/// 校验其表示一条指向网关的默认路由（`0.0.0.0/0`），随后请求 [`NetStackRef`] 添加或删除默认路由。
 fn route_ioctl(
     net: &NetStackRef,
     mm: &Mm,
     request: u32,
     argument: usize,
 ) -> Result<usize, FsError> {
-    // 两目标均为小端 LP64：三个 sockaddr、flags、metric 与机器字字段按固定偏移读取。
+    // Step 1: 拷贝完整的 `rtentry` 并按 LP64 固定字节偏移解析目的地址、网关地址与子网掩码。
     let bytes = copyin::<RTENTRY_LEN>(mm, argument)?;
     let destination = ipv4_sockaddr(&bytes, RT_DST_OFFSET)?;
     let gateway = ipv4_sockaddr(&bytes, RT_GATEWAY_OFFSET)?;
@@ -160,6 +205,7 @@ fn route_ioctl(
         return Err(FsError::Unsupported);
     }
 
+    // Step 2: 校验路由标志位（必须且只能包含 `RTF_UP | RTF_GATEWAY`）以及 metric、MTU、window、irtt 等扩展参数。
     let flags = word(&bytes, RT_FLAGS_OFFSET);
     if flags & !(RTF_UP | RTF_GATEWAY) != 0 {
         return Err(FsError::Unsupported);
@@ -176,6 +222,7 @@ fn route_ioctl(
         return Err(FsError::Unsupported);
     }
 
+    // Step 3: 若 `rt_dev` 指针非空，从用户空间读取以 NUL 结尾的接口名称字符串并解析为 `InterfaceId`。
     let device = long(&bytes, RT_DEVICE_OFFSET) as usize;
     let interface = if device == 0 {
         None
@@ -191,7 +238,9 @@ fn route_ioctl(
     Ok(0)
 }
 
-/// 名称只认 lo 和 eth0 的原字节，不增加地址别名或隐式设备。
+/// 从 `ifreq.ifr_name` 或 `rt_dev` 字节切片中截取首个 NUL 之前的有效字节，并解析为内核接口标识 [`InterfaceId`]。
+///
+/// 仅识别 `"lo"` 与 `"eth0"`，不支持地址别名（如 `"eth0:0"`）或其他未知设备名。
 fn interface_name(name: &[u8]) -> Result<InterfaceId, FsError> {
     let length = name
         .iter()
@@ -200,7 +249,9 @@ fn interface_name(name: &[u8]) -> Result<InterfaceId, FsError> {
     InterfaceId::from_name(&name[..length])
 }
 
-/// 可选 rt_dev 在首个 NUL 停止，最多读取十五字节并保留零填内核终止位。
+/// 从用户空间指针 `argument` 处逐字节读取可选的 `rt_dev` 设备名字符串。
+///
+/// 遇到首个 NUL 字节即停止，最多读取 15 个字节（`IFNAME_LEN - 1`），第 16 个字节始终保持为 0。
 fn copy_device_name(mm: &Mm, argument: usize) -> Result<[u8; IFNAME_LEN], FsError> {
     let mut name = [0u8; IFNAME_LEN];
     for (offset, byte) in name.iter_mut().enumerate().take(IFNAME_LEN - 1) {
@@ -213,7 +264,9 @@ fn copy_device_name(mm: &Mm, argument: usize) -> Result<[u8; IFNAME_LEN], FsErro
     Ok(name)
 }
 
-/// 只检查所选 IPv4 family 和地址，不验证没有配置含义的端口及 padding。
+/// 校验 `bytes[offset..]` 处的 `sockaddr_in` 地址族是否为 `AF_INET`，并提取其中的 4 字节 IPv4 地址。
+///
+/// 忽略在接口与路由配置中没有语义的端口号（`sin_port`）和填充字节（`sin_zero`）。
 fn ipv4_sockaddr(bytes: &[u8], offset: usize) -> Result<[u8; 4], FsError> {
     if word(bytes, offset) != AF_INET {
         return Err(FsError::InvalidOperation);
@@ -221,14 +274,16 @@ fn ipv4_sockaddr(bytes: &[u8], offset: usize) -> Result<[u8; 4], FsError> {
     Ok(address_bytes(bytes, offset))
 }
 
-/// 提取 sockaddr 内的四个网络序地址字节，不将其按目标主机整数解释。
+/// 提取 `sockaddr_in` 结构体内（偏移 `offset + 4..offset + 8`）的 4 字节网络字节序 IPv4 地址。
 fn address_bytes(bytes: &[u8], offset: usize) -> [u8; 4] {
     bytes[offset + 4..offset + 8]
         .try_into()
         .expect("fixed IPv4 address field")
 }
 
-/// 连续 IPv4 掩码转换为库 CIDR 前缀，零掩码和全一掩码分别为零及三十二。
+/// 将连续的 IPv4 子网掩码字节转换为 CIDR 前缀长度（`0..=32`）。
+///
+/// 全零掩码对应前缀长度 `0`，全一掩码对应 `32`；若掩码二进制位包含非连续的 `1`（如 `255.0.255.0`），返回 [`FsError::InvalidOperation`]。
 fn mask_prefix(mask: [u8; 4]) -> Result<u8, FsError> {
     let prefix = u32::from_be_bytes(mask).leading_ones() as u8;
     if prefix_mask(prefix) != mask {
@@ -237,7 +292,7 @@ fn mask_prefix(mask: [u8; 4]) -> Result<u8, FsError> {
     Ok(prefix)
 }
 
-/// 将库保证范围为零至三十二的 CIDR 前缀转换为网络序掩码。
+/// 将范围在 `0..=32` 内的 CIDR 前缀长度转换为 4 字节网络字节序的 IPv4 子网掩码。
 fn prefix_mask(prefix: u8) -> [u8; 4] {
     let mask = if prefix == 0 {
         0
@@ -247,7 +302,7 @@ fn prefix_mask(prefix: u8) -> [u8; 4] {
     mask.to_be_bytes()
 }
 
-/// 从已经完整复制的目标 ABI 结构中读取小端十六位字段。
+/// 从已拷贝到内核的 ABI 字节缓冲区 `bytes[offset..offset + 2]` 中读取小端序 `u16` 字段。
 fn word(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(
         bytes[offset..offset + 2]
@@ -256,7 +311,7 @@ fn word(bytes: &[u8], offset: usize) -> u16 {
     )
 }
 
-/// 从已经完整复制的 LP64 ABI 结构中读取小端六十四位字段。
+/// 从已拷贝到内核的 LP64 ABI 字节缓冲区 `bytes[offset..offset + 8]` 中读取小端序 `u64` 字段。
 fn long(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(
         bytes[offset..offset + 8]
@@ -265,7 +320,9 @@ fn long(bytes: &[u8], offset: usize) -> u64 {
     )
 }
 
-/// 一次复制完整固定结构，普通 copy 错误统一为 EFAULT，部分输入不允许提交控制。
+/// 从用户地址空间 `argument` 一次性完整拷贝 `N` 字节到内核栈数组。
+///
+/// 若发生缺页错误或实际拷贝字节数不足 `N`，统一返回 [`FsError::BadAddress`]（`EFAULT`），避免使用不完整的输入修改网络配置。
 fn copyin<const N: usize>(mm: &Mm, argument: usize) -> Result<[u8; N], FsError> {
     let mut bytes = [0u8; N];
     let progress = mm.copyin(&mut bytes, argument);
@@ -275,7 +332,9 @@ fn copyin<const N: usize>(mm: &Mm, argument: usize) -> Result<[u8; N], FsError> 
     Ok(bytes)
 }
 
-/// 仅回写已初始化的完整 ifreq；部分输出按原 uaccess 错误返回。
+/// 将已初始化完毕的 `ifreq` 字节切片一次性完整写回用户地址空间 `argument`。
+///
+/// 若写入中途失败或未能写满全部字节，返回 [`FsError::BadAddress`]（`EFAULT`）。
 fn copyout(mm: &Mm, argument: usize, bytes: &[u8]) -> Result<usize, FsError> {
     let progress = mm.copyout(argument, bytes);
     if progress.error.is_some() || progress.copied != bytes.len() {

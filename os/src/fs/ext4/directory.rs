@@ -1,4 +1,50 @@
-//! 目录记录、原生 HTree 修改与稳定续读游标共享同一后端。
+//! ext4 目录存储后端：负责线性目录块与 HTree（`dx`）哈希索引目录的读取、校验、稳定游标枚举与两阶段原子修改。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于 `crate::fs::ext4` 子系统内部，实现磁盘目录在块设备元数据缓存（`MetadataCache`）上的读写与结构演进：
+//! - **上游调用者**：`Ext4Volume`（转发来自 VFS `Inode` 缓存层与打开文件描述 `File` 的名字查找、`getdents64` 遍历、`lseek` 定位，以及 `mkdir` / `create` / `unlink` / `rmdir` / `rename` 的目录修改请求）。
+//! - **下游依赖**：`super::mapping`（逻辑块到物理块的查询与新块批量分配预备）、`super::codec`（小端字节编解码、目录名字哈希与 CRC32C 校验和计算）以及 `crate::cache::BufferRef`（元数据块缓存窗口读写与失效）。
+//!
+//! # 核心设计与磁盘布局
+//! ## 1. 三种目录块物理布局（`DirectoryLayout`）
+//! 1. **普通叶块（`Leaf`）**：线性目录的所有块，或 HTree 目录中存放实际目录项的叶子块（逻辑块号 `> 0`）。
+//! ```text
+//!  0                                            end             block_size
+//! +------------------+------------------+------+---------------+
+//! | ext4_dir_entry_2 | ext4_dir_entry_2 | ...  | dir_tail(12B) |
+//! +------------------+------------------+------+---------------+
+//!  <--------- 紧凑或含空闲槽的 4B 对齐记录链 -----> <-- 可选 CRC -->
+//! ```
+//! 每条 `ext4_dir_entry_2` 头部固定 8 字节：`inode(4B) | rec_len(2B) | name_len(1B) | file_type(1B)`（未启用 `FILETYPE` 特性时后两字节合并为 `name_len(2B)`），后跟变长原始名字字节并按 4 字节向上对齐。当卷启用 `METADATA_CSUM` 时，块末 12 字节固定为伪目录项形式的校验尾（`ft = 0xde`）。
+//!
+//! 2. **HTree 索引根块（`Root`，逻辑块 0 且 `inode.flags` 含 `INDEX`）**：复用 `.` 与 `..` 两条目录项的覆盖空间嵌入 `dx_root_info` 与顶层索引表。
+//! ```text
+//!  0            12           24             32                  limit*8+32   block_size
+//! +------------+------------+--------------+-------------------+------------+
+//! | "." (12B)  | ".." 头+名 | dx_root_info | dx_countlimit(8B) | dx_tail    |
+//! | rec_len=12 | rec_len=   | hash_ver(1B) | + dx_entry[1..]   | (可选 8B)  |
+//! |            | blk_sz-12  | info_len=8   | (每项 8B:         | 存放 CRC   |
+//! |            |            | depth(1B)    |  hash + block)    |            |
+//! +------------+------------+--------------+-------------------+------------+
+//! ```
+//! 注意第 0 个索引槽位于偏移 `32`，其前 4 字节被 `limit(2B) | count(2B)` 占用，因此首项的最小哈希值隐式为 `0`，仅偏移 `36..40` 存放首个子块逻辑块号。
+//!
+//! 3. **HTree 内部索引节点块（`Index`，逻辑块 `> 0` 的中间层索引块）**：块首 8 字节为全零 `fake_dirent`（`inode = 0, rec_len = block_size`），偏移 `8` 起为 `dx_countlimit` 与 `dx_entry` 数组，启用 `METADATA_CSUM` 时末尾保留 8 字节 `dx_tail`。
+//!
+//! ## 2. HTree 分裂、Continuation 位与升级演进
+//! - 当单块线性目录（仅逻辑块 0）插入新项空间不足且卷支持 `DIR_INDEX` 时，`make_indexed_directory` 将原普通目录项迁入新分配的叶块，把逻辑块 0 原地改造为 `Root` 并置位 `INDEX` 标志，随后触发首次叶分裂。
+//! - 叶块满时（`split_leaf`），按目录项哈希值排序并折半拆分到左右两个叶块。若分裂点两侧存在相同 `major` 哈希的记录，向父索引插入的分隔键最低位置 `1`（continuation 位），提示查找（`find_entry`）与遍历（`next_indexed`）在命中前驱叶后必须继续扫描相邻叶块。
+//! - 内部索引块满时折半分裂；根索引满且未达最大间接层数上限（普通 HTree 为 1 层，启用 `LARGEDIR` 时为 2 层）时，将原根条目下推至新内部节点并使树深度 `depth + 1`。
+//!
+//! ## 3. 两阶段准备与无失败发布（Prepare / Publish）
+//! 所有目录写操作均采用“锁内副本预演 + 物理映射预留 -> 原子字节拷贝发布”的两阶段状态流转：
+//! 1. **准备阶段（`DirectoryEditBuilder` -> `PreparedDirectoryEdit`）**：在可睡眠上下文读取受影响目录块的内存副本（`DirectoryImage`），在副本上完成记录增删、叶分裂、索引树更新及 CRC 重算；若需新增目录块，批量调用 `prepare_directory_mappings` 预留物理块并绑定缓存窗口（`BufferRef`）。此阶段任何校验失败、空间不足（`NoSpace`）或内存不足（`NoMemory`）均直接回滚预留块并失效未发布缓存窗口，已生效的盘面与缓存字节零修改。
+//! 2. **发布阶段（`PreparedDirectoryEdit::publish`）**：不做任何磁盘读取或内存分配，先将新分配目录块的完整字节写入缓存窗口，再覆盖已有目录块与索引块，最后消费块映射预留并返回新 `root` / `size` / `blocks` / `flags` 供调用方更新 Inode。
+//!
+//! # 锁获取顺序与并发契约
+//! - **读路径（`lookup` / `next` / `cursor_at` / `end_cookie` / `is_empty`）**：调用方必须持有目标目录 Inode 的目录操作读/写保护以及 `disk_root` 块映射读锁，保证传入的 `InodeMetadata` 与 60 字节 `map_root` 在整个块映射查询期间一致。在 `BufferRef::with_read` 闭包内持有单页内容锁，闭包内仅做纯内存解码与校验，严禁在闭包内再次发起磁盘 I/O 或获取其他锁。
+//! - **写准备路径（`prepare_*`）**：调用方持有目录写序列化锁与 `disk_root` 读锁（可睡眠上下文）。
+//! - **写发布路径（`PreparedDirectoryEdit::publish`）**：调用方持有目录写序列化锁与 `disk_root` **写锁**，排斥并发块映射读者；内部依次对单个 `BufferRef` 执行短临界区 `update` 拷贝字节。
 
 use alloc::vec::Vec;
 
@@ -11,40 +57,57 @@ use crate::fs::inode::InodeMetadata;
 use crate::fs::types::NAME_MAX;
 use crate::fs::{DirectoryCursor, DirectoryEntry, DirectoryPosition, FsError, InodeKind};
 
+/// 启用 `LARGEDIR` 特性时 HTree 允许的最大间接索引层数（根块之下最多 2 层内部索引节点，即 3 级索引树）。
 const DX_MAX_INDIRECT_LEVELS: usize = 2;
+/// HTree 哈希目录的 `SEEK_END` / 遍历结束 64 位 Cookie 哨兵值。
 const DX_EOF_COOKIE: u64 = 0x7fff_ffff_ffff_ffff;
+/// HTree `dx_entry` 中逻辑块号字段的有效位掩码（低 28 位表示逻辑块号，高 4 位保留清零）。
 const DX_BLOCK_MASK: u32 = (1 << 28) - 1;
 
+/// `ext4_dir_entry_2` 目录项的固定头部大小（单位：字节）。
 const DIRENT_HEADER_BYTES: usize = 8;
+/// 目录项记录长度（`rec_len`）的字节对齐粒度（4 字节对齐）。
 const DIRENT_ALIGNMENT: usize = 4;
+/// 计算 4 字节向上对齐所用的低位掩码（`3`）。
 const DIRENT_ROUND: usize = DIRENT_ALIGNMENT - 1;
+/// 包含至少 1 字节名字的最短合法目录项记录长度（12 字节）。
 const DIRENT_MIN_BYTES: usize = (DIRENT_HEADER_BYTES + 1 + DIRENT_ROUND) & !DIRENT_ROUND;
 
+/// 单个 HTree 索引条目（`dx_entry`：`hash(4B) + block(4B)`）的字节大小。
 const DX_ENTRY_BYTES: usize = 8;
+/// 启用 `METADATA_CSUM` 时 HTree 根块或内部索引块末尾 `dx_tail` 的字节大小（8 字节）。
 const DX_TAIL_BYTES: usize = 8;
+/// HTree 内部索引节点块（`dx_node`）中 `dx_countlimit` 与条目数组的起始字节偏移（跳过 8 字节伪目录项头）。
 const DX_NODE_ENTRIES_OFFSET: usize = 8;
+/// HTree 根块（`dx_root`）中 `dx_countlimit` 与条目数组的起始字节偏移（跳过 `.`、`..` 与 8 字节 `dx_root_info`）。
 const DX_ROOT_ENTRIES_OFFSET: usize = 32;
 
-/// 一次已准备目录修改对 canonical inode 发布的映射与计数。
+/// 目录修改发布后需要回写至规范（Canonical）Inode 的块映射与元数据统计结果。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryEditResult {
-    /// 修改后的 inode inline 块映射根。
+    /// 更新后的 Inode 内联 60 字节块映射根（Extent 树根或传统直接/间接块指针数组）。
     pub(crate) root: [u8; 60],
-    /// 目录按字节计的逻辑大小。
+    /// 更新后的目录逻辑大小（单位：字节，始终为文件系统块大小的整数倍）。
     pub(crate) size: u64,
-    /// 目录的 512 字节 sector 计数。
+    /// 更新后的目录已分配磁盘空间计数（单位：512 字节扇区）。
     pub(crate) blocks: u64,
-    /// 本次编辑更新后的 inode flags，包括可能的 INDEX promotion。
+    /// 更新后的 Inode 标志位（例如单块目录升级为 HTree 后新增 `INDEX` 标志）。
     pub(crate) flags: u32,
 }
 
+/// 单次目录编辑过程中缓存在内存里的单个逻辑目录块工作副本。
 struct DirectoryImage {
+    /// 该目录块在目录文件内的逻辑块号（从 `0` 开始）。
     logical: u64,
+    /// 对应的元数据缓存窗口句柄；对于编辑中途新预留的逻辑块，在 `finish` 批量分配物理块前暂为 `None`。
     buffer: Option<BufferRef>,
+    /// 长度等于文件系统块大小（`block_size`）的完整块字节工作副本。
     bytes: Vec<u8>,
 }
 
-/// 在位图归还前逐一失效本次未发表物理块的既有缓存窗口。
+/// 在归还块位图分配前，逐一失效本次未发布的新增物理目录块在元数据缓存中的窗口。
+///
+/// 调用上下文：可睡眠任务上下文，仅在目录编辑准备失败或显式取消（`cancel`）时调用。
 fn forget_unpublished_images(
     volume: &Ext4Volume,
     mapping: &PreparedDirectoryMappings,
@@ -62,13 +125,15 @@ fn forget_unpublished_images(
             continue;
         };
         buffer.wait_writeback();
-        // SAFETY: 该缓存窗口经同步 metadata_block 读入，wait_writeback 再等完该页 WB；
-        // 当前 reservation 仍持物理块，旧目录根和其他读者都不能引用此准确窗口。
+        // SAFETY:
+        // 1. `volume.claim()` 持有当前可写挂载对同一底层块视图的读写凭据；
+        // 2. `physical` 来自当前尚未发布的 `mapping` 预留块，从未写入任何已发布的 Inode 块映射根，其他读者无法通过目录树访问该块；
+        // 3. 前一行的 `buffer.wait_writeback()` 已等待该缓存页上可能残余的回写操作彻底结束，且此时物理块尚未归还给块分配器位图，不会与并发重分配冲突。
         unsafe { buffer.forget(volume.claim()) }.expect("unpublished directory block invalidation");
     }
 }
 
-/// 失效本次新增目录块的缓存窗口后，再返还全部映射 reservation。
+/// 先失效本次新增目录块的元数据缓存窗口，再取消并归还全部预留的物理块映射。
 fn cancel_unpublished_mappings(
     volume: &Ext4Volume,
     mapping: PreparedDirectoryMappings,
@@ -78,43 +143,54 @@ fn cancel_unpublished_mappings(
     mapping.cancel(volume);
 }
 
-/// 所有失败条件与元数据窗口均已准备，发布只改字节并消费已分配块。
+/// 已完成全部校验、块分配与缓存窗口绑定的待发布目录修改令牌。
+///
+/// 准备阶段已吸收所有可能的 I/O、空间不足与内存分配失败；调用 [`Self::publish`] 时仅执行内存拷贝与预留块提交，若放弃提交则必须调用 [`Self::cancel`] 归还物理块。
 pub(crate) struct PreparedDirectoryEdit {
+    /// 若本次修改新增了目录叶块或索引块，保存批量预留的块映射事务；纯原地修改时为 `None`。
     mapping: Option<PreparedDirectoryMappings>,
+    /// 本次修改涉及的所有已变更或新分配目录块的内存镜像与目标缓存窗口。
     images: Vec<DirectoryImage>,
+    /// 本次修改新分配的目录逻辑块号列表（用于区分新块与既有块的写入顺序及失败回滚失效范围）。
     logical_blocks: Vec<u64>,
+    /// 修改发布后将生效的 Inode 60 字节内联块映射根。
     root: [u8; 60],
+    /// 修改发布后将生效的目录逻辑大小（单位：字节）。
     size: u64,
+    /// 修改发布后将生效的目录占用扇区计数（单位：512 字节扇区）。
     blocks: u64,
+    /// 修改发布后将生效的 Inode 标志位。
     flags: u32,
 }
 
 impl PreparedDirectoryEdit {
-    /// 借用本次编辑将发布的 inode 块映射根。
+    /// 借用本次修改发布后将生效的 Inode 60 字节块映射根。
     pub(crate) fn root(&self) -> &[u8; 60] {
         &self.root
     }
 
-    /// 返回本次编辑将发布的目录字节大小。
+    /// 返回本次修改发布后将生效的目录逻辑大小（单位：字节）。
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
 
-    /// 返回本次编辑将发布的 512 字节 sector 计数。
+    /// 返回本次修改发布后将生效的 512 字节扇区计数。
     pub(crate) fn blocks(&self) -> u64 {
         self.blocks
     }
-    /// 返回本次编辑将发布的 inode flags。
+    /// 返回本次修改发布后将生效的 Inode 标志位。
     pub(crate) fn flags(&self) -> u32 {
         self.flags
     }
 
-    /// 判断本次是否实际改变了 dirent；同 inode rename 的 no-op 不改时间或链接数。
+    /// 判断本次准备是否实际改动了任何目录块字节（例如指向同一 Inode 的原地 `rename` 为无操作，不更新时间戳或链接数）。
     pub(crate) fn changed(&self) -> bool {
         !self.images.is_empty()
     }
 
-    /// 写入已准备的目录块和映射节点，不分配、读取磁盘或返回可恢复错误。
+    /// 将已准备就绪的全部目录块镜像与块映射树修改原子提交到元数据缓存窗口。
+    ///
+    /// 调用方必须持有目标目录的写序列化锁以及 `disk_root` 写锁。本函数不触发内存分配或磁盘读取，不会返回可恢复错误。
     pub(crate) fn publish(self, volume: &Ext4Volume) -> DirectoryEditResult {
         let Self {
             mapping,
@@ -126,7 +202,8 @@ impl PreparedDirectoryEdit {
             flags,
         } = self;
 
-        // 新目录块先有完整内容，旧根和索引只在其后才指向这些块。
+        // Step 1: 分两轮写入缓存窗口——第一轮先写入本次新增分配的块（`new_block == true`），
+        // 确保新叶块或新索引节点内容完整就绪后，第二轮再更新指向它们的既有索引块或根块。
         for new_block in [true, false] {
             for image in &images {
                 if logical_blocks.contains(&image.logical) != new_block {
@@ -139,6 +216,7 @@ impl PreparedDirectoryEdit {
             }
         }
 
+        // Step 2: 提交块映射预留（更新外部 Extent/间接块缓存窗口并消费新物理块所有权）。
         if let Some(mapping) = mapping {
             mapping.publish(volume);
         }
@@ -150,7 +228,7 @@ impl PreparedDirectoryEdit {
         }
     }
 
-    /// 归还尚未连接到目录映射的块，保留所有已发表目录内容。
+    /// 放弃本次未发布的目录编辑，失效新块缓存窗口并归还预留的物理块，保持原有目录内容不变。
     pub(crate) fn cancel(self, volume: &Ext4Volume) {
         if let Some(mapping) = self.mapping {
             cancel_unpublished_mappings(volume, mapping, &self.logical_blocks);
@@ -158,14 +236,20 @@ impl PreparedDirectoryEdit {
     }
 }
 
+/// 已通过完整性校验的单个目录块物理布局分类。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryLayout {
+    /// 存放实际目录项链表的叶子块或线性目录块（`end` 为目录项有效载荷区的结束字节偏移，不含末尾可选的 12 字节校验尾）。
     Leaf { end: usize },
+    /// HTree 索引目录的逻辑第 0 块（包含 `.`、`..` 记录、`dx_root_info` 以及顶层索引表）。
     Root,
+    /// HTree 索引目录的内部索引节点块（包含 8 字节伪目录项头与下级索引表）。
     Index,
 }
 
-/// 按 HTree cookie 解释共享位置；布局切换也沿用原 cookie 数值而不重置到开头。
+/// 将用户态 64 位目录偏移 Cookie 解码为 HTree 哈希索引游标。
+///
+/// 即使目录在打开期间由线性布局升级为 HTree 布局，仍沿用原 Cookie 的数值编码继续定位，并清空进程内哈希碰撞位置提示。
 fn indexed_cursor(cookie: u64) -> Result<DirectoryCursor, FsError> {
     if DX_EOF_COOKIE < cookie {
         return Err(FsError::InvalidOperation);
@@ -177,7 +261,9 @@ fn indexed_cursor(cookie: u64) -> Result<DirectoryCursor, FsError> {
     })
 }
 
-/// 从用户 cookie 建立后端位置，显式 seek 不沿用之前的碰撞状态。
+/// 根据 `lseek` 传入的 64 位用户态 Cookie 构造当前目录格式对应的遍历游标。
+///
+/// 调用方需持有目录读保护；显式定位不会沿用先前的哈希碰撞块内偏移状态。
 pub(crate) fn cursor_at(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -191,7 +277,7 @@ pub(crate) fn cursor_at(
     indexed_cursor(cookie)
 }
 
-/// 返回后端的 SEEK_END 位置，indexed 目录使用 hash EOF 哨兵。
+/// 返回当前目录在 `SEEK_END` 语义下的末尾 Cookie 值（线性目录为字节大小，HTree 目录为 `DX_EOF_COOKIE` 哨兵）。
 pub(crate) fn end_cookie(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -205,16 +291,22 @@ pub(crate) fn end_cookie(
     })
 }
 
+/// 从目录块字节流中解码出的单条 `ext4_dir_entry_2` 记录摘要。
 #[derive(Clone, Copy)]
 struct Record {
+    /// 目录项指向的 Inode 编号；为 `0` 表示该槽位是已删除留下的空闲记录。
     number: u64,
+    /// 名字原始字节在当前目录块切片内的起始偏移（单位：字节）。
     name_offset: usize,
+    /// 名字原始字节的实际长度（单位：字节，范围 `0..=NAME_MAX`）。
     name_len: usize,
+    /// 当卷启用 `FILETYPE` 特性且编码非 `0` 时解析出的目标对象类型，否则为 `None`。
     kind: Option<InodeKind>,
+    /// 下一条相邻目录项在当前目录块内的起始字节偏移（即 `offset + rec_len`）。
     next: usize,
 }
 
-/// 检查目录类型及完整块大小，避免将不完整尾块解释成目录项。
+/// 校验 Inode 是否为目录且逻辑大小非零、按文件系统块大小对齐，并核对 `INDEX` 标志与卷特性兼容位的一致性。
 fn check_directory(volume: &Ext4Volume, inode: &InodeMetadata) -> Result<(), FsError> {
     if inode.kind != InodeKind::Directory {
         return Err(FsError::NotDirectory);
@@ -230,7 +322,7 @@ fn check_directory(volume: &Ext4Volume, inode: &InodeMetadata) -> Result<(), FsE
     Ok(())
 }
 
-/// 读取一个真实目录块，空洞或未写入块不能充当空目录。
+/// 将目录逻辑块号映射为物理块并从元数据缓存读取对应窗口；若遇到稀疏空洞、未初始化区或越界则判定为文件系统损坏（`FsError::Corrupt`）。
 fn directory_block(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -244,28 +336,41 @@ fn directory_block(
     volume.metadata_block(physical)
 }
 
+/// HTree 索引下降路径中的单层节点访问帧。
 #[derive(Clone, Copy, Default)]
 struct DxFrame {
+    /// 当前索引节点块在目录文件内的逻辑块号（根块为 `0`，内部索引节点 `> 0`）。
     logical: u64,
+    /// 为 `true` 表示该层是逻辑第 0 块的 `dx_root`，为 `false` 表示内部索引节点 `dx_node`。
     root: bool,
+    /// 当前选中子范围条目在该节点 `dx_entry` 数组中的下标（`0..count`）。
     position: usize,
+    /// 该节点当前已使用的有效 `dx_entry` 条目总数。
     count: usize,
 }
 
+/// 解码后的单条 HTree 索引条目（`dx_entry`）。
 #[derive(Clone, Copy)]
 struct DxEntry {
+    /// 子树或叶块覆盖区间的起始 32 位哈希阈值（最低位为 `1` 时表示与前一相邻区间存在跨块同哈希记录，即 continuation 标志）。
     hash: u32,
+    /// 下级索引节点或目录叶块在目录文件内的逻辑块号。
     block: u64,
 }
 
+/// 从 HTree 根块下降至目标叶块的完整搜索路径栈。
 struct DxPath {
+    /// 自顶向下的各级索引节点访问帧（`frames[0]` 固定为 `dx_root`，后续元素为各级 `dx_node`）。
     frames: [DxFrame; DX_MAX_INDIRECT_LEVELS + 1],
+    /// `frames` 数组中当前有效的索引层数（取值范围 `1..=DX_MAX_INDIRECT_LEVELS + 1`）。
     len: usize,
+    /// 当前路径末端命中的目录叶块逻辑块号。
     leaf: u64,
+    /// 当前叶块区间经路径各层累积后的最小 `major` 哈希下界（已清除最低位 continuation 标志）。
     lower_bound: u32,
 }
 
-/// 返回当前文件系统允许的最大 dx 间接层数。
+/// 返回当前文件系统特性组合允许的最大 HTree 间接索引层数（启用 `LARGEDIR` 时为 2 层，否则为 1 层）。
 fn dx_max_indirect_levels(g: &Geometry) -> usize {
     if g.features_incompat & codec::FEATURE_INCOMPAT_LARGEDIR != 0 {
         DX_MAX_INDIRECT_LEVELS
@@ -274,7 +379,7 @@ fn dx_max_indirect_levels(g: &Geometry) -> usize {
     }
 }
 
-/// 解码根或节点中的一个真实 dx 条目，首项的哈希隐含为零。
+/// 解码 HTree 根块或内部节点中下标为 `position` 的索引条目；首项（`position == 0`）因存储槽存放 `limit/count` 而隐含起始哈希为 `0`。
 fn dx_entry(data: &[u8], offset: usize, position: usize) -> Result<DxEntry, FsError> {
     Ok(DxEntry {
         hash: if position == 0 {
@@ -288,7 +393,7 @@ fn dx_entry(data: &[u8], offset: usize, position: usize) -> Result<DxEntry, FsEr
     })
 }
 
-/// 按前驱规则选择不大于目标哈希的最后一个 dx 条目。
+/// 在按哈希升序排列的 `dx_entry` 数组中二分查找不大于目标 `hash` 的最后一个前驱条目下标。
 fn dx_select(data: &[u8], offset: usize, count: usize, hash: u32) -> Result<usize, FsError> {
     let mut low = 1usize;
     let mut high = count;
@@ -303,7 +408,9 @@ fn dx_select(data: &[u8], offset: usize, count: usize, hash: u32) -> Result<usiz
     Ok(low - 1)
 }
 
-/// 从一个已验证索引块中选择目标哈希的子范围。
+/// 读取并校验指定的 HTree 索引块，在其中二分选出覆盖目标 `hash` 的子范围条目。
+///
+/// 返回 `(当前层访问帧, 选中的子条目, 根块声明的间接深度)`（非根块第三项恒为 `0`）。
 fn read_dx_frame(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -340,7 +447,7 @@ fn read_dx_frame(
     })?
 }
 
-/// 从已选中的索引块读取指定条目并核对目录锁保护下的原条目数。
+/// 重新读取 `frame` 所在索引块中下标为 `position` 的条目，并校验节点有效条目总数与初次探测时一致。
 fn read_dx_entry(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -373,7 +480,7 @@ fn read_dx_entry(
     })?
 }
 
-/// 取得节点首项，用于从父索引的相邻范围继续下降。
+/// 读取并校验指定的内部索引节点块，返回指向其首项（`position == 0`）的访问帧与对应子条目，用于跨子树顺序推进。
 fn read_dx_first(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -399,13 +506,14 @@ fn read_dx_first(
     })?
 }
 
-/// 按真实索引前驱定位叶块，并累积该叶区间的最小 major 哈希。
+/// 自 HTree 根块逐层探测目标 `hash` 所属的初始叶块路径，同时检测索引环路并累积叶区间的最小 `major` 哈希下界。
 fn dx_probe(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
     map_root: &[u8; 60],
     hash: u32,
 ) -> Result<DxPath, FsError> {
+    // Step 1: 读取并校验逻辑第 0 块（`dx_root`），获取顶层前驱条目与间接索引层数 `depth`。
     let (root, entry, depth) = read_dx_frame(volume, inode, map_root, 0, true, hash)?;
     let mut path = DxPath {
         frames: [DxFrame::default(); DX_MAX_INDIRECT_LEVELS + 1],
@@ -415,6 +523,7 @@ fn dx_probe(
     };
     path.frames[0] = root;
     let mut logical = entry.block;
+    // Step 2: 沿内部索引节点逐层下降，利用 `visited` 数组拦截指向已访问节点的环路损坏。
     let mut visited = [u64::MAX; DX_MAX_INDIRECT_LEVELS];
     let max_frames = dx_max_indirect_levels(volume.geometry()) + 1;
     let mut level = 0usize;
@@ -434,7 +543,9 @@ fn dx_probe(
     Ok(path)
 }
 
-/// 按树内序查询下一叶区间下界；高于必须覆盖的 major 时不读取其子节点。
+/// 按 HTree 树内中序将 `path` 推进到下一个叶块区间，并返回新叶区间的 `major` 哈希下界。
+///
+/// 若传入 `through_major` 且下一区间的起始下界已严格大于 `through_major`，则直接返回该下界而无需读取下级内部索引块；若整棵树已遍历完毕则返回 `Ok(None)`。
 fn next_dx_leaf(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -442,6 +553,7 @@ fn next_dx_leaf(
     path: &mut DxPath,
     through_major: Option<u32>,
 ) -> Result<Option<u32>, FsError> {
+    // 自底向上回溯路径栈，寻找第一个尚未走到末尾槽位的索引层。
     let mut level = path.len;
     while 0 < level {
         level -= 1;
@@ -469,7 +581,7 @@ fn next_dx_leaf(
     Ok(None)
 }
 
-/// 递归穿过剩余 dx 索引层，按树内序访问真实叶块。
+/// 递归遍历剩余 `levels` 层 HTree 内部索引节点，按树内顺序对每个叶块逻辑块号调用 `visit`（返回 `Ok(false)` 时提前终止遍历）。
 fn for_each_dx_leaf(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -499,7 +611,7 @@ fn for_each_dx_leaf(
     Ok(true)
 }
 
-/// 按树内序逐个访问叶块，不分配目录项或叶位置副本。
+/// 按 HTree 索引树顺序遍历目录的所有叶块，无需在堆上收集全部叶块列表；若所有叶块均返回 `true` 则最终返回 `Ok(true)`。
 fn for_each_leaf(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -523,7 +635,9 @@ fn for_each_leaf(
     Ok(true)
 }
 
-/// 验证普通目录尾或 dx 根/节点及其正式校验范围，返回可枚举区域。
+/// 校验单个目录块的物理布局、记录边界与元数据 CRC32C 校验和，返回该块的布局类型及可枚举范围。
+///
+/// 参数 `index` 指示当块不是 `dx_root` 时，调用方是否预期将其作为内部索引节点（`dx_node`）解析。
 pub(crate) fn verify_directory(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -535,6 +649,7 @@ pub(crate) fn verify_directory(
     let indexed = inode.flags & INDEX != 0;
     let root = indexed && logical == 0;
     let node = indexed && !root && index;
+    // 分支 1: 校验 HTree 根块（`Root`）或内部索引节点（`Index`），根块还需核对 `.` 与 `..` 固定槽位。
     if root || node {
         verify_dx(g, inode, logical, data, root)?;
         if root {
@@ -556,6 +671,7 @@ pub(crate) fn verify_directory(
         return Ok(DirectoryLayout::Index);
     }
 
+    // 分支 2: 校验普通叶块（`Leaf`）；若启用 `METADATA_CSUM`，先核对末尾 12 字节伪目录项头与整块 CRC32C。
     let end = if g.features_ro_compat & METADATA_CSUM != 0 {
         let end = data.len() - codec::DIR_TAIL_BYTES;
         if codec::le32(data, end)? != 0
@@ -571,6 +687,7 @@ pub(crate) fn verify_directory(
         data.len()
     };
 
+    // 逐条遍历叶块内的记录链表，确保所有 `rec_len` 严丝合缝地拼接到有效载荷末尾 `end`。
     let mut offset = 0;
     while offset < end {
         offset = record(g, data, offset, end)?.next;
@@ -581,7 +698,7 @@ pub(crate) fn verify_directory(
     Ok(DirectoryLayout::Leaf { end })
 }
 
-/// 验证 dx 布局、条目排序与逻辑块地址，CRC 不包含未使用索引槽。
+/// 校验 HTree 根块或内部索引节点的头部字段、容量上限、条目哈希升序性、子块逻辑范围及尾部 CRC32C（不含未使用的空闲索引槽）。
 fn verify_dx(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -589,6 +706,7 @@ fn verify_dx(
     data: &[u8],
     root: bool,
 ) -> Result<(), FsError> {
+    // Step 1: 核对 `dx_root` 的 `.` / `..` 覆盖头与 `dx_root_info`，或 `dx_node` 的 8 字节全零伪目录项头。
     let offset = if root {
         if codec::le16(data, 4)? != 12
             || codec::le16(data, 16)? as usize != data.len() - 12
@@ -615,6 +733,7 @@ fn verify_dx(
         DX_NODE_ENTRIES_OFFSET
     };
 
+    // Step 2: 核对 `dx_countlimit` 与块大小、可选 8 字节 `dx_tail` 计算出的槽位上限一致。
     let limit = usize::from(codec::le16(data, offset)?);
     let count = usize::from(codec::le16(data, offset + 2)?);
     let tail_len = if g.features_ro_compat & METADATA_CSUM != 0 {
@@ -626,6 +745,7 @@ fn verify_dx(
         return Err(FsError::Corrupt);
     }
 
+    // Step 3: 逐项检查哈希键非递减排序，并确保目标逻辑块号非零、未越过目录末尾且未自环指向当前块。
     let blocks = inode.size / g.block_size as u64;
     let mut previous_hash = 0u32;
     for index in 0..count {
@@ -645,13 +765,13 @@ fn verify_dx(
 
     if tail_len != 0 {
         let tail = offset + limit * DX_ENTRY_BYTES;
-        // dx 尾的保留字节只参与 CRC，读取时不赋予零值约束。
+        // `dx_tail` 前 4 字节保留字段参与 CRC 计算，但磁盘格式不强制其为零值。
         codec::verify_dx_checksum(inode, data, offset + count * DX_ENTRY_BYTES, tail)?;
     }
     Ok(())
 }
 
-/// 解码一个真实记录并限制名称及下一记录边界，保留非 UTF-8 字节。
+/// 解码偏移 `offset` 处的单条目录项记录，校验 4 字节对齐、名字边界、剩余碎片尺寸与 `file_type` 编码，原样保留非 UTF-8 原始字节名字。
 fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record, FsError> {
     let number = u64::from(codec::le32(data, offset)?);
     let len = usize::from(codec::le16(data, offset + 4)?);
@@ -703,7 +823,9 @@ fn record(g: &Geometry, data: &[u8], offset: usize, end: usize) -> Result<Record
     })
 }
 
-/// 取指定真实游标之后的首个活记录，索引伪项及尾记录不进入结果。
+/// 在已校验的目录块内查找偏移不小于 `requested` 的第一条非空目录项（忽略 `inode == 0` 的已删除槽位、HTree 内部节点及块尾校验伪项）。
+///
+/// 若 `requested` 落在某条记录中间或越过有效区且不等于整块末尾，则返回 `FsError::InvalidOperation`。
 fn scan_next(
     g: &Geometry,
     data: &[u8],
@@ -734,16 +856,22 @@ fn scan_next(
     Ok(None)
 }
 
+/// 在目录中成功定位到的有效目录项位置与属性摘要。
 #[derive(Clone, Copy)]
 struct FoundEntry {
+    /// 该目录项所在的目录文件逻辑块号。
     logical: u64,
+    /// 该目录项在所属目录块内的起始字节偏移。
     offset: usize,
+    /// 目录项指向的目标 Inode 编号（非零）。
     number: u64,
+    /// 目录项名字的字节长度。
     name_len: usize,
+    /// 目录项中记录的目标对象类型（未启用 `FILETYPE` 或编码为 `0` 时为 `None`）。
     kind: Option<InodeKind>,
 }
 
-/// 在一个已校验的普通叶或目录根中按原始字节定位名字。
+/// 读取并校验指定的普通叶块或 HTree 根块，按原始字节精确匹配查找名为 `name` 的有效目录项。
 fn find_entry_in_block(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -780,7 +908,7 @@ fn find_entry_in_block(
     })?
 }
 
-/// 读取根中声明的哈希版本，不能用主超级块默认值替代旧目录自身格式。
+/// 读取 HTree 根块 `dx_root_info` 中声明的目录专属哈希算法版本号（不能用超级块的默认哈希版本替代既有目录自身的格式）。
 fn root_hash_version(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -795,7 +923,7 @@ fn root_hash_version(
     })?
 }
 
-/// 在 indexed 目录沿 dx_probe 路径及同 major continuation 叶查找名字。
+/// 在目录中查找名为 `name` 的目录项：线性目录按逻辑块顺序扫描，HTree 目录沿索引前驱及同哈希溢出链探测。
 fn find_entry(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -807,6 +935,7 @@ fn find_entry(
         return Err(FsError::InvalidName);
     }
 
+    // 分支 1: 普通线性目录按逻辑块号从 `0` 到末尾依次扫描。
     if inode.flags & INDEX == 0 {
         for logical in 0..inode.size / volume.geometry().block_size as u64 {
             if let Some(entry) = find_entry_in_block(volume, inode, map_root, logical, name)? {
@@ -815,10 +944,12 @@ fn find_entry(
         }
         return Ok(None);
     }
+    // 分支 2: HTree 索引目录中 `.` 与 `..` 固定存放在逻辑第 0 块头部，不参与哈希索引路由。
     if name == b"." || name == b".." {
         return find_entry_in_block(volume, inode, map_root, 0, name);
     }
 
+    // 分支 3: 计算名字哈希并探测起始叶块；若相邻叶块起始下界仍不大于目标哈希（即存在跨块哈希碰撞），继续向后扫描。
     let hash_version = root_hash_version(volume, inode, map_root)?;
     let (hash, _) = codec::directory_hash(volume.geometry(), hash_version, name)?;
     let mut path = dx_probe(volume, inode, map_root, hash)?;
@@ -836,7 +967,9 @@ fn find_entry(
     }
 }
 
-/// 按 HTree 路由索引目录查询，普通目录保持真实块顺序扫描。
+/// 在目录中查找单个路径组件 `name` 对应的目标 Inode 编号（未命中返回 `Ok(None)`）。
+///
+/// 调用方需持有目录读保护以及 `disk_root` 块映射读保护。
 pub(crate) fn lookup(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -846,14 +979,18 @@ pub(crate) fn lookup(
     Ok(find_entry(volume, inode, map_root, name)?.map(|entry| entry.number))
 }
 
+/// HTree 目录遍历时按哈希序与块内偏移参与排序的候选目录项。
 #[derive(Clone, Copy)]
 struct HashCandidate {
+    /// 目录项的 32 位主哈希值（最低位始终为 `0`）。
     major: u32,
+    /// 目录项的 32 位次哈希值。
     minor: u32,
+    /// 目录项在目录块内的物理位置与属性摘要。
     entry: FoundEntry,
 }
 
-/// 判断索引 cookie 之后的真实记录是否尚未交付。
+/// 判断指定目录项（由 `(major, minor)` 哈希对及块内位置 `position` 标识）是否严格排在当前遍历游标 `cursor` 之后（或恰为游标指向的未碰撞首项）。
 fn follows_cursor(
     cursor: &DirectoryCursor,
     major: u32,
@@ -882,7 +1019,7 @@ fn follows_cursor(
     }
 }
 
-/// 比较同一目录中按 major、minor 和真实记录位置排序的候选项。
+/// 比较两个 HTree 遍历候选项的产出先后顺序：依次按 `(major, minor, 逻辑块号, 块内字节偏移)` 字典序升序排列。
 fn precedes(left: HashCandidate, right: HashCandidate) -> bool {
     (
         left.major,
@@ -897,7 +1034,7 @@ fn precedes(left: HashCandidate, right: HashCandidate) -> bool {
     )
 }
 
-/// 按目录哈希和真实位置保留游标后的前两项。
+/// 维护游标之后排序最靠前的两个候选项（`best` 为本次将返回的目录项，`following` 用于构造指向下一项的 `next_cursor`）。
 fn keep_two_candidates(
     best: &mut Option<HashCandidate>,
     following: &mut Option<HashCandidate>,
@@ -911,7 +1048,7 @@ fn keep_two_candidates(
     }
 }
 
-/// 按已提交哈希和碰撞位置选出下一项，只扫描其候选所在的 HTree 哈希区间。
+/// 在 HTree 哈希索引目录中读取游标 `cursor` 对应的下一条目录项，并生成携带碰撞续读位置的下一个游标。
 fn next_indexed(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -928,6 +1065,7 @@ fn next_indexed(
         return Ok(None);
     }
 
+    // Step 1: 根块中的 `.` 与 `..` 不在叶块内，分别以固定伪主哈希 `0` 和 `2` 纳入候选比较。
     let g = volume.geometry();
     let version = root_hash_version(volume, inode, map_root)?;
     let mut best = None;
@@ -962,6 +1100,7 @@ fn next_indexed(
         }
     }
 
+    // Step 2: 从游标当前的 `major` 哈希探测起始叶块，仅扫描可能包含更优 `best` 或 `following` 的哈希桶区间。
     let mut path = dx_probe(volume, inode, map_root, *major)?;
     loop {
         let logical = path.leaf;
@@ -1010,12 +1149,13 @@ fn next_indexed(
         else {
             break;
         };
-        // continuation 位清除后仍等于候选 major，minor 与真实位置尚未排尽，须扫描整个哈希桶。
+        // 只要下一叶区间的起始下界等于 `following.major`，说明同主哈希桶跨块溢出尚未扫完，仍可能有更小的 `(minor, position)`。
         if following.is_some_and(|next| next.major < lower_bound) {
             break;
         }
     }
 
+    // Step 3: 为选中的最佳候选项分配名字缓冲区并拷贝原始名字字节。
     let Some(candidate) = best else {
         return Ok(None);
     };
@@ -1041,6 +1181,7 @@ fn next_indexed(
         Ok::<_, FsError>(())
     })??;
 
+    // Step 4: 根据次优候选项 `following` 计算 `next_cursor`；若两者 64 位哈希完全相同，记录当前项物理位置以消解碰撞。
     let next_cursor = match following {
         Some(next) => DirectoryCursor::Indexed {
             major: next.major,
@@ -1070,7 +1211,9 @@ fn next_indexed(
     }))
 }
 
-/// 当前后端布局下返回下一项；升为 HTree 后沿用旧游标的 cookie 数值。
+/// 读取目录游标之后的下一条有效目录项；若目录在打开期间由线性布局升级为 HTree 布局，自动将旧字节 Cookie 转换为哈希游标继续遍历。
+///
+/// 调用方需持有目录读保护以及 `disk_root` 块映射读保护。
 pub(crate) fn next(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -1121,18 +1264,26 @@ pub(crate) fn next(
     Ok(None)
 }
 
+/// 目录两阶段修改的准备器：在内存中维护受影响目录块的局部拷贝与新逻辑块预留列表，在 `finish` 前不分配物理块。
 struct DirectoryEditBuilder<'a> {
+    /// 目标目录所属的 ext4 卷引用。
     volume: &'a Ext4Volume,
+    /// 修改前目标目录的 Inode 元数据快照。
     inode: &'a InodeMetadata,
+    /// 修改前目标目录的 60 字节内联块映射根。
     map_root: &'a [u8; 60],
+    /// 本次修改期间已加载或新构造的目录块内存镜像列表。
     images: Vec<DirectoryImage>,
+    /// 本次修改新预留的目录逻辑块号列表。
     logical_blocks: Vec<u64>,
+    /// 下一个可供分配的目录末尾逻辑块号（初始为原目录包含的总块数）。
     next_logical: u64,
+    /// 修改完成后的目标 Inode 标志位（升级为 HTree 时置位 `INDEX`）。
     next_flags: u32,
 }
 
 impl<'a> DirectoryEditBuilder<'a> {
-    /// 创建只保存当前目录局部块图像的准备对象，不分配磁盘块。
+    /// 基于当前目录的元数据与块映射根创建空的编辑准备器，此时不触发任何磁盘读取或块分配。
     fn new(volume: &'a Ext4Volume, inode: &'a InodeMetadata, map_root: &'a [u8; 60]) -> Self {
         Self {
             volume,
@@ -1145,7 +1296,7 @@ impl<'a> DirectoryEditBuilder<'a> {
         }
     }
 
-    /// 获取一次目录编辑内共享的可变块图像。
+    /// 获取指定逻辑块的可变内存镜像；首次访问既有块时从元数据缓存拷贝一份块字节副本。
     fn image(&mut self, logical: u64) -> Result<&mut DirectoryImage, FsError> {
         if let Some(index) = self
             .images
@@ -1160,7 +1311,7 @@ impl<'a> DirectoryEditBuilder<'a> {
         Ok(self.images.last_mut().expect("reserved directory image"))
     }
 
-    /// 预留一个尚未映射的新目录逻辑块号。
+    /// 在目录末尾顺序预留一个新的逻辑块号（受限于 HTree 28 位块号上限），暂不分配底层物理块。
     fn reserve_logical(&mut self) -> Result<u64, FsError> {
         let logical = self.next_logical;
         if u64::from(DX_BLOCK_MASK) < logical {
@@ -1174,7 +1325,7 @@ impl<'a> DirectoryEditBuilder<'a> {
         Ok(logical)
     }
 
-    /// 保存已构造的新块图像，物理窗口在整批映射准备后再取得。
+    /// 登记一个已在内存中构造完毕的新增逻辑块字节镜像，对应的元数据缓存窗口留待 `finish` 批量分配物理块后绑定。
     fn push_new_image(&mut self, logical: u64, bytes: Vec<u8>) -> Result<(), FsError> {
         if bytes.len() != self.volume.geometry().block_size
             || !self.logical_blocks.contains(&logical)
@@ -1190,7 +1341,9 @@ impl<'a> DirectoryEditBuilder<'a> {
         Ok(())
     }
 
-    /// 准备目录叶、索引和块树，失败时仍未修改任何共同字节。
+    /// 为所有新预留逻辑块批量分配物理块映射并绑定元数据缓存窗口，封装为可无失败发布的 [`PreparedDirectoryEdit`]。
+    ///
+    /// 若块分配、溢出检查或缓存窗口获取失败，会自动失效未发布的新块缓存窗口并归还物理块，不会改动任何已发布的盘面或缓存状态。
     fn finish(self) -> Result<PreparedDirectoryEdit, FsError> {
         let Self {
             volume,
@@ -1201,6 +1354,7 @@ impl<'a> DirectoryEditBuilder<'a> {
             next_logical,
             next_flags,
         } = self;
+        // 快速路径：未新增任何逻辑块，所有变更均为既有目录块的原地修改。
         if logical_blocks.is_empty() {
             if images.iter().any(|image| image.buffer.is_none()) {
                 return Err(FsError::Corrupt);
@@ -1216,6 +1370,7 @@ impl<'a> DirectoryEditBuilder<'a> {
             });
         }
 
+        // Step 1: 批量分配新增目录块所需的物理数据块及 Extent/间接树内部节点，并核算更新后的字节大小与扇区计数。
         let inode_data = inode.with_block(map_root);
         let mapping = volume.prepare_directory_mappings(&inode_data, map_root, &logical_blocks)?;
         let size = match next_logical.checked_mul(volume.geometry().block_size as u64) {
@@ -1243,6 +1398,7 @@ impl<'a> DirectoryEditBuilder<'a> {
             }
         };
 
+        // Step 2: 为每个新增逻辑块获取对应的元数据缓存窗口句柄；若中途出错则统一回滚块映射预留。
         let mut images = images;
         let mut failure = None;
         for image in &mut images {
@@ -1279,7 +1435,7 @@ impl<'a> DirectoryEditBuilder<'a> {
     }
 }
 
-/// 复制一个已存在目录块的当前缓存字节，后续只提交本块的局部变更。
+/// 读取既有逻辑目录块的元数据缓存窗口并拷贝出一份独立字节副本，供本次编辑局部修改。
 fn read_image(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -1304,7 +1460,7 @@ fn read_image(
     })
 }
 
-/// 为一个全新 ext4 目录块准备明确大小的零图像。
+/// 精确分配一块长度等于 `size`（文件系统块大小）的全零目录块内存镜像。
 fn empty_block(size: usize) -> Result<Vec<u8>, FsError> {
     let mut bytes = Vec::new();
     bytes
@@ -1314,12 +1470,12 @@ fn empty_block(size: usize) -> Result<Vec<u8>, FsError> {
     Ok(bytes)
 }
 
-/// 返回含名称和固定八字节头的最小四字节对齐 dirent 长度。
+/// 计算容纳 `name_len` 字节名字与 8 字节头部所需的最小 4 字节对齐 `rec_len`。
 fn minimum_record_len(name_len: usize) -> usize {
     (DIRENT_HEADER_BYTES + name_len + DIRENT_ROUND) & !DIRENT_ROUND
 }
 
-/// 将受支持 inode 类型编码成 ext4 的原生 file_type。
+/// 将 VFS `InodeKind` 映射为 ext4 目录项头部 `file_type` 字段的磁盘编码值。
 fn directory_file_type(kind: InodeKind) -> u8 {
     match kind {
         InodeKind::Regular => 1,
@@ -1333,7 +1489,7 @@ fn directory_file_type(kind: InodeKind) -> u8 {
     }
 }
 
-/// 在准备好的槽中写入完整原始名字和准确记录长度。
+/// 在目录块切片 `data[offset..offset + rec_len]` 槽位中清零填充并编码一条完整的 `ext4_dir_entry_2` 记录。
 fn write_record(
     g: &Geometry,
     data: &mut [u8],
@@ -1366,7 +1522,7 @@ fn write_record(
     Ok(())
 }
 
-/// 在已有叶块的空记录或有效记录尾部插入 dirent，不移动其他名字。
+/// 尝试在叶块有效区 `data[..end]` 中复用空闲槽位或拆分有效记录的尾部剩余空间插入新目录项，成功后重算块尾 CRC 并返回 `Ok(true)`；空间不足时保持原字节不变并返回 `Ok(false)`。
 fn insert_record(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -1409,7 +1565,7 @@ fn insert_record(
     Ok(false)
 }
 
-/// 建立具有一个完整空闲记录和合法目录尾 CRC 的新叶块图像。
+/// 构造一个全新的空目录叶块镜像：包含一条覆盖整个有效区的空闲记录（`inode = 0, rec_len = end`）及合法的末尾校验尾。
 fn empty_leaf(g: &Geometry, inode: &InodeMetadata) -> Result<Vec<u8>, FsError> {
     let mut data = empty_block(g.block_size)?;
     let end = if g.features_ro_compat & METADATA_CSUM != 0 {
@@ -1422,7 +1578,7 @@ fn empty_leaf(g: &Geometry, inode: &InodeMetadata) -> Result<Vec<u8>, FsError> {
     Ok(data)
 }
 
-/// 校验一个新增、删除或移动所使用的单个原始组件。
+/// 校验目录增删改操作的目标文件名组件：拒绝空名、超长名、含 `\0` 或 `/` 以及保留项 `.` 和 `..`。
 fn check_edit_name(name: &[u8]) -> Result<(), FsError> {
     if name.is_empty()
         || NAME_MAX < name.len()
@@ -1436,7 +1592,7 @@ fn check_edit_name(name: &[u8]) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 校验新目录项引用的 inode 号可以写入 ext4 的 32 位 dirent 字段。
+/// 校验待写入目录项的 Inode 编号非零、未超过卷总 Inode 数且可装入 32 位 `inode` 字段。
 fn check_inode_number(g: &Geometry, number: u64) -> Result<(), FsError> {
     if number == 0 || g.inodes_count < number || u64::from(u32::MAX) < number {
         return Err(FsError::InvalidOperation);
@@ -1444,7 +1600,7 @@ fn check_inode_number(g: &Geometry, number: u64) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 返回普通目录数据区域在 checksum tail 之前的准确结束位置。
+/// 返回普通目录叶块中目录项有效载荷区的结束字节偏移（启用 `METADATA_CSUM` 时扣除末尾 12 字节校验尾）。
 fn leaf_end(g: &Geometry) -> usize {
     g.block_size
         - if g.features_ro_compat & METADATA_CSUM != 0 {
@@ -1454,7 +1610,7 @@ fn leaf_end(g: &Geometry) -> usize {
         }
 }
 
-/// 删除目标记录，将空间并入前项；首项保留 rec_len 以维持后续记录位置。
+/// 删除叶块中偏移为 `target` 的目录项并重算块尾 CRC：若存在前驱记录则将 `rec_len` 并入前驱槽位；若为块首第一条记录则保留原 `rec_len` 并将 `inode` 置零，避免移动后续记录改变并发遍历游标的字节偏移。
 fn remove_record(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -1484,7 +1640,7 @@ fn remove_record(
     Err(FsError::NotFound)
 }
 
-/// 替换已定位记录的 inode/type 字段，目录哈希和名字保持原样。
+/// 在目标目录项名字与长度保持不变的前提下，原地替换其指向的 Inode 编号与 `file_type` 编码并重算块尾 CRC。
 #[expect(
     clippy::too_many_arguments,
     reason = "记录窗口、旧 inode 身份和新 inode/type 在同一校验与校验和更新中直接使用"
@@ -1510,15 +1666,20 @@ fn replace_record_inode(
     codec::update_directory_checksum(g, inode, data)
 }
 
+/// 叶块分裂或升级 HTree 时提取出的有效目录项哈希与源块切片范围摘要。
 #[derive(Clone, Copy)]
 struct HashedRecord {
+    /// 目录项名字计算出的 32 位主哈希值（`major`）。
     hash: u32,
+    /// 该记录在原目录块镜像中的起始字节偏移。
     offset: usize,
+    /// 目录项名字的字节长度。
     name_len: usize,
+    /// 该记录在原目录块中占用的 `rec_len` 字节长度。
     rec_len: usize,
 }
 
-/// 收集一个叶的活动记录哈希和原始范围，名字仍由单个块图像借用。
+/// 扫描叶块内的全部非空目录项，计算各自的 `major` 哈希并按 `(hash, 原块内偏移)` 升序排列返回。
 fn hashed_records(
     g: &Geometry,
     data: &[u8],
@@ -1548,7 +1709,7 @@ fn hashed_records(
     Ok(records)
 }
 
-/// 将一组真实记录紧密写入新叶，并扩展末项覆盖剩余空间。
+/// 将 `records` 列表引用的原目录项按紧凑最小长度顺序拷贝到新叶块 `destination`，拉长最后一条记录覆盖至 `end`，并重算块尾 CRC。
 fn pack_leaf(
     g: &Geometry,
     inode: &InodeMetadata,
@@ -1582,7 +1743,7 @@ fn pack_leaf(
     codec::update_directory_checksum(g, inode, destination)
 }
 
-/// 计算 dx root 或普通 index-node 的可用条目容量。
+/// 计算单个 HTree 根块（`root == true`）或内部索引节点块所能容纳的最大 `dx_entry` 槽位数（`limit`）。
 fn dx_limit(g: &Geometry, root: bool) -> usize {
     let offset = if root {
         DX_ROOT_ENTRIES_OFFSET
@@ -1597,7 +1758,7 @@ fn dx_limit(g: &Geometry, root: bool) -> usize {
     (g.block_size - offset - tail) / DX_ENTRY_BYTES
 }
 
-/// 将已准备的 dx 条目和真实容量写入局部块图像并重算尾 CRC。
+/// 将排序完毕的 `dx_entry` 切片与容量头部写入指定索引块的内存镜像，清零未使用的尾部槽位并更新 `dx_tail` 校验和。
 fn write_dx_node(
     builder: &mut DirectoryEditBuilder<'_>,
     logical: u64,
@@ -1656,16 +1817,23 @@ fn write_dx_node(
     Ok(())
 }
 
+/// HTree 索引节点分裂或插入期间在内存中解码出的可变节点工作集。
 struct DxNodeEdit {
+    /// 该索引块在目录文件内的逻辑块号。
     logical: u64,
+    /// 是否为逻辑第 0 块的 `dx_root`。
     root: bool,
+    /// 本次下降路径在该节点中命中的前驱条目下标（新分隔条目将插入到 `position + 1`）。
     position: usize,
+    /// 根块记录的当前间接索引深度（内部节点恒为 `0`）。
     depth: u8,
+    /// 该节点可容纳的最大 `dx_entry` 条目上限。
     limit: usize,
+    /// 节点内当前有效的全部 `dx_entry` 条目列表。
     entries: Vec<DxEntry>,
 }
 
-/// 解码当前索引节点的条目到准备区，保留源块只在发布时修改。
+/// 从编辑准备器中校验并解码 `frame` 对应索引块的全部有效 `dx_entry` 到内存向量，供插入或分裂修改。
 fn load_dx_node(
     builder: &mut DirectoryEditBuilder<'_>,
     frame: DxFrame,
@@ -1716,7 +1884,7 @@ fn load_dx_node(
     })
 }
 
-/// 在 dx 路径插入分裂边界，必要时分裂 index-node 或增长根深度。
+/// 向 HTree 路径末端索引节点插入新叶块的分隔条目 `(hash, block)`；若节点满则自底向上分裂内部节点，直至必要时将根块下推一层并增加树深度。
 fn insert_dx_block(
     builder: &mut DirectoryEditBuilder<'_>,
     path: &DxPath,
@@ -1726,6 +1894,7 @@ fn insert_dx_block(
     let mut level = path.len.checked_sub(1).ok_or(FsError::Corrupt)?;
     let mut addition = DxEntry { hash, block };
     loop {
+        // Step 1: 在当前层命中槽位之后插入新条目；若未超出节点容量上限则直接写回镜像并返回。
         let frame = path.frames[level];
         let mut node = load_dx_node(builder, frame)?;
         let insertion = node.position + 1;
@@ -1735,6 +1904,7 @@ fn insert_dx_block(
             return write_dx_node(builder, node.logical, node.root, node.depth, &node.entries);
         }
 
+        // Step 2: 若根块容量溢出且未超过最大间接层数上限，分配一个新内部索引块承接原根全部条目，根块改为单条目指向该新块并将 `depth + 1`。
         if node.root {
             if dx_max_indirect_levels(builder.volume.geometry()) < usize::from(node.depth) + 1 {
                 return Err(FsError::NoSpace);
@@ -1750,6 +1920,7 @@ fn insert_dx_block(
             return write_dx_node(builder, node.logical, true, node.depth + 1, &root);
         }
 
+        // Step 3: 普通内部索引节点溢出时折半拆分为左右两个节点，将右半部分首项哈希向上提升插入父节点。
         if level == 0 {
             return Err(FsError::Corrupt);
         }
@@ -1772,7 +1943,7 @@ fn insert_dx_block(
     }
 }
 
-/// 分裂一个已满叶，按真实名字哈希分配记录并发表 continuation separator。
+/// 分裂空间不足的 HTree 叶块：按哈希排序折半重排既有记录、写入待插入新项，并将右叶块及其起始哈希（含跨块同哈希 continuation 标志）登记到上层索引树。
 fn split_leaf(
     builder: &mut DirectoryEditBuilder<'_>,
     path: &DxPath,
@@ -1794,6 +1965,7 @@ fn split_leaf(
         return Err(FsError::NoSpace);
     }
 
+    // Step 1: 按累计记录字节数接近半块大小寻找分裂点 `split`，计算右半区的起始哈希 `boundary` 及是否存在跨块同哈希碰撞（`continued`）。
     let (split, boundary, continued) = if records.len() == 1 {
         let old_hash = records[0].hash;
         if old_hash <= hash {
@@ -1822,6 +1994,7 @@ fn split_leaf(
         (split, boundary, records[split - 1].hash == boundary)
     };
 
+    // Step 2: 预留新叶块逻辑号，将左右两半记录分别紧密打包到两个块缓冲区，再将本次新增目录项插入对应的半区。
     let new_logical = builder.reserve_logical()?;
     let mut left = empty_block(g.block_size)?;
     let mut right = empty_block(g.block_size)?;
@@ -1839,12 +2012,13 @@ fn split_leaf(
         return Err(FsError::NoSpace);
     }
 
+    // Step 3: 更新原叶块镜像、登记新右叶块镜像，并将右叶分隔键（最低位或上 `continued`）插入 HTree 索引路径。
     builder.image(path.leaf)?.bytes = left;
     builder.push_new_image(new_logical, right)?;
     insert_dx_block(builder, path, boundary + u32::from(continued), new_logical)
 }
 
-/// 将单块普通目录迁移为 HTree，原普通项移入真实叶后执行叶分裂。
+/// 将写满的单块线性目录升级为 HTree 哈希索引目录：把除 `.` / `..` 外的既有项迁入新叶块、将第 0 块原地改写为 `dx_root`，随后对叶块执行首次分裂并插入新项。
 fn make_indexed_directory(
     builder: &mut DirectoryEditBuilder<'_>,
     name: &[u8],
@@ -1854,6 +2028,7 @@ fn make_indexed_directory(
     let g = builder.volume.geometry();
     let inode = builder.inode;
     let version = g.default_hash_version;
+    // Step 1: 校验原第 0 块的 `.` 与 `..` 记录，提取其余全部有效目录项并打包进暂存叶块缓冲区。
     let (parent_number, leaf) = {
         let root = builder.image(0)?;
         let layout = verify_directory(g, inode, 0, &root.bytes, false)?;
@@ -1882,6 +2057,7 @@ fn make_indexed_directory(
         (parent.number, leaf)
     };
 
+    // Step 2: 预留首个叶块逻辑号并置位 `INDEX` 标志，将第 0 块重写为包含 `.`、`..`、`dx_root_info` 与单条初始索引项的 `dx_root`。
     let leaf_logical = builder.reserve_logical()?;
     builder.push_new_image(leaf_logical, leaf)?;
     builder.next_flags |= INDEX;
@@ -1915,6 +2091,7 @@ fn make_indexed_directory(
     }];
     write_dx_node(builder, 0, true, 0, &root_entries)?;
 
+    // Step 3: 构造指向该初始叶块的单层路径，复用 `split_leaf` 完成叶块拆分与本次新目录项的写入。
     let mut frames = [DxFrame::default(); DX_MAX_INDIRECT_LEVELS + 1];
     frames[0] = DxFrame {
         logical: 0,
@@ -1937,7 +2114,7 @@ fn make_indexed_directory(
     )
 }
 
-/// 将名字写入既有目录叶，空间不足时沿当前 HTree 路径准备分裂。
+/// 在编辑准备器中插入一条新目录项：HTree 目录沿哈希路径插入或分裂叶块；线性目录优先复用既有块空闲空间，满时升级为 HTree（单块且启用 `DIR_INDEX`）或追加新线性叶块。
 fn add_to_builder(
     builder: &mut DirectoryEditBuilder<'_>,
     name: &[u8],
@@ -1990,7 +2167,9 @@ fn add_to_builder(
     builder.push_new_image(logical, data)
 }
 
-/// 先完成原始字节名冲突检查，再准备目录项及全部新增 HTree 映射。
+/// 预备向目录插入新目录项 `(name, number, kind)`：先完成名字合法性与重名冲突检查，再构造包含所有块修改与新增块预留的 [`PreparedDirectoryEdit`]。
+///
+/// 调用方需持有目标目录的写序列化锁与 `disk_root` 读锁（可睡眠上下文）。
 pub(crate) fn prepare_add(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2011,7 +2190,9 @@ pub(crate) fn prepare_add(
     builder.finish()
 }
 
-/// 删除父目录中这个名字的唯一 dirent，不释放目标 inode 或目录块。
+/// 预备从父目录删除名为 `name` 的目录项（仅清除或合并目录项记录，不释放目标 Inode 或回收空目录块）。
+///
+/// 调用方需持有父目录的写序列化锁与 `disk_root` 读锁（可睡眠上下文）。
 pub(crate) fn prepare_remove(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2033,7 +2214,9 @@ pub(crate) fn prepare_remove(
     builder.finish()
 }
 
-/// 替换同一父写侧重新查到的现有目录项 inode 身份。
+/// 预备将父目录中已存在的目录项 `name` 原地改指新的目标 `(number, kind)`（用于跨目录 `rename` 覆盖已存在目标）。
+///
+/// 调用方需持有目标父目录的写序列化锁与 `disk_root` 读锁（可睡眠上下文）。
 pub(crate) fn prepare_replace(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2067,7 +2250,9 @@ pub(crate) fn prepare_replace(
     builder.finish()
 }
 
-/// 同父原生 rename 同时准备 source 删除和 destination 安装或替换。
+/// 预备同一父目录内的 `rename` 操作：在同一个目录编辑事务中原子完成源目录项 `old_name` 的移除与目标项 `new_name` 的新建或覆盖替换。
+///
+/// 调用方需持有该目录的写序列化锁与 `disk_root` 读锁；若新旧名字相同或已指向同一 Inode，返回 `changed() == false` 的空编辑。
 #[expect(
     clippy::too_many_arguments,
     reason = "同父 rename 在同一旧根上核对源与覆盖目标并准备一份目录编辑"
@@ -2110,6 +2295,7 @@ pub(crate) fn prepare_move(
 
     let mut builder = DirectoryEditBuilder::new(volume, inode, map_root);
     let g = volume.geometry();
+    // 分支 1: 目标名字已存在且允许覆盖——先原地替换目标记录的 Inode 身份，再删除源记录（两者可能位于同一叶块或不同叶块）。
     if let Some((target_number, _)) = target {
         let target_entry = existing.ok_or(FsError::NotFound)?;
         {
@@ -2136,6 +2322,7 @@ pub(crate) fn prepare_move(
         };
         remove_record(g, inode, &mut image.bytes, end, source.offset)?;
     } else {
+        // 分支 2: 目标名字不存在——先删除源记录释放块内槽位，再插入新名字（可能触发叶块分裂或升级 HTree）。
         {
             let image = builder.image(source.logical)?;
             let layout = verify_directory(g, inode, source.logical, &image.bytes, false)?;
@@ -2149,7 +2336,9 @@ pub(crate) fn prepare_move(
     builder.finish()
 }
 
-/// 更新真实根块中的 `..` inode，不修改目录 HTree 叶或索引。
+/// 预备更新被跨目录移动的子目录第 0 块中 `..` 记录指向的新父目录 Inode 编号，并按当前根块布局重算尾部校验和。
+///
+/// 调用方需持有被移动子目录的写序列化锁与 `disk_root` 读锁。
 pub(crate) fn prepare_dotdot(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2182,7 +2371,7 @@ pub(crate) fn prepare_dotdot(
     builder.finish()
 }
 
-/// 验证单个普通叶只包含它所在位置允许的 `.` 与 `..`。
+/// 检查单个目录叶块是否不包含任何用户子项（仅允许非索引目录逻辑第 0 块的固定槽位出现 `.` 与 `..`）。
 fn directory_leaf_empty(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2219,7 +2408,9 @@ fn directory_leaf_empty(
     })?
 }
 
-/// 检查真实 `.`、`..` 与所有叶项，空目录不依赖 dcache 快照。
+/// 直接扫描磁盘目录块校验目录是否为空（仅含合法的 `.` 与 `..` 记录），不依赖内存 dentry 缓存的局部视图。
+///
+/// 调用方需持有目标目录的读/写保护以及 `disk_root` 块映射读保护。
 pub(crate) fn is_empty(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2276,7 +2467,9 @@ pub(crate) fn is_empty(
     Ok(true)
 }
 
-/// 为未链接的新目录准备真实 dot 项、初始叶和可选 dx 根。
+/// 为尚未链接到任何父目录的全新空目录 Inode 准备初始目录块（写入 `.` 与 `..` 记录，若预设了 `INDEX` 标志则同时构造初始 `dx_root` 与首个空叶块）。
+///
+/// 调用上下文：新目录 Inode 分配后的可睡眠准备阶段。
 pub(crate) fn prepare_new_directory(
     volume: &Ext4Volume,
     inode: &InodeMetadata,
@@ -2328,7 +2521,7 @@ pub(crate) fn prepare_new_directory(
         }];
         write_dx_node(&mut builder, root_logical, true, 0, &root_entries)?;
         builder.push_new_image(leaf_logical, empty_leaf(g, inode)?)?;
-        // 根块指向叶时，先让叶字节完成发表。
+        // 交换镜像顺序使初始空叶块排在根块之前，确保 `publish` 时先初始化叶块内容再写入指向它的根块。
         builder.images.swap(0, 1);
     } else {
         let root_logical = builder.reserve_logical()?;

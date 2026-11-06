@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""用明确的 ELF、盘角色与独占工作副本启动生产 QEMU。"""
+"""生产环境 QEMU 启动与配置管理入口脚本。
+
+本脚本负责为 `riscv64` 与 `loongarch64` 架构组装 QEMU 命令行、准备独占工作盘副本并启动虚拟机。
+同时向自动化自测脚本（如 `run_user_selftests.py`）导出参数解析、配置构造与持锁准备上下文函数。
+核心工作流程包括：
+1. 解析架构、内核 ELF、系统盘/比赛盘镜像路径、工作盘刷新策略（`fresh`/`reuse`/`refresh-system`）、网络与 GDB 调试选项；
+2. 构造不可变的 `QemuConfiguration` 对象（若指定 `--print-command` 则仅打印配置摘要与转义命令行后退出，不访问磁盘文件）；
+3. 校验内核 ELF 格式与 QEMU 可执行文件，获取工作盘目录 `flock` 排他锁并按策略复制或复用工作盘镜像；
+4. 将排他锁文件描述符设为可继承后，通过 `execve` 原地替换为 QEMU 进程，使锁生命周期覆盖整个虚拟机运行期。
+"""
 
 import sys
 
-# help 和命令展示不生成导入缓存。
+# 禁用 .pyc 字节码缓存生成，保持 tools 目录干净。
 sys.dont_write_bytecode = True
 
 import argparse
@@ -28,12 +37,19 @@ DEFAULT_GDB_PORT = 1234
 
 
 def repository_path(value):
-    """词法解释仓库相对路径，不读取未消费来源或解引用符号链接。"""
+    """将命令行传入的相对路径按仓库根目录规范化为绝对路径（纯词法拼接，不解引用符号链接或检查文件是否存在）。"""
     return Path(os.path.abspath(REPOSITORY_ROOT / value))
 
 
 def parse_arguments(argv, parser=None):
-    """共用生产参数与默认值；自动调用者可在同一解析器增加自己的输入。"""
+    """定义并解析 QEMU 启动参数，支持外部调用者传入已有 `ArgumentParser` 扩展自定义选项。
+
+    参数：
+    - `argv`：待解析的参数列表；为 `None` 时读取 `sys.argv[1:]`。
+    - `parser`：可选的外部 `ArgumentParser` 实例（如 `run_user_selftests.py` 传入的解析器）。
+
+    返回：`(parser, args)` 二元组。
+    """
     if parser is None:
         parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--arch", required=True, choices=("riscv64", "loongarch64"))
@@ -57,6 +73,8 @@ def parse_arguments(argv, parser=None):
     parser.add_argument("--qemu-binary", type=repository_path)
     parser.add_argument("--print-command", action="store_true")
     args = parser.parse_args(argv)
+
+    # 校验选项之间的依赖关系与取值范围。
     if args.system_only and not (args.shell or args.init_program is not None):
         parser.error("--system-only requires --shell or --init-program")
     if args.host_forward is not None and args.network == "none":
@@ -75,7 +93,11 @@ def parse_arguments(argv, parser=None):
 
 
 def boot_arguments(system_only, root_mode, shell, init_program):
-    """只把显式覆盖写入客体命令行，普通双盘运行不增加 append。"""
+    """根据命令行覆盖项拼装内核启动参数字符串（`-append`）。
+
+    默认双盘评测模式不传入任何额外启动参数（返回 `None`）；仅当显式指定单系统盘模式、
+    根挂载读写模式、交互式 shell 或自定义初始进程时才生成对应的内核命令行键值。
+    """
     arguments = []
     if system_only:
         arguments.append("root=/dev/vda")
@@ -91,7 +113,7 @@ def boot_arguments(system_only, root_mode, shell, init_program):
 def print_summary(kernel_elf_path, system_image_path, contest_image_path,
                   disk_paths, working_disk_directory, working_disk_action,
                   debug_enabled, gdb_port):
-    """展示绝对路径与本次动作的来源消费责任，不读取来源摘要。"""
+    """向标准错误输出打印本次 QEMU 运行的内核路径、工作盘目录、源镜像是否被读取复制以及 GDB 监听地址。"""
     print(f"run-qemu kernel-elf={kernel_elf_path}", file=sys.stderr, flush=True)
     print(f"run-qemu working-disk-dir={working_disk_directory} "
           f"working-disk-action={working_disk_action}", file=sys.stderr, flush=True)
@@ -108,7 +130,7 @@ def print_summary(kernel_elf_path, system_image_path, contest_image_path,
 
 @dataclass(frozen=True)
 class QemuConfiguration:
-    """保存纯解析得到的路径和命令，尚未读取 ELF、来源盘或工作目录。"""
+    """不可变的 QEMU 启动配置，保存解析后的路径与完整命令行元组（尚未接触文件系统或启动进程）。"""
 
     architecture: str
     kernel_elf_path: Path
@@ -122,7 +144,7 @@ class QemuConfiguration:
 
 
 def configure_qemu(args):
-    """只计算默认路径与完整 argv，展示和两种执行生命周期共用这一来源。"""
+    """根据已解析的命令行参数补齐架构默认路径，并构造 `QemuConfiguration` 配置对象。"""
     suffix = "rv" if args.arch == "riscv64" else "la"
     kernel_elf_path = args.kernel_elf or REPOSITORY_ROOT / f"kernel-{suffix}"
     system_image_path = args.system_image or REPOSITORY_ROOT / ("disk.img" if suffix == "rv" else "disk-la.img")
@@ -145,7 +167,7 @@ def configure_qemu(args):
 
 
 def summarize_configuration(configuration, disk_paths):
-    """展示实际配置和所选工作盘，保持未消费来源的只读约定。"""
+    """根据 `QemuConfiguration` 与工作盘路径字典输出启动配置摘要。"""
     print_summary(
         configuration.kernel_elf_path, configuration.system_image_path,
         configuration.contest_image_path, disk_paths, configuration.working_disk_directory,
@@ -154,11 +176,21 @@ def summarize_configuration(configuration, disk_paths):
 
 @contextmanager
 def prepare_qemu(configuration):
-    """核对 ELF 与 QEMU 后准备工作盘；锁覆盖调用者的执行、等待和盘面读取。"""
+    """校验内核 ELF 与 QEMU 可执行文件，获取工作盘排他锁并按策略准备工作盘镜像。
+
+    作为上下文管理器使用时，工作盘 `flock` 锁在整个 `with` 块期间保持持有，
+    确保外部调用者（如自测运行器）在 QEMU 退出并读取完工作盘结果后才释放锁。
+
+    生成：`(command, environment, disk_paths, lock_file)` 四元组。
+    异常：当内核 ELF 非普通文件、架构不匹配、找不到 QEMU 二进制或工作盘准备失败时抛出 `ValueError` / `OSError`。
+    """
+    # 校验内核 ELF 为普通文件且架构头部合法。
     kernel = configuration.kernel_elf_path
     if not stat.S_ISREG(kernel.stat().st_mode):
         raise ValueError(f"kernel ELF is not a regular file: {kernel}")
     read_kernel_elf(kernel, configuration.architecture)
+
+    # 解析 QEMU 可执行文件绝对路径，并清理可能干扰宿主机动态链接的环境变量。
     command = list(configuration.command)
     executable = shutil.which(command[0])
     if executable is None:
@@ -167,6 +199,8 @@ def prepare_qemu(configuration):
     environment = os.environ.copy()
     environment.pop("LD_LIBRARY_PATH", None)
     environment.pop("LD_PRELOAD", None)
+
+    # 获取工作盘排他锁并准备镜像副本，打印摘要后交由调用者启动 QEMU。
     with prepare_working_disks(
             configuration.working_disk_directory, configuration.system_image_path,
             configuration.contest_image_path, configuration.working_disk_action
@@ -177,7 +211,7 @@ def prepare_qemu(configuration):
 
 
 def main(argv=None):
-    """展示不读取输入；普通启动仍通过 execve 继承同一工作盘锁。"""
+    """脚本主入口：支持 `--print-command` 纯展示模式，或准备环境后通过 `execve` 启动 QEMU。"""
     parser, args = parse_arguments(argv)
     configuration = configure_qemu(args)
     if args.print_command:
@@ -188,6 +222,7 @@ def main(argv=None):
         return
     try:
         with prepare_qemu(configuration) as (command, environment, _, lock_file):
+            # 使排他锁文件描述符在 execve 后继续保持打开，直到 QEMU 进程退出才释放锁。
             os.set_inheritable(lock_file.fileno(), True)
             os.execve(command[0], command, environment)
     except (ValueError, OSError) as error:

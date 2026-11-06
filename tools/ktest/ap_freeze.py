@@ -1,4 +1,4 @@
-"""仅为 ap-freeze 资源冻结真实首条 AP 内存指令并保存不变性证据。"""
+"""`ap-freeze` 专项测试支持模块：通过 GDB 将从核（AP）首条访存指令改写为死循环，并在主核超时后核对从核内存与状态未被破坏。"""
 
 import json
 
@@ -6,7 +6,7 @@ from .catalog import require
 
 
 def command(args, kernel, directory, endpoint):
-    """生成本 VM 的独占 GDB 命令；只改运行内存，不改固定 ELF。"""
+    """生成当前虚拟机的 `ap-freeze.gdb` 批处理脚本并返回 GDB 启动命令；仅在运行期修改内存指令，不修改磁盘上的内核 ELF。"""
     configuration = dict(arch=args.arch, endpoint=endpoint,
                          evidence=str((directory / "ap-freeze.json").resolve()))
     script = directory / "ap-freeze.gdb"
@@ -17,9 +17,10 @@ def command(args, kernel, directory, endpoint):
 
 
 def verify(directory):
-    """真实 GDB 结束后核对记录、整栈与未上线状态，缺现场不能算成功。"""
+    """在 GDB 会话结束后核对 `ap-freeze.json` 与串口日志，确认从核在冻结期间启动记录、启动栈与未上线状态均保持不变。"""
     with (directory / "ap-freeze.json").open(encoding="utf-8") as source:
         evidence = json.load(source)
+    # 校验 GDB 脚本产出的证据文件字段完整，且确实捕获到了逻辑核 1 的启动记录。
     require(isinstance(evidence, dict), "AP freeze evidence must be an object")
     fields = ("logical_cpu", "record_physical", "record_before", "record_after",
               "stack_before_sha256", "stack_after_sha256", "online_before", "online_after",
@@ -28,12 +29,14 @@ def verify(directory):
     require(evidence.get("complete") is True, "AP freeze evidence is incomplete")
     require(evidence["logical_cpu"] == 1 and evidence["record_physical"] != 0,
             "AP freeze did not observe the actual first AP record")
+    # 校验从核在冻结期间未修改启动记录和启动栈内容，且始终处于未上线及死循环指令状态。
     require(evidence["record_before"] == evidence["record_after"], "AP boot record changed while frozen")
     require(evidence["stack_before_sha256"] == evidence["stack_after_sha256"],
             "AP boot stack changed while frozen")
     require(evidence["online_before"] == evidence["online_after"] == 0,
             "frozen AP was published online")
     require(evidence["instruction_after"] == evidence["self_loop"], "AP self-loop was not retained")
+    # 确认主核因从核启动超时而终止，未进入正常生产态 READY 阶段。
     with (directory / "uart.log").open("rb") as source:
         require(not any(line.startswith(b"READY arch=") for line in source),
                 "AP timeout VM reached production READY")

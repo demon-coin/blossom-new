@@ -1,4 +1,40 @@
-//! 卷内分配序列保护共同位图与计数；本次未发表资源由显式释放归还。
+//! ext4 物理块与 inode 位图的分配预留及事务化释放管理。
+//!
+//! # 模块职责与架构定位
+//! 本模块归属 `Ext4Volume`，向上游 `mapping`（Extent / 间接块树更新）、`directory`（目录增长）以及
+//! VFS `Inode` 生命周期（创建、截断、`nlink == 0` 最终回收）提供块与 inode 的位图分配和归还能力，
+//! 向下游操作 `MetadataCache` 中的超级块、块组描述符表（GDT）和位图缓冲区（`BufferRef`）。
+//!
+//! # 核心设计：位图预留与释放状态机
+//! 为了保证元数据更新在中途发生 I/O 错误或内存不足时不会泄漏位图位，也不会在 `Drop` 中隐式执行可能睡眠的缓存操作，
+//! 所有分配与释放均通过带显式激活标志 `Reservation::active` 的线性凭证管理：
+//!
+//! ```text
+//! [新资源分配路径]
+//!   allocate_block / allocate_inode
+//!       │ (持 allocation 锁置位位图、扣减组描述符与超级块空闲计数)
+//!       ▼
+//!   UnpublishedBlock / UnpublishedInode (reservation.active = true)
+//!       ├──► 成功挂载到块树或目录/InodeCache ──► publish() (active = false，位图保持已分配)
+//!       └──► 中途失败取消 ──► release_unpublished_*() (清位图、归还计数，active = false)
+//!
+//! [已有资源释放路径]
+//!   prepare_detached_block / prepare_inode_release
+//!       │ (预先钉住位图、组描述符、超级块 BufferRef，此时位图未改)
+//!       ▼
+//!   DetachedBlock / PreparedInodeRelease (reservation.active = false)
+//!       ├──► 提交前取消 ──► 直接 Drop (active == false，仅释放 BufferRef 引用)
+//!       └──► 块树或 Inode 已摘离引用 ──► arm_release() (active = true)
+//!                                            │
+//!                                            ▼
+//!                              release_detached_block / release_inode
+//!                              (失效旧缓存窗口、清位图并归还空闲计数，active = false)
+//! ```
+//! 若任何 `active == true` 的 `Reservation` 未经 `publish` 或显式 `release_*` 直接进入 `Drop`，将触发断言崩溃以暴露所有权遗漏。
+//!
+//! # 锁获取顺序与并发契约
+//! - VFS Inode 写序列化锁 / Extent 映射写锁 ➔ `Ext4Volume::allocation`（睡眠互斥锁 `SleepMutex`）➔ `MetadataCache` 页/内容锁（`BufferRef::with_read` / `update`）。
+//! - 在 `allocate_inode` 中等待旧内存中同号 `Inode` 彻底退场（`wait_inode_reuse`）时，必须在 `Ext4Volume::allocation` 锁**之外**睡眠等待，依靠已置位的位图阻止其他分配者重复选中同一位，防止阻塞全卷分配或与回收路径形成死锁。
 
 use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
@@ -10,70 +46,107 @@ use crate::mm::PAGE_SIZE;
 use crate::time;
 use alloc::vec::Vec;
 
+/// 块组内固定元数据表项的物理块起始地址（卷打开时解码并校验一次，运行期只读）。
 #[derive(Clone, Copy)]
 pub(crate) struct GroupLayout {
+    /// 本块组数据块分配位图所在的物理块号（单位：文件系统块）。
     pub block_bitmap: u64,
+    /// 本块组 inode 分配位图所在的物理块号（单位：文件系统块）。
     pub inode_bitmap: u64,
+    /// 本块组 inode 表起始物理块号（单位：文件系统块）。
     pub inode_table: u64,
 }
 
-/// 保留本次位图拥有权及已经准备好的释放窗口；析构不得执行睡眠释放。
+/// 单个块位或 inode 位的分配/释放事务凭证，预先持有归还所需的全部元数据缓存引用。
 struct Reservation {
+    /// 所属 `Ext4Volume` 的内核实例编号，防止跨卷误传凭证。
     volume: u32,
+    /// 目标位所在的块组索引（从 `0` 开始）。
     group: u64,
+    /// 目标位在块组位图内的偏移（从 `0` 开始，单位：bit）。
     bit: usize,
+    /// `true` 表示管理的是 inode 位图位，`false` 表示数据/元数据块位图位。
     inode: bool,
+    /// 当 `inode == true` 时标识该 inode 是否为目录，用于同步增减块组的 `bg_used_dirs_count`。
     directory: bool,
+    /// 目标块组的块位图或 inode 位图缓存窗口。
     bitmap: BufferRef,
+    /// 目标块组描述符所在的 GDT 块缓存窗口。
     descriptor: BufferRef,
+    /// 目标块组描述符在 `descriptor` 缓冲区内的字节偏移（单位：字节）。
     offset: usize,
+    /// 主超级块所在的第 0 页缓存窗口，用于同步更新全卷空闲块/inode 计数。
     superblock: BufferRef,
+    /// 是否负有待显式消费（`publish` 或 `release_reservation`）的位图责任；为 `true` 时禁止直接析构。
     active: bool,
 }
 
-/// 尚未连接到文件块树的单块责任，不允许 Clone 或从任意块号构造。
+/// 已在位图中置位但尚未挂载到任何文件块映射树的物理块所有权凭证。
 pub struct UnpublishedBlock {
+    /// 本次分配得到的全卷物理块号（单位：文件系统块）。
     physical: u64,
+    /// 对应的块位图预留凭证（`active == true` 直到发布或显式归还）。
     reservation: Reservation,
 }
 
-/// 已有数据或节点的预备释放窗口；准备时尚未摘树，取消只释放窗口引用。
+/// 准备从文件块树或外部扩展属性（EA）摘除的物理块释放上下文。
 pub(crate) struct DetachedBlock {
+    /// 预先加载好的位图、组描述符与超级块缓存窗口（预备期 `active == false`）。
     reservation: Reservation,
-    /// 数据只保已经存在的物理元数据别名，节点始终保实际读取的准确窗口。
+    /// 该物理块在 `MetadataCache` 中的元数据缓存窗口：
+    /// - 若释放的是树节点或外部 EA 块，总是持有其已读取的 `BufferRef`；
+    /// - 若释放的是普通文件数据块（曾作为目录块等进入过元数据缓存），仅保留已驻留的缓存命中窗口，未命中时为 `None`。
+    ///
+    /// 最终释放物理块前需通过该引用失效缓存中的脏状态，防止后台回写把旧数据写回已被复用的物理块。
     alias: Option<BufferRef>,
 }
 
-/// 尚未连接到名字的 inode 责任，位图、记录与释放窗口均由本次申请保留。
+/// 已在 inode 位图中置位并完成盘面初始记录清零、但尚未加入目录或 `InodeDomain` 的新 inode 凭证。
 pub struct UnpublishedInode {
+    /// 新分配的 1-based ext4 inode 编号。
     number: u64,
+    /// 对应的 inode 位图预留凭证（`active == true` 直到发布或显式归还）。
     reservation: Reservation,
+    /// 该 inode 盘面记录所在的 inode 表块缓存窗口。
     record: BufferRef,
+    /// 该 inode 记录在 `record` 缓冲区内的起始字节偏移（单位：字节）。
     offset: usize,
 }
 
-/// 最后一个未链接 inode 的具体释放窗口；尚未清位图，析构不执行等待或盘面修改。
+/// 链接数归零且无活跃引用的 inode 在最终回收前准备好的全套盘面释放窗口。
 pub(crate) struct PreparedInodeRelease {
+    /// 该 inode 自身位图位的释放凭证（预备期 `active == false`，进入 `release_inode` 后激活消费）。
     reservation: Reservation,
+    /// 该 inode 盘面记录所在的 inode 表块缓存窗口。
     record: BufferRef,
+    /// 该 inode 记录在 `record` 缓冲区内的起始字节偏移（单位：字节）。
     offset: usize,
+    /// 结合卷种子、inode 编号与 generation 预计算的 CRC32C 校验种子。
     seed: u32,
+    /// 该 inode 使用的扩展头部字节数（`i_extra_isize`，单位：字节）。
     extra_isize: usize,
+    /// 若该 inode 挂载了外部扩展属性块（`i_file_acl != 0`），保存其物理块号与预备释放窗口。
     acl: Option<(u64, DetachedBlock)>,
+    /// 该 inode（含内嵌 xattr 及引用计数即将归零的外部 xattr 块）引用的全部大值 EA inode 释放列表。
     ea: Vec<PreparedEaRelease>,
 }
 
-/// 一组真实 EA value 引用与其 canonical 使用、原记录窗口，取消时不改变计数。
+/// 待扣减引用计数（`EA_INODE` 专用大扩展属性值 inode）的预备释放项。
 struct PreparedEaRelease {
+    /// 共享 `InodeDomain` 中对应的 EA inode 内存引用。
     inode: InodeRef,
+    /// 该 EA inode 盘面记录所在的 inode 表块缓存窗口。
     record: BufferRef,
+    /// 该 EA inode 记录在 `record` 缓冲区内的起始字节偏移（单位：字节）。
     offset: usize,
+    /// 当前待删除宿主 inode 对该 EA inode 持有的总引用次数。
     count: u64,
+    /// 预备时从盘面读取到的该 EA inode 当前总引用计数（用于校验不小于 `count`）。
     references: u64,
 }
 
 impl DetachedBlock {
-    /// 新根和父字段发表后保留必须消费的释放责任，未发表准备仍可直接取消。
+    /// 在新的块映射根与 inode 字段正式提交后激活物理块释放责任；若提交前取消则无需调用此方法，直接丢弃即可。
     pub(crate) fn arm_release(&mut self) {
         assert!(
             !self.reservation.active,
@@ -84,34 +157,34 @@ impl DetachedBlock {
 }
 
 impl UnpublishedBlock {
-    /// 仅借用本次申请的物理地址，借用不会转移归还责任。
+    /// 返回本次分配得到的物理块号（单位：文件系统块），不转移位图归还责任。
     pub fn physical(&self) -> u64 {
         self.physical
     }
 
-    /// 映射指针正式发表后结束本次临时责任，不能再沿未发表接口归还。
+    /// 在物理块指针正式写入块映射树或 inode 后提交所有权，解除临时未发布状态。
     pub(crate) fn publish(mut self) {
         self.reservation.active = false;
     }
 }
 
 impl UnpublishedInode {
-    /// 返回本次尚未发表的 inode 号。
+    /// 返回本次分配的 1-based ext4 inode 编号。
     pub fn number(&self) -> u64 {
         self.number
     }
 
-    /// 确认临时 inode 位仍属于给定卷且尚未转移到 canonical inode。
+    /// 检查该未发布 inode 是否属于指定 `volume` 且仍处于未提交的活动预留状态。
     pub(crate) fn belongs_to(&self, volume: &Ext4Volume) -> bool {
         self.reservation.active && self.reservation.volume == volume.device
     }
 
-    /// 借用本次分配预留的 inode-table 窗口，不能转移其 bitmap 责任。
+    /// 借用该新 inode 在 inode 表中的元数据缓存窗口及块内字节偏移。
     pub(crate) fn record(&self) -> (&BufferRef, usize) {
         (&self.record, self.offset)
     }
 
-    /// 原 inode 已由 canonical 使用或名字保有后结束临时分配责任，位图仍保持已分配。
+    /// 在新 inode 已正式绑定到目录项或 `InodeDomain` 后解除临时预留责任，返回其 inode 编号。
     pub(crate) fn publish(mut self) -> u64 {
         self.reservation.active = false;
         self.number
@@ -119,14 +192,16 @@ impl UnpublishedInode {
 }
 
 impl Drop for Reservation {
-    /// 未发表资源必须经过显式释放，析构只暴露丢失拥有权的协议错误。
+    /// 断言该预留凭证已完成显式发布（`publish`）或归还（`release_*`），防止静默泄漏位图位。
     fn drop(&mut self) {
         assert!(!self.active, "unpublished ext4 reservation lost");
     }
 }
 
 impl Ext4Volume {
-    /// 普通任务按组提示扫描真实位图；零空间与缓存、页、设备失败分别返回。
+    /// 从目标提示块组 `hint` 开始扫描块位图，分配一个空闲物理块并返回未发布凭证。
+    ///
+    /// 必须在可睡眠的普通任务上下文调用；内部会获取 `self.allocation` 睡眠锁并按需读取元数据缓存。
     pub fn allocate_block(&self, hint: u64) -> Result<UnpublishedBlock, FsError> {
         let reservation = self.reserve(hint, false, false)?;
         let physical = self.geometry.first_data_block
@@ -138,12 +213,17 @@ impl Ext4Volume {
         })
     }
 
-    /// 当前操作尚未发表块指针时显式归还，不执行任何已接受前缀的回滚。
+    /// 显式归还本次分配但尚未挂载到块映射树的物理块，清零对应位图位并恢复空闲块计数。
+    ///
+    /// 必须在可睡眠上下文调用，内部会获取 `self.allocation` 睡眠锁。
     pub fn release_unpublished_block(&self, mut block: UnpublishedBlock) {
         self.release_reservation(&mut block.reservation);
     }
 
-    /// 取得临时 inode 位后先等待旧 canonical 身份退出，再初始化新记录；失败只归还本次临时位。
+    /// 分配一个新的盘面 inode 位并初始化其基础记录（递增 generation、设置权限属主及空 Extent 根）。
+    ///
+    /// 必须在可睡眠上下文且未持有 `self.allocation` 锁时调用。若选中的 inode 编号在 `InodeDomain` 中仍有正在异步淘汰的旧内存实例，
+    /// 会在释放 `self.allocation` 锁的状态下等待旧实例彻底退场后再覆写 inode 表记录；任何中途失败都会自动归还本次预留的位图位。
     pub fn allocate_inode(
         &self,
         hint: u64,
@@ -156,15 +236,17 @@ impl Ext4Volume {
             return Err(FsError::InvalidOperation);
         }
 
+        // Step 1: 在卷分配锁保护下扫描位图并置位，拿到独占的 inode 位预留凭证。
         let mut reservation = self.reserve(hint, true, directory)?;
         let number =
             reservation.group * self.geometry.inodes_per_group + reservation.bit as u64 + 1;
-        // 临时位由 Reservation 保有，等待旧 canonical 身份退出时不持卷分配锁。
+        // Step 2: 若内存中同编号的旧 Inode 尚未完成后台回收，在卷分配锁外等待其退场，避免阻塞其他分配或造成死锁。
         if let Err(error) = self.wait_inode_reuse(number) {
             self.release_reservation(&mut reservation);
             return Err(error);
         }
 
+        // Step 3: 读取 inode 表元数据块，递增 generation 并初始化干净的盘面记录与校验和。
         let result = self.inode_record(number, None);
         let (buffer, offset) = match result {
             Ok(record) => record,
@@ -216,12 +298,12 @@ impl Ext4Volume {
         })
     }
 
-    /// 本次 inode 尚未连接名字时归还位图与目录计数，不对已有对象作清理。
+    /// 显式归还尚未加入目录或 `InodeDomain` 的新分配 inode，清零位图位并恢复空闲 inode 及目录计数。
     pub fn release_unpublished_inode(&self, mut inode: UnpublishedInode) {
         self.release_reservation(&mut inode.reservation);
     }
 
-    /// 按父目录 setgid、kind mode 和当前主 group 准备新 inode owner。
+    /// 根据父目录的 `S_ISGID` 位、目标文件类型、`requested_mode` 与进程 `umask` 计算新 inode 的权限和属组，并按父目录所在块组就近分配。
     pub(crate) fn allocate_inode_for_parent(
         &self,
         parent: &InodeMetadata,
@@ -244,6 +326,7 @@ impl Ext4Volume {
             | InodeKind::Socket
             | InodeKind::Other => return Err(FsError::InvalidOperation),
         };
+        // Step 1: 依据标准 setgid 继承规则合成 mode 与有效 gid，防止非同组用户创建带 SGID+可执行位的文件。
         let parent_setgid = parent.mode & S_ISGID != 0;
         let mut mode = kind_mode
             | if kind == InodeKind::Symlink {
@@ -264,12 +347,15 @@ impl Ext4Volume {
             mode &= !(umask & S_IRWXUGO);
         }
         let gid = if parent_setgid { parent.gid } else { gid };
+        // Step 2: 以父目录所在的块组作为局域性提示（hint）分配新 inode。
         let hint =
             parent.number.checked_sub(1).ok_or(FsError::Corrupt)? / self.geometry.inodes_per_group;
         self.allocate_inode(hint, mode, uid, gid)
     }
 
-    /// 节点合并或截断在发表之前保留真实节点和释放窗口，尚不改变位图或空闲计数。
+    /// 为即将从映射树或 inode 摘除的元数据节点块（Extent 内部节点、间接块或外部 EA 块）预加载其自身缓存窗口与位图释放凭证。
+    ///
+    /// 预备期不修改位图或空闲计数；若后续操作取消，直接丢弃返回值即可无副作用释放缓存引用。
     pub(crate) fn prepare_detached_block(
         &self,
         physical: u64,
@@ -282,7 +368,7 @@ impl Ext4Volume {
         self.prepare_block_release(physical, Some(node), context)
     }
 
-    /// 数据删除只查当前物理元数据别名，缺失时不申请缓存页或读入旧文件数据。
+    /// 为即将释放的文件数据块（或目录块）准备位图释放凭证，并仅在 `MetadataCache` 已缓存该物理块时捕获其缓存窗口引用，避免无谓读盘。
     pub(crate) fn prepare_detached_data_block(
         &self,
         physical: u64,
@@ -295,7 +381,7 @@ impl Ext4Volume {
         self.prepare_block_release(physical, alias, context)
     }
 
-    /// 具体物理块保留同卷的位图、描述符和超级块视图，原块仍由旧树拥有。
+    /// 校验物理块地址合法性，换算其所属块组与组内位偏移，并预留归还所需的组描述符、位图与超级块缓存窗口。
     fn prepare_block_release(
         &self,
         physical: u64,
@@ -312,27 +398,32 @@ impl Ext4Volume {
         })
     }
 
-    /// 块根和 inode 记录均已去掉引用后归还实际物理空间，可能等待共同元数据内容锁。
+    /// 失效已摘除物理块的元数据缓存脏状态，并将该块位归还到块位图与空闲计数中。
+    ///
+    /// 可睡眠函数，内部会等待元数据页内容锁及获取 `self.allocation` 睡眠锁。
     ///
     /// # Safety
-    /// 调用者保持 inode 根写侧且已摘离此块；旧数据填充、WB 和设备 I/O 已真实结束。
-    /// 旧物理别名的使用者已结束且不会再提交内容，准备之后不能新建旧块别名；
-    /// 元数据窗口只能由本次释放保留到 forget，不能把软件取消当作设备收权。
+    /// 1. 调用方必须持有所属 inode 映射写锁，且已从盘面块映射树和 inode 记录中彻底移除对该物理块的引用（`block.arm_release()` 已调用）；
+    /// 2. 针对该物理块的所有文件页填充、脏页回写（Writeback）及底层块设备 DMA 传输必须已全部完成，硬件不再访问对应扇区；
+    /// 3. 自 `prepare_detached_*` 之后不存在也不再新建指向该物理块的 `MetadataCache` 读写消费者。
     pub(crate) unsafe fn release_detached_block(&self, mut block: DetachedBlock) {
         assert!(
             block.reservation.active,
             "ext4 block still belongs to its old tree"
         );
         if let Some(alias) = &block.alias {
-            // SAFETY: 调用者已摘树、结束旧数据和别名使用并排除新旧窗口生产者；
-            // alias 保准确物理范围，forget 等本页真实 WB 收权后只失效该窗口，位图尚未归还。
+            // SAFETY:
+            // 1. 调用方契约保证该物理块已从块映射树摘除，且不再有并发的元数据读取或新增脏写；
+            // 2. `alias` 在预备时绑定了该块精确的物理字节范围，且此时尚未清零块位图（不会被并发重分配）；
+            // 3. `BufferRef::forget` 会在等待该页在途回写彻底结束后仅清除本块范围的缓存有效与脏标志。
             unsafe { alias.forget(&self.claim) }.expect("detached physical block invalidation");
         }
         self.release_reservation(&mut block.reservation);
     }
 
-    /// 最后使用交接后、修改 EOF 前准备 inode、外部 EA 和隐藏 value 的全部释放视图。
-    /// 调用者保持 inode 写序列化和本卷元数据 WB 序列到消费结束；错误不改变原引用。
+    /// 在 `nlink == 0` 的 inode 失去最后一个活跃引用后、正式截断数据与清除记录前，预加载并校验该 inode 本身、外部扩展属性块及所有关联 `EA_INODE` 的释放窗口。
+    ///
+    /// 调用方须持有该 inode 的写序列化保护直至 `release_inode` 消费完毕；若本函数返回错误，盘面记录与引用计数保持原状不变。
     pub(crate) fn prepare_inode_release(
         &self,
         inode: &InodeData,
@@ -344,6 +435,7 @@ impl Ext4Volume {
             return Err(FsError::InvalidOperation);
         }
 
+        // Step 1: 读取并核对盘面 inode 记录与内存快照一致，提取内嵌扩展属性引用的 EA inode 编号。
         let (record, offset) = self.inode_record(inode.number, context)?;
         let mut numbers = [0u64; codec::MAX_EA_INODES];
         let count = record.with_read(|bytes| {
@@ -358,6 +450,7 @@ impl Ext4Volume {
             }
             codec::inline_ea_inodes(g, bytes, inode.extra_isize, &mut numbers)
         })??;
+        // Step 2: 预加载内嵌 EA inode 引用以及当前宿主 inode 自身位图的释放凭证。
         let mut ea = Vec::new();
         self.prepare_ea_references(inode.number, &numbers[..count], &mut ea, context)?;
         let group = (inode.number - 1) / g.inodes_per_group;
@@ -370,6 +463,7 @@ impl Ext4Volume {
             context,
         )?;
 
+        // Step 3: 若存在外部扩展属性块（file_acl），加载并校验其块头；仅当该块引用计数为 1（即将随本 inode 一并释放）时，收集其中引用的 EA inode。
         let acl = if inode.file_acl == 0 {
             None
         } else {
@@ -388,6 +482,7 @@ impl Ext4Volume {
             }
             Some((inode.file_acl, block))
         };
+        // Step 4: 确认每个待扣减的 EA inode 当前盘面引用计数均不小于本次即将扣除的次数。
         for put in &ea {
             if put.references < put.count {
                 return Err(FsError::Corrupt);
@@ -404,7 +499,7 @@ impl Ext4Volume {
         })
     }
 
-    /// 内嵌 EA 和最后外部 EA 块的逐项引用合并，所有窗口和 canonical 使用在发表前取得。
+    /// 将 `numbers` 中的大扩展属性值 `EA_INODE` 编号合并去重后追加到 `puts`，并预先加载每个目标的盘面记录与 `InodeDomain` 内存引用。
     fn prepare_ea_references(
         &self,
         parent: u64,
@@ -449,17 +544,19 @@ impl Ext4Volume {
         Ok(())
     }
 
-    /// 消费最终回收窗口，清本 inode 记录及 EA 引用后归还 inode 位图和目录计数。
-    /// 不申请内存或读盘；共享 EA 的当前引用计数由原卷分配锁串行化。
+    /// 消费已准备好的回收窗口：清零盘面 inode 记录，扣减或释放外部扩展属性块与关联 `EA_INODE` 引用，最后归还本 inode 的位图位及目录计数。
+    ///
+    /// 全程仅操作预备时已钉住的缓存窗口，不再申请堆内存或触发未缓存读盘；必须在可睡眠的任务或工作队列上下文中调用（严禁在中断上下文、任意 `Drop` 或自旋锁临界区内调用）。
     ///
     /// # Safety
-    /// 调用者已在 canonical 索引中禁止父 inode 新使用，nlink 为零且文件数据与树节点全部摘离。
-    /// 父文件页、填充、WB、设备 I/O 和旧别名已结束，原根写侧已排空并释放；
-    /// 持本卷元数据 WB 序列到返回，不能由 IRQ、任意 Drop 或索引短锁调用本睡眠操作。
+    /// 1. 调用方必须已在 `InodeDomain` 索引中将该宿主 inode 标记为正在回收，阻止任何新查找获取其引用，且其 `nlink == 0`、全部数据块与映射树节点均已释放完毕；
+    /// 2. 宿主 inode 关联的所有文件页读取、脏页回写、底层设备 DMA I/O 及旧元数据缓存窗口消费者均已彻底结束；
+    /// 3. 调用方必须在同一卷回写序列化上下文中调用直至本函数返回，防止并发修改关联 `EA_INODE` 的引用计数。
     pub(crate) unsafe fn release_inode(&self, mut prepared: PreparedInodeRelease) {
         assert_eq!(prepared.reservation.volume, self.device);
         prepared.reservation.active = true;
         let g = &self.geometry;
+        // Step 1: 将盘面 inode 记录标记为已释放（写入 dtime、清零块区并重算校验和）。
         prepared
             .record
             .update(&self.claim, |bytes| {
@@ -472,6 +569,7 @@ impl Ext4Volume {
             })
             .expect("prepared freed inode record");
 
+        // Step 2: 在卷分配锁下检查外部扩展属性块引用计数；若仍被其他 inode 共享则仅递减计数，否则摘除并释放该物理块。
         if let Some((physical, mut block)) = prepared.acl.take() {
             let shared = {
                 let _allocation = self.allocation.lock();
@@ -494,12 +592,14 @@ impl Ext4Volume {
             };
             if !shared {
                 block.arm_release();
-                // SAFETY: 最后 EA 引用已从本记录清除，卷分配锁下确认没有其他 inode 引用；
-                // 调用者已结束旧别名及元数据 WB，block 保原窗口到失效，随后才允许复用。
+                // SAFETY:
+                // 1. Step 1 已从当前 inode 记录中抹除 `file_acl` 引用，且 Step 2 在 `self.allocation` 锁下确认该外部 EA 块引用计数为 1（无其他共享者）；
+                // 2. 调用方契约保证针对该块的旧访问与在途回写已结束，`block` 持有预备时锁定的精确缓存窗口，在清位图重用前先由 `forget` 安全失效。
                 unsafe { self.release_detached_block(block) };
             }
         }
 
+        // Step 3: 逐项扣减关联大值 EA inode 的引用计数，最后归还本宿主 inode 的位图位。
         for put in &prepared.ea {
             put.inode
                 .release_ea_references(&self.claim, &put.record, put.offset, put.count);
@@ -507,7 +607,7 @@ impl Ext4Volume {
         self.release_reservation(&mut prepared.reservation);
     }
 
-    /// 只准备已分配资源的归还窗口，active 保持关闭，取消不会归还仍可寻址的位。
+    /// 预加载指定块组与位偏移归还所需的组描述符、位图及主超级块缓存窗口，初始 `active` 设为 `false` 以便中途取消时可直接丢弃。
     fn prepare_release_reservation(
         &self,
         group: u64,
@@ -543,12 +643,13 @@ impl Ext4Volume {
         })
     }
 
-    /// 先取得所有可能睡眠的窗口；内容借用内只扫描、置位与计算 CRC。
+    /// 在 `self.allocation` 锁保护下按提示块组循环扫描空闲位，必要时执行延迟位图初始化，置位位图并同步扣减块组描述符与超级块空闲计数。
     fn reserve(&self, hint: u64, inode: bool, directory: bool) -> Result<Reservation, FsError> {
         self.require_write(&self.claim)?;
         // ponytail: 卷分配睡眠锁串行化计数，真实分配竞争成为瓶颈时拆每组锁。
         let _allocation = self.allocation.lock();
         let g = &self.geometry;
+        // Step 1: 读取主超级块确认全卷尚有空闲块或空闲 inode，若已耗尽则直接返回 NoSpace。
         let superblock = self.metadata.get(0, PAGE_SIZE, None)?;
         let available = superblock.with_read(|bytes| -> Result<u64, FsError> {
             let record = &bytes[codec::SUPERBLOCK_OFFSET..codec::SUPERBLOCK_END];
@@ -566,6 +667,7 @@ impl Ext4Volume {
             return Err(FsError::NoSpace);
         }
 
+        // Step 2: 从 hint 所在块组开始环形遍历全卷各块组，跳过空闲计数为 0 的块组。
         for step in 0..g.groups_count {
             let group = (hint % g.groups_count + step) % g.groups_count;
             let (descriptor, offset) = self.group_buffer(group, None)?;
@@ -582,6 +684,7 @@ impl Ext4Volume {
             {
                 continue;
             }
+            // Step 3: 加载目标位图；若开启了延迟初始化（UNINIT），先在内存中按物理布局构造初始位图并落入缓存，随后校验位图 CRC。
             let layout = self.groups[group as usize];
             let bitmap = self.metadata_block(if inode {
                 layout.inode_bitmap
@@ -605,6 +708,7 @@ impl Ext4Volume {
                 }
             }
 
+            // Step 4: 在有效位范围内查找首个空闲位（第 0 组 inode 跳过保留区），置位后更新组描述符与主超级块的空闲计数及校验和。
             let valid = valid_bits(g, group, inode);
             let first = if inode && group == 0 {
                 g.first_inode.saturating_sub(1) as usize
@@ -669,7 +773,7 @@ impl Ext4Volume {
         Err(FsError::NoSpace)
     }
 
-    /// 合法延迟初始化按物理布局保留全部 flex 元数据和末组尾位。
+    /// 处理带有 `BG_INODE_UNINIT` 或 `BG_BLOCK_UNINIT` 标志的未初始化块组位图：按卷几何与 `flex_bg` 物理布局标记元数据占用位和组尾越界位，校验空闲数一致后写入缓存并清除 `UNINIT` 标志。
     fn initialize_bitmap(
         &self,
         group: u64,
@@ -729,7 +833,7 @@ impl Ext4Volume {
         Ok(())
     }
 
-    /// 只更新当前描述符字段，不把此前读取的整块副本覆盖共同内容。
+    /// 在组描述符缓存窗口的更新锁内，将新的块组空闲计数、标志与重算后的组校验和写回当前描述符槽位。
     fn commit_group(&self, group: u64, descriptor: &BufferRef, offset: usize, state: GroupState) {
         descriptor
             .update(&self.claim, |bytes| {
@@ -743,7 +847,7 @@ impl Ext4Volume {
             .expect("prepared writable group descriptor");
     }
 
-    /// 释放窗口随 token 保留，释放不申请内存、不读盘，内容锁等待在短锁之外。
+    /// 消费活动的 `Reservation`：在 `self.allocation` 锁保护下清零目标位图位，递增块组描述符与主超级块的空闲计数（及目录计数），并将 `active` 置为 `false`。
     fn release_reservation(&self, reservation: &mut Reservation) {
         assert_eq!(
             reservation.volume, self.device,
@@ -806,7 +910,7 @@ impl Ext4Volume {
     }
 }
 
-/// 位图有效位按实际组尾计算；inode 编号和块号具有各自独立的末组边界。
+/// 计算块组 `group` 位图中的实际有效位数（末个块组的块数或 inode 数可能少于标准每组上限）。
 fn valid_bits(g: &Geometry, group: u64, inode: bool) -> usize {
     if inode {
         (g.inodes_count - group * g.inodes_per_group).min(g.inodes_per_group) as usize
@@ -816,12 +920,12 @@ fn valid_bits(g: &Geometry, group: u64, inode: bool) -> usize {
     }
 }
 
-/// 小端位序与盘面 ext4 位图一致，不将字节尾 padding 当作可分配空间。
+/// 按 ext4 盘面小端位序（字节内 LSB 对应最小编号）检查位图第 `bit` 位是否已置为占用。
 fn bit_is_set(bits: &[u8], bit: usize) -> bool {
     bits[bit / 8] & (1 << (bit % 8)) != 0
 }
 
-/// 在已验证的位图范围内修改一位。
+/// 按 ext4 盘面小端位序将位图切片中的第 `bit` 位置为占用（`true`）或空闲（`false`）。
 fn set_bit(bits: &mut [u8], bit: usize, used: bool) {
     if used {
         bits[bit / 8] |= 1 << (bit % 8);
@@ -830,7 +934,7 @@ fn set_bit(bits: &mut [u8], bit: usize, used: bool) {
     }
 }
 
-/// 元数据按物理交集置位，多个逻辑组的 flex 表可以共同占据当前物理组。
+/// 在初始化数据块位图时，将落入物理块组 `group` 地址区间内的本组超级块/GDT 备份以及全卷所有块组（支持 `flex_bg` 跨组放置）的位图和 inode 表物理块统一标记为已占用。
 fn mark_metadata(g: &Geometry, layouts: &[GroupLayout], group: u64, bits: &mut [u8]) {
     let first = g.first_data_block + group * g.blocks_per_group;
     let end = (first + g.blocks_per_group).min(g.blocks_count);
@@ -851,7 +955,7 @@ fn mark_metadata(g: &Geometry, layouts: &[GroupLayout], group: u64, bits: &mut [
     }
 }
 
-/// 范围求交后置位；重复占用只保同一个 used 位，不重复扣计数。
+/// 求物理块区间 `[start, start + len)` 与当前块组物理范围 `[first, end)` 的交集，并将交集对应的组内相对位全部置为已占用。
 fn mark_range(bits: &mut [u8], first: u64, end: u64, start: u64, len: u64) {
     for physical in start.max(first)..(start + len).min(end) {
         set_bit(bits, (physical - first) as usize, true);

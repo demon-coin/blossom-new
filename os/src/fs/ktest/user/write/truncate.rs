@@ -1,11 +1,54 @@
-//! 截断失效、尾零、原回写等待与 canonical inode 最后使用退休。
+//! 文件截断（Truncate）、页缓存与页表映射失效、在途回写等待以及孤儿 Inode（`nlink == 0`）生命周期回收测试套件。
+//!
+//! # 模块职责与架构定位
+//! 本模块属于可写文件系统测试套件（`fs::ktest::user::write`）的子模块，专门验证文件尺寸截断（缩小/扩展）和未链接 Inode 最终释放全链路中的跨子系统不变量：
+//! - **上游调用者**：内核测试框架（`ktest`）调度执行本模块中的 `cases` 测试集，或通过用户态辅助测试程序发起 `truncate` / `ftruncate` 系统调用。
+//! - **下游依赖**：VFS 文件抽象（`File`）、Inode 缓存与生命周期管理（`Inode` / `InodeCache`）、页缓存（Page Cache / `AddressSpace`）、虚拟内存管理（`Mm` 共享/私有 VMA 反向映射与 TLB 跨核同步）、Ext4 磁盘卷块/Inode 分配器（`Ext4Volume`）以及底层块设备回写（Writeback）。
+//!
+//! # 核心机制与截断/回收状态机
+//! 文件截断缩小与孤儿 Inode 销毁需要严格按照两轮反向映射卸载、跨核 TLB 同步（CSD）和在途 I/O 排空顺序推进，防止并发缺页、`fork` 或后台回写访问已释放的物理页或磁盘块：
+//!
+//! ```text
+//! [步骤 0: 更新尺寸与首轮页表卸载 (First Unmap)]
+//!     │  1. 更新 Inode 尺寸为新 EOF，并对文件尾部残留半页清零（Zero Tail）。
+//!     │  2. 第一次扫描反向映射（rmap），卸载越界区间的用户页表叶项（PTE）并撤销部分尾页的写权限。
+//!     ▼  (TruncatePhase::AfterFirstUnmap)
+//! [步骤 1: 摘除页缓存与次轮兜底卸载 (Cache Invalidate & Second Unmap)]
+//!     │  3. 从 AddressSpace 摘除越界物理页（Folio），使之不再是权威缓存页（Non-canonical）。
+//!     │  4. (TruncatePhase::BeforeSecondUnmap) 第二次扫描反向映射，清理在步骤 0 与步骤 1 窗口期内
+//!     │     因并发私有写时复制（COW）缺页或 fork 残留的页表映射；
+//!     │     在跨核 TLB 刷新（FileUnmapPhase::BeforeSync -> CSD -> AfterSync）彻底完成前，
+//!     │     保持被卸载物理页与页表页的引用计数不释放。
+//!     ▼  (TruncatePhase::BeforeBlockRelease)
+//! [步骤 2: 等待在途回写并释放磁盘块 (Wait Writeback & Block Release)]
+//!     │  5. 等待被截断数据页及 Ext4 映射树元数据块上的在途回写 I/O 及完成回调彻底结束。
+//!     │  6. 释放磁盘数据块与间接块/Extent 节点块，清除块位图（Block Bitmap）分配位。
+//!     ▼  (TruncatePhase::AfterStorageRelease — 仅孤儿 Inode 最后一个引用释放时触发)
+//! [步骤 3: 孤儿 Inode 元数据落盘与缓存槽退场 (Post-Delete Writeback & Slot Eviction)]
+//!        7. 归还 Inode 位图分配位，提交清空后的磁盘 Inode 记录回写（Post-delete Metadata WB）。
+//!        8. 并发分配同一 Inode 号的线程必须在 `iget` 处等待旧缓存槽完成落盘并退场，随后递增 generation 复用。
+//! ```
+//!
+//! # 锁获取顺序与并发同步契约
+//! - **业务锁层级**：遵循 VFS 与内存管理标准锁顺序——先获取 Inode 元数据/尺寸串行化上下文，再操作页缓存（`AddressSpace`）与反向映射锁，最后进入单个 `Mm` 页表锁或 Ext4 卷位图/块分配锁。
+//! - **测试同步门控（`TruncateControls` / `InodeReuseControls`）**：测试钩子（Hook）回调在内核路径中触发时，仅通过原子变量（`AtomicUsize` / `AtomicBool`）记录当前进度并在 `Completion` 门控上等待，**严禁在持有自旋锁（`SpinLock`）期间阻塞等待 `Completion`**；测试局部状态（如 `before_sync`、`after_sync`、`allocation`）均在极短的 `SpinLock` 临界区内读写后立即释放锁。
 
 use super::*;
 
-/// 三类截断停点共用的观察回调拥有，原 inode 和阶段仍由调用者借入。
+/// 截断关键节点观察回调的类型别名。
+///
+/// 由 `Arc` 共享所有权并注册到目标 Inode 上；当截断流程推进到各个关键节点（[`TruncatePhase`]）时，
+/// 内核以借用形式传入当前 `InodeRef` 与进度枚举，供测试观测状态或阻塞在同步门控上。
 type TruncateObserver = Arc<dyn Fn(&InodeRef, TruncatePhase) + Send + Sync>;
 
-/// 有效前缀和新尾由独立图样决定；普通读取、原共享 VMA 与冷 FS 读取采用相同逐页字节断言。
+/// 逐页校验文件在截断或扩展后的字节内容（有效前缀为 `0x65`，扩展尾部为零字节）。
+///
+/// # 参数
+/// - `context`：测试上下文，用于执行断言。
+/// - `file`：待校验的打开文件句柄（通过普通 `read_at` 读取验证）。
+/// - `mapping`：可选的共享内存映射所属地址空间（`Mm`）；若提供，则同时校验虚拟地址 `SOURCE + offset` 处的映射字节。
+/// - `prefix`：保留原始数据（填充为 `0x65`）的有效前缀字节数（单位：字节）。
+/// - `size`：文件当前总大小（单位：字节）；`[prefix, size)` 区间内的所有字节必须为 `0x00`。
 fn truncate_contents(
     context: &mut TestContext<'_>,
     file: &FileRef,
@@ -13,6 +56,7 @@ fn truncate_contents(
     prefix: usize,
     size: usize,
 ) -> TestResult {
+    // 按页粒度遍历 [0, size) 区间，构造每页预期字节图样并对比文件读取与内存映射视图
     for offset in (0..size).step_by(PAGE_SIZE) {
         let length = PAGE_SIZE.min(size - offset);
         let mut expected = [0u8; PAGE_SIZE];
@@ -27,10 +71,17 @@ fn truncate_contents(
 }
 
 #[ktest::suite(fixture = WriteOwner, suite_resources = UserSuite, context = "Thread", tags("fs-write", "fs-path", "fs-oom"), resources("root"), timeout_ms = 180000)]
+/// 文件截断、映射失效、回写等待与孤儿 Inode 回收测试用例集。
 pub(super) mod cases {
     use super::*;
 
-    /// 同块、跨块和精确边界缩小后增长，原共享叶重新受 mkwrite 约束；正式同步并结束旧 FS 后重新读设备。
+    /// 测试文件在块内、跨块、块边界及页边界处先截断缩小再扩展增长时，尾部清零、共享/私有映射权限同步以及冷卸载重读的一致性。
+    ///
+    /// - **测试目标**：验证 `truncate` 缩小文件时保留私有映射（`MAP_PRIVATE`）已触发写时复制（COW）的物理页、清除越界数据并保持文件偏移量（Offset）不变；验证再次 `truncate` 扩大文件时，新扩展区间读取为零，半页 EOF 所在的共享映射页写权限被撤销以重新受 `page_mkwrite` 追踪，且 `sync_range` 落盘并冷重启文件系统后磁盘数据与块树结构完全一致。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：根据 `boundary` 参数（`0`=同块 `9->3->9`，`1`=跨块半尾，`2`=块边界，`3`=页边界）向冷挂载文件写入 `size` 字节的 `0x65`，建立共享可写映射（`mm`）与私有可写映射（`private`）并各自通过 `copyout` 写入脏字节触发缺页/COW。
+    ///   2. **When**：将文件游标 `seek` 到 `size + 17`，调用 `truncate(prefix)` 缩小文件；随后对新尾部写入使共享页获得写权限，再调用 `truncate(size)` 扩回原大小，并通过共享映射向新尾部 `size - 1` 写入字节触发 `mkwrite` 块分配，最后执行 `sync_range` 刷盘并卸载旧文件系统实例重新挂载读取。
+    ///   3. **Then**：缩小后文件大小变为 `prefix`，游标仍为 `size + 17`，私有映射的 COW 页物理帧号（PFN）与内容 `0x83` 保持不变；扩回 `size` 后，若 `prefix` 不在整页边界上则原尾页写权限被撤销，`[prefix, size)` 区间读出全零，向新尾部写入会增加 `mkwrite` 计数并完成磁盘块映射，冷重开后从底层块设备读出的文件属性、块映射树与字节内容与同步前一致。
     #[test]
     #[case("same_block_9_3_9", 0u8)]
     #[case("cross_block_partial", 1u8)]
@@ -58,6 +109,7 @@ pub(super) mod cases {
             _ => unreachable!(),
         };
 
+        // Step 1: 将文件清空并按页写入初始大小 `size` 的测试字节（0x65）
         checked(context, file.truncate(0))?;
         for offset in (0..size).step_by(PAGE_SIZE) {
             let length = PAGE_SIZE.min(size - offset);
@@ -70,6 +122,7 @@ pub(super) mod cases {
             );
         }
 
+        // Step 2: 建立共享可写映射（mm）与私有可写映射（private），分别写入字节以建立可写叶页表项与私有 COW 页
         let mm = Arc::try_new(vm(context, Mm::try_new().map_err(VmError::from))?)
             .map_err(|_| TestError("truncate shared MM owner OOM"))?;
         vm(
@@ -92,7 +145,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq(private.copyout(SHARED_ALIAS, &[0x83]).copied, 1);
         let private_pfn = private.mapping(SHARED_ALIAS).unwrap().physical;
-
+        // Step 3: 将文件偏移量设置到 EOF 之外，执行截断缩小到 `prefix`，验证游标不变、共享视图截断且私有 COW 页不受影响
         checked(context, file.seek(SeekFrom::Start((size + 17) as u64)))?;
         checked(context, file.truncate(prefix as u64))?;
         context.expect_eq(checked(context, file.stat())?.size, prefix as u64);
@@ -106,8 +159,9 @@ pub(super) mod cases {
         let mut eof = [0xa7];
         context.expect_eq(file.read_at(prefix as u64, &mut eof), Ok(0));
         context.expect_eq(eof, [0xa7]);
-
-        // 页内 EOF 的有效页再次暖 W；精确页边界之前的整页写许可无需因增长撤销。
+        // Step 4: 重新向 `prefix - 1` 写入使尾页在页表中恢复可写权限，随后将文件扩展回 `size`；
+        // 若 `prefix` 位于页内中间位置，扩展操作会撤销该半页的写权限以便后续写入时重新经过 `page_mkwrite` 分配底层块，
+        // 而当 `prefix` 恰好位于整页边界时，前面完整页的写权限无需撤销。
         context.expect_eq(mm.copyout(SOURCE + prefix - 1, &[0x65]).copied, 1);
         let old_tail = SOURCE + (prefix - 1) / PAGE_SIZE * PAGE_SIZE;
         context.expect_eq(mm.mapping(old_tail).unwrap().permissions.write, true);
@@ -138,7 +192,7 @@ pub(super) mod cases {
         bytes_at(context, &file, (size - 1) as u64, &[0x7e])?;
         context.expect_eq(mm.copyout(SOURCE + size - 1, &[0]).copied, 1);
         truncate_contents(context, &file, Some(&mm), prefix, size)?;
-
+        // Step 5: 同步文件数据与 FLUSH 命令到底层磁盘，销毁旧文件系统与页缓存实例，冷重开后验证磁盘持久化的元数据、块树与尾零内容
         drop(private);
         let before_sync = disk.test_snapshot();
         checked(context, file.sync_range(0..u64::MAX, false))?;
@@ -175,7 +229,13 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 普通用户直接消费截断 ABI、准入 errno 和 OFD 位置；权限修改仅作用于本例正常工作文件。
+    /// 测试用户态程序调用截断相关系统调用（`truncate` / `ftruncate` / `open(O_TRUNC)`）时的权限准入检查、错误码（errno）、文件大小更新与文件游标保持行为。
+    ///
+    /// - **测试目标**：验证读写模式下的尺寸边界检查（如 `u64::MAX` 返回 `FileTooLarge`）与正常截断语义，只读挂载点拒绝截断且不破坏原文件，以及非特权用户（`uid=1001, gid=1001`）对只读权限（`0o444`）文件发起截断时被正确拦截且原文件内容保持完好。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：根据 `admission` 分支准备环境：`1`（`read_only_mount`）准备只读映射测试文件并记录初始 `stat` 与前 32 字节；`0`（`read_write`）打开可写预留文件；`2`（`write_permission`）写入 `"123456789"` 并将文件权限临时改为 `0o444`。
+    ///   2. **When**：分别运行用户态测试程序（参数 `"v"`、`"t"` 或以 `uid=1001` 身份运行 `"h"`）发起截断系统调用，测试结束后恢复被修改的文件权限。
+    ///   3. **Then**：只读挂载与无写权限场景下用户态收到预期拒绝错误码，文件大小与原有字节内容未发生任何改变；可写场景下超大尺寸截断返回 `FsError::FileTooLarge`，合法截断将文件大小更新为预期值。
     #[test]
     #[case("read_write", 0u8)]
     #[case("read_only_mount", 1u8)]
@@ -187,6 +247,7 @@ pub(super) mod cases {
         admission: u8,
     ) -> TestResult {
         if admission == 1 {
+            // 分支 1（read_only_mount）：验证只读条件下截断被拒绝，文件元数据与前缀字节保持不变
             fixture
                 .inodes
                 .try_reserve_exact(16)
@@ -204,10 +265,12 @@ pub(super) mod cases {
             fixture.prepare(context)?;
             let file = fixture.open(context, b"/test/write-reserve", 2)?;
             if admission == 0 {
+                // 分支 0（read_write）：验证超大长度返回 FileTooLarge，随后由用户态程序完成正常截断与游标检查
                 context.expect_eq(file.truncate(u64::MAX), Err(FsError::FileTooLarge));
                 fixture.run(context, b"t")?;
                 context.expect_eq(checked(context, file.stat())?.size, 0);
             } else {
+                // 分支 2（write_permission）：将文件模式临时改为 0o444，以普通用户（uid=1001）运行测试程序验证权限拦截，之后恢复原权限
                 assert_eq!(admission, 2);
                 checked(context, file.truncate(0))?;
                 context.expect_eq(file.write_at(0, b"123456789"), Ok(9));
@@ -255,8 +318,13 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 真实 private 候选在首失效后完成 store 与 fork；另一个参数在真实 fork 快照后失效，禁止提交过期子叶。
-    /// 原文件页在失效前由显式有限请求准备，并保活到两次失效完成。
+    /// 测试文件截断缩小过程中，首轮反向映射卸载（First Unmap）与并发私有写时复制（COW）缺页或 `fork` 页表复制的交错同步，以及次轮卸载（Second Unmap）和跨核 TLB 刷新（CSD）的生命周期保障。
+    ///
+    /// - **测试目标**：验证在截断完成首轮页表卸载但尚未从页缓存摘除旧页的窗口期内：（1）`late_private_cow` 分支下恢复执行的私有写缺页若已完成 COW 分配并 `fork` 给子进程，次轮反向映射卸载必须清除父子进程对应的越界页表项，且在跨核 TLB 同步（CSD）彻底完成前保持被卸载的 2 个物理页及页表页引用不释放；（2）`fork_snapshot` 分支下若 `fork` 在首轮卸载前暂停快照，恢复后不得向子进程提交已越界的过期页表项。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：向文件写入 8192 字节（2 页）并同步落盘，预先获取第 1 页的页缓存 `Folio`（`original`）保活至测试结束；注册截断观察钩子（在 `AfterFirstUnmap` 与 `BeforeSecondUnmap` 阻塞）及页表卸载同步钩子（在 `FileUnmapPhase::BeforeSync` 阻塞），并在虚拟地址 `SOURCE`（映射文件第 1 页）上挂载缺页钩子或 `fork` 钩子。
+    ///   2. **When**：启动用户态进程触发 `SOURCE` 处的私有写缺页或 `fork` 并使其在钩子处暂停阻塞；后台线程发起 `truncate(PAGE_SIZE)` 完成首轮卸载并在 `AfterFirstUnmap` 处暂停；随后放行用户态进程完成 COW 写入与 `fork`，再依次放行截断线程执行页缓存摘除、次轮反向映射扫描与跨核 TLB 同步（CSD）。
+    ///   3. **Then**：`fork_snapshot` 模式下父子进程在 `SOURCE` 处均无残留映射；`late_private_cow` 模式下首轮卸载后建立的父子 COW 页在次轮卸载中被彻底清除，`BeforeSync` 与 `AfterSync` 钩子观测到被保留的物理页数为 2、页表数不少于 2，最终父子进程访问 `SOURCE` 均返回 `VmError::BeyondEof`。
     #[test]
     #[case("late_private_cow", false)]
     #[case("fork_snapshot", true)]
@@ -266,6 +334,7 @@ pub(super) mod cases {
         fixture: &mut WriteOwner,
         fork_snapshot: bool,
     ) -> TestResult {
+        // Step 1: 准备 2 页（8192 字节）文件数据并同步落盘，获取第 1 页的页缓存 Folio 引用，初始化用户态共享控制区偏移量
         fixture.prepare(context)?;
         let file = fixture.open(context, b"/test/write-reserve", 2)?;
         checked(context, file.truncate(0))?;
@@ -289,6 +358,7 @@ pub(super) mod cases {
             return Err(TestError("truncate file offset initialization failed"));
         }
 
+        // Step 2: 注册 Inode 截断进度钩子、页表卸载跨核同步（CSD）钩子以及 Mm 缺页/fork 暂停钩子
         let controls = TruncateControls::new()?;
         fixture.truncate_controls = Some(controls.clone());
         let stages = controls.clone();
@@ -352,6 +422,7 @@ pub(super) mod cases {
             mm.ktest_set_fault_hook(Some(hook));
         }
 
+        // Step 3: 启动用户态进程推进至缺页或 fork 钩子处阻塞，随后发起异步 truncate(PAGE_SIZE) 完成首轮卸载并暂停
         fixture.start_shared(context, image)?;
         fixture.phase(&mm, 0, 1)?;
         WriteOwner::release(&mm, 1)?;
@@ -386,6 +457,7 @@ pub(super) mod cases {
         context.expect_eq(checked(context, file.stat())?.size, PAGE_SIZE as u64);
         context.expect_eq(mm.mapping(SOURCE), None);
 
+        // Step 4: 唤醒暂停的缺页或 fork 线程，验证首轮卸载后的并发 COW 建立与子进程复制行为，然后放行截断进入页缓存摘除流程
         gate.complete();
         mm.ktest_set_fault_hook(None);
         mm.ktest_set_fork_hook(None);
@@ -432,6 +504,7 @@ pub(super) mod cases {
             context.expect_eq(child_mm.mapping(SOURCE).is_some(), true);
         }
 
+        // Step 5: 放行次轮反向映射卸载与跨核 TLB 同步（CSD），验证被卸载物理页与页表在 CSD 前后受保护且最终父子地址空间均返回 BeyondEof
         controls.gates[1].complete();
         if !fork_snapshot {
             until(
@@ -475,8 +548,13 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 普通 ftruncate 等原数据或真实树节点 WB；旧位图仍 used，真实全尾结束后旧 data 和 metadata 块才复用为新数据。
-    /// 旧树全部原页共享准备预算，块复用后的新页检查使用独立有限请求。
+    /// 测试 `ftruncate` 截断文件时必须等待在途的数据页或块映射树元数据节点回写（Writeback）完成，之后才释放磁盘块位图并允许旧物理块被安全复用。
+    ///
+    /// - **测试目标**：验证当被截断文件存在正在飞行的底层磁盘数据回写（`metadata = false`）或间接块/Extent 树节点元数据回写（`metadata = true`）时，用户态 `ftruncate` 会阻塞等待回写 I/O 及其完成回调彻底结束，在此期间旧数据块与元数据块在位图中保持已分配状态（不会被新块分配请求提前复用），防止在途旧 DMA 回写覆盖新分配块的数据。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：根据 Inode 布局（传统间接块或 Extent 树）在 5 个逻辑块偏移处写入数据以构造包含元数据内部节点的块映射树，记录全部旧物理块号及对应的页缓存 `Folio`，并执行首次同步落盘。
+    ///   2. **When**：再次标脏全部数据块或元数据树节点块，挂起块设备完成中断（`test_suspend_completions`）并启动后台回写使其处于飞行阻塞状态；随后放行用户态线程发起 `ftruncate(fd, 0)`，检查阻塞期间的块位图与探测分配结果，再恢复块设备完成中断让回写与截断全部执行完毕，最后向文件重新写入新数据（`0xd7`）以复用刚才释放的物理块并刷盘重读。
+    ///   3. **Then**：回写飞行期间用户态 `ftruncate` 线程处于 `State::Blocked`，所有旧数据块与树节点块的位图分配位均为 `true`，探测分配的新块绝不与旧块重合；回写完成后截断返回，文件大小与块数归零，旧块位图全部清零；后续写入成功复用全部旧物理块且分配全新的页缓存物理页，底层磁盘对应物理块读出新数据 `0xd7`（未被早前的旧回写覆盖）。
     #[test]
     #[case("data", false)]
     #[case("metadata_node", true)]
@@ -495,6 +573,7 @@ pub(super) mod cases {
             return Err(TestError("W21 requires production FLUSH"));
         }
 
+        // Step 1: 写入 5 个跨度较大的逻辑块以生成多层块映射树（数据块 + 元数据树节点），记录所有旧物理块与页缓存 Folio 并先行同步
         checked(context, file.truncate(0))?;
         let block = volume.geometry().block_size;
         let traditional = checked(context, inode.metadata_snapshot())?.flags & codec::EXTENTS == 0;
@@ -541,6 +620,7 @@ pub(super) mod cases {
         let node_folio = node_buffer.folio().clone();
         checked(context, file.sync_range(0..u64::MAX, false))?;
 
+        // Step 2: 启动用户态测试进程准备发起 ftruncate，标脏目标元数据块或数据块，挂起磁盘完成回调并提交回写使 I/O 停留在飞行状态
         let image = fixture.shared_image(context, b"j")?;
         let mm = image.mm.clone();
         fixture.start_shared(context, image)?;
@@ -565,7 +645,7 @@ pub(super) mod cases {
         inode.ktest_set_truncate_hook(Some(hook));
 
         if metadata {
-            // 原节点条目和 CRC 保持合法；update 重新记其真实 Dirty，正式 metadata WB 写出旧树字节。
+            // 保持树节点原有条目与校验和合法，通过空闭包 update 将元数据缓冲区重新标记为 Dirty，触发元数据回写
             checked(
                 context,
                 node_buffer
@@ -606,6 +686,7 @@ pub(super) mod cases {
             submitted && snapshot.inflight != 0 && observed.blocked()
         })?;
 
+        // Step 3: 放行用户态 ftruncate，验证其阻塞等待在途回写，且阻塞期间旧物理块位图仍标记为占用、不会被新块分配请求提前拿走
         WriteOwner::release(&mm, 1)?;
         until(
             "W21 ordinary ftruncate did not block on original IO",
@@ -639,6 +720,7 @@ pub(super) mod cases {
         context.expect_eq(observed.result.lock().is_none(), true);
         context.diagnostic(format_args!("W21 kind={} completion-consumption-paused=1 ordinary-sys46-blocked=1 first-unmap-observed={} old-data-and-node-bitmap-used=1 real-allocation-excludes-old-blocks=1 allocated-probe={} hardware-DMA-inflight-claim=0", if metadata { "metadata-node" } else { "data" }, first_unmap.load(Ordering::Acquire), allocated));
 
+        // Step 4: 恢复磁盘完成回调并排空工作队列，验证截断彻底完成后旧块位图归还，随后写入新数据可安全复用全部旧物理块且分配新 Folio
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -712,14 +794,20 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 合法未链接 inode 的缓存先退出，OFD、VMA、外部原页和真实 IO 分别保活；最后使用交原 Task 回收并返块和 inode 位。
-    /// 外部原页由一份显式有限请求取得，其最后释放仍承担原 inode 寿命。
+    /// 测试合法已发布但未链接（`nlink == 0`）的孤儿 Inode 在 InodeCache 引用、打开文件描述符（OFD）、内存映射（VMA）、外部页缓存 `Folio` 引用以及在途回写 I/O 依次释放时的生命周期管理与资源回收。
+    ///
+    /// - **测试目标**：验证上述任意一类持有者存活期间，孤儿 Inode 的缓存槽位、磁盘块与 Inode 位图均保持占用；仅当最后一个持有者（本例中为在途回写 I/O 及其完成回调）彻底退出后，才在可睡眠任务上下文中触发 Inode 驱逐，归还数据块位图与 Inode 位图，并允许该 Inode 号被新分配请求安全复用。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：分配并发布一个硬链接数为 0（`links == 0`）的新 Inode，通过未哈希路径打开为可写 `File`，写入 1 页数据，获取其第 0 页的 `Folio` 句柄，建立共享内存映射（`mm`），并挂起磁盘完成中断后发起该页的后台回写使其处于飞行阻塞状态。
+    ///   2. **When**：按顺序依次释放 `InodeCache` 持有引用、打开文件句柄 `file`、虚拟内存空间 `mm` 以及外部 `Folio` 引用，每次释放后观测驱逐状态与位图；最后恢复磁盘完成中断，等待在途回写及其工作队列回调执行完毕，并尝试重新分配一个新的 Inode。
+    ///   3. **Then**：在前四类引用依次释放后，由于飞行回写仍持有 Inode 引用，缓存槽位、Inode 位图与数据块位图始终保持占用（`true`）；当回写彻底完成后，缓存槽被移除，Inode 位图与数据块位图全部归还（`false`），卷空闲计数恢复至初始值，且随后的 `allocate_inode` 成功复用了同一个 Inode 号。
     #[test]
     #[ktest(tags("fs-truncate", "fs-inode-lifetime", "fs-sync"), min_cpus = 2)]
     fn unlinked_last_ofd_vma_folio_and_io_release_canonical_inode(
         context: &mut TestContext<'_>,
         fixture: &mut WriteOwner,
     ) -> TestResult {
+        // Step 1: 验证已链接 Inode 拒绝构造 unhashed 路径，随后分配并发布一个 nlink == 0 的孤儿 Inode，打开文件写入 1 页数据并获取 Folio 与共享 VMA 映射
         let (linked, cold_vfs) = fixture.cold_open(context)?;
         let volume = fixture.cold_volume.as_ref().unwrap().clone();
         let cache = fixture.cold_cache.as_ref().unwrap().clone();
@@ -778,6 +866,7 @@ pub(super) mod cases {
             true,
         );
 
+        // Step 2: 挂起块设备完成回调并提交孤儿 Inode 数据页回写，使底层回写 I/O 处于飞行阻塞状态
         let disk = fixture.user.path.owner.disk()?.clone();
         let ranges = checked(context, prepare_unlinked_original_writeback(&inode, &folio))?;
         disk.test_suspend_completions();
@@ -807,6 +896,7 @@ pub(super) mod cases {
             },
         )?;
 
+        // Step 3: 依次释放缓存句柄、OFD（file）、VMA（mm）与外部 Folio 引用，验证在途回写单独保活 Inode 及所有磁盘位图
         fixture.inodes.clear();
         drop(inode);
         drop(fixture.cold_cache.take());
@@ -852,6 +942,7 @@ pub(super) mod cases {
         }
         context.diagnostic(format_args!("inode-last-use number={} legitimate-published-nlink0=1 unhashed-real-OFD-and-VMA=1 cache-owner-ended=1 OFD-then-VMA-then-folio-ended=1 original-IO-credential-only-owns-inode=1 bitmap-and-size-preserved=1", number));
 
+        // Step 4: 恢复磁盘完成中断让在途回写彻底结束，验证任务上下文完成最终驱逐、归还块与 Inode 位图，且同一 Inode 号可被重新分配
         disk.test_resume_completions();
         fixture.join_consumers()?;
         context.expect_eq(*observed.result.lock(), Some(Ok(())));
@@ -901,19 +992,29 @@ pub(super) mod cases {
         Ok(())
     }
 
+    /// 孤儿 Inode 存储释放后与复用分配之间的测试同步门控。
     struct InodeReuseControls {
+        /// 标识被删除 Inode 是否已到达 `TruncatePhase::AfterStorageRelease` 节点（`0` 为未到达，`1` 为已到达）。
         phase: AtomicUsize,
+        /// 异常退出或测试结束时的取消标志，防止钩子回调永久阻塞在 `gate` 上。
         cancelled: AtomicBool,
+        /// 控制被删除 Inode 从 `AfterStorageRelease` 继续推进到删除后元数据回写（Post-delete Metadata WB）的同步门。
         gate: Completion,
     }
 
+    /// 已完成分配并在 `InodeCache` 中发布登记的权威 Inode 结果。
     struct ReusedCanonicalInode {
+        /// 分配得到的 Ext4 Inode 编号。
         number: u64,
+        /// 在调用 `cache.iget` 之前，旧 Inode 在缓存中的槽位是否已经移除。
         slot_removed_before_iget: bool,
+        /// 从 `InodeCache` 获取并已正式发布（`token.publish()`）的权威 Inode 引用。
         inode: InodeRef,
     }
 
-    /// 分配成功后先由同一缓存取得 canonical inode，再发表并结束临时 reservation。
+    /// 在指定 Ext4 卷上分配一个新 Inode，通过同一 `InodeCache` 获取其权威缓存实例并完成正式发布。
+    ///
+    /// 若 `cache.iget` 失败（例如旧缓存槽的删除后元数据回写失败），则自动归还未发布的临时 Inode 预留令牌。
     fn allocate_published_inode(
         volume: &Arc<Ext4Volume>,
         cache: &Arc<InodeCache>,
@@ -936,7 +1037,13 @@ pub(super) mod cases {
         })
     }
 
-    /// 真实未链接 inode 释放存储后，分配者须等 post-delete metadata WB 和原 canonical 槽退场。
+    /// 测试未链接（`nlink == 0`）Inode 释放磁盘块与位图后，并发复用该 Inode 号的分配者必须等待删除后元数据回写（Post-delete Metadata WB）及旧缓存槽退场，并验证元数据回写失败时的回滚与重试恢复。
+    ///
+    /// - **测试目标**：验证当旧孤儿 Inode 已归还位图但尚未完成磁盘 Inode 记录清零回写时，新分配者虽然能在位图中预留同一 Inode 号，但在 `cache.iget` 获取权威缓存槽时必须阻塞等待旧槽完成回写并退场；若回写成功（`running`），新 Inode 继承该编号并将 `generation` 加 1；若回写发生 I/O 错误（`failed`），新分配者的 `iget` 收到原始错误并自动回滚位图预留，旧缓存槽保留在缓存中直到显式调用 `prune_unused()` 重试回写成功后才允许再次分配复用。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：分配并发布一个 `links == 0` 的孤儿 Inode，记录其初始 `generation` 与磁盘记录快照；注册 `TruncatePhase::AfterStorageRelease` 钩子以在位图归还后、删除后元数据回写提交前暂停驱逐流程。
+    ///   2. **When**：丢弃该孤儿 Inode 的全部引用使其暂停在 `AfterStorageRelease`；启动后台分配线程调用 `allocate_published_inode` 使其预留同一 Inode 号并在 `cache.iget` 处阻塞等待旧槽退场；随后挂起磁盘完成中断（在 `failed` 分支下注入一次元数据 I/O 错误 `test_fail_next_metadata`），放行旧 Inode 提交删除后元数据回写，再恢复磁盘完成中断观测结果。
+    ///   3. **Then**：`running` 分支下回写完成后旧槽退场，后台分配者被唤醒并成功返回新 Inode，`generation` 为 `old_generation + 1`；`failed` 分支下回写报错导致驱逐与后台 `iget` 均返回 `FsError::Io(BlockError::Io)`，预留位图被回滚且旧槽仍留在缓存中，随后调用 `cache.prune_unused()` 重新提交元数据回写并移除旧槽，再次调用 `allocate_published_inode` 成功复用该编号并将 `generation` 加 1。
     #[test]
     #[case("running", false)]
     #[case("failed", true)]
@@ -956,6 +1063,7 @@ pub(super) mod cases {
         let allocation = Arc::try_new(SpinLock::new(None::<Result<ReusedCanonicalInode, FsError>>))
             .map_err(|_| TestError("inode reuse result OOM"))?;
         let body = (|| -> TestResult {
+            // Step 1: 分配并发布初始孤儿 Inode（links == 0），注册 AfterStorageRelease 暂停钩子，随后释放全部引用使其停在位图已归还但缓存槽未退场的位置
             let (linked, cold_vfs) = fixture.cold_open(context)?;
             let volume = fixture.cold_volume.as_ref().unwrap().clone();
             let cache = fixture.cold_cache.as_ref().unwrap().clone();
@@ -1017,7 +1125,7 @@ pub(super) mod cases {
             let (old_record, record_size) = inode_record_snapshot(context, &volume, number)?;
             let old_generation = checked(context, codec::le32(&old_record[..record_size], 100))?;
             context.expect_eq(old_generation, original_metadata.generation);
-
+            // Step 2: 启动并发分配者，验证其在位图中重新预留该 Inode 号后，在 cache.iget 处阻塞等待旧权威缓存槽退场
             let result = allocation.clone();
             let actor_volume = volume.clone();
             let actor_cache = cache.clone();
@@ -1046,6 +1154,7 @@ pub(super) mod cases {
                 Ok(old_generation),
             );
 
+            // Step 3: 挂起磁盘完成回调（可选注入元数据 I/O 失败），放行旧 Inode 发起删除后元数据回写，随后恢复磁盘完成回调等待回写结束
             disk.test_suspend_completions();
             let before_writeback = disk.test_snapshot();
             context.expect_eq(before_writeback.inflight, 0);
@@ -1077,6 +1186,7 @@ pub(super) mod cases {
             context.expect_eq(before_writeback.completed < completed.completed, true);
             context.expect_eq(disk.test_completion_error_pending(), false);
 
+            // Step 4: 验证回写失败分支（错误传播、位图预留回滚、prune_unused 显式重试恢复）与正常完成分支下的 Inode 复用及 generation 递增
             let reused = if fail_metadata {
                 until(
                     "inode reuse allocator did not return the real metadata error",
@@ -1191,8 +1301,13 @@ pub(super) mod cases {
         Ok(())
     }
 
-    /// 新 VMA 发表而必撤叶尚在时，旧文件来源与登记仍须供真实截断找到；CSD 结束后才能丢原页表拥有。
-    /// 旧文件与可选新文件分别用独立有限请求准备原页，保留各自的来源身份。
+    /// 测试当虚拟内存区间（VMA）被覆盖映射（文件映射替换、匿名映射替换）或 `munmap` 卸载，且在旧页表叶项尚未清理前暂停时，并发截断旧文件仍能通过反向映射找到并清理旧页表项，并在跨核 TLB 同步（CSD）完成前保有物理页与页表引用。
+    ///
+    /// - **测试目标**：验证在 `mmap(MAP_FIXED)` 覆盖或 `munmap` 操作已发布新 VMA 元数据、但正阻塞在页表叶项清理钩子（`vma_unmap_hook`）的窗口期内，旧文件对应的反向映射登记依然有效；此时对旧文件执行 `truncate(0)` 能够定位并清除 `SOURCE` 处的旧页表叶项，在 `FileUnmapPhase::BeforeSync` 到 `AfterSync`（CSD）期间安全持有 1 个物理页及至少 2 级页表的引用，且后续放行 VMA 替换线程后新映射缺页或 `munmap` 状态完全正常。
+    /// - **场景步骤（Given-When-Then）**：
+    ///   1. **Given**：向旧文件写入 1 页 `0x4f` 并落盘，获取其第 0 页 `old_folio`，将其只读映射到 `mm` 的 `SOURCE` 地址并触发缺页建立叶页表项；若 `replacement == 0`（`file_to_file`），同时准备新文件及其第 0 页 `new_folio`；在 `mm` 上注册 `vma_unmap_hook` 并在 `old_inode` 上注册 `unmap_hook`。
+    ///   2. **When**：启动后台线程在 `SOURCE` 处执行新文件 `mmap(Fixed)`、私有匿名 `mmap(Fixed)` 或 `unmap`，使其在 `vma_unmap_hook` 处暂停（此时旧叶页表项仍指向 `old_folio`）；启动另一后台线程对旧文件执行 `truncate(0)`，观测 `BeforeSync` 与 `AfterSync` 计数后完成截断；最后放行 `vma_unmap_hook` 让 VMA 替换/卸载线程完成，并对 `SOURCE` 发起读缺页验证。
+    ///   3. **Then**：旧文件 `truncate(0)` 通过反向映射成功清除 `SOURCE` 处的旧叶页表项，CSD 同步前后均观测到保活 1 个物理页和不少于 2 个页表对象；VMA 操作完成后，`munmap` 分支下访问 `SOURCE` 返回 `VmError::Unmapped`，文件替换分支下缺页映射到 `new_folio` 并读出新文件数据，匿名替换分支下缺页映射到非 `old_folio` 的零页。
     #[test]
     #[case("file_to_file", 0u8)]
     #[case("file_to_anonymous", 1u8)]
@@ -1203,6 +1318,7 @@ pub(super) mod cases {
         fixture: &mut WriteOwner,
         replacement: u8,
     ) -> TestResult {
+        // Step 1: 准备旧文件（填充 0x4f）及可选替换用的新文件，各自获取第 0 页 Folio，在 mm 的 SOURCE 处建立旧文件映射并注册 VMA 卸载与文件反向映射钩子
         fixture.prepare(context)?;
         let old = fixture.open(context, b"/test/write-reserve", 2)?;
         checked(context, old.truncate(0))?;
@@ -1278,6 +1394,7 @@ pub(super) mod cases {
             .map_err(|_| TestError("mandatory retirement ownership hook OOM"))?;
         old_inode.mapping().ktest_set_unmap_hook(Some(hook));
 
+        // Step 2: 启动后台任务在 SOURCE 处执行覆盖 mmap 或 munmap，并使其在 vma_unmap_hook 处暂停（此时旧页表叶项尚未被 VMA 路径清除）
         let result = Arc::try_new(SpinLock::new(None::<Result<(), VmError>>))
             .map_err(|_| TestError("mandatory retirement result OOM"))?;
         let recorded = result.clone();
@@ -1326,6 +1443,7 @@ pub(super) mod cases {
         )?;
         context.expect_eq(mm.mapping(SOURCE).unwrap().physical, old_folio.phys_addr());
 
+        // Step 3: 对旧文件并发执行 truncate(0)，验证反向映射仍能定位并清除 SOURCE 处的旧页表叶项，且跨核 TLB 同步（CSD）期间保有物理页与页表引用
         let truncating = old.clone();
         let observed = fixture.consume_sync(1, move || truncating.truncate(0))?;
         until("old file rmap lost mandatory retirement source", || {
@@ -1351,6 +1469,7 @@ pub(super) mod cases {
         context.expect_eq(checked(context, old.stat())?.size, 0);
         context.expect_eq(mm.mapping(SOURCE), None);
 
+        // Step 4: 唤醒 VMA 覆盖/卸载任务完成收尾，随后触发 SOURCE 读缺页验证新映射（文件或匿名零页）或 Unmapped 状态
         gate.complete();
         mm.ktest_set_vma_unmap_hook(None);
         fixture.prepare_gate.take();

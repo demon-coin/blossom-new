@@ -1,8 +1,47 @@
-//! 同核 IRQ-off 的真实 ABI 哨兵；异常在内部 Rust catch 返回，不跨 C/汇编边界。
+//! 跨异常展开边界的被调用者保存（Callee-Saved）寄存器与控制状态往返自检模块。
+//!
+//! ## 模块职责与架构定位
+//! 本模块归属内核测试框架（`ktest`）自检子系统，用于验证当 Rust 代码在触发 `panic!` 并完成栈展开（Unwind）与捕获（`panic::catch`）后，
+//! 底层 DWARF 展开器与编译器生成的着陆垫（Landing Pad）是否正确恢复或保持了目标架构 ABI 规定的所有被调用者保存寄存器及控制状态。
+//! - **上游调用者**：`ktest::selftest` 中的 `boot::registers` 与 `thread::registers` 自检用例。
+//! - **下游依赖**：`ktest::panic::catch`（内核态异常捕获器）与 `sync::IrqSaveGuard`（中断屏蔽守卫）。
+//!
+//! ## 核心设计与栈帧布局
+//! 测试通过一段架构相关的汇编桩函数 `ktest_register_roundtrip_asm` 驱动，整体执行流程如下：
+//! 1. **保存调用方现场**：在当前栈上开辟固定栈帧，保存所有被调用者保存通用寄存器（GPR）、线程指针（`tp` / `$r21`）、栈指针（`sp`）以及浮点控制状态与被调用者保存浮点寄存器（FPR）。
+//! 2. **注入特征哨兵值**：临时开启硬件浮点单元（FPU），向 `FCSR` 与所有被调用者保存浮点寄存器写入特征浮点位模式，随即关闭 FPU；向所有被调用者保存通用寄存器写入特征整数值。
+//! 3. **触发并捕获栈展开**：调用 C ABI 回调函数 `caught_panic`。该函数在内部触发一次 Rust `panic!` 并立即通过 `panic::catch` 拦截，确保栈展开完全收敛在 Rust 栈帧内部，绝不跨越 `extern "C"` 或汇编边界。
+//! 4. **校验寄存器与控制位**：回调返回后，汇编桩逐一比对中断使能位、FPU 开关位、`sp`、Per-CPU 基址寄存器、被调用者保存 GPR、FPU 状态字以及被调用者保存 FPR 是否与调用前注入的哨兵值完全一致。
+//! 5. **恢复现场并返回**：无论校验是否通过，均将栈帧中备份的调用方原始 GPR/FPR 与 FCSR 完整恢复，维持 FPU 关闭状态后返回布尔结果（`1` 表示通过，`0` 表示失败）。
+//!
+//! ### 汇编保存栈帧布局（以 `riscv64` 256 字节栈帧为例）
+//! ```text
+//! 高地址 (调用前原始 sp)
+//! +-------------------------------+ sp + 256
+//! | 240(sp): 校验结果标志 (0 / 1) |
+//! | 232(sp): 回调函数指针 (a0)    |
+//! | 224(sp): 分配栈帧后的基准 sp  |
+//! | 128..216: fs0 .. fs11 备份    |
+//! | 120(sp): 原始 fcsr 备份       |
+//! | 104(sp): 原始 tp 备份         |
+//! |   8..96: s0 .. s11 备份       |
+//! |   0(sp): 返回地址 ra 备份     |
+//! +-------------------------------+ sp + 0 (当前栈顶)
+//! 低地址
+//! ```
+//! （`loongarch64` 采用类似的 224 字节栈帧，额外备份 `$fp`、`$r21` 与 `CSR_KS0`。）
+//!
+//! ## 锁获取顺序与并发契约
+//! - 本模块不获取任何自旋锁或睡眠锁。
+//! - `selftest_register_roundtrip` 全程持有 `IrqSaveGuard` 屏蔽本地 CPU 中断，从而固定当前执行 CPU（禁止抢占与跨核迁移），并确保临时开启 FPU 读写浮点哨兵寄存器期间不会被中断处理程序打断。
 
 use crate::sync::IrqSaveGuard;
 
-/// 固定 C 回调只在内部普通 Rust 栈展开；任何异常都在返回此 C 帧之前归还。
+/// 供汇编桩调用的 C ABI 回调函数：在内部触发一次栈展开并原地捕获。
+///
+/// 调用上下文：在本地中断关闭且 FPU 关闭的状态下由 `ktest_register_roundtrip_asm` 调用。
+/// 内部所有的栈展开（Unwind）都在返回此 `extern "C"` 函数帧之前由 `panic::catch` 拦截完毕，
+/// 若成功捕获目标异常且展开状态已完全清理，则返回 `1`，否则返回 `0`。
 #[inline(never)]
 extern "C" fn caught_panic() -> usize {
     match super::panic::catch(|| panic!("vertical register roundtrip")) {
@@ -14,23 +53,33 @@ extern "C" fn caught_panic() -> usize {
 }
 
 extern "C" {
-    /// 保存原 GPR/FP/FCSR 与控制状态，以真实哨兵调用内部捕获回调，核验并恢复。
+    /// 架构相关的寄存器往返校验汇编入口：备份原始寄存器现场，注入哨兵值后调用 `callback`，校验返回后的寄存器与控制位并恢复原始现场。
+    ///
     /// # Safety
-    /// 当前必须同 CPU、IRQ-off、FP Off；callback 必须自己捕获全部 Rust panic，不得调度。
+    /// 1. 调用时必须已关闭本地 CPU 中断（禁止抢占与跨核迁移），且硬件浮点单元（FPU）处于关闭状态（Off）。
+    /// 2. `callback` 必须在内部捕获所有 Rust `panic!`，不得让栈展开跨越 C/汇编调用边界，且执行期间不得触发任务调度或开启中断。
     fn ktest_register_roundtrip_asm(callback: extern "C" fn() -> usize) -> usize;
 }
 
-/// 验证硬浮点目标 ABI 的全部 callee-saved GPR/FP、SP、per-CPU 基址和控制状态。
-/// 主体回调维持 FP Off；只在 IRQ-off 汇编测量窗口临时启 FP，不允许迁核。
+/// 执行被调用者保存通用寄存器（GPR）、浮点寄存器（FPR）、栈指针（SP）、Per-CPU 基址寄存器及控制状态的栈展开往返自检。
+///
+/// 调用上下文：可在 Boot 阶段早期栈或 Thread 阶段内核线程栈上调用。
+/// 函数内部通过 `IrqSaveGuard` 关闭本地中断以固定当前 CPU；主体回调执行期间维持 FPU 关闭，仅在汇编桩注入与核对浮点哨兵值的受控窗口内临时启用 FPU。
+///
+/// 返回值：若所有被调用者保存寄存器与控制状态在经历 `panic!` 栈展开后均完好无损，则返回 `true`。
 pub(crate) fn selftest_register_roundtrip() -> bool {
     let _irq = IrqSaveGuard::new();
-    // SAFETY: IRQ guard 固定本 CPU；汇编拒绝非 FP Off 入口，完整保存原现场，
-    // caught_panic 在内部 Rust catch 收回异常且不调度，从不向 C/汇编调用帧展开。
+    // SAFETY:
+    // 1. `_irq` 守卫已屏蔽本地 CPU 中断，保证当前执行流不会发生任务抢占或跨核迁移。
+    // 2. 内核常规执行流默认处于 FPU 关闭状态，汇编入口也会前置检查 FPU 开关位并完整保存/恢复所有被调用者保存寄存器。
+    // 3. `caught_panic` 在函数内部通过 `panic::catch` 拦截全部栈展开且不触发调度，不会向汇编调用帧传播异常。
     unsafe { ktest_register_roundtrip_asm(caught_panic) != 0 }
 }
 
-// SAFETY: 两段汇编只由 IRQ guard 下的窄入口调用；临时 FP 访问前显式启用，
-// 回调前关闭，返回后核验，最终恢复原 FCSR/全部 ABI callee-saved FP/GPR。
+// SAFETY:
+// 1. 以下两段全局汇编仅定义 `ktest_register_roundtrip_asm` 符号，且仅由上方持有 `IrqSaveGuard` 的 `selftest_register_roundtrip` 调用。
+// 2. 汇编在访问浮点寄存器前先检查并临时置位 `sstatus.FS` / `CSR_EUEN.FPE`，调用 `callback` 前将其清零，
+//    并在退出前完整恢复调用方原有的 `FCSR`、所有被调用者保存浮点与通用寄存器以及栈指针 `sp`，严格遵循目标平台 C ABI。
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(
     r#"

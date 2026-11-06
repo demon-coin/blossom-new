@@ -1,4 +1,47 @@
-//! extent 与传统间接树只在内容借用中解码，树下降和真实 I/O 在借用之外。
+//! ext4 文件逻辑块映射查询、块树写入预备与尾部截断模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块负责将文件内的逻辑块号（Logical Block）翻译或修改为磁盘上的物理块号（Physical Block），
+//! 同时完整支持现代 **Extent B+ 树（`EXT4_EXTENTS_FL`）** 与传统 **直接/一二三级间接块指针树**：
+//! - **上游调用者**：`Ext4Volume`（`ext4.rs`）、目录扩展与 HTree 索引分裂（`directory.rs`）以及 VFS Inode 的读写、缺页可写转换（`mkwrite`）与 `truncate` 路径。
+//! - **下游依赖**：`ext4::codec`（节点头部、条目与 CRC32C 编解码）、`ext4::allocation`（未发布块 `UnpublishedBlock` 分配与待回收块 `DetachedBlock` 登记）以及 `MetadataCache` 元数据块缓存。
+//!
+//! # 核心设计：两阶段预备与提交状态机（Prepare / Publish / Cancel）
+//! 为了保证在内存不足（OOM）、磁盘空间耗尽（ENOSPC）或元数据损坏时已生效的文件树与位图不出现半修改状态，
+//! 所有块树变更均严格遵循两阶段协议，且只保存结构化条目而非整块旧字节快照：
+//! ```text
+//!   prepare / prepare_directory_mappings / prepare_truncate
+//!   (在持缓存读锁外预先申请堆内存、分配新块、加载并校验树路径，修改仅写入私有计划)
+//!                            |
+//!             +--------------+--------------+
+//!             | (后续准备失败)               | (数据页与 inode 记录就绪，持 disk_root 写锁)
+//!             v                             v
+//!       cancel(volume)               publish(volume, seed)
+//!   1. 失效新分配树节点的缓存别名     1. 原地更新各脏树节点字段与尾部 CRC
+//!   2. 将全部 UnpublishedBlock       2. 解除 UnpublishedBlock 临时回滚责任
+//!      归还块位图与空闲计数          3. 激活 DetachedBlock 延迟释放令牌返回给调用方，
+//!   (已生效的旧块树毫发无损)             待旧数据/元数据 I/O 排空后再归还位图
+//! ```
+//!
+//! ## 两种盘面块映射树结构对比
+//! ```text
+//! 1. Extent 树（inode.i_block 60B = 12B Header + 4 * 12B Entry）：
+//!    depth > 0: [ExtentIdx (logical_lo, leaf_phys_48b)] ---> 外部 Extent 块（末尾含 4B CRC32C）
+//!    depth = 0: [ExtentLeaf (logical, len+unwritten_bit, data_phys_48b)] ---> 连续物理数据块
+//!
+//! 2. 传统块指针树（inode.i_block 60B = 15 * u32 块号，每个外部块含 block_size/4 个 u32）：
+//!    slot 0..12 : 直接指向数据块
+//!    slot 12    : 一级间接块 -> 数据块
+//!    slot 13    : 二级间接块 -> 一级间接块 -> 数据块
+//!    slot 14    : 三级间接块 -> 二级间接块 -> 一级间接块 -> 数据块
+//! ```
+//!
+//! # 锁获取顺序（Lock Ordering）与并发契约
+//! 1. **Inode 写序列化锁（外层）**：所有 `prepare*` 与 `truncate` 均在调用方持有目标 inode 写互斥/失效锁的前提下运行，保证同一时刻只有一个写者规划块树变更，期间并发读者仍可在 `disk_root` 读锁下安全遍历旧树。
+//! 2. **`disk_root` 读写锁 -> 元数据块内容锁（`BufferRef`）**：
+//!    - 只读映射查询（`map`）在调用方持有 `disk_root` 读锁时执行；每层外部树块仅在 `BufferRef::with_read` 闭包内短暂持有页内容读锁完成解码，绝不跨磁盘 I/O 或堆分配持锁。
+//!    - `prepare*` 阶段需要分配物理块时会获取卷级 `allocation` 睡眠锁，此时尚未持有 `disk_root` 写锁，也未持有任何 `BufferRef` 内容锁。
+//!    - `publish` 阶段由调用方持有 `disk_root` 写锁排斥并发读者，在锁内依次对已预留的 `BufferRef` 调用 `update` 原地写入新指针与校验和，全程不触发内存分配或读盘 I/O。
 
 use crate::block::MetadataIoContext;
 use crate::cache::BufferRef;
@@ -9,18 +52,25 @@ use crate::fs::{FsError, InodeKind};
 use alloc::vec::Vec;
 use core::convert::{TryFrom, TryInto};
 
+/// Extent 树单层节点解析后的下一步动作。
 #[derive(Clone, Copy)]
 enum Step {
+    /// 已在叶节点命中目标逻辑块或确认其位于空洞区间，可直接返回映射结果。
     Mapping(BlockMapping),
+    /// 当前为内部索引节点，需要继续下降读取指定的下一层子块。
     Child {
+        /// 下一层子节点的物理块号。
         physical: u64,
+        /// 下一层子节点应当匹配的期望深度（`parent.depth - 1`）。
         depth: u16,
+        /// 该子树负责的起始逻辑块号下界（等于选中的索引条目起始逻辑块号）。
         low: u64,
+        /// 该子树负责的逻辑块号排他上界（等于右侧相邻索引条目的起始块号或父节点上界）。
         high: u64,
     },
 }
 
-/// 校验 inode 内根节点或全部传统块指针，不读取额外节点。
+/// 仅校验 inode 内联 `i_block` 根节点（Extent 根头与根条目，或全部 15 个传统块指针）的合法性，不发起外部块读取。
 pub(crate) fn validate_root(g: &Geometry, inode: &InodeData) -> Result<(), FsError> {
     if inode.flags & EXTENTS != 0 {
         extent_step(
@@ -38,7 +88,10 @@ pub(crate) fn validate_root(g: &Geometry, inode: &InodeData) -> Result<(), FsErr
     Ok(())
 }
 
-/// 依据文件的实际映射格式选择有限树算法。
+/// 查询文件在 `[logical, end)` 区间起点的连续块映射关系（已映射物理块、未写入预分配块或文件空洞）。
+///
+/// 调用方须持有该 inode 块映射根的读锁（或独占写序列化保护），并保证 `logical < end`；
+/// 返回的连续段长度 `len` 会自动按请求的排他上界 `end - logical` 截断。
 pub(crate) fn map(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -67,7 +120,9 @@ pub(crate) fn map(
     })
 }
 
-/// 逐层下降 extent 树，每个已读取的外部节点先校验自身 CRC 和全部条目。
+/// 沿 Extent 树自根向叶逐层下降查找逻辑块 `logical` 的映射。
+///
+/// 通过固定长度的 `visited` 数组检测并拒绝深度超限或祖先自引用环路；每个外部节点在读取时都会校验其尾部 CRC32C 与全部条目边界。
 fn extent_map(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -116,7 +171,10 @@ fn extent_map(
     }
 }
 
-/// 解码一个节点并选取下一层，完整验证条目排序、父边界及物理范围。
+/// 在单个 Extent 节点字节切片上解码校验全部条目，并选出覆盖 `logical` 的叶子映射或下一层子节点。
+///
+/// 完整检查头部深度、外部节点 CRC32C、条目逻辑块严格递增且互不重叠、首项与父索引键一致、以及所有物理块范围不越界。
+/// 若 `logical` 落在条目之间的间隙，则精确计算出到达下一个已存在条目（或节点上界 `high`）的空洞长度。
 fn extent_step(
     g: &Geometry,
     inode: &InodeData,
@@ -197,7 +255,7 @@ fn extent_step(
     })))
 }
 
-/// 校验传统指针数组中每个非零地址，零指针保持合法空洞含义。
+/// 校验传统 32 位块指针切片中的每一个非零物理块号是否合法（值为 `0` 代表合法的空洞指针）。
 fn validate_pointers(g: &Geometry, data: &[u8]) -> Result<(), FsError> {
     if data.len() % 4 != 0 {
         return Err(FsError::Corrupt);
@@ -211,7 +269,9 @@ fn validate_pointers(g: &Geometry, data: &[u8]) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 传统 direct、single、double、triple 树只下降最多三次，并拒绝祖先自引用。
+/// 在传统直接块及一、二、三级间接块指针树中查找逻辑块 `logical` 的映射。
+///
+/// 最多下降三层外部指针块，使用 `visited` 数组拒绝指向祖先块或自身的环路；若中途遇到零指针，则按该层子树剩余跨度返回对应长度的空洞。
 fn indirect_map(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -219,6 +279,7 @@ fn indirect_map(
     context: Option<MetadataIoContext<'_>>,
 ) -> Result<BlockMapping, FsError> {
     let g = volume.geometry();
+    // Step 1: 校验内联指针数组；若逻辑块号落在前 12 个直接块内，直接返回对应数据块或单块空洞。
     validate_pointers(g, &inode.block)?;
     if logical < codec::DIRECT_BLOCKS as u64 {
         let physical = u64::from(codec::le32(&inode.block, logical as usize * 4)?);
@@ -229,6 +290,7 @@ fn indirect_map(
         });
     }
 
+    // Step 2: 计算逻辑块所属的间接层级（1..=3）及其在该层子树内的相对偏移。
     let pointers = (g.block_size / 4) as u64;
     let mut remaining = logical - codec::DIRECT_BLOCKS as u64;
     let mut span = pointers;
@@ -242,6 +304,7 @@ fn indirect_map(
         return Err(FsError::Corrupt);
     }
 
+    // Step 3: 从内联间接根槽位出发逐层读取外部指针块，校验整块指针并检测环路，直至定位到底层数据块指针。
     let mut physical = u64::from(codec::le32(
         &inode.block,
         (codec::DIRECT_BLOCKS - 1 + depth) * 4,
@@ -278,48 +341,79 @@ fn indirect_map(
     }
 }
 
-/// 一个 inode 的块树修改计划；只保存条目和字段，不保存可覆盖共同页的旧块快照。
+/// 针对单个 inode 的块映射树写入修改计划。
+///
+/// 仅保存变更后的内联根字节、需要原地更新的结构化节点条目以及未发布的块分配令牌，
+/// 避免保存整块旧快照，从而在提交时不会误覆盖共享同一缓存页的其他元数据。
 pub(crate) struct PreparedMapping {
+    /// 提交后将写入 inode `i_block` 的 60 字节新映射根。
     pub root: [u8; 60],
+    /// 本次目标逻辑块最终映射到的目标数据块物理块号。
     pub physical: u64,
+    /// 目标数据块是否为新分配或由未写入段（unwritten）首次转正，写入前需先在页缓存中清零未覆盖区域。
     pub zero: bool,
+    /// 本计划新分配的文件系统块总数（含新数据块与新增的 Extent/间接树节点块）。
     pub added_blocks: u64,
+    /// 本计划因路径合并（Consolidation）而摘除回收的外部树节点块数。
     pub removed_blocks: u64,
+    /// 树路径合并后待延后释放回位图的旧外部树节点块列表。
     retired: Vec<DetachedBlock>,
+    /// Extent 树路径上加载或新建的节点编辑状态（索引 `0` 固定为内联根节点）。
     nodes: Vec<NodeEdit>,
+    /// 传统间接块树路径上待写入的指针槽编辑列表。
     indirect: Vec<IndirectEdit>,
+    /// 本计划新申请但尚未接入已生效块树的物理块分配令牌列表。
     allocated: Vec<UnpublishedBlock>,
 }
 
+/// Extent 树单个节点（内联根或外部块节点）的内存编辑状态。
 struct NodeEdit {
+    /// 外部树节点对应的元数据块缓存句柄；内联根节点为 `None`。
     buffer: Option<BufferRef>,
+    /// 外部树节点的物理块号；内联根节点为 `0`。
     physical: u64,
+    /// 节点内按逻辑块升序排列的 12 字节原始条目列表（叶条目或索引条目）。
     entries: Vec<[u8; 12]>,
+    /// 节点允许容纳的最大条目数（`eh_max`）。
     max: usize,
+    /// 节点在树中的高度（`0` 为叶节点，大于 `0` 为索引节点）。
     depth: u16,
+    /// 节点头保存的 `eh_generation` 字段值。
     generation: u32,
+    /// 该节点在本次规划中是否发生了条目或头部变更，需要在 `publish` 时写回。
     dirty: bool,
+    /// 该节点是否为本计划全新分配的外部块（提交时需先将整块清零，取消时需失效其缓存窗口）。
     new: bool,
 }
 
+/// 传统间接指针块上的单条 32 位块号写入操作。
 struct IndirectEdit {
+    /// 目标间接块对应的元数据块缓存句柄。
     buffer: BufferRef,
+    /// 目标间接块的物理块号。
     physical: u64,
+    /// 待写入指针在该间接块内的字节偏移（4 字节对齐）。
     offset: usize,
+    /// 待写入的下级块物理块号（32 位）。
     pointer: u32,
+    /// 该间接块是否为本计划全新分配的块（首次提交时需先将整块其余槽位清零，取消时需失效缓存窗口）。
     initialize: bool,
 }
 
-/// 目录一次扩展所需的新逻辑块映射，所有根和块 token 同属一个准备。
+/// 目录或符号链接一次性批量扩展多个连续逻辑块时的映射修改计划。
 pub(crate) struct PreparedDirectoryMappings {
+    /// 聚合了整批逻辑块分配与树分裂操作的基础映射计划。
     mapping: PreparedMapping,
+    /// 按顺序记录的待扩展逻辑块号列表。
     logical: Vec<u64>,
+    /// 与 `logical` 一一对应的已分配物理数据块号列表。
     physical: Vec<u64>,
+    /// 所属 inode 的元数据 CRC32C 校验种子，用于提交外部 Extent 树块尾部校验和。
     seed: u32,
 }
 
 impl PreparedDirectoryMappings {
-    /// 返回批次中逻辑目录块对应的实际物理块。
+    /// 查询本批次中指定逻辑块 `logical` 所分配到的物理数据块号。
     pub(crate) fn physical(&self, logical: u64) -> Option<u64> {
         self.logical
             .iter()
@@ -327,43 +421,47 @@ impl PreparedDirectoryMappings {
             .map(|index| self.physical[index])
     }
 
-    /// 返回完成整批修改后的 inline inode 块根。
+    /// 返回完成整批块扩展后的 60 字节新内联块映射根。
     pub(crate) fn root(&self) -> &[u8; 60] {
         &self.mapping.root
     }
 
-    /// 返回数据块和 extent/indirect 节点的总文件系统块数。
+    /// 返回本批次共新增分配的文件系统块总数（含目录/链接数据块及新增树节点块）。
     pub(crate) fn added_blocks(&self) -> u64 {
         self.mapping.added_blocks
     }
 
-    /// 目录块内容提交后接入全部映射节点，并消费所有未发表块位。
+    /// 在新目录块内容落入缓存后正式提交全部树节点修改，并解除所有新分配块的临时回滚责任。
     pub(crate) fn publish(self, volume: &Ext4Volume) {
         let retired = self.mapping.publish(volume, self.seed);
         assert!(retired.is_empty(), "directory mapping retired old blocks");
     }
 
-    /// 目录准备失败时只归还本批次仍未连接的块。
+    /// 在目录操作准备失败时取消本批次修改，失效新建树节点缓存并将全部未连接的新块归还位图。
     pub(crate) fn cancel(self, volume: &Ext4Volume) {
         self.mapping.cancel(volume);
     }
 }
 
 impl PreparedMapping {
-    /// 映射准备或目的页准备失败时只释放本次尚未连接的全部块。
+    /// 放弃尚未发布的映射修改计划，失效新建树节点的缓存窗口并将所有新分配的物理块归还给卷位图。
     pub(crate) fn cancel(mut self, volume: &Ext4Volume) {
         for node in &self.nodes {
             if node.new {
                 let buffer = node.buffer.as_ref().expect("new extent node lacks buffer");
-                // SAFETY: 该块仍由本计划 reservation 保有且未接入旧根；metadata_block 读取已结束，
-                // 新节点未发表写回且没有旧树消费者，失效准确窗口后才归还位图。
+                // SAFETY:
+                // 1. `node.new` 仅在 `new_node` 为本计划新分配的块上置位，该物理块仍由 `self.allocated` 中的 `Reservation` 独占持有，从未写入已生效的 `disk_root`；
+                // 2. `new_node` 中的 `metadata_block` 读取已结束，该新建缓存窗口从未提交写回，也没有其他并发读者；
+                // 3. 在下方释放位图前先失效该元数据窗口，可防止物理块被重新分配给其他用途后残留脏缓存别名。
                 unsafe { buffer.forget(volume.claim()) }.expect("new extent alias invalidation");
             }
         }
         for edit in &self.indirect {
             if edit.initialize {
-                // SAFETY: initialize 仅标记本计划新间接节点；旧读取已结束、指针尚未进旧根，
-                // 其 BufferRef 没有写回或其他消费者，失效窗口后才归还物理位。
+                // SAFETY:
+                // 1. `edit.initialize` 仅标记 `prepare_indirect` 中由本计划全新分配的间接指针块，其指针尚未写入已生效的父节点或 `disk_root`；
+                // 2. 该 `BufferRef` 没有正在进行的写回，也不存在并发树遍历读者；
+                // 3. 在将物理块归还块位图前先失效其元数据缓存窗口，保证后续复用安全。
                 unsafe { edit.buffer.forget(volume.claim()) }
                     .expect("new indirect alias invalidation");
             }
@@ -377,7 +475,9 @@ impl PreparedMapping {
         }
     }
 
-    /// caller 保持 root 写侧，所有窗口已有效且属于卷自身 RW claim；提交不分配或读盘。
+    /// 在调用方持有 inode `disk_root` 写锁时正式发布外部树节点的全部变更，并返回待延后释放的旧节点块列表。
+    ///
+    /// 所有目标 `BufferRef` 均已在准备阶段加载就绪且卷具备读写权限，本方法全程只做内存原地修补与标记，不进行内存分配或读盘。
     pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlock> {
         for node in &self.nodes {
             if !node.dirty {
@@ -392,7 +492,7 @@ impl PreparedMapping {
             }
         }
 
-        // 新间接链先初始化，最后才连接已有父指针；读者仍受 inode root 写侧排斥。
+        // `prepare_indirect` 按自底向上顺序压入编辑项：先初始化新分配的子间接块，最后才改写已有父节点的指针，且全程受 `disk_root` 写锁保护。
         for edit in &self.indirect {
             edit.buffer
                 .update(volume.claim(), |bytes| {
@@ -414,7 +514,7 @@ impl PreparedMapping {
     }
 }
 
-/// 建立一份仅持本次计划、不隐含任何已发表块拥有的修改容器。
+/// 创建一个以 `root` 为初始内联根、不含任何新分配块或节点变更的空映射修改计划。
 fn empty_mapping(root: [u8; 60]) -> PreparedMapping {
     PreparedMapping {
         root,
@@ -429,7 +529,11 @@ fn empty_mapping(root: [u8; 60]) -> PreparedMapping {
     }
 }
 
-/// 普通前台写按原读格式准备映射；调用者没有回写停止边界，查询不附 metadata IO context。
+/// 为普通文件前台写或缺页可写（`mkwrite`）规划单个逻辑块 `logical` 的物理块映射。
+///
+/// - 若 `logical` 已映射到已初始化数据块，直接复用现有物理块并返回空变更计划；
+/// - 若 `logical` 位于文件空洞或预分配未写入段（unwritten），则分配数据块/切分叶子并维护树平衡，同时将 `zero` 置为 `true`；
+/// - 准备中途若发生任何错误会自动调用 `cancel` 归还已申请的块，不会污染已生效的块树。
 pub(crate) fn prepare(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -468,7 +572,7 @@ pub(crate) fn prepare(
     Ok(prepared)
 }
 
-/// 为一次目录扩展预留全部数据块和块树修改；新映射在统一发表前不接入旧 inode 根。
+/// 为目录扩容一次性预留全部新逻辑块的数据块与块树节点修改计划（校验 `inode` 必须为目录）。
 pub(crate) fn prepare_directory_mappings(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -481,7 +585,7 @@ pub(crate) fn prepare_directory_mappings(
     prepare_mapping_batch(volume, inode, root, logical_blocks)
 }
 
-/// 符号链接使用相同的 block-tree planner 和 reservation path。
+/// 为长符号链接分配外部数据块及块树映射计划（校验 `inode` 必须为符号链接）。
 pub(crate) fn prepare_symlink_mappings(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -494,7 +598,9 @@ pub(crate) fn prepare_symlink_mappings(
     prepare_mapping_batch(volume, inode, root, logical_blocks)
 }
 
-/// 普通目录或符号链接分配在同一预备树累积连续空洞，不继承回写停止边界或发表中间根。
+/// 在同一份 [`PreparedMapping`] 上依次为一组严格连续且当前为空洞的逻辑块规划物理块分配。
+///
+/// 整批修改在内存中累积到同一个待发布根与节点集合中，任一步失败即整体调用 `cancel` 回收本批全部未发布块。
 fn prepare_mapping_batch(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -564,7 +670,7 @@ fn prepare_mapping_batch(
     })
 }
 
-/// 准备条目容量在任何共同 Buffer 内容借用之前完成。
+/// 在获取任何元数据缓存块内容锁之前预先在堆上分配条目存储数组（额外预留 2 项分裂空间，支持未写入段三段切分）。
 fn entry_storage(max: usize) -> Result<Vec<[u8; 12]>, FsError> {
     let mut entries = Vec::new();
     entries
@@ -573,7 +679,7 @@ fn entry_storage(max: usize) -> Result<Vec<[u8; 12]>, FsError> {
     Ok(entries)
 }
 
-/// 已校验的节点条目进入预备独占空间，内容借用内不分配或重复计算 CRC。
+/// 将已通过完整格式与 CRC 校验的 Extent 节点条目拷贝到预分配好的私有数组 `entries` 中，构造 [`NodeEdit`]。
 fn read_node(bytes: &[u8], mut entries: Vec<[u8; 12]>) -> Result<NodeEdit, FsError> {
     let header = codec::extent_header(bytes, None)?;
     assert!(usize::from(header.max) + 2 <= entries.capacity());
@@ -594,7 +700,10 @@ fn read_node(bytes: &[u8], mut entries: Vec<[u8; 12]>) -> Result<NodeEdit, FsErr
     })
 }
 
-/// 叶条目只对单个真正初始化的 FS 块转换，前后 unwritten 继续保持零语义。
+/// 为单个逻辑块 `logical` 规划 Extent 树的插入或未写入段（unwritten）转正。
+///
+/// 若 `existing` 为空洞则分配新物理数据块；若为未写入预分配段则原地切分出单个已初始化块（前后剩余未写入子段保持零语义）。
+/// 当 `consolidate` 为 `true` 且本次未发生节点分裂时，会尝试合并相邻兄弟节点并压缩单子根节点高度。
 fn prepare_extent(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -604,6 +713,7 @@ fn prepare_extent(
     consolidate: bool,
 ) -> Result<(), FsError> {
     let g = volume.geometry();
+    // Step 1: 确定当前树深度，预先为节点列表、新分配块令牌及待回收块令牌保留足够的堆容量，加载内联根节点。
     let depth = if prepared.nodes.is_empty() {
         codec::extent_header(&inode.block, None)?.depth as usize
     } else {
@@ -634,6 +744,7 @@ fn prepare_extent(
         )?);
     }
 
+    // Step 2: 从根节点向下定位 `logical` 所在的叶子路径，优先复用 `prepared.nodes` 中已缓存的节点，未加载的外部节点则从元数据缓存读取并校验。
     let mut path = [0usize; codec::EXTENT_DEPTH_LIMIT + 1];
     let mut slots = [0usize; codec::EXTENT_DEPTH_LIMIT + 1];
     let mut visited = [0u64; codec::EXTENT_DEPTH_LIMIT];
@@ -694,6 +805,7 @@ fn prepare_extent(
         high = next_high;
     }
 
+    // Step 3: 确定目标数据块的物理块号（复用未写入段已有物理块或为空洞新分配一块），并在叶子节点上插入或切分合并条目。
     prepared.physical = match existing {
         BlockMapping::Unwritten { physical, .. } => physical,
         BlockMapping::Hole { .. } => {
@@ -716,6 +828,7 @@ fn prepare_extent(
     )?;
     prepared.nodes[leaf].dirty = true;
 
+    // Step 4: 自底向上检查节点条目数是否溢出 `max`；若溢出则对半分裂右兄弟节点并更新父索引，若根节点溢出则分配左右两个子块使树高加 1。
     let mut split_nodes = false;
     let mut level = depth;
     loop {
@@ -776,6 +889,7 @@ fn prepare_extent(
         level -= 1;
     }
 
+    // Step 5: 若未发生分裂且允许路径压缩（如未写入段连续转正使叶子条目减少），尝试合并相邻节点并编码更新内联根字节。
     if consolidate && !split_nodes {
         consolidate_path(volume, inode, prepared, &mut slots, depth)?;
     }
@@ -788,7 +902,9 @@ fn prepare_extent(
     Ok(())
 }
 
-/// 分配新外部节点并保留原 token；任何后续失败由 prepare 的唯一错误出口归还。
+/// 为 Extent 树分裂分配一个全新的外部节点块，预先加载其元数据缓存窗口并登记到 `prepared` 中。
+///
+/// 新分配块的 `UnpublishedBlock` 令牌推入 `prepared.allocated`；若后续步骤报错，由外层 `prepare` 统一调用 `cancel` 失效缓存并归还位图。
 fn new_node(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -830,8 +946,9 @@ fn new_node(
     Ok(physical)
 }
 
-/// 相邻同层节点能容纳时合并条目并删父索引，再把单子根压回 inode。
-/// 所有释放窗口在发表之前取得，旧树在准备失败时仍保持原样。
+/// 在叶子条目合并缩短后，自底向上尝试将当前路径节点与相邻兄弟节点合并，并在根节点仅剩单个子索引且容量允许时将子节点拉回内联根以降低树高。
+///
+/// 被摘除的外部树节点通过 `prepare_detached_block` 预留释放窗口并登记入 `prepared.retired`，待 `publish` 提交新树后才真正回收。
 fn consolidate_path(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -909,7 +1026,7 @@ fn consolidate_path(
         prepared.retired.push(release);
     }
 
-    // 单子根降深不需要申请新节点，inline 容量始终是四项。
+    // 当内联根仅剩 1 个子索引且该子节点的条目数不超过内联根上限（4 项）时，直接将其提升回内联根并淘汰原外部块。
     for level in 1..=depth {
         if prepared.nodes[0].entries.len() != 1
             || codec::EXTENT_ROOT_ENTRIES < prepared.nodes[level].entries.len()
@@ -933,7 +1050,7 @@ fn consolidate_path(
     Ok(())
 }
 
-/// 邻项只在状态、逻辑/物理连续和 ee_len 容量全部相容时合并。
+/// 判断两个相邻叶子 Extent 条目是否满足合并条件：未写入状态一致、逻辑块号紧邻连续、物理块号紧邻连续，且总长度不超过对应编码上限。
 fn leaves_merge(left: &[u8; 12], right: &[u8; 12]) -> Result<bool, FsError> {
     let (physical, len, unwritten) = leaf_fields(left)?;
     let (next_physical, next_len, next_unwritten) = leaf_fields(right)?;
@@ -948,18 +1065,18 @@ fn leaves_merge(left: &[u8; 12], right: &[u8; 12]) -> Result<bool, FsError> {
             }))
 }
 
-/// 条目 key 是逻辑 FS 块号，与物理块地址的高低半编码无关。
+/// 提取 12 字节 Extent 叶条目或索引条目头 4 字节记录的起始逻辑块号（`ee_block` / `ei_block`）。
 fn entry_key(entry: &[u8; 12]) -> u64 {
     u32::from_le_bytes(entry[..4].try_into().unwrap()) as u64
 }
 
-/// 组合 extent index 的 48 位物理地址。
+/// 从 12 字节 Extent 索引条目（`ext4_extent_idx`）中拼出下一层子节点的 48 位物理块号。
 fn index_physical(entry: &[u8; 12]) -> u64 {
     u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64
         | ((u16::from_le_bytes(entry[8..10].try_into().unwrap()) as u64) << 32)
 }
 
-/// 构造正式 index 条目，保留两字节 unused 为零。
+/// 构造 12 字节 Extent 索引条目（`ext4_extent_idx`），末尾 2 字节保留字段保持为零。
 fn index_entry(logical: u64, physical: u64) -> [u8; 12] {
     let mut entry = [0; 12];
     codec::put32(&mut entry, 0, logical as u32);
@@ -968,7 +1085,7 @@ fn index_entry(logical: u64, physical: u64) -> [u8; 12] {
     entry
 }
 
-/// 构造容量已经检查的 initialized 或 unwritten 叶条目。
+/// 构造 12 字节 Extent 叶条目（`ext4_extent`），根据 `unwritten` 标志编码 16 位长度字段并写入 48 位起始物理块号。
 fn leaf_entry(logical: u64, physical: u64, len: u64, unwritten: bool) -> [u8; 12] {
     let mut entry = [0; 12];
     codec::put32(&mut entry, 0, logical as u32);
@@ -986,7 +1103,7 @@ fn leaf_entry(logical: u64, physical: u64, len: u64, unwritten: bool) -> [u8; 12
     entry
 }
 
-/// 解码独占条目中的物理地址、长度和 unwritten 状态。
+/// 解码 12 字节 Extent 叶条目的 `(起始物理块号, 块长度, 是否为未写入段)`。
 fn leaf_fields(entry: &[u8; 12]) -> Result<(u64, u64, bool), FsError> {
     let (len, unwritten) = codec::extent_length(codec::le16(entry, 4)?)?;
     Ok((
@@ -996,7 +1113,10 @@ fn leaf_fields(entry: &[u8; 12]) -> Result<(u64, u64, bool), FsError> {
     ))
 }
 
-/// 插入或三段切分只作用于准备空间，随后合并同状态且逻辑/物理连续的邻项。
+/// 在叶节点的内存条目数组中将单个逻辑块 `logical` 更新为已初始化物理块 `physical`。
+///
+/// 若命中已有的未写入（unwritten）段，则将其切分为“前段未写入（可选）+ 当前单块已初始化 + 后段未写入（可选）”最多三项；
+/// 若位于空洞区间，则按序插入单块已初始化条目。更新完成后自动合并所有可相连的相邻条目。
 fn change_leaf(entries: &mut Vec<[u8; 12]>, logical: u64, physical: u64) -> Result<(), FsError> {
     let mut index = 0;
     while index < entries.len() && entry_key(&entries[index]) <= logical {
@@ -1030,7 +1150,7 @@ fn change_leaf(entries: &mut Vec<[u8; 12]>, logical: u64, physical: u64) -> Resu
     merge_leaf(entries)
 }
 
-/// 每次合并减少一项；状态和最大长度限制与盘面 ee_len 编码保持一致。
+/// 顺序扫描叶节点条目数组，将所有状态一致、逻辑与物理块均连续且合并后不超过 `ee_len` 上限的相邻条目原地合并。
 fn merge_leaf(entries: &mut Vec<[u8; 12]>) -> Result<(), FsError> {
     let mut index = 0;
     while index + 1 < entries.len() {
@@ -1057,7 +1177,9 @@ fn merge_leaf(entries: &mut Vec<[u8; 12]>) -> Result<(), FsError> {
     Ok(())
 }
 
-/// 字段级编码节点及有效条目；共同 Buffer 的其他区域不从旧快照恢复。
+/// 将 [`NodeEdit`] 的头部字段与有效条目原地编码到目标字节切片 `bytes` 中，并为外部树块计算写入末尾 CRC32C。
+///
+/// 新建外部节点（`node.new == true`）会先将整块清零；已有节点仅覆写头部、有效条目与尾部 CRC，不触碰同一缓存页的其他区域。
 fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
     if node.new {
         bytes.fill(0);
@@ -1077,7 +1199,10 @@ fn patch_node(g: &Geometry, bytes: &mut [u8], node: &NodeEdit, seed: u32) {
     }
 }
 
-/// 传统块号分解为 inode 槽及至多三层指针槽，不改变已有映射格式。
+/// 将传统映射下的逻辑块号 `logical` 分解为 `(各层槽位下标数组, 路径有效长度)`。
+///
+/// `offsets[0]` 为 inode `i_block` 内联数组下标（`0..12` 为直接块，`12..15` 为一至三级间接根），
+/// `offsets[1..length]` 依次为从顶层间接块到底层数据块指针槽的块内下标。
 fn indirect_offsets(
     g: &Geometry,
     logical: u64,
@@ -1108,7 +1233,10 @@ fn indirect_offsets(
     Ok((offsets, depth + 1))
 }
 
-/// 从真实节点窗口或本批修改中读取传统指针，不把未写入的新节点旧盘字节当成有效内容。
+/// 读取传统间接块 `physical` 在 `offset` 字节处的 32 位下级指针。
+///
+/// 优先从 `prepared.indirect` 中查找同一批次先前已规划的修改；若该块是本批次新分配但尚未落盘清零的新间接块（`initialize == true`），
+/// 则直接视其余槽位为 `0`，避免将未初始化盘面残留字节误判为有效块指针。
 fn indirect_pointer(
     prepared: &PreparedMapping,
     buffer: &BufferRef,
@@ -1135,13 +1263,14 @@ fn indirect_pointer(
     ))
 }
 
-/// 传统 direct/single/double/triple 分支累积到同一准备中再发表。
+/// 为传统直接/间接块映射树中的空洞逻辑块 `logical` 分配目标数据块及沿途缺失的各级间接指针块，并将编辑操作追加到 `prepared` 中。
 fn prepare_indirect(
     volume: &Ext4Volume,
     inode: &InodeData,
     logical: u64,
     prepared: &mut PreparedMapping,
 ) -> Result<(), FsError> {
+    // Step 1: 计算逻辑块对应的多级槽位坐标，并预留编辑项与分配块令牌的堆容量。
     let (offsets, length) = indirect_offsets(volume.geometry(), logical)?;
     prepared
         .indirect
@@ -1152,6 +1281,7 @@ fn prepare_indirect(
         .try_reserve_exact(length)
         .map_err(|_| FsError::NoMemory)?;
 
+    // Step 2: 从待发布根出发向下遍历已存在的间接块链，找到首个零指针断开层级 `missing`。
     let mut parent = None;
     let mut missing = 0;
     let mut physical = u64::from(codec::le32(&prepared.root, offsets[0] * 4)?);
@@ -1166,6 +1296,7 @@ fn prepare_indirect(
         return Err(FsError::Corrupt);
     }
 
+    // Step 3: 自底向上依次分配目标数据块与缺失的各级新间接块，最后将新链顶指针写入已有父间接块或内联 `prepared.root`。
     let mut next = 0u32;
     for level in (missing..length).rev() {
         let block =
@@ -1204,19 +1335,27 @@ fn prepare_indirect(
     Ok(())
 }
 
-/// 截断只预备原树的尾部字段和释放窗口，失败或取消不会修改已发表的块树与位图。
+/// 文件截断（`truncate`）操作的块树尾部裁剪计划。
+///
+/// 准备阶段仅在私有内存中计算裁剪后的新根节点与待修补的外部节点，并为将被摘除的数据块和树节点块预留释放令牌；
+/// 若中途失败直接丢弃本结构即可释放缓存引用，不会改动已生效的块树或磁盘位图。
 pub(crate) struct PreparedTruncate {
+    /// 截断完成后将写入 inode `i_block` 的 60 字节新映射根。
     pub root: [u8; 60],
-    /// 实际摘离的文件系统块数，包括 initialized、unwritten 数据与外部树节点。
+    /// 本次截断共摘除的文件系统块总数（含已初始化数据块、未写入预分配块以及被整体回收的外部树节点块）。
     pub removed_blocks: u64,
+    /// 被摘除的数据块与外部树节点块的延迟释放令牌列表。
     retired: Vec<DetachedBlock>,
+    /// 截断后仍保留在树中、但条目被缩短而需要原地更新的外部 Extent 节点列表。
     nodes: Vec<NodeEdit>,
+    /// 截断后仍保留在树中、但需要将末尾指针区间 `[first * 4..]` 清零的外部传统间接块列表。
     indirect: Vec<(BufferRef, usize)>,
 }
 
 impl PreparedTruncate {
-    /// 调用者保持 inode 根写侧并已准备本记录；这里只修改当前节点字段，不分配或读盘。
-    /// 返回的窗口仍未归还位图，须在旧数据与元数据 I/O、别名使用全部结束后消费。
+    /// 在调用方持有 inode `disk_root` 写锁且旧页缓存已清理完毕后，原地提交所有剩余树节点的裁剪修改，并激活待释放块的回收责任。
+    ///
+    /// 返回的 [`DetachedBlock`] 列表尚未归还块位图；调用方须在更新完 inode 记录并确认旧数据/元数据写回彻底结束后再逐一释放。
     pub(crate) fn publish(mut self, volume: &Ext4Volume, seed: u32) -> Vec<DetachedBlock> {
         for node in &self.nodes {
             node.buffer
@@ -1239,8 +1378,10 @@ impl PreparedTruncate {
     }
 }
 
-/// 在 inode 写序列化与根保护下预备字节 EOF 后的全部块；块内部分尾保留给页截断处理。
-/// 增长只保留原根；所有可失败的窗口和容量申请均在任何共同树字段修改之前完成。
+/// 在调用方持有 inode 写序列化锁时，规划将文件截断到 `new_size` 字节所需摘除的全部尾部块（即索引号 `>= ceil(new_size / block_size)` 的完整块）。
+///
+/// 跨越 `new_size` 的最后一个保留块内部的部分尾部字节清零由上层页缓存截断逻辑处理；文件扩大（`new_size > inode.size`）时保持原块树不变。
+/// 所有可能失败的内存预留、块读取和校验均在修改任何共享元数据前完成。
 pub(crate) fn prepare_truncate(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1297,7 +1438,7 @@ pub(crate) fn prepare_truncate(
     Ok(prepared)
 }
 
-/// 数据块只保原位图与已缓存物理别名，不为删除读入文件数据或改动分配状态。
+/// 为一段即将被截断摘除的连续数据块 `[physical, physical + count)` 预留位图释放窗口与已存在的元数据缓存别名，不触发文件数据读盘。
 fn retire_data(
     volume: &Ext4Volume,
     physical: u64,
@@ -1317,7 +1458,7 @@ fn retire_data(
     Ok(())
 }
 
-/// 外部树节点只在确认从准备根不可寻址后登记，准备计划析构仍只放窗口引用。
+/// 为一棵子树已全部清空、即将从父节点摘除的外部树节点块 `physical` 预留位图释放与缓存失效令牌。
 fn retire_node(
     volume: &Ext4Volume,
     physical: u64,
@@ -1334,7 +1475,7 @@ fn retire_node(
     Ok(())
 }
 
-/// 在共同内容借用外申请条目容量，读取时沿原 extent 格式校验深度、父边界与 CRC。
+/// 在元数据块读锁外预分配条目数组，随后读取并校验截断路径上的外部 Extent 节点块，返回其私有 [`NodeEdit`]。
 fn load_truncate_extent(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1360,7 +1501,10 @@ fn load_truncate_extent(
     Ok(node)
 }
 
-/// 从右向左缩短叶尾并逐级摘空索引；只保留仍可寻址且确实变化的外部节点字段。
+/// 自右向左递归裁剪单个 Extent 树节点中逻辑块号 `>= keep` 的尾部区间。
+///
+/// - 叶节点（`depth == 0`）：从末尾向前移除完全超出 `keep` 的叶条目，或缩短跨界条目的长度，登记摘除的数据块；
+/// - 索引节点（`depth > 0`）：从末尾向前递归裁剪覆盖 `keep` 右侧的子节点；完全清空的子节点直接登记回收并弹出父索引，部分保留且发生修改的最后一个跨界子节点加入 `prepared.nodes` 待写回。
 fn truncate_extent_node(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1424,7 +1568,7 @@ fn truncate_extent_node(
     Ok(())
 }
 
-/// 空树恢复 inline 叶根；单子节点四项内逐级降深，不申请新磁盘块。
+/// 规划 Extent 树的尾部截断：递归裁剪根子树后，若树变空则重置为深度 0 的空叶根；若根仅剩单个子节点且其条目装得进内联根（不超过 4 项），则循环提升子节点降低树高。
 fn prepare_extent_truncate(
     volume: &Ext4Volume,
     inode: &InodeData,
@@ -1492,7 +1636,7 @@ fn prepare_extent_truncate(
     Ok(())
 }
 
-/// 读取间接节点的指针字段到固定栈空间，内容锁内只解码和检查物理范围。
+/// 在元数据块读锁内将传统间接块中的全部 32 位块指针解码到固定栈数组 `pointers` 中，并逐一校验非零物理块号合法性。
 fn read_truncate_indirect(
     g: &Geometry,
     bytes: &[u8],
@@ -1507,7 +1651,9 @@ fn read_truncate_indirect(
     Ok(())
 }
 
-/// 传统树从尾部向上预备释放；剩余节点只记录要清零的指针后缀，不发表旧块快照。
+/// 自右向左递归裁剪单个传统间接指针块中覆盖 `>= keep` 逻辑块区间的尾部子树，返回该间接块裁剪后是否已完全变空。
+///
+/// 若整块指针均归零则直接登记回收该间接块本身；若仍有前缀有效指针，则记录首个归零槽位下标 `first`，供 `publish` 阶段原地将 `[first * 4..]` 清零。
 fn truncate_indirect_node(
     volume: &Ext4Volume,
     physical: u64,
@@ -1562,7 +1708,7 @@ fn truncate_indirect_node(
     Ok(empty)
 }
 
-/// 先处理 direct 尾指针，再按各层逻辑跨度处理 single、double、triple 和空根。
+/// 规划传统块指针树的尾部截断：先倒序清理内联直接块槽位，再依次按跨度递归裁剪一、二、三级间接子树并在子树全空时清零对应的内联根指针。
 fn prepare_indirect_truncate(
     volume: &Ext4Volume,
     inode: &InodeData,

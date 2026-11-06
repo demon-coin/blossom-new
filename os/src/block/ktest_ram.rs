@@ -1,4 +1,31 @@
-//! 专用原页承载真实 RAM 磁盘，视图、占用和缓存用例共用生产请求与停止路径。
+//! 基于物理内存页后端的 RAM 块设备（`Disk::prepare_ram`）、块视图（`BlockView`）、文件系统范围声明（`FsClaim`）与元数据缓存（`MetadataCache`）单元测试。
+//!
+//! # 模块职责与架构定位
+//! 本模块属于块设备子系统的内核单元测试（`ktest`），使用专门分配的 64 KiB（16 个 4 KiB 物理页，共 128 个 512B 扇区）
+//! 连续物理页构建真实的 RAM 块设备，全面测试块设备子系统在 `BlockView` 分区裁剪、`FsClaim` 读写权限与重叠范围保护、
+//! `EndIo::Task` 异步回调阻塞期间的范围占用保持，以及 `MetadataCache` 跨视图共享物理页（`Folio`）与部分失效重读机制。
+//!
+//! # 核心设计与测试扇区布局
+//! 每个测试用例独占一块 64 KiB 的 RAM 盘后端，各用例围绕如下扇区（Sector，512 字节/扇区）与 4 KiB 物理页边界展开验证：
+//!
+//! ```text
+//! 64 KiB RAM Disk (128 Sectors, 512B/Sector, 8 Sectors/4KiB Folio)
+//! +------------------+------------------+------------------+------------------+
+//! | Sectors 0..8     | Sectors 8..16    | Sectors 16..24   | Sectors 24..128  |
+//! | (Folio PFN #0)   | (Folio PFN #1)   | (Folio PFN #2)   | (Remaining)      |
+//! +------------------+------------------+------------------+------------------+
+//!                          |                  |
+//!                          |                  +--> 细分为子范围测试同页共享与部分失效：
+//!                          |                       - [16..18) (1 KiB, 页内偏移 0..1024)
+//!                          |                       - [18..20) (1 KiB, 页内偏移 1024..2048)
+//!                          |                       - [20..22) (1 KiB, 页内偏移 2048..3072)
+//!                          +--> 视图边界与 FsClaim 占用保护测试区 ([8..16))
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 全局回调定位锁 `CALLBACK`：叶子自旋锁，仅在注册或进入 `held_endio` 时短暂获取以克隆 `Arc<Callback>`，严禁持锁执行 I/O 或睡眠。
+//! - `Callback::task` 自旋锁：叶子自旋锁，仅保护回调执行任务 `Option<Arc<Task>>` 的读写；查询调度状态前必须先克隆 `Arc<Task>` 并释放该锁。
+//! - `Folio` 内容睡眠锁（`folio.lock_content()`）与磁盘队列自旋锁（`Disk::queue`）：遵循块层与缓存层标准锁顺序，不在持有自旋锁时获取睡眠锁。
 
 use ::ktest::{self, Fixture, TestContext, TestError, TestResult};
 use alloc::sync::Arc;
@@ -18,19 +45,28 @@ use crate::task::{self, Task};
 use crate::workqueue::{WorkQueue, WorkQueueConfig};
 use crate::{cpu, mm, sched, time, timer};
 
+/// 全局当前活跃测试夹具的回调观测槽位，供 `held_endio` 函数指针定位当前用例的 `Callback` 实例。
 static CALLBACK: SpinLock<Option<Arc<Callback>>> = SpinLock::new(None);
 
+/// `EndIo::Task` 异步完成回调的跨线程同步与状态观测结构。
 struct Callback {
+    /// 当前测试用例持有的 RAM 块设备引用，供回调内部发起同盘独立读取请求。
     disk: DiskRef,
+    /// 控制回调何时退出的外部完成门控（Gate）。
     gate: Completion,
+    /// 记录执行 `held_endio` 回调的内核任务（`Task`）强引用，由自旋锁保护。
     task: SpinLock<Option<Arc<Task>>>,
+    /// 标记回调内部的同盘同步读取是否已执行完毕。
     peer_finished: AtomicBool,
+    /// 标记回调收到的 `IoResult`、物理页所有权状态及同盘读取数据是否全部符合预期。
     valid: AtomicBool,
+    /// 记录 `held_endio` 回调被调用的次数。
     calls: AtomicUsize,
+    /// 标记 `held_endio` 回调在通过 `gate` 后是否已彻底执行完毕并准备退出。
     returned: AtomicBool,
 }
 
-/// 同盘 Task endio 先完成独立 Read 再等待外部 gate，不能占住 RAM 的唯一复制通道。
+/// 阻塞型 `EndIo::Task` 回调函数：先在同一 RAM 盘上发起并完成一次同步读取（验证回调不会占死 RAM 盘的唯一复制通道），随后在 `gate` 上阻塞等待测试主线程放行。
 fn held_endio(result: &IoResult, memory: &[MappedPages]) {
     let owner = CALLBACK
         .lock()
@@ -58,7 +94,7 @@ fn held_endio(result: &IoResult, memory: &[MappedPages]) {
     owner.returned.store(true, Ordering::Release);
 }
 
-/// 期限仅约束对生产状态的观察，不把 sleep 当作异步完成或资源归还证据。
+/// 在 5 秒单调时钟期限内轮询条件 `predicate`，未满足时每次睡眠 1 毫秒；超时则返回 `TestError(label)`。
 fn until(label: &'static str, mut predicate: impl FnMut() -> bool) -> TestResult {
     let deadline = time::now()
         .checked_add(time::Duration::from_secs(5))
@@ -72,7 +108,7 @@ fn until(label: &'static str, mut predicate: impl FnMut() -> bool) -> TestResult
     Ok(())
 }
 
-/// 全部参与者结束后整理同一 VM 的真实页缓存，保存完整六域账本。
+/// 等待除当前 CPU 外的所有核心进入空闲（idle）状态，收缩 SLUB 缓存并排空每 CPU 页面缓存，返回全系统 6 个内存域的统计快照。
 fn settled() -> Result<mm::MemoryStats, TestError> {
     until("RAM resource CPUs did not settle", || {
         (0..cpu::count())
@@ -83,14 +119,18 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
     Ok(mm::stats())
 }
 
+/// 单页 `Bio` 请求封装，负责管理待提交请求、完成句柄与初始物理缓冲区的元数据快照。
 struct Request {
+    /// 待提交的 `Bio` 请求实例（提交时通过 `take()` 取出所有权）。
     pending: Option<Bio>,
+    /// 该请求对应的异步完成等待句柄。
     completion: BioCompletion,
+    /// 构造请求时记录的初始物理页载荷范围（物理地址、长度与 DMA 方向），用于完成后的不变量核对。
     original: PayloadRange,
 }
 
 impl Request {
-    /// 每请求消费独占原页，CPU 范围只保存真实物理身份，不构造设备地址或假 DMA。
+    /// 分配一个独占清零物理页（写操作填充字节 `tag`）并构造单页 `Bio` 请求。
     fn prepare(
         disk: &Disk,
         operation: BlkOperation,
@@ -124,8 +164,9 @@ impl Request {
             .map_err(|_| TestError("RAM payload owner allocation failed"))?;
         memory.push(mapped);
 
-        // SAFETY: 原页独占且已清零，Write 的完整范围又写入图样；CPU 裸别名均已结束。
-        // 回调只访问已收权来源，等待独立同盘 Read 与外部 gate，不等待自身或本盘 stop。
+        // SAFETY:
+        // 1. `pages` 由 `mm::alloc_pages(0, true)` 分配并清零（写操作已将 `[0..len)` 完整初始化为 `tag`），且所有权已移交 `memory` 向量，无任何外部可变别名；
+        // 2. 可选的 `EndIo::Task` 回调仅访问已交还 CPU 访问权的缓冲区并等待同盘独立读取与外部 `gate`，不会等待自身完成或磁盘停止。
         let bio = unsafe { Bio::try_new(disk, operation, sector, memory, 0, endio) }
             .map_err(|_| TestError("RAM Bio construction failed"))?;
         let completion = bio.completion();
@@ -136,7 +177,7 @@ impl Request {
         })
     }
 
-    /// 原 view 和 FS claim 使用相同父请求，只在正式准入处判断范围和权限。
+    /// 将请求提交到指定的 `BlockView` 或已授权的 `FsClaim` 通道（若 `claim` 为 `Some` 则经由文件系统声明提交，否则作为裸视图请求提交）。
     fn submit(&mut self, view: &BlockView, claim: Option<&FsClaim>) {
         let bio = self.pending.take().expect("RAM request submitted twice");
         match claim {
@@ -145,7 +186,7 @@ impl Request {
         }
     }
 
-    /// 原完成者结束后只取一次原页，成功 Read 核全长内容，拒绝不冒充设备发表。
+    /// 等待请求完成并取回物理页所有权，校验物理地址、长度、DMA 方向、CPU 访问权收回状态以及（若指定 `tag`）读取到的全长字节内容。
     fn finish(self, context: &mut TestContext<'_>, tag: Option<u8>) -> Result<IoResult, TestError> {
         until("RAM parent completion did not progress", || {
             self.completion.is_complete()
@@ -168,7 +209,9 @@ impl Request {
             );
             context.expect_eq(mapped.is_device_owned(), false);
             if let Some(tag) = tag {
-                // SAFETY: 原页完整清零且无共享写者，整个成功 Read 已收权，观察者独占领取原 memory。
+                // SAFETY:
+                // 1. 上方已验证 `!mapped.is_device_owned()`，物理页的访问权已回到 CPU，且通过 `take_memory()` 由当前调用方独占拥有；
+                // 2. 该物理页在分配时已清零且经过 RAM 盘读取填充，在 `[0..len)` 范围内构造只读字节切片是安全的。
                 let bytes = unsafe { mapped.bytes() };
                 context.expect_eq(bytes.iter().all(|byte| *byte == tag), true);
             }
@@ -178,7 +221,7 @@ impl Request {
         Ok(result)
     }
 
-    /// 完成和预期结果比较分开借用测试上下文，不改变原请求的真实错误值。
+    /// 等待请求完成、校验缓冲区与可选字节图样 `tag`，并断言返回的 `IoResult` 等于 `expected`。
     fn expect_result(
         self,
         context: &mut TestContext<'_>,
@@ -191,19 +234,26 @@ impl Request {
     }
 }
 
+/// RAM 块设备测试夹具，持有 64 KiB 底层物理页、RAM `Disk` 实例、专属工作队列与元数据缓存槽位。
 struct Ram {
+    /// 用例启动前全系统 6 个内存域的统计基线。
     baseline: mm::MemoryStats,
+    /// 被测 RAM 块设备引用。
     disk: DiskRef,
+    /// 供 RAM 块设备处理请求与完成回调的工作队列。
     queue: WorkQueue,
+    /// 供 `held_endio` 回调使用的跨线程同步与观测对象。
     callback: Arc<Callback>,
+    /// 测试用例按需创建的元数据缓存槽位（在 `quiesce` 中统一丢弃私有缓存并释放）。
     caches: [Option<Arc<MetadataCache>>; 4],
-    // 必须晚于 Disk 与 WorkQueue 析构；只有真实 stop/close 全尾以后才归还此原阶。
+    /// 承载 64 KiB RAM 磁盘数据的底层高阶物理页（阶数 4，即 16 页）；声明在 `disk` 与 `queue` 之后，确保最后析构释放。
     _backing: mm::OwnedPages,
+    /// 记录 `disk.start()` 阶段是否发生错误。
     activation_error: Option<BlockError>,
 }
 
 impl Ram {
-    /// 在普通 Task 中准备独占 64KiB backing、原完成域和软件槽，所有 fallible 存储先于 start。
+    /// 分配 64 KiB 清零物理页后端、工作队列与 `Callback` 观测器，初始化并启动 RAM `Disk` 实例。
     fn prepare(context: &mut TestContext<'_>) -> Result<Self, TestError> {
         let baseline = settled()?;
         let backing =
@@ -218,8 +268,9 @@ impl Ram {
             reclaim: true,
         })
         .map_err(|_| TestError("RAM completion domain unavailable"))?;
-        // SAFETY: 本 fixture 独占完整已清零原页块，永久直映有效；未创建内容 slice、用户映射
-        // 或设备映射，backing 保活到 Disk stop、全部 Work close/join 和 Disk 析构以后。
+        // SAFETY:
+        // 1. `backing` 是当前夹具通过 `mm::alloc_pages(4, true)` 独占分配并清零的 64 KiB 连续物理页，内核恒等/直接映射在整个生命周期内有效；
+        // 2. 该物理区间未建立任何外部切片、用户态映射或硬件 DMA 映射，且 `_backing` 字段在 `Ram` 结构体中排在 `disk` 与 `queue` 之后，保证在 `Disk::stop`、工作队列关闭及 `Disk` 析构之后才释放物理页。
         let disk = match unsafe { Disk::prepare_ram(region, &queue) } {
             Ok(disk) => disk,
             Err(_) => {
@@ -273,7 +324,7 @@ impl Ram {
         })
     }
 
-    /// 主体只使用真实成功启动的原磁盘，不更换后端或初始化另一块内存。
+    /// 检查 RAM 块设备是否在 `set_up` 阶段成功启动。
     fn ready(&self) -> TestResult {
         if self.activation_error.is_some() {
             return Err(TestError("RAM activation failed"));
@@ -281,7 +332,7 @@ impl Ram {
         Ok(())
     }
 
-    /// 同步原请求保完整结果；字节图样检查只作用于真正全长成功的读取。
+    /// 在指定 `BlockView` 上同步执行一次读写请求（读取时自动校验全长字节是否为 `tag`），返回 `IoResult`。
     fn io(
         &self,
         context: &mut TestContext<'_>,
@@ -301,7 +352,7 @@ impl Ram {
         request.finish(context, read_tag)
     }
 
-    /// 同步请求返回完整真实结果以后再比较，避免嵌套借用测试上下文。
+    /// 在指定 `BlockView` 上同步执行一次读写请求，并断言返回结果等于 `expected`。
     #[expect(
         clippy::too_many_arguments,
         reason = "RAM 请求测试显式列出视图、操作、扇区、长度、字节图样和独立预期，不合并实际值与断言来源"
@@ -321,14 +372,14 @@ impl Ram {
         Ok(())
     }
 
-    /// 全部真实页访问和私有缓存消费者停止以后结束本盘，再同步关闭原完成域。
+    /// 静止化清理流程：放行回调门控、刷新完成任务、丢弃测试期间创建的私有元数据缓存，停止 RAM 盘并同步关闭工作队列。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.callback.gate.complete();
         self.disk.test_flush_completions();
         for cache in self.caches.iter().flatten() {
-            // SAFETY: 本例没有 FS 卷、用户映射或 WB 生产者；主体局部 Buffer 已结束，
-            // 所有缓存消费者及原 Work 均已停止。相交 RO 范围也无存活消费者，
-            // 仅独占 RAM fixture 的私有 metadata 修改无需持久化。
+            // SAFETY:
+            // 1. 当前测试用例未挂载持久化文件系统、未创建用户态映射，也未启动后台回写线程；
+            // 2. 测试函数体内的局部 `Buffer` 守卫均已释放，关联的异步任务已停止，且底层为当前用例独占的临时 RAM 盘，直接丢弃未落盘的私有脏元数据是安全的。
             unsafe { cache.discard_private() }
                 .map_err(|_| TestError("RAM private cache retained an external owner"))?;
         }
@@ -347,7 +398,7 @@ impl Ram {
         Ok(())
     }
 
-    /// 原 Disk、观察者、backing 和 Work 真实析构以后核本例完整六域，没有跨 VM 合账。
+    /// 销毁 `Ram` 夹具（释放 `Disk`、`WorkQueue` 与 64 KiB 物理页后端），等待全系统 6 个内存域统计恢复至测试前基线。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let before = self.baseline;
         drop(self);
@@ -365,15 +416,15 @@ impl Ram {
 }
 
 impl Fixture<()> for Ram {
-    /// 每例使用独立的真实原页 backing，不依赖启动 initrd 或前一例留下的数据。
+    /// 为每个测试用例创建独立的 64 KiB RAM 块设备测试夹具。
     fn set_up(context: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         Self::prepare(context)
     }
-    /// 主体失败也释放合法 gate 并等待本盘和原工作域的全部真实尾部。
+    /// 在测试用例结束（无论成功或失败）时静止化回调、缓存、RAM 磁盘与工作队列。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         Ram::quiesce(self, context)
     }
-    /// 安全静止化成功后消费原 fixture 并比较自身资源。
+    /// 在静止化完成后销毁夹具并校验内存零泄漏。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         Ram::tear_down(self, context)
     }
@@ -383,13 +434,14 @@ impl Fixture<()> for Ram {
 mod views {
     use super::*;
 
-    /// 两个视图的偏移、最后 sector 与整盘位置一致，越界请求不能发表或修改相邻范围。
+    /// 测试目标：验证相邻不重叠 `BlockView` 的起始偏移与末尾扇区映射正确，且跨视图边界的越界读写请求在准入阶段被拒绝（返回 `BlockError::InvalidRange`），不会篡改相邻视图的数据。
     #[test]
     fn nonoverlapping_offsets_and_tail_bounds(
         context: &mut TestContext<'_>,
         fixture: &mut Ram,
     ) -> TestResult {
         fixture.ready()?;
+        // Step 1: 创建扇区 [8..16) 与 [16..24) 两个相邻视图以及整盘视图，并在各自首尾扇区写入特征字节。
         let first = BlockView::new(fixture.disk.clone(), 8, 8)
             .map_err(|_| TestError("first RAM view unavailable"))?;
         let second = BlockView::new(fixture.disk.clone(), 16, 8)
@@ -415,6 +467,7 @@ mod views {
             )?;
         }
 
+        // Step 2: 通过整盘视图与视图相对字节偏移接口读取并校验刚写入的数据。
         for (sector, tag) in [(8, 0x19), (15, 0x37), (16, 0xa3), (23, 0xc5)] {
             fixture.expect_io(
                 context,
@@ -435,6 +488,7 @@ mod views {
             .map_err(|_| TestError("RAM view final sector read failed"))?;
         context.expect_eq(bytes, [0x37; 512]);
 
+        // Step 3: 提交跨越第一个视图末尾边界（扇区 15 起、长度 1024B）的写请求及越界同步读请求，验证均以 `InvalidRange` 拒绝且相邻扇区 16 的数据完好无损。
         let before = fixture.disk.test_snapshot().submitted;
         let mut rejected =
             Request::prepare(&fixture.disk, BlkOperation::Write, 15, 1024, 0xee, None)?;
@@ -469,13 +523,15 @@ mod views {
         Ok(())
     }
 
-    /// 原 FS 范围拒重叠 raw 写，独立 scratch 可写；回调尾仍保占用且同盘 Read 可完成。
+    /// 测试目标：验证 `FsClaim` 占用期间拒绝同一视图上的裸写请求（`BlockError::ReadOnly`）但不影响相邻视图；
+    /// 且当经由 `FsClaim` 提交的请求仍阻塞在 `EndIo::Task` 回调中时，提前 Drop `FsClaim` 门面仍会保持该范围的占用保护，直到回调彻底退出后才允许裸写。
     #[test]
     fn claims_keep_accepted_callback_tail_and_release_range(
         context: &mut TestContext<'_>,
         fixture: &mut Ram,
     ) -> TestResult {
         fixture.ready()?;
+        // Step 1: 在 `root` ([8..16)) 上建立读写 `FsClaim`，验证对 `root` 的直接裸写被拒绝，而对不重叠 `scratch` ([16..24)) 的裸写成功。
         let root = BlockView::new(fixture.disk.clone(), 8, 8)
             .map_err(|_| TestError("RAM root view unavailable"))?;
         let scratch = BlockView::new(fixture.disk.clone(), 16, 8)
@@ -509,6 +565,7 @@ mod views {
             },
         )?;
 
+        // Step 2: 经由 `claim` 提交带 `held_endio` 回调的写请求，等待回调内部完成同盘独立读取并阻塞在外部 `gate` 上。
         let mut held = Request::prepare(
             &fixture.disk,
             BlkOperation::Write,
@@ -527,6 +584,7 @@ mod views {
             task.is_some_and(|task| sched::test_state(&task) == task::State::Blocked)
         })?;
         context.expect_eq(fixture.callback.valid.load(Ordering::Acquire), true);
+        // Step 3: 在回调阻塞期间释放 `claim` 句柄，验证在途回调仍保持 `root` 范围的占用保护，此时对 `root` 的裸写依然返回 `ReadOnly`。
         drop(claim);
         let before = fixture.disk.test_snapshot().submitted;
         fixture.expect_io(
@@ -543,6 +601,7 @@ mod views {
         )?;
         context.expect_eq(fixture.disk.test_snapshot().submitted, before);
 
+        // Step 4: 放行回调门控 `gate` 并等待请求与槽位彻底结束，验证范围占用已解除，对 `root` 的裸写与回读恢复成功。
         fixture.callback.gate.complete();
         held.expect_result(
             context,
@@ -585,13 +644,15 @@ mod views {
         Ok(())
     }
 
-    /// RO 热页转交 RW 同源控制后，相邻卷保留脏边界页；退休 A 后 raw 改尾并重开读取新盘面。
+    /// 测试目标：验证共享同一 4 KiB 物理页（`Folio`）的两个相邻视图 A（只读）与 B（读写）中，
+    /// 当 A 的 `FsClaim` 与缓存门面全部释放且最后一个 `Buffer` 守卫析构后，仅 A 所属的半页范围失效并允许裸写更新，而 B 所属半页的脏数据与状态完全保留。
     #[test]
     fn retired_range_reloads_raw_tail_without_losing_adjacent_dirty(
         context: &mut TestContext<'_>,
         fixture: &mut Ram,
     ) -> TestResult {
         fixture.ready()?;
+        // Step 1: 初始化扇区 [16..18) 与 [18..20) 的底层数据，分别为视图 A（RO）与视图 B（RW）建立声明和共享 `MetadataCache`，验证两者映射到同一物理页（`Folio`）。
         let whole = BlockView::whole(fixture.disk.clone());
         for (sector, tag) in [(16, 0x33), (18, 0x44)] {
             fixture.expect_io(
@@ -650,11 +711,11 @@ mod views {
         let dirty = right.folio().dirty_sectors();
         context.expect_eq(dirty, 0b0000_1100);
 
+        // Step 2: 释放视图 A 的 `FsClaim` 与缓存实例，验证仅存的 `left` (`Buffer`) 仍保持范围占用，此时对 A 的裸写仍被拒绝。
         context.expect_eq(fixture.caches[0].as_ref().unwrap().prune_unused(), 0);
         drop(a_claim);
         drop(fixture.caches[0].take());
         drop(a_peer);
-        // facade 已撤离，唯一剩下的 A Buffer 仍保活真实 claim，不能提前失效或准入 raw。
         context.expect_eq(right.folio().range_ready(0, 1024), Ok(()));
         fixture.expect_io(
             context,
@@ -668,6 +729,7 @@ mod views {
                 error: Some(BlockError::ReadOnly),
             },
         )?;
+        // Step 3: 释放 `left` 守卫，验证同一 `Folio` 内仅 A 的字节范围 `[0..1024)` 变为 `NotReady`，而 B 的范围与脏扇区位图保持有效，且对 A 的裸写获准执行。
         let (a_ready, b_ready) = {
             let content = right.folio().lock_content();
             drop(left);
@@ -693,6 +755,7 @@ mod views {
             },
         )?;
 
+        // Step 4: 重新声明视图 A 并通过缓存读取，验证从 RAM 盘重新加载了裸写修改后的新数据，且相邻视图 B 的未落盘脏数据完好无损。
         let reopened = Disk::claim_fs(&a, AccessMode::ReadOnly)
             .map_err(|_| TestError("RAM retired range did not reopen"))?;
         fixture.caches[0] = Some(
@@ -721,13 +784,15 @@ mod views {
         Ok(())
     }
 
-    /// 重叠只读 claim 保留公共 sector，结束外层范围后仅两侧空段重新准入 raw。
+    /// 测试目标：验证外层大范围只读声明（扇区 `[16..22)`）与内层子范围只读声明（扇区 `[18..20)`）重叠时，
+    /// 释放外层声明后仅使外层独有的两侧范围（`[16..18)` 与 `[20..22)`）失效并重新允许裸写，而内层声明保护的中间范围保持就绪且拒绝裸写。
     #[test]
     fn overlapping_readonly_claim_preserves_live_middle_range(
         context: &mut TestContext<'_>,
         fixture: &mut Ram,
     ) -> TestResult {
         fixture.ready()?;
+        // Step 1: 在扇区 `[16..22)` 写入初始图样，分别建立外层 `[16..22)` 与中间 `[18..20)` 两个重叠只读声明及元数据缓存，并预热读取全部 3 个 1 KiB 块。
         let whole = BlockView::whole(fixture.disk.clone());
         fixture.expect_io(
             context,
@@ -771,6 +836,7 @@ mod views {
             .get(0, 1024, None)
             .map_err(|_| TestError("RAM middle metadata block read failed"))?;
 
+        // Step 2: 释放外层声明与外层缓存，验证共享 `Folio` 的首尾两段（`[0..1024)` 与 `[2048..3072)`）变为 `NotReady`，而中间段保持可读。
         drop(outer_claim);
         drop(fixture.caches[0].take());
         context.expect_eq(live.folio().range_ready(0, 1024), Err(BlockError::NotReady));
@@ -783,6 +849,7 @@ mod views {
             Ok(true),
         );
 
+        // Step 3: 验证已释放的外层两侧扇区（16 与 20）允许裸写更新，而仍被内层声明占用的中间扇区（18）拒绝裸写。
         for (sector, tag) in [(16, 0x56), (20, 0x78)] {
             fixture.expect_io(
                 context,
@@ -810,6 +877,7 @@ mod views {
             },
         )?;
 
+        // Step 4: 重新建立外层只读声明并读取全部 3 个块，验证两侧块读到新写入的数据，中间块仍保留原数据，且三者共用同一个 `Folio`。
         let reopened = Disk::claim_fs(&outer, AccessMode::ReadOnly)
             .map_err(|_| TestError("RAM overlapping readonly range did not reopen"))?;
         fixture.caches[0] = Some(
@@ -831,13 +899,15 @@ mod views {
         Ok(())
     }
 
-    /// 相对块零按绝对物理页区分，同页不相交范围共用 PFN 且更新不能越过各自 claim。
+    /// 测试目标：验证不同起始偏移的 `BlockView` 在访问各自的相对逻辑块 0 时映射到各自独立的物理页（PFN），
+    /// 而位于同一 4 KiB 物理页内的不相交视图共享同一个 `Folio` PFN，且每个 `Buffer::update` 严格校验传入的 `FsClaim` 是否覆盖该缓冲区范围。
     #[test]
     fn physical_cache_keeps_view_zero_and_shared_page_ranges(
         context: &mut TestContext<'_>,
         fixture: &mut Ram,
     ) -> TestResult {
         fixture.ready()?;
+        // Step 1: 在扇区 0、8、16、18 写入不同特征字节，并为 `[0..8)`、`[8..16)`、`[16..18)`、`[18..20)` 四个视图分别建立读写声明与元数据缓存。
         let whole = BlockView::whole(fixture.disk.clone());
         for (sector, tag) in [(0, 0x11), (8, 0x22), (16, 0x33), (18, 0x44)] {
             fixture.expect_io(
@@ -872,6 +942,7 @@ mod views {
             claims.push(claim);
         }
 
+        // Step 2: 读取四个缓存各自的相对块 0，断言前两个 4 KiB 视图的 `Folio` PFN 不同，而后两个同页 1 KiB 子视图共享同一个 `Folio` PFN 且页内偏移分别为 0 和 1024。
         let first = fixture.caches[0]
             .as_ref()
             .unwrap()
@@ -910,6 +981,7 @@ mod views {
             );
         }
 
+        // Step 3: 验证使用视图 3 的 `FsClaim` 更新视图 2 的 `Buffer` 会因范围不匹配返回 `InvalidRange`，而使用视图 2 自身的 `FsClaim` 可正常更新并仅置位对应扇区的脏位图。
         context.expect_eq(
             left.update(&claims[3], |bytes| bytes.fill(0xee)),
             Err(BlockError::InvalidRange),

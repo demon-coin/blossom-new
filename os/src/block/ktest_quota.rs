@@ -1,4 +1,37 @@
-//! 同一原完成域的非 slot finalizer 配额回归；受控父账本不冒充硬件 used。
+//! 块设备完成工作队列（WorkQueue）配额、预留完成任务（Finalizer Task）隔离与 OOM 压力回归测试。
+//!
+//! # 模块职责与架构定位
+//! 本模块属于块设备子系统的内核单元测试（`ktest`），专门验证当大量非硬件槽位触发的 `Bio` 完成回调
+//! （如准入拒绝或生成期最后完成回调）在 `EndIo::Task` 上下文中阻塞等待其他磁盘 I/O 时，
+//! 不会耗尽共享 `WorkQueue` 的并发配额（`max_active`），从而保证真实的硬件 `Used` 环完成任务与进度推进任务仍能正常调度。
+//!
+//! # 核心设计与并发交互拓扑
+//! 测试构造两类并发请求流（请求组 A 与独立请求 B），它们共享同一个 `WorkQueue` 完成域：
+//!
+//! ```text
+//! +-----------------------------------------------------------------------+
+//! | 共享完成工作队列 WorkQueue (普通并发配额 max_active = N * (32 + 1))    |
+//! +-----------------------------------------------------------------------+
+//!        |                                             |
+//!        | (1) 非槽位完成路径 (A 组: 33/34/67 个 Bio)   | (2) 真实硬件 I/O 路径 (独立请求 B)
+//!        v                                             v
+//! +-----------------------------------+   +-------------------------------+
+//! | Origin::Reject (RO FsClaim 拒绝)  |   | VirtIO 硬件槽位提交 Read (B)  |
+//! | 或 Origin::GenerationLast         |   | ktest_hold_used 暂缓完成通知  |
+//! +-----------------------------------+   +-------------------------------+
+//!        |                                             |
+//!        v                                             v
+//! +-----------------------------------+   +-------------------------------+
+//! | 触发各自预留的 Finalizer Task     |   | 释放 Used 后触发槽位专属的    |
+//! | 进入 waiting_callback             |   | slot completion_work 与       |
+//! | 调用 owner.peer.wait() 陷入阻塞   |   | peer_callback，唤醒全部 A     |
+//! +-----------------------------------+   +-------------------------------+
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 全局定位锁 `ACTIVE`：仅在进入回调或清理夹具时短暂获取以克隆 `Arc<Observation>`，严禁持锁睡眠或嵌套获取其他锁。
+//! - 观测状态自旋锁（`Observation::tasks`、`peer_task`、`stop_tasks`、`stop_results`）：叶子自旋锁，仅保护各自槽位的读写，持锁期间不调用调度器查询接口（先克隆 `Arc<Task>` 释放锁后再查询 `sched::test_state`）。
+//! - 磁盘队列自旋锁 `Disk::queue`：用于读取队列阶段与槽位状态，严禁与 `Observation` 内部自旋锁交叉嵌套。
 
 use ::ktest::{self, Fixture, TestContext, TestError, TestResult};
 use alloc::alloc::{alloc, dealloc};
@@ -25,34 +58,54 @@ use crate::task::{self, JoinHandle, PreparedTask, State, Task};
 use crate::workqueue::{Work, WorkQueue, WorkQueueConfig};
 use crate::{cpu, mm, sched, time, timer};
 
-// EndIo 的函数指针只经此单槽定位当前 fixture；所有 Task/页/gate 均由该例拥有。
+/// 全局当前活跃测试夹具的观察状态槽位。
+/// `EndIo::Task` 仅接收裸函数指针，回调通过此全局槽位获取当前用例的 `Observation` 强引用。
 static ACTIVE: SpinLock<Option<Arc<Observation>>> = SpinLock::new(None);
 
+/// 请求组 A 触发非硬件槽位完成回调的来源模式。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Origin {
+    /// 磁盘被只读文件系统声明（`FsClaim`）占用时，提交写请求在准入阶段被立即拒绝（返回 `BlockError::ReadOnly`）。
     Reject,
+    /// 通过受控账本路径模拟生成期最后一个子分片完成（不占用硬件描述符槽位）。
     GenerationLast,
 }
 
+/// 测试用例运行期间的跨任务共享观测状态。
 struct Observation {
+    /// 独立请求 B 的完成句柄，供 A 组所有回调阻塞等待。
     peer: BioCompletion,
+    /// 请求组 A 每个 `Bio` 预期收到的完成结果。
     expected_a: IoResult,
+    /// 请求组 A 每个 `Bio` 绑定的原始 DMA 物理段描述（用于校验物理地址、长度与方向未发生篡改）。
     originals: Vec<MappedSegment>,
+    /// 记录执行每个 A 组回调的内核任务（`Task`）强引用，由自旋锁保护，按 `originals` 下标索引。
     tasks: SpinLock<Vec<Option<Arc<Task>>>>,
+    /// 已进入 `waiting_callback` 回调的 A 组任务计数。
     entered: AtomicUsize,
+    /// 已从 `waiting_callback` 唤醒并退出的 A 组任务计数。
     returned: AtomicUsize,
+    /// 请求组 A 的回调参数、DMA 缓冲区所有权与等待返回值是否全部符合预期。
     valid_a: AtomicBool,
+    /// 独立请求 B 的回调 `peer_callback` 被调用的次数（预期恰好为 1）。
     peer_calls: AtomicUsize,
+    /// 执行独立请求 B 回调的内核任务（`Task`）强引用，由自旋锁保护。
     peer_task: SpinLock<Option<Arc<Task>>>,
+    /// 独立请求 B 的回调参数、DMA 缓冲区及扇区数据图样是否全部校验通过。
     valid_b: AtomicBool,
+    /// 独立请求 B 绑定的原始 DMA 物理段描述。
     peer_original: MappedSegment,
+    /// 独立请求 B 所在目标磁盘的扇区图样标识（`1` 或 `2`）。
     peer_tag: AtomicUsize,
+    /// 各块设备独立执行 `Disk::stop` 的内核任务强引用，按磁盘下标索引。
     stop_tasks: SpinLock<Vec<Option<Arc<Task>>>>,
+    /// 各块设备独立执行 `Disk::stop` 的返回结果，按磁盘下标索引。
     stop_results: SpinLock<Vec<Option<Result<(), BlockError>>>>,
 }
 
 impl Observation {
-    /// 短锁仅克隆现存强拥有，真实 Blocked 状态始终向调度器查询。
+    /// 统计请求组 A 中当前已在调度器中处于 `State::Blocked` 阻塞状态的回调任务数量。
+    /// 在自旋锁临界区内仅克隆 `Arc<Task>`，随后在锁外向调度器查询任务状态。
     fn blocked(&self) -> usize {
         (0..self.originals.len())
             .filter(|&ordinal| {
@@ -62,14 +115,14 @@ impl Observation {
             .count()
     }
 
-    /// 独立 stop Task 的观察不能用尚未返回或 entered 标记替代真实 park。
+    /// 查询指定磁盘下标对应的 `Disk::stop` 任务是否已在调度器中处于 `State::Blocked` 阻塞状态。
     fn stop_blocked(&self, index: usize) -> bool {
         let task = self.stop_tasks.lock()[index].clone();
         task.is_some_and(|task| sched::test_state(&task) == State::Blocked)
     }
 }
 
-/// 克隆当前例的有界强拥有后立即放开定位锁，不在回调中分配控制对象。
+/// 从全局 `ACTIVE` 槽位克隆当前测试夹具的 `Observation` 强引用，随后立即释放自旋锁。
 fn observation() -> Arc<Observation> {
     ACTIVE
         .lock()
@@ -78,12 +131,14 @@ fn observation() -> Arc<Observation> {
         .clone()
 }
 
-/// 固定 raw 图样按整个成功范围逐字节核对，不把首 byte 当作数据完整性证明。
+/// 校验 `memory` 缓冲区的全部字节是否匹配指定磁盘标识 `tag` 与起始扇区 `sector` 的确定性数据图样。
 fn patterned(memory: &MappedPages, tag: u8, sector: u64) -> bool {
     if memory.is_device_owned() {
         return false;
     }
-    // SAFETY: 调用者只在 Read 全长成功且 CPU 已收权后调用；原页不再有设备写者。
+    // SAFETY:
+    // 1. 前置条件 `if memory.is_device_owned()` 已确认物理页的 DMA 访问权已交还 CPU；
+    // 2. 调用方仅在读取完成且无并发设备写入时调用本函数，在缓冲区的有效长度内创建只读字节切片是安全的。
     unsafe { memory.bytes() }
         .iter()
         .enumerate()
@@ -97,7 +152,8 @@ fn patterned(memory: &MappedPages, tag: u8, sector: u64) -> bool {
         })
 }
 
-/// A 只等独立 B Read；拒绝不发表 Write，generation-last 不发表任何地址。
+/// 请求组 A 的 `EndIo::Task` 完成回调函数。
+/// 校验完成状态与全零物理页后记录当前执行任务，并阻塞等待独立请求 B 完成。
 fn waiting_callback(result: &IoResult, memory: &[MappedPages]) {
     let owner = observation();
     let valid = *result == owner.expected_a && memory.len() == 1 && !memory[0].is_device_owned();
@@ -106,7 +162,9 @@ fn waiting_callback(result: &IoResult, memory: &[MappedPages]) {
         let segment = mapped
             .segment(crate::mm::dma::DmaDomain::qemu_coherent())
             .expect("QEMU fixture mapping must be reachable");
-        // SAFETY: A 的原页预先全部清零；两种 origin 均无设备 descriptor 引用。
+        // SAFETY:
+        // 1. 请求组 A 的物理页在 `bio()` 构造时通过 `mm::alloc_pages(0, true)` 分配并清零；
+        // 2. `Reject` 与 `GenerationLast` 两种路径均未向硬件描述符环发布该页，且上方已检查 `!memory[0].is_device_owned()`，CPU 独占访问该页。
         let zero = unsafe { mapped.bytes() }.iter().all(|byte| *byte == 0);
         owner.originals.iter().position(|original| {
             zero && segment.address == original.address
@@ -137,7 +195,8 @@ fn waiting_callback(result: &IoResult, memory: &[MappedPages]) {
     owner.returned.fetch_add(1, Ordering::Release);
 }
 
-/// B 的真实 slot Task 回调检查完整不同盘图样、原页和恰一次执行，不等待自身。
+/// 独立请求 B 的 `EndIo::Task` 完成回调函数。
+/// 在可调度上下文中校验回调仅执行一次、DMA 物理段属性一致以及扇区 400 的完整数据图样。
 fn peer_callback(result: &IoResult, memory: &[MappedPages]) {
     let owner = observation();
     sched::assert_switchable();
@@ -175,7 +234,7 @@ fn peer_callback(result: &IoResult, memory: &[MappedPages]) {
     }
 }
 
-/// 有限单调期限只检查确切谓词；计时器睡眠本身不是任何完成或阻塞证据。
+/// 在 10 秒单调时钟期限内轮询条件 `ready`，每次未就绪时睡眠 1 毫秒；超时则返回 `TestError(label)`。
 fn until(label: &'static str, mut ready: impl FnMut() -> bool) -> TestResult {
     let deadline = time::now()
         .checked_add(time::Duration::from_secs(10))
@@ -189,7 +248,7 @@ fn until(label: &'static str, mut ready: impl FnMut() -> bool) -> TestResult {
     Ok(())
 }
 
-/// 所有参与者离栈后整理真实 allocator backing，保存完整 MM 六域账本。
+/// 等待除当前 CPU 外的所有核心进入空闲（idle）状态，随后收缩 SLUB 缓存并排空每 CPU 页面缓存，返回全系统 6 个内存域的统计快照。
 fn settled() -> Result<mm::MemoryStats, TestError> {
     until("quota services did not settle", || {
         (0..cpu::count())
@@ -200,7 +259,7 @@ fn settled() -> Result<mm::MemoryStats, TestError> {
     Ok(mm::stats())
 }
 
-/// 每例借 suite 的一次发现库存准备独占工作设备，不重复扫描 PCI。
+/// 从测试套件共享的设备发现清单 `inventory` 中准备指定数量（`count`）的 VirtIO 块设备及其 Legacy 布局标志。
 fn devices(
     inventory: &DeviceInventory,
     count: usize,
@@ -223,13 +282,17 @@ fn devices(
         .try_reserve_exact(count)
         .map_err(|_| TestError("quota inventory owner allocation failed"))?;
     for candidate in &inventory.mmio_blocks {
-        // SAFETY: 本例唯一库存与永久强序映射；host 只挂该例的 raw 工作副本，无其它 owner。
+        // SAFETY:
+        // 1. `candidate` 来自启动阶段枚举的合法 VirtIO MMIO 区域且具备永久强序内核映射；
+        // 2. 测试套件声明了 `isolation = "Case"` 且上一用例已在 `quiesce` 中停止并回收设备，当前用例独占该硬件实例。
         let device = unsafe { VirtioDevice::prepare_mmio(candidate) }
             .map_err(|_| TestError("quota MMIO preparation failed"))?;
         prepared.push((device, candidate.version == 1));
     }
     for candidate in pci {
-        // SAFETY: 同一真实库存中的独占 BDF；上一例 stop/join 完成后才会创建本例。
+        // SAFETY:
+        // 1. `candidate` 来自 PCI 总线枚举到的合法 VirtIO 块设备 BDF；
+        // 2. 上一测试用例已完成设备停止与工作线程回收，当前用例独占该 PCI 设备。
         let device = unsafe { VirtioDevice::prepare_pci(&inventory.pci, candidate) }
             .map_err(|_| TestError("quota PCI preparation failed"))?;
         prepared.push((device, false));
@@ -237,7 +300,7 @@ fn devices(
     Ok(prepared)
 }
 
-/// 原零页在压力前完整预备；Write 只用作 claim 拒绝，不向设备发表。
+/// 为指定磁盘 `disk` 分配一个清零物理页并构造单扇区（扇区号 400）的 `Bio` 请求，绑定 `callback` 完成回调并返回对应的 DMA 段信息。
 fn bio(
     disk: &Disk,
     operation: BlkOperation,
@@ -266,7 +329,9 @@ fn bio(
         .map_err(|_| TestError("quota original owner vector failed"))?;
     memory.push(mapped);
 
-    // SAFETY: 全零原页完整初始化且无裸别名；A 仅等待独立 B，不等待自身/stop/复用槽。
+    // SAFETY:
+    // 1. `pages` 由 `mm::alloc_pages(0, true)` 分配并清零，且所有权已完全移交 `memory` 向量，不存在其他 CPU 别名引用；
+    // 2. 绑定的 `EndIo::Task(callback)` 仅等待独立的请求 B，不会死锁于自身或当前槽位。
     let bio = unsafe { Bio::try_new(disk, operation, 400, memory, 0, Some(EndIo::Task(callback))) }
         .map_err(|_| {
             TestError("quota Bio construction failed; Reject needs writable raw working copy")
@@ -274,14 +339,16 @@ fn bio(
     Ok((bio, original))
 }
 
+/// 内存压力控制器，用于在测试关键阶段耗尽物理页与全部 SLUB 堆大小类别的空闲内存，并在阶段结束后原样归还。
 struct Pressure {
+    /// 压力期间持有的全部高阶/单页物理页所有权列表（容量在施加压力前预先分配）。
     pages: Vec<mm::OwnedPages>,
-    // 原堆对象的首个 usize 仅在此唯一拥有者内保存下一节点，不需要压力期间扩容。
+    /// 每个 SLUB 大小类别（`mm::SLUB_SIZES`）的侵入式单向空闲链表头指针（以 `usize` 地址保存，0 表示空链表）。
     heap: [usize; mm::SLUB_SIZES.len()],
 }
 
 impl Pressure {
-    /// 页凭证容量在任何压力之前准备，堆链的控制槽直接属于 fixture。
+    /// 在施加 OOM 压力前预先为物理页保存向量分配足够的容量，避免在耗尽内存时发生向量扩容。
     fn prepare() -> Result<Self, TestError> {
         let mut pages = Vec::new();
         pages
@@ -293,7 +360,7 @@ impl Pressure {
         })
     }
 
-    /// 真正耗尽页和当前控制 Task 可用的全部堆类别，返回无分配的观察证据。
+    /// 耗尽系统当前可用的全部单页物理内存与所有 SLUB 堆大小类别，并返回 `(物理页是否耗尽, 堆内存是否耗尽)` 的探测结果。
     fn exhaust(&mut self) -> (bool, bool) {
         mm::shrink_all();
         mm::drain_all_pages();
@@ -309,12 +376,14 @@ impl Pressure {
             let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
                 .expect("quota heap pressure layout");
             loop {
-                // SAFETY: 固定非零合法布局，真实全局堆入口；只消费真实成功分配。
+                // SAFETY: `size` 来自内核预定义的合法非零 `mm::SLUB_SIZES`，对齐要求为 `usize` 对齐，`Layout` 合法。
                 let pointer = black_box(unsafe { alloc(layout) });
                 if pointer.is_null() {
                     break;
                 }
-                // SAFETY: 每类别至少8字节且8对齐，独占对象保存自身链字，没有外部借用。
+                // SAFETY:
+                // 1. 上方已检查 `!pointer.is_null()`，该内存块由当前调用方独占拥有；
+                // 2. `mm::SLUB_SIZES` 中最小类别不小于 `size_of::<usize>()` 且满足 `usize` 对齐，在首字写入下一节点地址安全。
                 unsafe {
                     pointer.cast::<usize>().write(self.heap[index]);
                 }
@@ -332,8 +401,7 @@ impl Pressure {
         {
             let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
                 .expect("quota heap probe layout");
-            // SAFETY: 探测同一真实全局堆；若意外成功立即按原布局归还，不记录假 OOM。
-            // 不让分配与立即归还被优化成假成功，保留真实 NULL 探测。
+            // SAFETY: `layout` 为合法的非零大小与 `usize` 对齐布局；若探测意外分配成功，立即使用完全相同的 `layout` 释放该指针。
             let pointer = black_box(unsafe { alloc(layout) });
             if !pointer.is_null() {
                 heap_failed = false;
@@ -345,14 +413,16 @@ impl Pressure {
         (pages_failed, heap_failed)
     }
 
-    /// 每个原堆节点按原布局归还一次，再释放原页压力，绝不手工改 allocator 状态。
+    /// 遍历所有 SLUB 大小类别的侵入式链表并将堆块按原布局逐一释放，随后清空持有的全部物理页。
     fn release(&mut self) {
         for (index, size) in mm::SLUB_SIZES.iter().copied().enumerate() {
             let layout = Layout::from_size_align(size, core::mem::align_of::<usize>())
                 .expect("quota heap release layout");
             while self.heap[index] != 0 {
                 let pointer = self.heap[index] as *mut u8;
-                // SAFETY: 节点来自本链的原 alloc，首字已初始化，布局与分配完全一致。
+                // SAFETY:
+                // 1. `pointer` 来自 `exhaust()` 中使用相同 `layout` 成功分配的非空块；
+                // 2. 首字在入链时已写入前驱节点地址，读取后立即调用 `dealloc` 释放，不会产生二次释放或悬垂访问。
                 unsafe {
                     self.heap[index] = pointer.cast::<usize>().read();
                     dealloc(pointer, layout);
@@ -364,39 +434,62 @@ impl Pressure {
 }
 
 impl Drop for Pressure {
-    /// body 的任何错误也不遗失真正页/堆压力凭证。
+    /// 析构时自动释放全部持有的堆块与物理页，防止测试中途出错退出时泄漏内存压力资源。
     fn drop(&mut self) {
         self.release();
     }
 }
 
+/// 单盘或双盘配额饱和回归测试的夹具主结构，负责管理设备、工作队列、请求及辅助任务的完整生命周期。
 struct Owner {
+    /// 用例启动前全系统 6 个内存域的统计基线（用于在 `tear_down` 中校验零内存泄漏）。
     baseline: mm::MemoryStats,
+    /// 请求组 A 触发非槽位完成回调的路径类型（`Reject` 或 `GenerationLast`）。
     origin: Origin,
+    /// 是否在请求 B 已收到硬件 `Used` 环通知但尚未放行完成时施加物理页与堆 OOM 压力。
     oom: bool,
+    /// 当前用例管理的块设备实例列表（单盘为 1 个，双盘为 2 个）。
     disks: Vec<DiskRef>,
+    /// 与 `disks` 一一对应的 VirtIO Legacy 寄存器布局标志。
     legacy: Vec<bool>,
+    /// 所有磁盘与 `Bio` 完成回调共享的 `WorkQueue` 完成域。
     queue: WorkQueue,
+    /// 共享 `WorkQueue` 的普通并发工作任务配额（每块磁盘 `tag_count + 1` 的总和）。
     max_active: usize,
+    /// 跨任务与回调共享的观测状态。
     observation: Arc<Observation>,
+    /// 请求组 A 所有 `Bio` 的完成句柄列表。
     completions: Vec<BioCompletion>,
+    /// 预先分配好内核栈、负责提交请求组 A 的生产者任务（绑定在 CPU 0）。
     prepared_a: Option<PreparedTask>,
+    /// 预先分配好内核栈、负责提交独立请求 B 的生产者任务（绑定在 CPU 1）。
     prepared_b: Option<PreparedTask>,
+    /// 请求组 A 生产者任务发布调度后的 `JoinHandle`。
     producer: Option<JoinHandle>,
+    /// 独立请求 B 生产者任务发布调度后的 `JoinHandle`。
     submitter: Option<JoinHandle>,
+    /// 为每块磁盘预先分配好内核栈、用于并发执行 `Disk::stop` 的任务列表。
     prepared_stops: Vec<Option<PreparedTask>>,
+    /// 各磁盘 `Disk::stop` 任务发布调度后的 `JoinHandle` 列表。
     stops: Vec<Option<JoinHandle>>,
+    /// 在 `Origin::Reject` 模式下持有的整盘只读文件系统声明（用于触发写请求准入拒绝）。
     claim: Option<FsClaim>,
+    /// 物理页与 SLUB 堆 OOM 内存压力控制器。
     pressure: Pressure,
+    /// 磁盘在 `Disk::start()` 阶段是否发生错误。
     activation_error: bool,
+    /// 提交请求组 A 之前，磁盘 0 的 `(已发布请求数, 已完成请求数)` 快照。
     before_a: (usize, usize),
+    /// 提交独立请求 B 之前，目标磁盘 B 的 `(已发布请求数, 已完成请求数)` 快照。
     before_b: (usize, usize),
+    /// 独立请求 B 预期推进到的 VirtIO `Used` 环索引目标值。
     used_target: u16,
+    /// 独立请求 B 在目标磁盘 B 上占用的硬件槽位下标。
     b_slot: Option<usize>,
 }
 
 impl Owner {
-    /// 借一次库存建立原共享 quota、Bio、观察者及本例 producer/stop 栈。
+    /// 根据指定的磁盘数量 `count` 与测试用例参数，预先分配共享 `WorkQueue`、`Bio` 请求、观测状态以及生产者与停止任务。
     fn prepare(
         count: usize,
         context: &mut TestContext<'_>,
@@ -463,7 +556,7 @@ impl Owner {
         }
 
         let resources = (|| {
-            // 原33回归与新增普通quota+1边界分别具名，双盘总是使用实际共享额度+1。
+            // Step 1: 计算请求组 A 的并发数量（`normal33`/`oom33` 使用 `max_active`，其余用例使用 `max_active + 1` 超出普通配额）。
             let a_count = if count == 1
                 && context
                     .case
@@ -646,7 +739,7 @@ impl Owner {
         })
     }
 
-    /// 各 raw 工作副本全长 identity Read 对固定图样，跨盘必须 tag1/tag2 均真实不同。
+    /// 读取每块磁盘扇区 0 的全扇区字节图样，校验磁盘身份标识（`tag1` / `tag2`）完整且双盘互不相同。
     fn identities(&self, context: &mut TestContext<'_>) -> TestResult {
         let mut tags = 0_u8;
         for (index, disk) in self.disks.iter().enumerate() {
@@ -654,7 +747,7 @@ impl Owner {
             let mut bytes = [0_u8; mm::PAGE_SIZE];
             disk.read_exact_at(0, &mut bytes[..unit])
                 .map_err(|_| TestError("quota raw identity Read failed"))?;
-            // 真实发现顺序不等于 host root/extra attach 顺序；用全范围图样核实际身份。
+            // 设备枚举顺序可能与宿主挂载顺序不同，通过首字节与全扇区校验公式确定磁盘的实际 tag 编号。
             let tag = match bytes[0] {
                 29 => 1_u8,
                 58 if self.disks.len() == 2 => 2_u8,
@@ -694,7 +787,8 @@ impl Owner {
         Ok(())
     }
 
-    /// 保原33反例并覆盖普通配额+1边界，核每个 A 自己的原生 Task 真 Blocked。
+    /// 执行配额饱和与预留完成任务隔离测试主流程：
+    /// 让请求组 A 全部阻塞在 `waiting_callback` 中，验证独立请求 B 仍能通过专属预留任务完成硬件读取并唤醒全部 A 组任务。
     fn saturation(&mut self, context: &mut TestContext<'_>) -> TestResult {
         if self.activation_error {
             return Err(TestError(
@@ -711,6 +805,7 @@ impl Owner {
                 .map_err(|_| TestError("quota RO FS claim failed"))?,
             );
         }
+        // Step 1: 发布请求组 A 的生产者任务，等待全部 A 组回调进入 `waiting_callback` 并在调度器中处于 `Blocked` 状态。
         self.before_a = self.counts(0);
         let b = self.disks.len() - 1;
         self.before_b = self.counts(b);
@@ -746,6 +841,7 @@ impl Owner {
             }
         }
 
+        // Step 2: 暂缓磁盘 B 的 `Used` 环完成处理，发布独立请求 B 并等待硬件将其写入 `Used` 环且预留工作任务就绪。
         self.disks[b].ktest_hold_used();
         self.used_target = super::tests::used_index(&self.disks[b], self.legacy[b]).wrapping_add(1);
         self.submitter = Some(self.prepared_b.take().expect("quota prepared B").publish());
@@ -799,7 +895,7 @@ impl Owner {
         context.expect_eq(self.observation.peer_calls.load(Ordering::Acquire), 0);
         context.expect_eq(self.observation.blocked(), count);
 
-        // 在 B 的真实 SG/descriptor/生成者与全部观察/stop 栈已经存在后才开始 OOM。
+        // Step 3: 在请求 B 的描述符与所有预留任务就绪后，按用例配置施加 OOM 压力，或在非 OOM 模式下并发发起 `Disk::stop`。
         let oom_evidence = if self.oom {
             Some(self.pressure.exhaust())
         } else {
@@ -819,6 +915,7 @@ impl Owner {
             Ok(())
         };
 
+        // Step 4: 释放磁盘 B 的 `Used` 环拦截，验证在配额耗尽（及 OOM）条件下请求 B 仍能完成并唤醒全部请求组 A。
         self.disks[b].ktest_release_used();
         let progressed = until(
             "quota B and all A did not progress with original execution resources",
@@ -828,12 +925,12 @@ impl Owner {
                     && self.completions.iter().all(BioCompletion::is_complete)
             },
         );
-        // OOM 区间内不打印、构造 SG 或申请控制对象；放压后再报告确切探测结果。
+        // Step 5: 解除内存压力后，再执行后续断言与诊断输出。
         self.pressure.release();
         stopped_wait?;
         progressed?;
 
-        // OOM 放压之前不发表其它盘 stop，避免先归还原控制栈稀释 B 恢复前的真实压力。
+        // Step 6: 触发剩余磁盘的停止任务，等待硬件槽位归零，并校验回调执行次数、任务隔离性及 DMA 缓冲区数据完整性。
         if self.oom {
             self.start_stop(b);
         }
@@ -897,13 +994,13 @@ impl Owner {
         Ok(())
     }
 
-    /// 只借生产 queue 短锁观察真 publish/finish，不另造测试计数模型。
+    /// 获取指定磁盘当前的 `(已发布到硬件槽位的请求数, 已完成硬件槽位的请求数)` 统计快照。
     fn counts(&self, index: usize) -> (usize, usize) {
         let q = self.disks[index].queue.lock();
         (q.ktest_stop.published, q.ktest_stop.finished)
     }
 
-    /// stop 控制 Task 和闭包早已准备；发表不需要申请 Task/栈/控制对象。
+    /// 将指定磁盘预先准备好的 `Disk::stop` 内核任务发布到调度器执行。
     fn start_stop(&mut self, index: usize) {
         self.stops[index] = Some(
             self.prepared_stops[index]
@@ -913,7 +1010,7 @@ impl Owner {
         );
     }
 
-    /// body 失败仍先结束生成者及释放 B，再按 B/A 责任顺序真 stop/IRQ/Work/native join。
+    /// 静止化清理流程：释放内存压力与 `Used` 环拦截，回收所有生产者任务，按逆序停止磁盘并关闭共享工作队列。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         self.pressure.release();
         let b = self.disks.len() - 1;
@@ -998,7 +1095,7 @@ impl Owner {
             }
         }
 
-        // 所有 producer 已结束，所有盘 slot/progress 已 close/join；最后关闭原共享域。
+        // Step 1: 所有生产者与磁盘专属工作项均已停止并回收，同步关闭共享 `WorkQueue` 并刷新所有 `Bio` 预留完成任务。
         self.queue.close_sync();
         context.expect_eq(self.queue.ktest_reserved_workers(), 0);
         for completion in &self.completions {
@@ -1008,7 +1105,7 @@ impl Owner {
         self.observation.peer.test_flush_finalizer();
         context.expect_eq(self.observation.peer.ktest_finalizer_joined(), true);
 
-        // stop 与域真实 native join 之后才摘当前 EndIo 定位槽。
+        // Step 2: 所有异步回调任务均已确认退出，清空全局 `ACTIVE` 定位槽。
         let active = ACTIVE
             .lock()
             .take()
@@ -1018,7 +1115,7 @@ impl Owner {
         Ok(())
     }
 
-    /// 最后观察 Arc/Task metadata/页拥有全部普通析构后再核六域，不把 joined 当成全析构。
+    /// 销毁测试夹具并等待所有 CPU 核心空闲、排空页面缓存，断言全系统 6 个内存域统计与测试前基线完全一致。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let baseline = self.baseline;
         drop(self);
@@ -1032,7 +1129,7 @@ impl Owner {
     }
 }
 
-/// Bio 完成后只取同一原 DMA 页一次，并再核全范围真实 raw 数据。
+/// 从已完成的 `BioCompletion` 中取回 DMA 物理页所有权，校验结果、物理段属性、数据图样以及重复取回时的 `BlockError::Busy` 错误。
 fn reclaim(
     context: &mut TestContext<'_>,
     completion: &BioCompletion,
@@ -1063,24 +1160,26 @@ fn reclaim(
     Ok(())
 }
 
+/// 单盘配额回归测试夹具封装（包装 `Owner`）。
 struct Single(Owner);
+/// 双盘跨盘配额回归测试夹具封装（包装 `Owner`）。
 struct Double(Owner);
 
 macro_rules! fixture {
     ($name:ident, $count:expr) => {
         impl Fixture<DeviceInventory> for $name {
-            /// 每例只借一次发现的库存，独立取得真实设备、域、原页与控制责任。
+            /// 从共享设备清单中初始化指定磁盘数量的 `Owner` 测试夹具。
             fn set_up(
                 context: &mut TestContext<'_>,
                 inventory: &DeviceInventory,
             ) -> Result<Self, TestError> {
                 Owner::prepare($count, context, inventory).map(Self)
             }
-            /// 不能安全收敛时 Err 交原 typed case-abort 保活终结 VM，不 Drop 活设备。
+            /// 静止化夹具中的所有活跃任务、磁盘中断、工作项与共享工作队列。
             fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
                 self.0.quiesce(context)
             }
-            /// 全部 join 以后析构并核完整六域。
+            /// 销毁夹具并校验全系统 6 个内存域无任何泄漏。
             fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
                 self.0.tear_down(context)
             }
@@ -1094,7 +1193,8 @@ fixture!(Double, 2);
     tags("block", "quota", "B11", "T5"), resources("root"), timeout_ms = 60000)]
 mod single {
     use super::*;
-    /// 原 tag32 单盘 A33 反例和原普通 quota33 的 A34 边界分别保留合法 peer 等待。
+    /// 测试目标：验证单盘场景下，当 33 或 34 个写请求因只读 `FsClaim` 被准入拒绝并全部阻塞在 `EndIo::Task` 回调中时，
+    /// 同一磁盘上的独立硬件读请求 B 仍能通过预留工作任务完成（含正常与 OOM 压力模式）并唤醒所有阻塞回调。
     #[test]
     #[case("normal33", ())]
     #[case("oom33", ())]
@@ -1104,7 +1204,8 @@ mod single {
         fixture.0.saturation(context)
     }
 
-    /// 单盘生成者最后完成只走已有受控账本 seam，独立 B 是真实硬件 Read。
+    /// 测试目标：验证单盘场景下，当 33 或 34 个请求通过生成期最后完成路径阻塞在 `EndIo::Task` 回调中时，
+    /// 同一磁盘上的独立硬件读请求 B 仍能正常完成硬件读取（含正常与 OOM 压力模式）并唤醒所有阻塞回调。
     #[test]
     #[case("normal33", ())]
     #[case("oom33", ())]
@@ -1119,7 +1220,8 @@ mod single {
     tags("block", "quota", "cross-disk", "B11", "T5"), resources("root", "extra"), timeout_ms = 60000)]
 mod double {
     use super::*;
-    /// 双盘共享原普通 quota66，A67 在盘A原保留栈等待盘B真实 Task Read。
+    /// 测试目标：验证双盘共享同一个 `WorkQueue`（普通并发配额 66）时，磁盘 A 上 67 个被只读 `FsClaim` 拒绝的请求回调全部阻塞后，
+    /// 磁盘 B 上的独立硬件读请求仍能完成（含正常与 OOM 压力模式）并唤醒磁盘 A 的全部阻塞回调。
     #[test]
     #[case("normal", ())]
     #[case("oom", ())]
@@ -1127,7 +1229,8 @@ mod double {
         fixture.0.saturation(context)
     }
 
-    /// 双盘受控 generation-last A67 不占用或替代另一盘独立 slot/progress/Bio 栈。
+    /// 测试目标：验证双盘共享同一个 `WorkQueue`（普通并发配额 66）时，磁盘 A 上 67 个生成期最后完成回调全部阻塞后，
+    /// 不会占用或阻塞磁盘 B 的独立槽位与进度工作项，磁盘 B 的硬件读取仍能完成并唤醒所有回调。
     #[test]
     #[case("normal", ())]
     #[case("oom", ())]
@@ -1136,23 +1239,30 @@ mod double {
     }
 }
 
+/// 验证“已构造但从未提交的预留工作项（Reserved Work）”在工作队列关闭时能正确退出并回收的测试夹具。
 struct Unsubmitted {
+    /// 用例启动前全系统 6 个内存域的统计基线。
     baseline: mm::MemoryStats,
+    /// 被测工作队列实例。
     queue: WorkQueue,
+    /// 已通过 `Work::try_new_reserved` 构造但从未入队提交的预留工作项。
     work: Pin<Arc<Work>>,
+    /// 记录 `unsubmitted_callback` 被调用次数的原子计数器（预期始终为 0）。
     calls: Arc<AtomicUsize>,
+    /// 标记工作队列是否已执行 `close_sync`。
     closed: bool,
 }
 
-/// 正常路径不会调用：若未提交 Work 意外执行，真实原子证据使 case 失败。
+/// 未提交预留工作项的回调函数（正常情况下永不会被调用；若被误调用则递增计数器使断言失败）。
 fn unsubmitted_callback(work: Pin<&Work>) {
-    // SAFETY: fixture 强保 calls 到原域 close/join 结束；context 指向该固定 Arc payload。
+    // SAFETY: `Unsubmitted` 夹具持有 `calls: Arc<AtomicUsize>` 直到 `queue.close_sync()` 完成，
+    // `work.context()` 保存的是 `Arc::as_ptr(&calls)` 转换而来的合法有效指针。
     let calls = unsafe { &*(work.context() as *const AtomicUsize) };
     calls.fetch_add(1, Ordering::Release);
 }
 
 impl Fixture<()> for Unsubmitted {
-    /// 真构造 reserved Work/native Task，却不提交任何票，并保外部 Work owner 穿过 close。
+    /// 创建 `max_active = 1` 的工作队列并构造一个带专属预留任务的 `Work`，但不向队列提交该工作项。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let baseline = settled()?;
         let calls = Arc::try_new(AtomicUsize::new(0))
@@ -1184,7 +1294,7 @@ impl Fixture<()> for Unsubmitted {
         })
     }
 
-    /// owner 不丢 Work，不伪 join；真实域 close 会撤未提交预留并等原 manager 离栈 join。
+    /// 若用例尚未关闭队列则执行同步关闭，并断言预留工作者计数归零、预留任务已退出回收且回调从未执行。
     fn quiesce(&mut self, context: &mut TestContext<'_>) -> TestResult {
         if !self.closed {
             self.queue.close_sync();
@@ -1196,7 +1306,7 @@ impl Fixture<()> for Unsubmitted {
         Ok(())
     }
 
-    /// 所有原控制 Arc drop 后核 MM 六域，native joined 与 Task metadata 分开验证。
+    /// 释放夹具持有的全部控制结构与 `Arc` 引用，断言全系统 6 个内存域恢复至基线水平。
     fn tear_down(self, context: &mut TestContext<'_>) -> TestResult {
         let baseline = self.baseline;
         drop(self);
@@ -1210,7 +1320,8 @@ impl Fixture<()> for Unsubmitted {
     tags("block", "quota", "reserved", "T5"), timeout_ms = 15000)]
 mod reserved {
     use super::*;
-    /// 外部仍持成功构造但从未 submit 的 Work 时，domain.close_sync 必须实际退出并 join。
+    /// 测试目标：验证当外部仍持有 `Pin<Arc<Work>>` 强引用且该预留 `Work` 从未调用 `queue()` 提交时，
+    /// 调用 `WorkQueue::close_sync()` 能正确撤销未提交的预留任务并等待其内核线程退出回收，且关闭后再次入队返回错误。
     #[test]
     fn unsubmitted_domain_close(context: &mut TestContext<'_>, fixture: &mut Unsubmitted) {
         context.expect_eq(fixture.queue.ktest_reserved_workers(), 1);

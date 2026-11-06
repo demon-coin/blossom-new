@@ -1,4 +1,39 @@
-//! 每个固件参数实例重新复制实际 DTB；副本锁不覆盖任何异步服务。
+//! 启动阶段（Boot）固件设备树（FDT/DTB）解析、内存预留与 DMA 一致性策略测试套件。
+//!
+//! # 模块定位
+//! 本模块隶属于内核自检框架（`ktest`）的启动阶段用例集（`boot_cases`），用于在启动早期验证平台设备树
+//! （Flattened Device Tree, DTB）解析器、物理内存与保留区容量边界、动态预留分配、`no-map` 页表直映扣除
+//! 以及设备 DMA 缓存一致性继承策略（`dma-coherent` / `dma-noncoherent` / `interconnects`）。
+//! 上游由 `ktest` 启动阶段分发器调用，下游调用 `platform::ktest_*` 发现与校验接口、`boot::BootInfo`
+//! 预留管理接口以及 `arch` 直映区域计算接口。
+//!
+//! # 核心机制与 FDT 二进制布局
+//! 为避免破坏内核已发布的全局 `boot::info()` 快照或原始 DTB 物理内存，每个测试用例通过 `Dtb` 夹具
+//! （`Fixture`）在 2 MiB 的静态缓冲区 `COPY` 中复制一份独立的 DTB 字节副本，并在原地执行属性插入、替换或
+//! `FDT_NOP` 抹除操作以构造各种边界条件与损坏输入：
+//!
+//! ```text
+//! Flattened Device Tree (DTB) 副本布局 (大端序 32-bit 字对齐)
+//! ┌──────────────────────────────────────────────────────────────┐ 0
+//! │ FDT Header (40 bytes / 10 words)                             │
+//! │   +0x04 totalsize         +0x08 off_dt_struct                │
+//! │   +0x0c off_dt_strings    +0x10 off_mem_rsvmap               │
+//! │   +0x20 size_dt_strings   +0x24 size_dt_struct               │
+//! ├──────────────────────────────────────────────────────────────┤ off_mem_rsvmap
+//! │ Memory Reservation Block                                     │
+//! ├──────────────────────────────────────────────────────────────┤ off_dt_struct
+//! │ Structure Block                                              │
+//! │   [FDT_PROP (3) | len | nameoff] + value (4-byte padded)     │
+//! │   (插入/变长替换属性时整体平移后续 Structure 与 Strings 块)   │
+//! ├──────────────────────────────────────────────────────────────┤ off_dt_strings
+//! │ Strings Block (以 '\0' 结尾的属性名字符串池)                 │
+//! └──────────────────────────────────────────────────────────────┘ length (<= CAPACITY 2 MiB)
+//! ```
+//!
+//! # 锁与并发契约
+//! - `COPY_LOCK`：保护静态大缓冲区 `COPY` 以及两个 `BootInfo` 快照槽 `ACTUAL`、`EXPECTED` 的唯一可变借用。
+//! - 本模块所有用例均在启动阶段（单核 BSP、中断关闭）串行运行；`Dtb::set_up` 获取 `COPY_LOCK` 并将守卫
+//!   保存在 `Dtb::_exclusive` 中，直到单个用例执行完毕析构 `Dtb` 时才释放锁，期间严禁跨用例保留切片或指针。
 
 use crate::sync::{SpinLock, SpinLockGuard};
 use crate::{arch, boot, platform};
@@ -26,17 +61,26 @@ static mut COPY: [u8; CAPACITY] = [0; CAPACITY];
 static mut ACTUAL: MaybeUninit<boot::BootInfo> = MaybeUninit::uninit();
 static mut EXPECTED: MaybeUninit<boot::BootInfo> = MaybeUninit::uninit();
 
+/// 设备树（DTB）可写副本测试夹具。
+///
+/// 每个测试实例在 `set_up` 时从当前启动的真实 DTB 复制一份独占字节序列到静态缓冲区 `COPY`，
+/// 并提供两个未初始化的 `BootInfo` 静态槽供解析对比使用。
 struct Dtb {
-    /// 完整独占容量仅供原地扩展；解析器和旧边界用例只读取实际前缀。
+    /// 指向完整 2 MiB 静态缓冲区 `COPY` 的独占可变切片；实际有效 DTB 内容位于 `..self.length` 前缀，
+    /// 尾部剩余空间供原地插入或扩展属性时平移数据使用。
     bytes: &'static mut [u8],
+    /// 当前 DTB 副本的有效字节总长度（对应 FDT 头部的 `totalsize` 字段，单位：字节）。
     length: usize,
+    /// 供被测解析路径写入输出结果的独占 `BootInfo` 静态槽。
     actual: &'static mut MaybeUninit<boot::BootInfo>,
+    /// 供基准对照路径写入预期结果的独占 `BootInfo` 静态槽。
     expected: &'static mut MaybeUninit<boot::BootInfo>,
+    /// 持有 `COPY_LOCK` 的自旋锁守卫，确保在夹具生命周期内独占访问 `COPY`、`ACTUAL` 和 `EXPECTED`。
     _exclusive: SpinLockGuard<'static, ()>,
 }
 
 impl Fixture for Dtb {
-    /// 早期 IRQ 关闭且只有 BSP 使用此副本，锁拥有唯一可变借用。
+    /// 获取静态缓冲区独占锁，并将内核启动信息中的原始 DTB 完整复制到测试工作区。
     fn set_up(_: &mut TestContext<'_>, _: &()) -> Result<Self, TestError> {
         let exclusive = COPY_LOCK.lock();
         let info = boot::info();
@@ -46,8 +90,10 @@ impl Fixture for Dtb {
             .checked_sub(info.dtb.start)
             .filter(|&n| n <= CAPACITY)
             .ok_or(TestError("DTB copy exceeds capacity"))?;
-        // SAFETY: BootInfo 的原始 DTB 已验证并永久保留；目标静态副本不重叠，
-        // 独占锁保活到 fixture 消费且任何其他访问 COPY 都取得同一锁。
+        // SAFETY:
+        // 1. `info.dtb` 在内核早期启动阶段已通过校验并作为保留区永久映射，且上面已确认 `length <= CAPACITY`；
+        // 2. 静态数组 `COPY` 位于内核 `.bss` 段，与原始 DTB 物理区不重叠；
+        // 3. `exclusive` 持有了 `COPY_LOCK`，且所有访问 `COPY` 的代码均受该锁保护，在 `Self` 析构前不存在别名访问。
         let bytes = unsafe {
             let copy = core::ptr::addr_of_mut!(COPY).cast::<u8>();
             core::ptr::copy_nonoverlapping(
@@ -60,9 +106,9 @@ impl Fixture for Dtb {
         Ok(Self {
             bytes,
             length,
-            // SAFETY: COPY_LOCK同时独占两个永久快照槽；所有解析借用在fixture释放锁前结束。
+            // SAFETY: `exclusive` 已持有 `COPY_LOCK`，保证了当前夹具实例对静态槽 `ACTUAL` 的唯一可变引用。
             actual: unsafe { &mut *core::ptr::addr_of_mut!(ACTUAL) },
-            // SAFETY: 此槽与COPY及ACTUAL均不重叠，同一独占锁保持到fixture消费。
+            // SAFETY: `EXPECTED` 与 `COPY`、`ACTUAL` 内存互不重叠，且同样受 `COPY_LOCK` 独占保护直到夹具析构。
             expected: unsafe { &mut *core::ptr::addr_of_mut!(EXPECTED) },
             _exclusive: exclusive,
         })
@@ -70,13 +116,16 @@ impl Fixture for Dtb {
 }
 
 impl Dtb {
-    /// 在真实 chosen 中定位 bootargs；缺失时先插入空属性，供同一替换路径填写边界值。
+    /// 在 `/chosen` 节点中定位 `bootargs` 属性的值偏移与长度；若该属性不存在则先插入一个空属性，
+    /// 返回 `(属性值在副本中的起始字节偏移, 当前属性值的字节长度)`。
     fn prepare_bootargs(&mut self) -> (usize, usize) {
         self.prepare_property("/chosen", "bootargs")
     }
 
-    /// 在独占的真实节点中定位属性；缺失时插入空值，属性名保存在同一字符串块。
+    /// 在指定路径节点 `path` 中查找属性 `name`；若属性已存在则直接返回其值偏移与长度，
+    /// 若不存在则在节点的首个属性之前原地插入一个长度为 0 的新属性条目，并将属性名追加到字符串块末尾。
     fn prepare_property(&mut self, path: &str, name: &str) -> (usize, usize) {
+        // Step 1: 解析当前 DTB，若目标属性已存在则直接返回其值在副本中的偏移和长度；否则记录首个属性头部的插入偏移。
         let offset = {
             let tree = fdt::Fdt::new(&self.bytes[..self.length]).expect("actual DTB invalid");
             let node = tree.find_node(path).expect("actual DTB node absent");
@@ -98,6 +147,7 @@ impl Dtb {
                 .expect("DTB property offset overflow")
         };
 
+        // Step 2: 读取并校验 FDT 头部各区块（保留表、结构块、字符串块）的偏移、大小与 4 字节对齐约束。
         let word = |field: usize| {
             let end = field
                 .checked_add(FDT_WORD_BYTES)
@@ -126,7 +176,7 @@ impl Dtb {
         assert!(structure <= offset && value <= structure_end);
         assert!(structure_end <= strings && strings_end <= self.length);
 
-        // 仅支持保留表、结构、字符串依次排列的真实副本；末尾填充可容纳新增属性名。
+        // Step 3: 计算插入 12 字节空属性头及在字符串块末尾追加属性名后的新偏移与总长度，确认不超过缓冲区容量。
         let name_length = name
             .len()
             .checked_add(1)
@@ -189,6 +239,7 @@ impl Dtb {
             )
         });
 
+        // Step 4: 向后平移插入点之后的结构块与字符串块，写入属性名字符串并更新 FDT 头部与新属性描述符。
         self.bytes.copy_within(offset..self.length, value);
         self.bytes[name_start..name_end - 1].copy_from_slice(name.as_bytes());
         self.bytes[name_end - 1] = 0;
@@ -199,8 +250,10 @@ impl Dtb {
         (value, 0)
     }
 
-    /// 在独占副本内替换现有属性，移动结构尾部及字符串块后同步全部长度字段。
+    /// 在 DTB 副本中将偏移 `offset` 处原长度为 `old_length` 的属性值替换为新字节序列 `value`，
+    /// 自动按 4 字节对齐平移后续结构块尾部与字符串块，并同步更新 FDT 头部及属性长度字段。
     fn replace_property(&mut self, offset: usize, old_length: usize, value: &[u8]) {
+        // Step 1: 读取 FDT 头部偏移信息，校验目标属性头标识（`FDT_PROP`）、原长度及对齐状态。
         let word = |field: usize| {
             let end = field
                 .checked_add(FDT_WORD_BYTES)
@@ -226,6 +279,7 @@ impl Dtb {
         assert!(word(FDT_OFF_MEM_RSVMAP) < structure);
         assert_eq!(offset & FDT_ALIGN_MASK, 0);
 
+        // Step 2: 计算旧属性值与新属性值按 4 字节向上取整后的占用跨度，推导平移后的区块尺寸与头部字段值。
         let old_padded = old_length
             .checked_add(FDT_ALIGN_MASK)
             .expect("DTB property overflow")
@@ -271,6 +325,7 @@ impl Dtb {
             ),
         ];
 
+        // Step 3: 平移后续字节，写入新属性值与对齐填充零字节，最后回写更新后的大端序头部字段。
         self.bytes.copy_within(old_end..self.length, new_end);
         self.bytes[offset..value_end].copy_from_slice(value);
         self.bytes[value_end..new_end].fill(0);
@@ -283,13 +338,14 @@ impl Dtb {
         self.length = total;
     }
 
-    /// 用正式属性替换路径设置一个值，不保留跨结构移动的节点或属性借用。
+    /// 在指定节点 `path` 中设置属性 `name` 的值为 `value`（若属性不存在则先插入空属性再替换）。
     fn put_property(&mut self, path: &str, name: &str, value: &[u8]) {
         let (offset, length) = self.prepare_property(path, name);
         self.replace_property(offset, length, value);
     }
 
-    /// 用 NOP 移除独占副本中的现有属性，保持其它节点和属性的物理布局。
+    /// 使用 `FDT_NOP`（`4`）覆盖指定节点 `path` 下的属性 `name`（含属性头与 4 字节对齐的值区），
+    /// 在不改变其它节点和属性偏移的情况下将该属性从逻辑树中抹除。
     fn remove_property(&mut self, path: &str, name: &str) {
         let range = {
             let tree = fdt::Fdt::new(&self.bytes[..self.length]).expect("actual DTB invalid");
@@ -308,7 +364,8 @@ impl Dtb {
     }
 }
 
-/// 从完整真实输入在独占槽重新解析，不改写已发表BootInfo或按值返回大型快照。
+/// 调用平台发现入口从给定的 DTB 字节切片 `bytes` 与指定主核硬件编号 `bsp` 重新解析启动资源，
+/// 将结果就地写入调用方提供的独占槽 `output` 并返回可变引用，避免修改全局 `boot::info()` 或在栈上拷贝大结构体。
 fn parse<'a>(
     bytes: &[u8],
     output: &'a mut MaybeUninit<boot::BootInfo>,
@@ -319,7 +376,7 @@ fn parse<'a>(
         .expect("actual DTB resource parse failed")
 }
 
-/// 比较 DTB 来源资源；LA 寄存器命令行与内核保留项由独立启动步骤取得。
+/// 逐项断言重新解析出的 `actual` 与基准 `expected` 中所有由 DTB 决定的硬件资源描述完全一致。
 fn same_resources(
     context: &mut TestContext<'_>,
     actual: &boot::BootInfo,
@@ -381,14 +438,20 @@ fn same_resources(
     context.expect_eq(actual.counter_frequency, expected.counter_frequency);
 }
 
-// 平台选择发生在 suite 注册展开前，公共测试和 QEMU RTC 测试保持原模块路径。
+// 在注册测试套件前通过宏参数注入平台专属用例（如 QEMU virt 的 RTC 校验），使通用用例与平台用例共享同一模块路径。
 macro_rules! firmware_cases {
     ($($qemu_rtc:tt)*) => {
 #[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
 pub(crate) mod cases {
     use super::*;
 
-    /// 固件原始参数和完整 DTB 的身份来自这次真实启动。
+    /// 测试目标：验证固件传入的原始寄存器参数、BSP 硬件核编号与 DTB 重新解析所得结果完全一致。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 启动阶段保存的全局 `boot::info()` 快照与复制出的 `Dtb` 夹具副本。
+    /// - When: 使用当前 BSP 硬件 ID 重新解析 DTB 副本。
+    /// - Then: 解析出的硬件资源、原始参数数组 `raw_args`、BSP 硬件 ID（固定排在 `hardware_ids[0]`）与全局快照一致；
+    ///   在 RISC-V 64 下同时校验 `a0` 为 hartid、`a1` 为 DTB 物理起始地址。
     #[test]
     fn raw_arguments(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let live = boot::info();
@@ -415,7 +478,13 @@ pub(crate) mod cases {
         ));
     }
 
-    /// RAM、固件保留区和 PCI 地址域直接核对解析结果与永久输入。
+    /// 测试目标：验证物理 RAM 区间、固件保留区（含内核镜像、DTB、initrd）、RTC 与 PCI 地址窗口的解析完整性与互不越界不变量。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 全局 `boot::info()` 快照与重新解析的 `BootInfo`。
+    /// - When: 检查内核镜像、DTB、可选 `initrd` 与 RAM 区间、保留区列表的包含关系，以及 RTC 与 RAM 的重叠情况。
+    /// - Then: 内核与 `initrd` 完全位于有效 RAM 区间内且均已登记在 `reserved` 表中；重新解析的所有保留区及 `no_map` 属性
+    ///   均包含在全局保留表中；RTC MMIO 窗口与任何 RAM 区间均不重叠。
     #[test]
     fn resource_regions(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let live = boot::info();
@@ -477,7 +546,14 @@ pub(crate) mod cases {
         }
     }
 
-    /// 板资源消费真实 CPU、控制器和 UART 描述，不把硬件编号当成逻辑数组下标。
+    /// 测试目标：验证各硬件平台（VisionFive2 / Ls2k1000la / QemuVirt）的 CPU 拓扑映射、中断控制器与串口参数解析正确。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 全局 `boot::info()` 与重新解析的 `BootInfo`。
+    /// - When: 核对逻辑核号到硬件核号的无重复映射，并根据平台类型检查特定外设参数。
+    /// - Then: 每个逻辑核的 `CpuLocal::hardware_id` 与 `BootInfo::hardware_ids` 一一对应且无重复；
+    ///   VisionFive2 具备 64 字节缓存行、32 位宽寄存器偏移的 DW-APB UART 及合法 hartid（1..=4）；
+    ///   Ls2k1000la 具备双 bank LIOINTC 路由与足够宽的寄存器窗口；QemuVirt 无板级 L2 Cache 控制器。
     #[test]
     fn platform_resources(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let live = boot::info();
@@ -512,7 +588,13 @@ pub(crate) mod cases {
         }
     }
 
-    /// FDT 来源的命令行完整保存容量内字节并拒绝超限；不覆盖 LA 原始 a1 命令行。
+    /// 测试目标：验证设备树 `/chosen/bootargs` 命令行长度在容量上限（4095 字节）时完整保留，超出上限（4096 字节）时被拒绝且缓冲区清零。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 在 `Dtb` 副本中定位或插入 `/chosen/bootargs` 属性。
+    /// - When: 将 `bootargs` 替换为长度为 `length`（4095 或 4096）加末尾 `'\0'` 的字符串，调用 `ktest_discover_tree` 解析。
+    /// - Then: 当 `length == 4095` 时解析成功，内容、长度及末尾 NUL 字节匹配；当 `length == 4096` 时返回错误，
+    ///   且输出槽中的 `bootargs` 保持全零状态。
     #[test]
     #[case("maximum", 4095usize)]
     #[case("overflow", 4096usize)]
@@ -541,15 +623,23 @@ pub(crate) mod cases {
             context.expect_eq(parsed.bootargs[length], 0);
         } else {
             assert!(result.is_err(), "oversized bootargs accepted");
-            // SAFETY: ktest_discover_tree在任何错误返回前已逐字段初始化此独占槽；
-            // result已消费且没有返回的BootInfo借用，当前读取不修改永久启动快照。
+            // SAFETY:
+            // 1. `ktest_discover_tree` 在检查 `bootargs` 之前已将独占槽 `fixture.actual` 完整初始化为默认 `BootInfo`；
+            // 2. `result` 已在上一行断言为 `Err`，不存在任何指向 `fixture.actual` 的活动可变引用。
             let parsed = unsafe { fixture.actual.assume_init_ref() };
             context.expect_eq(parsed.bootargs_len, 0);
             assert!(parsed.bootargs.iter().all(|byte| *byte == 0));
         }
     }
 
-    /// 真实 RAM 的合法分割覆盖内核及原有资源，分别检查最后合法条目与首个超限条目。
+    /// 测试目标：验证物理内存（RAM）区间表在达到容量上限（32 段）时正常合并/接纳，超出上限（33 段）时被解析器拒绝。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 找出包含内核镜像的 RAM 段，并计算内核、DTB 与 `initrd` 占用的受保护物理范围。
+    /// - When: 在避开受保护范围的头部或尾部切分出 `extra` 个 4 KiB 独立物理页段，替换 DTB 中 `memory` 节点的 `reg` 属性，
+    ///   使总 RAM 段数达到 `count`（32 或 33），随后重新解析。
+    /// - Then: 当 `count == 32` 时解析成功，各 RAM 段互不重叠、总字节数守恒且仍完整覆盖内核镜像；
+    ///   当 `count == 33` 时因超出 `MAX_MEMORY_REGIONS` 而返回错误。
     #[test]
     #[case("32_ranges", 32usize)]
     #[case("33_ranges", 33usize)]
@@ -577,6 +667,7 @@ pub(crate) mod cases {
             ram.end.checked_sub(split_bytes).expect("RAM tail overflow")
         };
 
+        // Step 1: 构造包含 `extra` 个额外 4 KiB 分段的 `memory/reg` 属性字节序列并写回 DTB 副本。
         let mut replacement = [0u8; (boot::MAX_MEMORY_REGIONS + 1) * 16];
         let (offset, old_length, replacement_length) = {
             let tree = fdt::Fdt::new(&fixture.bytes[..fixture.length]).expect("actual DTB invalid");
@@ -630,6 +721,7 @@ pub(crate) mod cases {
         fixture.replace_property(offset, old_length, &replacement[..replacement_length]);
         assert!(platform::ktest_validate(&fixture.bytes[..fixture.length]).is_ok());
 
+        // Step 2: 重新运行平台设备树发现流程，校验 32 段上限通过与 33 段超限拒绝。
         let result = platform::ktest_discover_tree(
             &fixture.bytes[..fixture.length], live.raw_args, live.bsp_hardware_id,
             live.dtb.start, fixture.actual,
@@ -653,7 +745,13 @@ pub(crate) mod cases {
         }
     }
 
-    /// 普通和 no-map 共用同一容量；失败不得提交区间、属性或计数中的任何一项。
+    /// 测试目标：验证普通保留区与 `no-map` 保留区共享 `MAX_RESERVED_REGIONS` 容量上限，且超限追加失败时具有强原子性（不破坏已有记录）。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 清空 `actual` 的保留区计数，并在可用 RAM 中规划 `MAX_RESERVED_REGIONS + 1` 个连续 4 KiB 页。
+    /// - When: 交替调用 `reserve` 与 `reserve_no_map` 填满全部 `MAX_RESERVED_REGIONS` 个槽位，随后尝试再插入第 `MAX + 1` 个区域。
+    /// - Then: 前 `MAX_RESERVED_REGIONS` 次插入全部成功且属性一致；超限的 `reserve` 与 `reserve_no_map` 均返回 `Err`，
+    ///   且保留区计数、区间数组与 `no_map` 标记数组保持原状不被修改。
     #[test]
     #[case("ordinary_first", false)]
     #[case("no_map_first", true)]
@@ -696,7 +794,13 @@ pub(crate) mod cases {
         context.expect_eq(&actual.reserved_no_map[..], &expected.reserved_no_map[..]);
     }
 
-    /// 动态预留可跨无序相邻 RAM 段，真实孔洞不能由两端地址合并成可用内存。
+    /// 测试目标：验证动态内存预留分配器能够跨乱序但物理相邻的 RAM 段分配连续区域，但不会跨越中间存在物理空洞的两个 RAM 段。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 构造包含两个 4 KiB RAM 段的 `BootInfo`（逆序存放）：当 `adjacent == true` 时两段物理紧邻，
+    ///   当 `adjacent == false` 时两段之间隔开 1 个 4 KiB 空洞。
+    /// - When: 请求分配长度为 1.5 页（6 KiB）、按页对齐的动态保留区。
+    /// - Then: 物理相邻时成功合并并返回跨两段的区间 `base..base + size`；存在物理空洞时返回 `None`。
     #[test]
     #[case("adjacent", true)]
     #[case("hole", false)]
@@ -727,7 +831,12 @@ pub(crate) mod cases {
         context.expect_eq(selected, expected);
     }
 
-    /// 内核尚未登记时仍须避开其跨度，并与 DTB、initrd 和先前请求保持独占。
+    /// 测试目标：验证动态预留分配器自动避开内核镜像、DTB、`initrd` 以及已登记的保留区间，按低地址优先顺序依次分配空闲窗口。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 单段 RAM 覆盖 `kernel.start..base + 8 * page`，其中 `base..base + 3 * page` 已被 DTB、`initrd` 和已有保留区占用。
+    /// - When: 连续两次调用 `ktest_find_reserved_region` 申请 1 页大小的动态保留区，并将第一次结果登记到 `reserved` 表。
+    /// - Then: 第一次分配返回紧随占用区之后的第 4 页（`base + 3*page..base + 4*page`），第二次返回第 5 页（`base + 4*page..base + 5*page`）。
     #[test]
     fn dynamic_occupied_regions(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let page = crate::mm::PAGE_SIZE;
@@ -755,7 +864,13 @@ pub(crate) mod cases {
         context.expect_eq(second, Some(boot::Region { start: base + 4 * page, end: base + 5 * page }));
     }
 
-    /// 字节区间互不重叠仍可能共用禁映页，普通请求和 no-map 请求均须避开整页。
+    /// 测试目标：验证当某物理页内存在 `no-map` 保留区（或本次请求本身为 `no-map`）时，同一物理页内的剩余字节不可被混用，必须整页避开。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 在第 0 页内的 `base + 0x801..base + 0x900` 登记一段保留区（根据 `existing_no_map` 设为 `no-map` 或普通保留）。
+    /// - When: 尝试在同页的 `base + 0x940..base + 0xb40` 窗口内申请一段属性相反（`!existing_no_map`）的 64 字节区域；
+    ///   随后将搜索窗口扩大到 `base + 2 * page` 再次申请。
+    /// - Then: 限制在同一页内时因页级映射属性冲突返回 `None`；允许跨页后跳过整个第 0 页，返回第 1 页起始处的 `base + page..base + page + 64`。
     #[test]
     #[case("existing_no_map", true)]
     #[case("requested_no_map", false)]
@@ -795,7 +910,12 @@ pub(crate) mod cases {
 
     $($qemu_rtc)*
 
-    /// 所有不完整前缀都必须由生产边界验证拒绝。
+    /// 测试目标：验证 DTB 边界校验器能够拒绝任何被截断的不完整字节前缀。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 校验通过的完整 DTB 副本（长度为 `fixture.length`）。
+    /// - When: 遍历所有严格小于 `fixture.length` 的截断长度 `0..fixture.length`，依次调用 `platform::ktest_validate`。
+    /// - Then: 所有截断前缀均返回 `Err`。
     #[test]
     fn truncated_prefixes(_: &mut TestContext<'_>, fixture: &mut Dtb) {
         assert!(platform::ktest_validate(&fixture.bytes[..fixture.length]).is_ok());
@@ -808,7 +928,12 @@ pub(crate) mod cases {
         }
     }
 
-    /// 单个块字段损坏独立实例，真实总长保持不变。
+    /// 测试目标：验证当 FDT 头部中的任一区块偏移或大小字段损坏为越界值（`u32::MAX`）时，`ktest_validate` 均能准确拒绝。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 完整的 DTB 副本。
+    /// - When: 将指定头部字段 `field`（结构块偏移、字符串块偏移、保留表偏移、字符串块大小或结构块大小）覆写为 `u32::MAX`。
+    /// - Then: `platform::ktest_validate` 返回 `Err`。
     #[test]
     #[case("structure_offset", 8usize)]
     #[case("strings_offset", 12usize)]
@@ -824,7 +949,12 @@ pub(crate) mod cases {
         );
     }
 
-    /// 原输入支持把实际最后一个硬件核作为 BSP，不假设 BSP 硬件编号为零。
+    /// 测试目标：验证无论固件以第一个硬件核还是最后一个硬件核作为启动主核（BSP），解析器都能将 BSP 置于 `hardware_ids[0]` 并保留全部 CPU。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 原始 DTB 副本与当前系统的硬件核 ID 列表。
+    /// - When: 分别传入首个硬件核或末尾硬件核作为 `bsp` 参数调用 `parse`。
+    /// - Then: 解析出的 CPU 总数不变，`actual.hardware_ids[0]` 等于传入的 `bsp`，且原硬件核集合完整保留。
     #[test]
     #[case("first", false)]
     #[case("last", true)]
@@ -839,7 +969,12 @@ pub(crate) mod cases {
         }
     }
 
-    /// 只改 CPU reg 保留原 phandle 和控制器描述，正式 parser 必须保稀疏硬件编号及 BSP 重排。
+    /// 测试目标：验证当设备树中的 CPU 硬件编号（`reg`）为大于 `MAX_CPUS` 的稀疏非连续数值时，解析器仍能正确关联中断控制器并重排 BSP。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 定位 DTB 副本中 `/cpus` 下所有 CPU 节点的 `reg` 属性偏移。
+    /// - When: 将各 CPU 的硬件编号原地改写为 `MAX_CPUS + 1 + logical * 3` 的稀疏大编号，保持 `phandle` 与中断控制器引用不变，重新解析。
+    /// - Then: 解析成功，所有外设资源与预期一致，`hardware_ids[0]` 为指定的稀疏 BSP 编号，且所有硬件 ID 均大于 `MAX_CPUS`。
     #[test]
     #[case("first", false)]
     #[case("last", true)]
@@ -896,7 +1031,12 @@ pub(crate) mod cases {
         ));
     }
 
-    /// 把真实根 compatible 属性替换为 FDT_NOP 后资源发现仍完整。
+    /// 测试目标：验证将根节点 `/` 的 `compatible` 属性用 `FDT_NOP` 标记抹除后，其余硬件资源的发现结果不受影响。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 预先解析原始 DTB 副本得到基准快照 `original`。
+    /// - When: 定位根节点 `/` 的 `compatible` 属性区间，将其全部 32 位字替换为 `FDT_NOP`（`4`），再次调用 `parse`。
+    /// - Then: 重新解析的资源与 `original` 完全一致。
     #[test]
     fn nop_property(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let live = boot::info();
@@ -922,13 +1062,18 @@ pub(crate) mod cases {
     };
 }
 
-/// RV 直映扣洞和活动对象边界使用同一独占固件副本验证。
+/// RISC-V 64 架构下物理内存直接映射（Direct Map）的 `no-map` 整页扣除与活动对象冲突保护测试套件。
 #[cfg(target_arch = "riscv64")]
 #[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware"), timeout_ms = 10000)]
 pub(crate) mod no_map {
     use super::*;
 
-    /// 无序、重叠、相邻及跨 bank 的 no-map 按整页并集扣除，普通保留不缩减直映。
+    /// 测试目标：验证乱序、重叠、相邻及跨 RAM 段的 `no-map` 保留区会按 4 KiB 整页并集从内核直接映射区间中扣除，而普通保留区不影响直接映射。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 登记一段 `0..0x28000` 的普通保留区，以及 7 段乱序、非页对齐或相互重叠的 `no-map` 保留区。
+    /// - When: 对三个候选 RAM 窗口调用 `arch::direct_map_regions` 计算可建立直接映射的子区间。
+    /// - Then: 普通保留区仍保留在直接映射中，所有触及 `no-map` 的物理页均被整页剔除，最终精确产出 3 段页对齐的直映区间。
     #[test]
     fn no_map_union(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let info = parse(
@@ -994,7 +1139,13 @@ pub(crate) mod no_map {
         );
     }
 
-    /// 全容量 RAM 和内部分裂同时经过正式映射表及 L1/L0 预算，不能只按原 bank 数预留。
+    /// 测试目标：验证在最大 RAM 段数（`MAX_MEMORY_REGIONS`）与最大 `no-map` 空洞数（`MAX_RESERVED_REGIONS`）满载分裂下，
+    /// 页表预留预算能够覆盖全部碎片及对应的 Sv39 L2/L1/L0 页表页数量。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 构造 `MAX_MEMORY_REGIONS` 个非 2 MiB 对齐的 RAM 段，并在每段内部的 4 MiB 边界处打入 `holes` 个跨边界 `no-map` 空洞。
+    /// - When: 调用 `arch::ktest_ram_mapping_budget(info)` 计算映射碎片数与所需页表页总数。
+    /// - Then: 碎片总数等于 `MAX_MEMORY_REGIONS + MAX_RESERVED_REGIONS`；页表预算等于 1 个 L2 根表 + 跨及的 L1 表数 + 每个碎片两端所需的 2 个 L0 表。
     #[test]
     fn no_map_mapping_capacity(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         let info = parse(
@@ -1030,13 +1181,22 @@ pub(crate) mod no_map {
             fragments,
             boot::MAX_MEMORY_REGIONS + boot::MAX_RESERVED_REGIONS,
         );
-        // 每段两端落在不同 2MiB 槽；独立计算整个直映 VA 范围触及的 L1 数。
+        // 每个映射碎片的两端均非 2 MiB 对齐且落在不同的 2 MiB 槽位，因此每个碎片需要 2 个 L0 页表；同时累加整个直映虚拟地址范围跨及的 L1 页表数。
         let first = arch::phys_to_virt(info.memory[0].start) >> 30;
         let last = arch::phys_to_virt(info.memory[info.memory_count - 1].end - 1) >> 30;
         context.expect_eq(tables, 1 + last - first + 1 + 2 * fragments);
     }
 
-    /// 活动对象冲突按页拒绝，完整镜像尾部也受保护；宽泛普通保留与固件 no-map 可以相交。
+    /// 测试目标：验证启动期活动对象（内核镜像、DTB、`initrd`）所在物理页严禁与 `no-map` 区域共享同一物理页，而紧邻页边界之外的 `no-map` 则允许通过。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 设置内核镜像、非页对齐起始的 DTB（`0x4001..0x5000`）与 `initrd` 的物理区间。
+    /// - When:
+    ///   1. 在不相交的 `0..0x1001` 登记 `no-map`，校验通过；
+    ///   2. 依次在内核、DTB、`initrd` 的末尾最后 1 字节处登记 `no-map`，校验被拒；
+    ///   3. 在与 DTB 共享同一起始页的前半页（`0x4000..0x4001`）登记 `no-map`，校验被拒；
+    ///   4. 在紧随内核结束页边界之后的 `kernel.end..kernel.end + 1` 登记 `no-map`，校验通过。
+    /// - Then: 凡是与活动对象落在同一 4 KiB 物理页内的 `no-map` 均被 `validate_boot_no_map` 拒绝，页边界外的 `no-map` 正常放行。
     #[test]
     fn no_map_live_objects(_: &mut TestContext<'_>, fixture: &mut Dtb) {
         let info = parse(
@@ -1100,7 +1260,12 @@ pub(crate) mod no_map {
 
 #[cfg(blossom_platform = "qemu-virt")]
 firmware_cases! {
-    /// RTC 缺失、窗口损坏或覆盖 RAM 均由实际资源发现拒绝，不生成日历默认值。
+    /// 测试目标：验证 QEMU virt 平台下当 RTC 设备节点缺失、寄存器地址未对齐、窗口过短或与 RAM 重叠时，平台资源发现流程会拒绝启动。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 定位 DTB 副本中的 RTC 节点（RISC-V 为 `google,goldfish-rtc`，LoongArch64 为 `loongson,ls7a-rtc`）。
+    /// - When: 根据 `mode` 破坏 `compatible` 字符串（0）、将基址设为奇数未对齐（1）、将窗口长度缩减为 4 字节（2）或将基址改写到 RAM 起始处（3），重新解析。
+    /// - Then: 四种损坏模式下 `platform::ktest_discover_tree` 均返回 `Err`。
     #[test]
     #[case("missing", 0u8)]
     #[case("unaligned", 1u8)]
@@ -1153,7 +1318,7 @@ firmware_cases! {
 #[cfg(not(blossom_platform = "qemu-virt"))]
 firmware_cases! {}
 
-/// DMA 属性只改变测试独占的真实 DTB 副本，不要求存在或启动原生设备。
+/// 设备树 DMA 缓存一致性属性（`dma-coherent` / `dma-noncoherent`）与 `interconnects` 父链解析测试套件。
 #[::ktest::suite(context = "Boot", fixture = Dtb, tags("boot", "firmware", "dma-policy"), timeout_ms = 10000)]
 pub(crate) mod dma_policy {
     use super::*;
@@ -1161,7 +1326,12 @@ pub(crate) mod dma_policy {
     const PROVIDER: u32 = 0xffff_fffe;
     const CONSUMER: u32 = 0xffff_fffd;
 
-    /// 无显式声明且父链结束时，RISC-V 和 LA 的调用默认值保持各自含义。
+    /// 测试目标：验证当设备节点及其祖先链均未声明任何 DMA 一致性属性时，`ktest_dma_coherent` 返回调用方传入的架构默认值。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 移除根节点 `/` 上的 `dma-coherent`、`dma-noncoherent` 与 `interconnect-names` 属性。
+    /// - When: 分别以 `default = false` 和 `default = true` 查询根节点的 DMA 一致性。
+    /// - Then: 返回结果与传入的 `default` 参数完全一致。
     #[test]
     fn architecture_defaults(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         for name in ["dma-coherent", "dma-noncoherent", "interconnect-names"] {
@@ -1175,7 +1345,15 @@ pub(crate) mod dma_policy {
         }
     }
 
-    /// 最近节点覆盖相反的祖先声明，同节点两属性保持 coherent 优先。
+    /// 测试目标：验证子节点显式声明的 DMA 属性优先于祖先节点声明，且同一节点同时存在两个属性时 `dma-coherent` 优先。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 根节点 `/` 与子节点 `/chosen`。
+    /// - When:
+    ///   1. `/` 设为 `dma-coherent`、`/chosen` 设为 `dma-noncoherent`，查询 `/chosen`；
+    ///   2. `/` 设为 `dma-noncoherent`、`/chosen` 设为 `dma-coherent`，查询 `/chosen`；
+    ///   3. 移除 `/chosen` 上的属性使其继承根节点 `/` 的 `dma-noncoherent`，查询 `/chosen`。
+    /// - Then: 依次返回 `Ok(false)`、`Ok(true)`、`Ok(false)`。
     #[test]
     fn closest_explicit_attribute(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         fixture.put_property("/", "dma-coherent", &[]);
@@ -1202,7 +1380,13 @@ pub(crate) mod dma_policy {
         );
     }
 
-    /// dma-mem 跳到非结构父节点，索引前的空 phandle 不冒充有参数的 provider。
+    /// 测试目标：验证当节点通过 `interconnect-names` 指定了 `"dma-mem"` 路径时，解析器会跳过前面无关的 interconnect 条目并沿目标 `phandle` 继承一致性属性。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 将 `/cpus` 配置为 `#interconnect-cells = 2`、句柄为 `PROVIDER` 的互连提供者；在 `/chosen` 上设置
+    ///   `interconnect-names = "other\0dma-mem\0"`，其中第 0 项为 0 句柄（无参数），第 1 项指向 `PROVIDER` 并携带 2 个参数 cell。
+    /// - When: 先将 `/cpus` 设为 `dma-noncoherent`（根节点为 `dma-coherent`）查询 `/chosen`；再将 `/cpus` 改为 `dma-coherent`（根节点为 `dma-noncoherent`）查询 `/chosen`。
+    /// - Then: `/chosen` 始终忽略结构父节点 `/` 的属性，准确继承 `dma-mem` 目标节点 `/cpus` 的属性（先 `Ok(false)` 后 `Ok(true)`）。
     #[test]
     fn selected_dma_parent(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         fixture.put_property("/", "dma-coherent", &[]);
@@ -1233,7 +1417,12 @@ pub(crate) mod dma_policy {
         );
     }
 
-    /// 已选择的缺失或截断 interconnect 保持错误，不回普通父节点的 coherent 声明。
+    /// 测试目标：验证当 `"dma-mem"` 选中的 `interconnects` 属性被截断、指向空句柄、指向不存在的 `phandle` 或提供者的 `#interconnect-cells` 格式非法时，解析器直接报错而非回退到结构父节点。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 根节点 `/` 设为 `dma-coherent`，`/chosen` 通过 `interconnect-names = "dma-mem"` 指向需要 2 个参数 cell 的 `/cpus`（共需 12 字节）。
+    /// - When: 依次将 `interconnects` 截断为 0/3/4/8 字节、将目标句柄设为 0、设为不存在的 `PROVIDER - 2`，或将 `/cpus` 的 `#interconnect-cells` 破坏为 1 字节长度。
+    /// - Then: 所有损坏情形下 `platform::ktest_dma_coherent` 均返回 `Err`。
     #[test]
     fn selected_parent_errors(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         fixture.put_property("/", "dma-coherent", &[]);
@@ -1276,7 +1465,12 @@ pub(crate) mod dma_policy {
         );
     }
 
-    /// DMA 父环不能无限遍历；设备自身的显式声明不消费无关的错误父链。
+    /// 测试目标：验证当两个节点的 `dma-mem` 互连引用形成环路时解析器能检测并返回错误，而若起始节点自身已有显式 DMA 属性则直接返回而不受后续坏链影响。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// - Given: 将 `/chosen`（`CONSUMER`）与 `/cpus`（`PROVIDER`）的 `dma-mem` `interconnects` 设为互相指向对方，且两者均无显式 DMA 属性。
+    /// - When: 先查询 `/chosen` 的 DMA 一致性；随后在 `/chosen` 上添加显式 `dma-noncoherent` 属性并再次查询。
+    /// - Then: 存在无属性环路时返回 `Err`；添加本地显式属性后立即返回 `Ok(false)`。
     #[test]
     fn parent_cycle_and_local_override(context: &mut TestContext<'_>, fixture: &mut Dtb) {
         for path in ["/chosen", "/cpus"] {

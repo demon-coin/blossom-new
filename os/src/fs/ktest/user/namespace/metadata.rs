@@ -1,4 +1,31 @@
-//! 超级块整页与短窗口共享原页的并发更新消费者。
+//! Ext4 超级块元数据缓存（`MetadataCache`）多粒度子窗口视图与并发更新集成测试。
+//!
+//! # 模块定位
+//! 本模块属于文件系统命名空间与元数据写入测试子集（`fs::ktest::user::namespace::metadata`），
+//! 上游由 `namespace::anchor` 挂载进内核单元测试框架，下游直接调用 `Ext4Volume::metadata_cache`、
+//! `BufferRef::update` 与 `sync_metadata` 回写路径。
+//!
+//! # 核心机制与物理页子窗口共享布局
+//! 当 Ext4 块大小小于物理页大小（`PAGE_SIZE = 4096`，例如 1024B 或 2048B 块）时，
+//! 磁盘块号 0 所在的同一个物理页（`Folio`）可被不同长度的 `BufferRef` 视图共享访问：
+//!
+//! ```text
+//! 物理页 Folio (PFN = X, 4096 Bytes)
+//! +-----------------------+-----------------------+-----------------------------------+
+//! | 0..1024 (short 视图)   | 1024..2048            | 2048..4096                        |
+//! |   [17]: 引导区保留字节 |                       |                                   |
+//! +-----------------------+-----------------------+-----------------------------------+
+//! | 0..2048 (wide 视图)                            |                                   |
+//! |                           [31]: 引导区保留字节 |                                   |
+//! +-----------------------------------------------+-----------------------------------+
+//! | 0..4096 (full 整页视图，覆盖引导扇区与 Ext4 超级块偏移 1024..2048)                   |
+//! +-----------------------------------------------------------------------------------+
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 测试线程通过 `Completion` 门闩同步起跑后，并发调用 `BufferRef::update`。
+//! - `BufferRef::update` 内部先获取底层 `Folio` 的内容读写锁，再执行字节修改闭包并标记脏位，
+//!   各线程仅在独立持锁期间修改字节，不存在跨把自旋锁的嵌套持有。
 
 use alloc::sync::Arc;
 
@@ -11,7 +38,13 @@ use crate::fs::writeback::sync_metadata;
 pub(super) mod cases {
     use super::*;
 
-    /// 已打开卷的整页超级块视图与短窗口保持同一原页；两个任务只改 boot 保留字节并恢复。
+    /// 验证同一物理页上的整页（4096B）与子窗口（1024B、2048B）元数据缓存视图共享底层物理页帧，
+    /// 且两个并发写任务对 x86 引导扇区保留字节（偏移 17 与 31）的更新不会相互覆盖。
+    ///
+    /// # 测试场景（Given-When-Then）
+    /// - **Given**：打开 Ext4 卷，在块号 0 处分别获取 4096B（`full`）、1024B（`short`）和 2048B（`wide`）三个 `BufferRef` 视图，确认三者指向同一物理页帧（PFN）。
+    /// - **When**：启动两个并发工作线程在门闩处对齐，同时通过 `short` 视图异或修改偏移 17 字节、通过 `wide` 视图异或修改偏移 31 字节。
+    /// - **Then**：`full` 整页视图能够同时观察到两处修改且其余超级块内容完好无损；随后恢复原始引导字节并执行 `sync_metadata` 刷盘成功。
     #[test]
     #[ktest(min_cpus = 2, tags("W02", "fs-metadata-super"))]
     fn initial_super_page_and_short_views_keep_both_updates(
@@ -43,6 +76,7 @@ pub(super) mod cases {
         expected[17] ^= 0x6e;
         expected[31] ^= 0xb1;
 
+        // Step 1: 构造并发起跑门闩，启动两个工作线程分别通过 1024B 和 2048B 视图修改偏移 17 与 31。
         let gate = Arc::try_new(crate::sync::Completion::new())
             .map_err(|_| TestError("metadata view start gate OOM"))?;
         let entered = Arc::try_new(AtomicUsize::new(0))
@@ -70,7 +104,7 @@ pub(super) mod cases {
             )
         })();
 
-        // 每个真实等待者消费一个 token；准备失败也先放行已发表任务再 join。
+        // Step 2: 释放两个门闩许可唤醒全部等待线程（即便前置等待失败也必须先放行已派发线程再汇合）。
         gate.complete();
         gate.complete();
         let joined = fixture.join_consumers();
@@ -78,7 +112,7 @@ pub(super) mod cases {
             .with_read(|bytes| bytes == expected)
             .map_err(FsError::from);
 
-        // 只恢复两个 boot 保留字节，不覆盖超级块或其它访问者的共同记录。
+        // Step 3: 仅原地恢复偏移 17 与 31 两个引导扇区保留字节，避免破坏偏移 1024 处的 Ext4 超级块字段。
         let restored = short
             .update(volume.claim(), |bytes| {
                 bytes[17] = original[0];

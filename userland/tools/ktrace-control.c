@@ -5,7 +5,13 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-/// 通过真实设备的无指针 ioctl 开始或停止固定捕获，所有失败保留非零退出状态。
+/*
+ * `/dev/ktrace` 内核事件追踪启停控制工具（安装为 `/bin/ktrace-control`）。
+ *
+ * 用法：
+ * - `ktrace-control start`：向 `/dev/ktrace` 发送 BLOSSOM_TRACE_START，清空并开启追踪。
+ * - `ktrace-control stop` ：向 `/dev/ktrace` 发送 BLOSSOM_TRACE_STOP，冻结当前追踪记录供读取。
+ */
 int main(int argc, char **argv)
 {
     int request;

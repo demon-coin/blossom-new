@@ -1,4 +1,41 @@
-//! 内核异常与物理 refill 的硬件入口；两者的 CSR 和 frame 不混用。
+//! LoongArch64 内核态普通异常/中断入口（`la_kernel_trap`）与 TLB 重填物理入口（`la_kernel_refill`）。
+//!
+//! ## 模块职责与架构定位
+//! 本模块提供安装在 `CSR_EENTRY` 与 `CSR_TLBRENTRY` 上的两个硬件向量裸汇编入口：
+//! 1. `la_kernel_trap`：处理 CPU 在内核态（PLV0）执行期间触发的硬件中断与同步异常，将寄存器现场保存为栈上的 `KernelTrapFrame`，调用 `loongarch_trap` 分派处理后再通过 `ertn` 返回。
+//! 2. `la_kernel_refill`：响应全机（含用户态 PLV3 与内核态 PLV0）的 TLB 重填异常（TLB Refill）。由于硬件在触发 TLB 重填时会自动切换到直接地址翻译模式（DA，`CRMD.DA = 1, PG = 0`）并跳转到 `CSR_TLBRENTRY` 物理地址，且使用独立的一套 CSR（`TLBRERA`、`TLBRPRMD`、`TLBRBADV`、`TLBREHI`、`TLBRELO0/1`、`TLBRSAVE`），因此不能与普通异常混用同一套保存栈帧。
+//!
+//! ## 核心机制与 TLB 重填分流流程
+//! ```text
+//!                        [硬件触发 TLB Refill 异常]
+//!            (自动进入 PLV0 + DA 物理寻址模式，跳入 la_kernel_refill)
+//!                                    │
+//!                    检查 TLBRPRMD.PPLV 是否为用户态 (PLV3)?
+//!                       ┌────────────┴────────────┐
+//!                  是 (PLV3)                  否 (PLV0)
+//!                       │                         │
+//!                       ▼                         ▼
+//!           检查 TLBRBADV 是否 < 2^39?     检查 EENTRY == la_user_trap?
+//!              ┌────────┴────────┐           ┌────┴─────────────┐
+//!             是                 否          是                 否
+//!              ▼                 ▼           ▼                  ▼
+//!          读取 PGDL       加载 LA_INVALID_ROOT  跳入 la_user_kernel_refill_fault  标签 6 (致命内核 Refill):
+//!              └────────┬────────┘        (借用 KS3 切换回内核栈转为普通页故障)    1. 在当前内核栈压入 RefillFrame
+//!                       ▼                                                          2. 跳转到高地址并恢复 CRMD.PG=1
+//!        执行 lddir (Level 3) + lddir (Level 1)                                    3. 调用 loongarch_refill 报告致命错误
+//!        加载偶奇双页表项写入 TLBRELO0 / TLBRELO1
+//!        执行 tlbfill 填入 TLB -> ertn 返回用户态
+//! ```
+//!
+//! ## 临时寄存器（Scratch CSR）分配约定
+//! - `CSR_KS0`：永久保存当前 CPU 的 `CpuLocal` 指针（在 `la_kernel_refill` 中严禁破坏）。
+//! - `CSR_KS1` / `CSR_KS3`：由 `user.rs` 在进入用户态前保存用户上下文指针与内核续接栈顶，供用户态异常入口与用户态窗口内的 Refill 故障路径读取。
+//! - `CSR_TLBRSAVE`：在 `la_kernel_refill` 入口暂存通用寄存器 `$t0`。
+//! - `CSR_KS2`：在 `la_kernel_refill` 内部暂存通用寄存器 `$t1`，在执行 `ertn` 或构造 `RefillFrame` 前恢复。
+//!
+//! ## 并发与锁契约
+//! - 硬件进入 `la_kernel_trap` 或 `la_kernel_refill` 时会自动清除 `CRMD.IE`（关闭本核硬件中断）。
+//! - 汇编入口本身不获取任何锁；页表遍历指令 `lddir` 在本核关闭中断状态下只读访问当前激活的页表页或静态只读的 `LA_INVALID_ROOT` 页表链。
 
 use crate::arch::loongarch64::mmu::{PHYSICAL_BITS, PT_INDEX_BITS, USER_ADDRESS_BITS};
 use crate::arch::loongarch64::register as reg;
@@ -7,25 +44,32 @@ use crate::arch::loongarch64::{loongarch_refill, loongarch_trap, KernelTrapFrame
 use crate::mm::PAGE_SHIFT;
 use core::arch::naked_asm;
 
+/// `lddir` 指令遍历三级用户页表时的顶层目录级别编号（Level 3，对应 `PWCH.Dir3` 配置的 PGD）。
 const LDDIR_ROOT: usize = 3;
+/// `lddir` 指令遍历三级用户页表时的中间目录级别编号（Level 1，对应 `PWCL.Dir1` 配置的 PMD）。
 const LDDIR_MIDDLE: usize = 1;
 use core::mem::{offset_of, size_of};
 
 extern "C" {
-    // 永久 invalid 根由同架构 MMU 模块拥有，入口只取得其链接地址。
+    /// 静态全无效三级页表根（定义于 `mmu.rs`），当用户态访问超出 39 位有效虚址范围时作为兜底页表根。
     static LA_INVALID_ROOT: u8;
 }
 
-/// 保存完整内核整数、异常 CSR、KS0 及条件 FP/FCSR/FCC，返回原被打断现场。
+/// 内核态（PLV0）普通中断与异常的硬件向量入口：在当前内核栈上构造 `KernelTrapFrame`，调用 `loongarch_trap` 分派处理后恢复现场并执行 `ertn`。
+///
+/// 当进入异常时若浮点扩展单元处于开启状态（`CSR_EUEN.FPE != 0`），一并保存和恢复 32 个 64 位浮点寄存器（`$f0`–`$f31`）、`FCSR0` 与 8 个条件标志寄存器（`$fcc0`–`$fcc7`）；若浮点单元未启用则跳过浮点区域读写。
 ///
 /// # Safety
-/// 仅供 PLV0 的普通异常硬件入口使用；当前栈必须有效、独占且有 KernelTrapFrame 空间，DMW 和本核 KS0 必须保活。
-/// 原 EUEN.FPE 开启时全部标量 FP 可读写；Rust 分派不得跨裸帧展开。
+/// - 只能作为 `CSR_EENTRY` 的内核态硬件中断/异常入口由 CPU 硬件直接跳入，进入时必须处于 PLV0 且 `CRMD.IE == 0`。
+/// - 当前 `$sp` 必须指向本核独占、16 字节对齐且剩余空间足以容纳 `KernelTrapFrame` 的有效内核栈，且 DMW0/DMW1 与 `CSR_KS0` 已正确初始化。
+/// - 下游 Rust 处理函数 `loongarch_trap` 严禁跨此裸汇编栈帧发生栈展开（unwind）。
 #[naked]
 #[no_mangle]
 #[link_section = ".text.vector.kernel_trap"]
 pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
-    // SAFETY: 硬件入口保证 PLV0 和有效内核栈；按 KernelTrapFrame 保存完整现场，Rust 分派仅在帧完成后调用。
+    // SAFETY: 1. 硬件在 PLV0 触发异常或中断时进入本入口，当前 `$sp` 为有效内核栈；
+    // 2. 汇编严格按照 `KernelTrapFrame` 的字段偏移保存全部 32 个通用寄存器、异常相关 CSR（ERA/PRMD/ESTAT/BADV/EUEN/KS0）以及条件启用的浮点寄存器；
+    // 3. 将栈顶指针通过 `$a0` 传给 `loongarch_trap(&mut KernelTrapFrame)`，返回后按相反顺序恢复寄存器并执行 `ertn`。
     unsafe {
         naked_asm!(
                 r#"
@@ -252,16 +296,24 @@ pub(super) unsafe extern "C" fn la_kernel_trap() -> ! {
     }
 }
 
-/// 在 DA 下区分用户 refill 与内核致命 refill，完整装入偶奇叶或保存独立 CSR 现场。
+/// LoongArch64 硬件 TLB 重填（TLB Refill）物理入口：在硬件自动切换的 DA 直接地址翻译模式下，快速填充用户态页表项或捕获内核态致命 TLB 重填异常。
+///
+/// 硬件触发 TLB 重填时会把 `CRMD.DA` 置 1、`CRMD.PG` 清 0，并将故障信息写入 `TLBRERA`、`TLBRPRMD`、`TLBRBADV` 与 `TLBREHI`，不会修改普通异常使用的 `ERA`、`PRMD` 与 `BADV`。
+/// - 若故障源于用户态（`TLBRPRMD.PPLV == PLV3`）：利用 `lddir` 指令遍历 `CSR_PGDL`（越界地址则导向 `LA_INVALID_ROOT`），将偶奇相邻的一对 64 位页表项装入 `TLBRELO0`/`TLBRELO1` 后执行 `tlbfill` 并立即返回。
+/// - 若故障发生在 `la_user_trap` 刚进入 PLV0 但尚未切换完用户栈/内核栈的窗口期：直接跳转到 `la_user_kernel_refill_fault`，借用 `CSR_KS3` 恢复内核栈并按用户访存异常处理。
+/// - 若故障源于普通内核态代码：在当前内核栈上保存 `RefillFrame`，跳回高地址虚拟空间并重新置位 `CRMD.PG`，最后交由 `loongarch_refill` 输出致命错误报告。
 ///
 /// # Safety
-/// 仅供 TLBRENTRY 物理入口使用，PW 与永久 invalid 链必须已初始化；正常内核来源须有可在 DA 下访问的有效栈。
-/// 用户入口窗口必须保留 KS1/KS3 的受信现场；高地址跳转和 DMW 恢复完成前不得调用普通 Rust。
+/// - 只能将其物理地址写入 `CSR_TLBRENTRY` 供 CPU 硬件在触发 TLB Refill 时直接跳入。
+/// - 调用前必须已通过 `mmu::initialize_current_cpu` 配置好 `PWCL`/`PWCH` 页表遍历寄存器，并通过 `mmu::initialize_invalid_tables` 初始化好 `LA_INVALID_ROOT` 兜底页表链。
+/// - 若从普通内核态进入，当前 `$sp` 除去高地址 DMW 前缀后的物理地址必须指向合法可写的内核栈；若从 `la_user_trap` 窗口进入，`CSR_KS1` 与 `CSR_KS3` 必须持有有效的用户上下文与内核栈顶。
 #[naked]
 #[no_mangle]
 #[link_section = ".text.vector.kernel_refill"]
 pub(super) unsafe extern "C" fn la_kernel_refill() -> ! {
-    // SAFETY: 已安装的 PW/invalid 链限定页表访问；内核栈或 KS3 由入口契约保活，先恢复高别名和 DMW 再调用 Rust。
+    // SAFETY: 1. 硬件在触发 TLB Refill 时自动进入 PLV0 + DA 模式，并保证 `TLBR*` 系列 CSR 包含当前故障现场；
+    // 2. 用户态快速路径仅使用 `TLBRSAVE`（暂存 $t0）与 `CSR_KS2`（暂存 $t1），只读遍历 `CSR_PGDL` 或 `LA_INVALID_ROOT` 后执行 `tlbfill`，不破坏用户栈或 `CSR_KS0`；
+    // 3. 内核态致命路径先在 DA 模式下通过物理地址掩码向当前内核栈写入 `RefillFrame`，随后跳转到 DMW1 高地址并恢复 `CRMD.PG = 1`，满足调用 Rust 函数 `loongarch_refill` 的全部 ABI 前提。
     unsafe {
         naked_asm!(
                 r#"

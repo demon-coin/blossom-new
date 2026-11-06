@@ -1,4 +1,57 @@
-//! 磁盘结构仅从有界小端字节解码，校验和与布局共用同一实现。
+//! ext4 磁盘元数据编解码、目录名字哈希与 CRC 校验和模块。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于 ext4 文件系统内部，专职处理原始小端字节切片与内核内存结构之间的编码与解码：
+//! - **上游调用者**：`ext4` 卷管理（`ext4.rs`）、块与 inode 分配器（`allocation.rs`）、
+//!   目录与 HTree 索引操作（`directory.rs`）、逻辑块映射（`mapping.rs`）以及 VFS Inode 层。
+//! - **下游依赖**：仅依赖 `ext4::crc` 提供的 CRC16 / CRC32C 计算原语与文件系统类型常量，
+//!   自身不持有任何锁，也不直接发起块设备或缓存 I/O。
+//!
+//! # 核心盘面布局与位域编码
+//! 1. **Inode 记录布局（128 字节基础区 + 可选扩展区，最大 256 字节）**：
+//! ```text
+//! +--------+--------+--------------------------------------------------------+
+//! | Offset | Length | Description                                            |
+//! +--------+--------+--------------------------------------------------------+
+//! | 0x00   | 40 B   | 基础属性（mode, uid_lo, size_lo, a/c/mtime, gid_lo,    |
+//! |        |        | links_count, blocks_lo, flags, i_version_lo）          |
+//! | 0x28   | 60 B   | i_block：Extent 树根节点（头+4项）、12直接+3间接指针、 |
+//! |        |        | 快速符号链接内联字节或字符/块设备号                    |
+//! | 0x64   | 28 B   | generation, file_acl_lo, size_high, blocks_high,       |
+//! |        |        | file_acl_high, uid_high, gid_high, checksum_lo (124)   |
+//! | 0x80   | extra  | extra_isize(128), checksum_hi(130), c/m/atime_extra    |
+//! | 0x80+e | 剩余   | 内联扩展属性区（以 XATTR_MAGIC 0xea020000 开头）       |
+//! +--------+--------+--------------------------------------------------------+
+//! ```
+//!
+//! 2. **扩展时间戳（32 位 `*_extra` 字段）与 EA Inode 64 位引用计数**：
+//! ```text
+//! Inode 扩展时间戳字（ctime_extra / mtime_extra / atime_extra）：
+//!  31                                        2  1        0
+//! +-------------------------------------------+-----------+
+//! |              nanoseconds (30b)            | epoch (2b)|
+//! +-------------------------------------------+-----------+
+//! 实际秒数 = (i32 基础秒 as i64) + ((epoch as i64) << 32)
+//!
+//! 隐藏 EA 值 Inode（EXT4_EA_INODE_FL）的 64 位引用计数复用字段：
+//! +-----------------------------------+-----------------------------------+
+//! |        i_ctime [63:32]            |       i_version (offset 36) [31:0]|
+//! +-----------------------------------+-----------------------------------+
+//! ```
+//!
+//! 3. **Extent 节点与叶子长度最高位状态编码**：
+//! ```text
+//! 节点字节布局：[ExtentHeader: 12B] + max * [ExtentEntry: 12B] + [CRC32C Tail: 4B]
+//! 叶子 ee_len（u16）：
+//!   0x0001 ..= 0x8000  => 已初始化数据段，块数为 raw（1..=32768）
+//!   0x8001 ..= 0xFFFF  => 预分配未写入段（unwritten），块数为 raw - 0x8000（1..=32767）
+//! ```
+//!
+//! # 并发契约与局部原地修补原则
+//! - 本模块所有函数均为无锁纯计算函数，仅在调用方传入的切片边界内读写。
+//! - 所有 `patch_*` 修改函数均在调用方持有的元数据缓冲区内容锁（`BufferRef::update`）内执行，
+//!   且仅原地覆写目标记录的指定字段与对应的校验和，保留同一磁盘块内相邻记录与未知扩展字段不变，
+//!   避免全块快照写回覆盖并发操作修改过的其他元数据记录。
 
 use crate::block::SECTOR_BYTES;
 pub(crate) use crate::fs::ext4::crc::{crc16, crc32c};
@@ -11,25 +64,38 @@ use crate::fs::types::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IF
 use crate::fs::{FsError, InodeKind, InodeTime};
 use crate::time::NSEC_PER_SEC;
 
+/// Inode 标志（`EXT4_EXTENTS_FL`）：`i_block` 区域存放 Extent 树而非传统直接/间接块指针。
 pub(crate) const EXTENTS: u32 = 0x0008_0000;
+/// Inode 标志（`EXT4_EA_INODE_FL`）：该 inode 专用于存储大尺寸扩展属性（xattr）的值。
 pub(crate) const EA_INODE: u32 = 0x0020_0000;
+/// Inode 标志（`EXT4_INDEX_FL`）：目录启用了 HTree（DX）哈希树索引布局。
 pub(crate) const INDEX: u32 = 0x1000;
 
+/// 只读兼容特性位（`EXT4_FEATURE_RO_COMPAT_METADATA_CSUM`）：元数据启用 CRC32C 校验和。
 pub(crate) const METADATA_CSUM: u32 = 0x400;
 
-// inode 标志与超级块 feature 属于不同字段；同名能力不能共用位值。
+// Inode 标志字段（i_flags）与超级块特性字段处于各自独立的命名空间，同名特性的位掩码不同，切勿混用。
+/// Inode 标志（`EXT4_HUGE_FILE_FL`）：`i_blocks` 按文件系统块大小而非 512 字节扇区为单位计数。
 pub(crate) const HUGE_FILE: u32 = 0x0004_0000;
+/// Inode 标志（`EXT4_COMPR_FL`）：文件启用透明压缩（当前不支持）。
 const COMPR: u32 = 0x0000_0004;
+/// Inode 标志（`EXT4_IMMUTABLE_FL`）：不可变文件标志。
 const IMMUTABLE: u32 = 0x0000_0010;
+/// Inode 标志（`EXT4_APPEND_FL`）：仅允许追加写入标志。
 const APPEND: u32 = 0x0000_0020;
+/// Inode 标志（`EXT4_ENCRYPT_FL`）：文件启用 fscrypt 加密（当前不支持）。
 const ENCRYPT: u32 = 0x0000_0800;
+/// Inode 标志（`EXT4_VERITY_FL`）：文件启用 fs-verity 只读完整性校验（当前不支持）。
 const VERITY: u32 = 0x0010_0000;
+/// Inode 标志（`EXT4_INLINE_DATA_FL`）：小文件或目录数据内联存储在 inode 内部（当前不支持）。
 const INLINE_DATA: u32 = 0x1000_0000;
+/// Inode 标志（`EXT4_CASEFOLD_FL`）：目录名比较启用大小写折叠（当前不支持）。
 const CASEFOLD: u32 = 0x4000_0000;
-
+// 兼容特性位（s_feature_compat）：未知兼容特性不影响安全读写。
 pub(crate) const FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 pub(crate) const FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 
+// 不兼容特性位（s_feature_incompat）：若包含未知位则必须拒绝挂载。
 pub(crate) const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 pub(crate) const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
@@ -39,6 +105,7 @@ pub(crate) const FEATURE_INCOMPAT_EA_INODE: u32 = 0x0400;
 const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
 pub(crate) const FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
 
+// 只读兼容特性位（s_feature_ro_compat）：若包含不支持修改的格式位则拒绝挂载。
 pub(crate) const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 pub(crate) const FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 const FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0004;
@@ -49,6 +116,7 @@ pub(crate) const FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
 const FEATURE_RO_COMPAT_BIGALLOC: u32 = 0x0200;
 const FEATURE_RO_COMPAT_VERITY: u32 = 0x8000;
 
+// 超级块位置、魔数与块尺寸边界（支持 1KiB / 2KiB / 4KiB 块）。
 pub(crate) const SUPER_MAGIC: u16 = 0xef53;
 pub(crate) const SUPERBLOCK_OFFSET: usize = 1024;
 pub(crate) const SUPERBLOCK_BYTES: usize = 1024;
@@ -69,7 +137,9 @@ pub(crate) const INODE_EXTRA_BYTES: usize = 160 - GOOD_OLD_INODE_BYTES;
 const MIN_DESCRIPTOR_BYTES: usize = 32;
 const LARGE_DESCRIPTOR_BYTES: usize = 64;
 
+/// 块组描述符标志：该组的 inode 位图与表尚未在盘面初始化。
 pub(crate) const BG_INODE_UNINIT: u16 = 0x0001;
+/// 块组描述符标志：该组的数据块位图尚未在盘面初始化。
 pub(crate) const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 pub(crate) const DIRECT_BLOCKS: usize = 12;
@@ -91,9 +161,11 @@ pub(crate) const EXTENT_ROOT_ENTRIES: usize =
     (INODE_BLOCK_BYTES - EXTENT_HEADER_BYTES) / EXTENT_ENTRY_BYTES;
 pub(crate) const EXTENT_LOGICAL_BLOCKS: u64 = 1u64 << u32::BITS;
 pub(crate) const EXTENT_PHYSICAL_LIMIT: u64 = 1u64 << (u32::BITS + u16::BITS);
-// 树遍历与准备路径使用同一深度上限，路径栈另留一个根节点位置。
+/// Extent 树的最大允许深度上限；遍历与修改路径栈均基于此常数定界（路径数组额外预留 1 个根节点槽位）。
 pub(crate) const EXTENT_DEPTH_LIMIT: usize = 32;
+/// 已初始化叶子 Extent 单项可表示的最大文件系统块数（`32768`，编码值 `0x8000`）。
 pub(crate) const EXTENT_INIT_MAX_LEN: u16 = 1 << 15;
+/// 未写入（unwritten）叶子 Extent 单项可表示的最大文件系统块数（`32767`，编码值 `0xFFFF`）。
 pub(crate) const EXTENT_UNWRITTEN_MAX_LEN: u16 = EXTENT_INIT_MAX_LEN - 1;
 
 pub(crate) const DIR_TAIL_BYTES: usize = 12;
@@ -113,25 +185,31 @@ const DX_HASH_HALF_MD4_UNSIGNED: u8 = 4;
 pub(crate) const DX_HASH_TEA_UNSIGNED: u8 = 5;
 const DX_HASH_SIPHASH: u8 = 6;
 
-/// 借用明确的字节范围，拒绝短输入与加法溢出。
+/// 从 `data` 中安全借用 `[offset, offset + len)` 范围的子切片。
+///
+/// 若 `offset + len` 发生整数溢出或超出 `data` 长度，返回 `FsError::Corrupt`。
 pub(crate) fn bytes(data: &[u8], offset: usize, len: usize) -> Result<&[u8], FsError> {
     data.get(offset..offset.checked_add(len).ok_or(FsError::Corrupt)?)
         .ok_or(FsError::Corrupt)
 }
 
-/// 解码有界的十六位小端值。
+/// 从 `data` 的 `offset` 字节处读取 16 位小端无符号整数，越界时返回 `FsError::Corrupt`。
 pub(crate) fn le16(data: &[u8], offset: usize) -> Result<u16, FsError> {
     let b = bytes(data, offset, 2)?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// 解码有界的三十二位小端值。
+/// 从 `data` 的 `offset` 字节处读取 32 位小端无符号整数，越界时返回 `FsError::Corrupt`。
 pub(crate) fn le32(data: &[u8], offset: usize) -> Result<u32, FsError> {
     let b = bytes(data, offset, 4)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// 按目录哈希版本计算原始字节的 major/minor 哈希。
+/// 根据 HTree 目录指定的哈希算法版本计算目录项名称 `name` 的 `(major, minor)` 哈希值。
+///
+/// 返回的 `major` 会清除最低位（HTree 最低位保留作碰撞跨叶继续标志），并将全 1 边界值
+/// `0xffff_fffe` 规避为 `0xffff_fffc`（避免与 HTree 索引游标结束哨兵冲突）。
+/// 若遇到不支持的哈希版本（如 SipHash 或未知编号），返回 `FsError::Unsupported`。
 pub(crate) fn directory_hash(
     geometry: &Geometry,
     hash_version: u8,
@@ -164,7 +242,9 @@ pub(crate) fn directory_hash(
     Ok((major, minor))
 }
 
-/// 计算不使用目录种子的旧版 32 位名字哈希。
+/// 计算不依赖超级块种子的传统（Legacy）32 位目录名哈希值。
+///
+/// `unsigned` 为 `true` 时将每个名称字节视为无符号 `0..=255`，否则按有符号 `i8` 符号扩展。
 fn legacy_hash(name: &[u8], unsigned: bool) -> u32 {
     let mut hash0 = 0x12a3_fe2d_u32;
     let mut hash1 = 0x37ab_e8f9_u32;
@@ -184,7 +264,9 @@ fn legacy_hash(name: &[u8], unsigned: bool) -> u32 {
     hash0.wrapping_shl(1)
 }
 
-/// 将一个名字分组转换为半 MD4 使用的整数缓冲。
+/// 将目录名从 `offset` 起的一段字节打包并填充为 Half-MD4 或 TEA 哈希变换所需的 8 个 `u32` 输入字。
+///
+/// 不足整块的部分使用剩余字节数 `remaining` 重复拼接成的 32 位填充字补齐。
 fn hash_buffer(
     name: &[u8],
     offset: usize,
@@ -217,7 +299,7 @@ fn hash_buffer(
     result
 }
 
-/// 以三轮布尔函数更新半 MD4 状态并返回其主要哈希字。
+/// 对 4 字状态向量执行一轮三阶段 Half-MD4 压缩变换，并返回更新后的主哈希字 `state[1]`。
 fn half_md4_transform(state: &mut [u32; 4], input: &[u32; 8]) -> u32 {
     let [mut a, mut b, mut c, mut d] = *state;
     macro_rules! round {
@@ -268,7 +350,9 @@ fn half_md4_transform(state: &mut [u32; 4], input: &[u32; 8]) -> u32 {
     state[1]
 }
 
-/// 计算半 MD4 的 major/minor 哈希。
+/// 使用 Half-MD4 算法按 32 字节分组计算目录名 `name` 的 `(major, minor)` 哈希值。
+///
+/// 若超级块 `seed` 全为 0，则回退使用标准 MD4 初始幻数状态。
 fn half_md4_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
     let mut state = if seed.iter().all(|&word| word == 0) {
         [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
@@ -285,7 +369,7 @@ fn half_md4_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
     (state[1], state[2])
 }
 
-/// 执行 TEA 目录哈希的一轮十六步变换。
+/// 对状态向量前两个字执行一轮 16 步 TEA（Tiny Encryption Algorithm）Feistel 轮变换。
 fn tea_transform(state: &mut [u32; 4], input: &[u32; 8]) {
     const DELTA: u32 = 0x9e37_79b9;
     let mut sum = 0u32;
@@ -308,7 +392,9 @@ fn tea_transform(state: &mut [u32; 4], input: &[u32; 8]) {
     state[1] = state[1].wrapping_add(b1);
 }
 
-/// 计算 TEA 的 major/minor 哈希。
+/// 使用 TEA 算法按 16 字节分组计算目录名 `name` 的 `(major, minor)` 哈希值。
+///
+/// 若超级块 `seed` 全为 0，则回退使用标准初始幻数状态。
 fn tea_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
     let mut state = if seed.iter().all(|&word| word == 0) {
         [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
@@ -325,7 +411,9 @@ fn tea_hash(name: &[u8], unsigned: bool, seed: [u32; 4]) -> (u32, u32) {
     (state[0], state[1])
 }
 
-/// 重新计算带 metadata_csum 的普通目录尾 CRC。
+/// 初始化普通线性目录叶块末尾 12 字节的伪目录项尾部（`ext4_dir_entry_tail`），并更新 CRC32C 校验和。
+///
+/// 若卷未启用 `METADATA_CSUM` 特性则直接返回 `Ok(())`。调用方须持有该目录块的可变内容访问权。
 pub(crate) fn update_directory_checksum(
     geometry: &Geometry,
     inode: &InodeMetadata,
@@ -349,7 +437,9 @@ pub(crate) fn update_directory_checksum(
     Ok(())
 }
 
-/// 按 dx 中实际使用的条目计算 root 或 index-node 尾 CRC。
+/// 重算并写入 HTree 根节点或内部索引节点块尾（`ext4_dx_tail`）的 CRC32C 校验和。
+///
+/// `entries_end` 为当前已使用索引条目的结束偏移，`tail` 为 8 字节 `dx_tail` 结构的起始偏移。
 pub(crate) fn update_dx_checksum(
     inode: &InodeMetadata,
     data: &mut [u8],
@@ -363,7 +453,9 @@ pub(crate) fn update_dx_checksum(
     Ok(())
 }
 
-/// dx checksum 覆盖已用条目、tail 保留字与置零的 checksum 字段。
+/// 计算 HTree 节点块的 CRC32C 校验和。
+///
+/// 校验范围依次覆盖：`[0, entries_end)` 内的已用条目、`[tail, tail + 4)` 的保留字段，以及视作全零的 4 字节校验和字段本身。
 pub(crate) fn dx_checksum(
     seed: u32,
     data: &[u8],
@@ -375,7 +467,9 @@ pub(crate) fn dx_checksum(
     Ok(crc32c(checksum, &[0; 4]))
 }
 
-/// 从 metadata_csum 目录尾验证普通 dirent 块 CRC。
+/// 校验普通目录叶块的末尾 CRC32C 校验和（`end` 为尾部 `DIR_TAIL_BYTES` 之前的有效目录项结束偏移）。
+///
+/// 若卷未启用 `METADATA_CSUM` 则跳过检查；校验和不匹配时返回 `FsError::Checksum`。
 pub(crate) fn verify_directory_checksum(
     geometry: &Geometry,
     inode: &InodeMetadata,
@@ -390,7 +484,7 @@ pub(crate) fn verify_directory_checksum(
     Ok(())
 }
 
-/// 解码 dx 根或 index-node 的已用条目数并验证真实尾 CRC。
+/// 校验 HTree 根节点或内部索引节点块尾存储的 CRC32C 校验和，不匹配时返回 `FsError::Checksum`。
 pub(crate) fn verify_dx_checksum(
     inode: &InodeMetadata,
     data: &[u8],
@@ -403,7 +497,9 @@ pub(crate) fn verify_dx_checksum(
     Ok(())
 }
 
-/// 向上取整块数，不让外部计数加法溢出。
+/// 计算无符号整数向上取整除法 `ceil(value / unit)`，避免 `(value + unit - 1)` 发生加法溢出。
+///
+/// 若除数 `unit` 为 0，返回 `FsError::Corrupt`。
 pub(crate) fn ceil_div(value: u64, unit: u64) -> Result<u64, FsError> {
     if unit == 0 {
         return Err(FsError::Corrupt);
@@ -411,8 +507,12 @@ pub(crate) fn ceil_div(value: u64, unit: u64) -> Result<u64, FsError> {
     Ok(value / unit + u64::from(value % unit != 0))
 }
 
-/// 从当前盘面数据建立只读几何；日志状态不参与解码，也不执行日志恢复。
+/// 解码并校验 1024 字节主超级块，构造卷的不可变几何参数 [`Geometry`]。
+///
+/// 本实现不挂载 JBD2 日志或执行崩溃日志重放，仅依据超级块当前记录的特征位、块尺寸、块组划分与校验种子建立几何视图。
+/// 若盘面不变量矛盾或校验和错误，返回 `FsError::Corrupt` / `FsError::Checksum`；遇到未实现的扩展特性则返回 `FsError::Unsupported`。
 pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, FsError> {
+    // Step 1: 校验超级块魔数，并在启用 METADATA_CSUM 时校验超级块自身的 CRC32C。
     let data = bytes(data, 0, SUPERBLOCK_BYTES)?;
     if le16(data, 56)? != SUPER_MAGIC {
         return Err(FsError::Corrupt);
@@ -430,7 +530,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         }
     }
 
-    // 只读兼容位可忽略未知值，已知扩展读取格式仍须明确拒绝。
+    // Step 2: 校验兼容、不兼容与只读兼容特性集，拒绝未知不兼容位或未支持的布局特性（如 bigalloc、fs-verity、旧式 btree 目录）。
     let supported_incompat = FEATURE_INCOMPAT_FILETYPE
         | FEATURE_INCOMPAT_RECOVER
         | FEATURE_INCOMPAT_EXTENTS
@@ -455,6 +555,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         return Err(FsError::Unsupported);
     }
 
+    // Step 3: 解码文件系统块大小、簇（cluster）大小及首个数据块编号，验证 1KiB/2KiB/4KiB 布局约束。
     let log = le32(data, 24)?;
     if MAX_BLOCK_LOG < log {
         return Err(FsError::Unsupported);
@@ -468,6 +569,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         return Err(FsError::Corrupt);
     }
 
+    // Step 4: 解码块总数、inode 总数、每组容量、inode 记录尺寸（128 或 256 字节）与块组描述符尺寸（32 或 64 字节）。
     let has64 = features_incompat & FEATURE_INCOMPAT_64BIT != 0;
     let blocks_count = u64::from(le32(data, 4)?)
         | if has64 {
@@ -500,6 +602,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         return Err(FsError::Unsupported);
     }
 
+    // Step 5: 校验位图容量、设备字节边界以及由块数和 inode 数分别推导出的块组总数一致性。
     if blocks_count <= first_data_block
         || inodes_count == 0
         || blocks_per_group == 0
@@ -538,6 +641,7 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
         return Err(FsError::Corrupt);
     }
 
+    // Step 6: 提取卷 UUID、元数据 CRC32C 种子以及 HTree 目录名字哈希种子与默认版本。
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(bytes(data, 104, 16)?);
     let checksum_seed = if features_incompat & FEATURE_INCOMPAT_CSUM_SEED != 0 {
@@ -588,12 +692,16 @@ pub(crate) fn decode_super(data: &[u8], device_bytes: u64) -> Result<Geometry, F
     })
 }
 
-/// 校验组描述符并提取完整 inode 表地址；flex 组允许表位于其他块组。
+/// 校验第 `group` 号块组描述符的完整性，并返回该组的 inode 表起始物理块号。
+///
+/// 会根据卷特性校验描述符 CRC32C 或传统 GDT CRC16，并验证块位图、inode 位图与 inode 表三者的物理块范围合法且互不重叠。
+/// 启用 `FLEX_BG` 时允许这三个元数据区跨出当前块组落入卷内其他数据区，否则要求严格位于本块组范围内。
 pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64, FsError> {
     let data = bytes(data, 0, g.descriptor_size)?;
     if g.groups_count <= group {
         return Err(FsError::Corrupt);
     }
+    // Step 1: 校验块组描述符校验和（优先使用 METADATA_CSUM 的 CRC32C，否则检查 GDT_CSUM 的 CRC16）。
     let number = (group as u32).to_le_bytes();
     let stored = le16(data, 30)?;
     if g.features_ro_compat & METADATA_CSUM != 0 {
@@ -614,6 +722,7 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
         }
     }
 
+    // Step 2: 计算元数据允许存放的物理块边界（FLEX_BG 放宽至全卷数据区），逐一解码并验证块位图、inode 位图和 inode 表起点。
     let first = if g.features_incompat & FEATURE_INCOMPAT_FLEX_BG != 0 {
         g.first_data_block
     } else {
@@ -635,6 +744,7 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
             return Err(FsError::Corrupt);
         }
     }
+    // Step 3: 计算 inode 表占用的总块数，确保块位图和 inode 位图互不重合且均不落入 inode 表区间内。
     let table_blocks = ceil_div(
         g.inodes_per_group
             .checked_mul(g.inode_size as u64)
@@ -654,13 +764,17 @@ pub(crate) fn decode_group(g: &Geometry, group: u64, data: &[u8]) -> Result<u64,
     Ok(pointers[2])
 }
 
-/// 解码并校验完整 inode，保留块计数的统一 512 字节单位。
+/// 解码并完整校验单个磁盘 inode 记录，构造内存 [`InodeData`] 快照。
+///
+/// 返回的 `blocks` 字段统一换算为 512 字节扇区数（即使盘面置位了 `HUGE_FILE` 按文件系统块计数也会在此折算），
+/// 以便上层 `stat` 系统调用和空间配额统计使用统一单位。
 pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<InodeData, FsError> {
     let data = bytes(data, 0, g.inode_size)?;
     if number == 0 || g.inodes_count < number {
         return Err(FsError::Corrupt);
     }
 
+    // Step 1: 解析扩展头长度 extra_isize，计算该 inode 专属的 CRC32C 种子（融合卷种子、inode 号与 generation）并验证记录校验和。
     let extra_isize = if g.inode_size == GOOD_OLD_INODE_BYTES {
         0
     } else {
@@ -698,6 +812,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         }
     }
 
+    // Step 2: 解码文件类型模式位与 inode 标志位，拒绝压缩、加密、内联数据等未支持特性以及与超级块特性冲突的标志。
     let mode = le16(data, 0)?;
     let kind = match mode & S_IFMT {
         S_IFREG => InodeKind::Regular,
@@ -723,6 +838,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         return Err(FsError::Corrupt);
     }
 
+    // Step 3: 组合 64 位文件字节大小与已分配块计数，将 HUGE_FILE 模式下的文件系统块数统一折算为 512 字节扇区单位。
     let size = u64::from(le32(data, 4)?)
         | if kind == InodeKind::Regular || g.features_incompat & FEATURE_INCOMPAT_LARGEDIR != 0 {
             u64::from(le32(data, 108)?) << 32
@@ -744,6 +860,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         return Err(FsError::Corrupt);
     }
 
+    // Step 4: 解码外部扩展属性块（file_acl），并结合剩余扇区计数判断符号链接是否采用内联快速符号链接（fast symlink）编码。
     let file_acl = u64::from(le32(data, 104)?)
         | if g.features_incompat & FEATURE_INCOMPAT_64BIT != 0 {
             u64::from(le16(data, 118)?) << 32
@@ -768,6 +885,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
         return Err(FsError::Corrupt);
     }
 
+    // Step 5: 拷贝 60 字节 i_block 区域，还原特殊设备号、32 位 UID/GID 及扩展纳秒时间戳。
     let mut block = [0u8; 60];
     block.copy_from_slice(bytes(data, 40, 60)?);
     let rdev = decode_device(kind, &block);
@@ -794,7 +912,7 @@ pub(crate) fn decode_inode(g: &Geometry, number: u64, data: &[u8]) -> Result<Ino
     })
 }
 
-/// 按 ext4 特殊 inode 的旧版或新版盘面编码还原内核设备号。
+/// 从字符设备或块设备 inode 的 `i_block` 前 8 字节解码主次设备号（兼容旧版 `i_block[0]` 16 位编码与新版 `i_block[1]` 32 位编码）。
 fn decode_device(kind: InodeKind, block: &[u8; 60]) -> u64 {
     if !matches!(kind, InodeKind::Character | InodeKind::Block) {
         return 0;
@@ -812,7 +930,7 @@ fn decode_device(kind: InodeKind, block: &[u8; 60]) -> u64 {
     encode_device(major, minor)
 }
 
-/// 将 major/minor 组合成本内核与 Linux new_encode_dev 相同的设备号。
+/// 将主设备号 `major` 与次设备号 `minor` 按 Linux `new_encode_dev` 64 位格式编码为统一设备号。
 fn encode_device(major: u64, minor: u64) -> u64 {
     ((major & 0xffff_f000) << 32)
         | ((major & 0x0000_0fff) << 8)
@@ -820,7 +938,7 @@ fn encode_device(major: u64, minor: u64) -> u64 {
         | (minor & 0x0000_00ff)
 }
 
-/// 基础秒有符号扩展；只有 extra_isize 覆盖该字段时才消费 epoch 和纳秒。
+/// 解码 inode 时间戳：基础 32 位字段按有符号 `i32` 秒数符号扩展，仅当 `extra_isize` 覆盖对应扩展字段时才叠加上高 2 位 epoch 与 30 位纳秒。
 fn decode_time(
     data: &[u8],
     base: usize,
@@ -839,7 +957,10 @@ fn decode_time(
     })
 }
 
-/// 受控属性更新不改变文件内容、块布局或 inode 身份；格式有限位宽在改字节前检查。
+/// 校验元数据属性更新请求是否合法。
+///
+/// 属性更新仅允许修改权限位（不含文件类型 `S_IFMT`）、`uid`、`gid`、`links` 以及三个时间戳，不得篡改文件大小、块布局或 inode 身份；
+/// 同时预先检查硬链接数是否超出 `u16` 上限、三个新时间戳是否能被当前 inode 的 `extra_isize` 无损编码。
 pub(crate) fn validate_inode_metadata_update(
     old: &InodeMetadata,
     next: &InodeMetadata,
@@ -862,7 +983,10 @@ pub(crate) fn validate_inode_metadata_update(
     Ok(())
 }
 
-/// 根据本 inode 的真实 extra_isize 编码秒扩展与纳秒，不静默截断不可表示时间。
+/// 将 [`InodeTime`] 编码为盘面基础秒字段与可选的 32 位扩展字段 `(base_sec, extra_word)`。
+///
+/// 若纳秒超出 `[0, 10^9)`，或当前 `extra_isize` 不足以容纳扩展字段但时间带有非零纳秒/跨 32 位纪元偏移，
+/// 则返回 `FsError::InvalidOperation` 而非静默截断。
 fn time_encoding(
     time: InodeTime,
     extra: usize,
@@ -893,7 +1017,9 @@ fn time_encoding(
     }
 }
 
-/// 按该时间字段的真实记录精度准备值，整秒记录不保留无法写回的纳秒。
+/// 根据当前 inode 的 `extra_isize` 将待写入时间戳规范化为盘面实际可表达的精度。
+///
+/// 若记录未包含该时间戳的扩展纳秒字段，则主动抹零纳秒部分（保留整秒精度），随后校验秒数范围是否合法。
 pub(crate) fn prepare_inode_time(
     mut time: InodeTime,
     extra: usize,
@@ -909,7 +1035,9 @@ pub(crate) fn prepare_inode_time(
     Ok(time)
 }
 
-/// 写提交使用已有时钟的时间值，mtime 和 ctime 各按实际扩展字段保留纳秒或整秒。
+/// 将单调或实时时钟纳秒值转换为匹配当前 inode 盘面精度的 `(mtime, ctime)` 时间戳对。
+///
+/// 由于 `mtime_extra`（偏移 136）与 `ctime_extra`（偏移 132）在扩展区位置不同，两者分别按各自的字段边界决定是否保留纳秒。
 pub(crate) fn prepare_inode_write_times(
     nanoseconds: u64,
     extra_isize: usize,
@@ -923,7 +1051,10 @@ pub(crate) fn prepare_inode_write_times(
     Ok((mtime, ctime))
 }
 
-/// 同一元数据 guard 内只改当前记录的属性和 CRC，保留块根、未知字段及邻记录。
+/// 在调用方持有的元数据块可变锁内原地更新单个 inode 记录的常规属性与校验和。
+///
+/// 修改前会先重新解码校验盘面当前属性与 `old` 一致；仅覆写权限、属主、链接数、三个时间戳及 CRC，
+/// 保持 `i_block` 映射根、未知扩展字段以及同一磁盘块内的相邻 inode 记录原封不动。
 pub(crate) fn patch_inode_metadata(
     g: &Geometry,
     record: &mut [u8],
@@ -954,12 +1085,12 @@ pub(crate) fn patch_inode_metadata(
     Ok(())
 }
 
-/// 写入已由固定 inode 几何验证的字段，修改不跨出本记录。
+/// 向已通过长度校验的记录切片 `offset` 处写入 16 位小端整数。
 pub(crate) fn put16(record: &mut [u8], offset: usize, value: u16) {
     record[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-/// 使用预先检查的时间编码，不在修改了部分记录后再引入可失败步骤。
+/// 将预先通过 [`time_encoding`] 校验的时间戳编码无失败地写入记录的基础秒偏移 `base` 与可选扩展偏移 `extra`。
 fn put_time(record: &mut [u8], base: usize, extra: usize, encoding: (u32, Option<u32>)) {
     record[base..base + 4].copy_from_slice(&encoding.0.to_le_bytes());
     if let Some(extension) = encoding.1 {
@@ -967,14 +1098,21 @@ fn put_time(record: &mut [u8], base: usize, extra: usize, encoding: (u32, Option
     }
 }
 
+/// Extent 树节点头部的 12 字节解码结果（对应磁盘 `ext4_extent_header`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExtentHeader {
+    /// 当前节点内实际有效的条目数（`eh_entries`）。
     pub entries: u16,
+    /// 当前节点可容纳的最大条目数（`eh_max`，内联根节点通常为 4，外部块节点由块大小决定）。
     pub max: u16,
+    /// 当前节点距离叶子层的高度（`eh_depth`：`0` 表示存放数据映射的叶节点，大于 `0` 表示内部索引节点）。
     pub depth: u16,
 }
 
-/// 解码 extent 头，并在下降时要求深度严格匹配。
+/// 解码并校验 Extent 树节点头（`ext4_extent_header`）。
+///
+/// 检查魔数 `0xf30a`、最大深度上限、容量边界以及非零深度节点不能为空的不变量；
+/// 若传入 `expected_depth`，还会强制要求节点记录的 `depth` 与父节点推导出的期望深度严格相等。
 pub(crate) fn extent_header(
     data: &[u8],
     expected_depth: Option<u16>,
@@ -999,7 +1137,9 @@ pub(crate) fn extent_header(
     Ok(h)
 }
 
-/// 0x8000 仍是已初始化的 32768 块，只有更大的编码表示未写入。
+/// 解码叶子 Extent 的 16 位长度字段 `ee_len`，返回 `(文件系统块数, 是否为未写入预分配段)`。
+///
+/// 盘面编码规则：`0` 非法；`1..=0x8000` 表示已初始化块（最大 32768 块）；`0x8001..=0xFFFF` 表示未写入（unwritten）块，实际长度为 `raw - 0x8000`。
 pub(crate) fn extent_length(raw: u16) -> Result<(u64, bool), FsError> {
     if raw == 0 {
         return Err(FsError::Corrupt);
@@ -1015,7 +1155,9 @@ pub(crate) fn extent_length(raw: u16) -> Result<(u64, bool), FsError> {
     ))
 }
 
-/// 验证已解码外部 extent 节点的正式尾 CRC，根节点由 inode CRC 保护。
+/// 校验外部 Extent 树节点块末尾（`ext4_extent_tail`）的 CRC32C 校验和。
+///
+/// 内联在 inode `i_block` 中的根节点没有独立尾部，其完整性直接由所在 inode 记录的整体 CRC32C 保护。
 pub(crate) fn verify_extent_checksum(
     g: &Geometry,
     inode: &InodeData,
@@ -1031,12 +1173,14 @@ pub(crate) fn verify_extent_checksum(
     Ok(())
 }
 
-/// 写入已经过几何检查的四字节字段，不复制共同块的其余字节。
+/// 向已通过长度校验的记录切片 `offset` 处写入 32 位小端整数。
 pub(crate) fn put32(record: &mut [u8], offset: usize, value: u32) {
     record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// 组的物理布局固定，计数与 flags 每次从共同描述符重新解码。
+/// 解码并校验第 `group` 号块组描述符中的静态元数据块位置（块位图、inode 位图与 inode 表物理块号）。
+///
+/// 这些物理位置在格式化后固定不变，卷打开时缓存为 `GroupLayout`；而空闲计数与标志位则在每次分配/释放时从描述符缓冲区实时读取。
 pub(crate) fn group_layout(
     g: &Geometry,
     group: u64,
@@ -1061,18 +1205,28 @@ pub(crate) fn group_layout(
     })
 }
 
+/// 块组描述符中的动态可变计数与状态快照（兼容 32 字节与 64 字节描述符格式）。
 #[derive(Clone, Copy)]
 pub(crate) struct GroupState {
+    /// 本块组剩余空闲数据块数量（`bg_free_blocks_count`）。
     pub free_blocks: u32,
+    /// 本块组剩余空闲 inode 数量（`bg_free_inodes_count`）。
     pub free_inodes: u32,
+    /// 本块组已分配的目录 inode 数量（`bg_used_dirs_count`）。
     pub used_dirs: u32,
+    /// 块组标志位（`bg_flags`，如 [`BG_INODE_UNINIT`]、[`BG_BLOCK_UNINIT`]）。
     pub flags: u16,
+    /// 本块组 inode 表尾部从未被使用过的连续槽位数量（`bg_itable_unused`）。
     pub unused_inodes: u32,
+    /// 数据块位图的 CRC32C 校验和（32 字节描述符仅存低 16 位，64 字节存完整 32 位）。
     pub block_checksum: u32,
+    /// Inode 位图的 CRC32C 校验和（32 字节描述符仅存低 16 位，64 字节存完整 32 位）。
     pub inode_checksum: u32,
 }
 
-/// 组合描述符的低高半字段，32 字节格式只消费实际存在的低半。
+/// 从块组描述符切片中解码动态状态 [`GroupState`]。
+///
+/// 当描述符大小为 64 字节时拼接高低两个 16 位半字，32 字节传统描述符仅读取低 16 位字段。
 pub(crate) fn group_state(g: &Geometry, record: &[u8]) -> Result<GroupState, FsError> {
     let field = |low, high| -> Result<u32, FsError> {
         Ok(u32::from(le16(record, low)?)
@@ -1093,7 +1247,7 @@ pub(crate) fn group_state(g: &Geometry, record: &[u8]) -> Result<GroupState, FsE
     })
 }
 
-/// 对当前描述符作字段级提交，CRC 消费包含邻字段的当前记录。
+/// 在调用方持有卷分配锁及描述符缓冲区可变锁的前提下，原地写回 [`GroupState`] 各字段并重算块组描述符校验和（CRC32C 或 CRC16）。
 pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: GroupState) {
     for (low, high, value) in [
         (12, 44, state.free_blocks),
@@ -1126,7 +1280,10 @@ pub(crate) fn patch_group(g: &Geometry, group: u64, record: &mut [u8], state: Gr
     }
 }
 
-/// 位图 CRC 只覆盖每组实际格式规定的位数，末组仍使用整组校验长度。
+/// 计算单个块位图或 inode 位图的 CRC32C 校验和。
+///
+/// 按照 ext4 盘面规范，校验字节长度固定为 `inodes_per_group / 8` 或 `blocks_per_group / 8`（最后一个不满整组的块组同样按整组位宽计算）；
+/// 32 字节描述符格式下截断保留低 16 位。
 pub(crate) fn bitmap_checksum(g: &Geometry, bitmap: &[u8], inode: bool) -> u32 {
     let bits = if inode {
         g.inodes_per_group
@@ -1141,7 +1298,9 @@ pub(crate) fn bitmap_checksum(g: &Geometry, bitmap: &[u8], inode: bool) -> u32 {
     }
 }
 
-/// 已初始化位图先校验正式 CRC，UNINIT 的构造路径由分配器单独负责。
+/// 校验已初始化的数据块位图或 inode 位图的 CRC32C 校验和是否与块组描述符记录一致。
+///
+/// 带有 `UNINIT` 未初始化标志的位图在首次分配时由分配器在内存中直接构造，不经过此函数校验旧盘面字节。
 #[cfg(feature = "ktest")]
 pub(crate) fn verify_bitmap(
     g: &Geometry,
@@ -1163,7 +1322,7 @@ pub(crate) fn verify_bitmap(
     Ok(())
 }
 
-/// 在主超级块当前字段上提交空闲计数与本次写入时间；调用者已经串行化卷的分配。
+/// 在调用方持有卷分配锁（`allocation`）及主超级块可变锁时，按有符号增量更新全局空闲块数、空闲 inode 数、最近写入时间（`s_wtime`）与超级块 CRC32C。
 pub(crate) fn patch_super_counts(
     g: &Geometry,
     record: &mut [u8],
@@ -1192,7 +1351,7 @@ pub(crate) fn patch_super_counts(
     }
     put32(record, 16, next_inodes as u32);
 
-    // ABI: s_wtime 与 s_wtime_hi 共同编码 40 位秒数，使用与 inode 时间相同的时钟。
+    // 盘面规范：偏移 48 的 s_wtime（低 32 位）与偏移 0x274 的 s_wtime_hi（高 8 位）共同组成 40 位写入秒数。
     let write_seconds = now_ns / NSEC_PER_SEC;
     put32(record, 48, write_seconds as u32);
     record[0x274] = (write_seconds >> 32) as u8;
@@ -1205,7 +1364,11 @@ pub(crate) fn patch_super_counts(
     }
 }
 
-/// 根据统一 sector 计数选择盘面编码；超过当前格式容量时在发表前拒绝。
+/// 将内存统一维护的 512 字节扇区计数 `sectors` 转换为盘面 `i_blocks` 计数值与是否置位 `HUGE_FILE` 标志。
+///
+/// - 若 `sectors <= u32::MAX`，直接以 512 字节扇区为单位编码，不置 `HUGE_FILE`；
+/// - 若超出 32 位上限但启用了 `RO_COMPAT_HUGE_FILE`：48 位扇区数装得下时仍按扇区编码，否则切换为按文件系统块为单位并置位 `HUGE_FILE`；
+/// - 若仍超出 48 位上限或卷未开启 `RO_COMPAT_HUGE_FILE`，返回 `FsError::FileTooLarge`。
 pub(crate) fn blocks_encoding(g: &Geometry, sectors: u64) -> Result<(u64, bool), FsError> {
     if sectors <= u32::MAX as u64 {
         return Ok((sectors, false));
@@ -1223,7 +1386,9 @@ pub(crate) fn blocks_encoding(g: &Geometry, sectors: u64) -> Result<(u64, bool),
     Ok((blocks, true))
 }
 
-/// 只更新当前 inode 的大小、sector 计数、块根、修改时间及 CRC，保留未知字段和邻记录。
+/// 在元数据块可变锁内原地更新单个 inode 的大小、块计数、`HUGE_FILE` 标志、60 字节块映射根、`mtime`/`ctime` 及校验和。
+///
+/// 调用方在进入此函数前已通过预检保证时间戳与块计数可无损编码；同一磁盘块内的相邻 inode 记录及本记录其余字段保持不变。
 pub(crate) fn patch_inode_mapping(
     g: &Geometry,
     record: &mut [u8],
@@ -1251,7 +1416,7 @@ pub(crate) fn patch_inode_mapping(
     inode_checksum(g, record, next.checksum_seed, next.extra_isize);
 }
 
-/// 零化校验字段后以 inode 固定种子计算完整记录的 CRC。
+/// 先将 inode 记录内的校验和字段（偏移 124 低 16 位及可选偏移 130 高 16 位）清零，再以 `seed` 计算整条记录的 CRC32C 并写回。
 pub(crate) fn inode_checksum(g: &Geometry, record: &mut [u8], seed: u32, extra: usize) {
     if g.features_ro_compat & METADATA_CSUM == 0 {
         return;
@@ -1267,7 +1432,9 @@ pub(crate) fn inode_checksum(g: &Geometry, record: &mut [u8], seed: u32, extra: 
     }
 }
 
-/// 最终回收只清当前 inode 的内容引用和分配计数，保留 generation、未知字段和邻记录。
+/// 在 inode 彻底释放回位图前清理其磁盘记录：清零大小、块数、链接数与外部 ACL 块指针，重置空的 `i_block`（保留 Extent 头），清除内联大 EA 引用，写入 `i_dtime` 删除时间并重算 CRC。
+///
+/// 保留 `i_generation`、未知扩展字段及同块相邻 inode 记录，供后续分配复用时递增版本号。
 pub(crate) fn patch_inode_release(g: &Geometry, record: &mut [u8], seed: u32, extra: usize) {
     let flags = le32(record, 32).expect("prepared freed inode flags") & !HUGE_FILE;
     let deletion_time = le32(record, 12).expect("prepared freed inode ctime");
@@ -1293,14 +1460,16 @@ pub(crate) fn patch_inode_release(g: &Geometry, record: &mut [u8], seed: u32, ex
     inode_checksum(g, record, seed, extra);
 }
 
-/// 外部 EA 的 CRC 使用卷种子和物理块号，校验字段按零参与整块计算。
+/// 计算外部独立扩展属性（xattr）物理块的 CRC32C 校验和。
+///
+/// 种子由卷种子与 64 位物理块号小端字节混合生成，偏移 `[16, 20)` 的校验和字段自身按全零参与整块计算。
 fn xattr_block_checksum(g: &Geometry, physical: u64, bytes: &[u8]) -> u32 {
     let seed = crc32c(g.checksum_seed, &physical.to_le_bytes());
     let prefix = crc32c(seed, &bytes[..16]);
     crc32c(crc32c(prefix, &[0; 4]), &bytes[20..g.block_size])
 }
 
-/// 删除外部 EA 前校验真实头和物理块 CRC，返回其中隐藏 value inode 的准确编号。
+/// 在释放外部扩展属性块前校验其头部魔数、单块计数、非零引用计数以及整块 CRC32C，并提取其中引用的全部大属性（EA inode）编号填入 `numbers`，返回提取数量。
 pub(crate) fn verify_xattr_release(
     g: &Geometry,
     physical: u64,
@@ -1322,7 +1491,9 @@ pub(crate) fn verify_xattr_release(
     Ok(0)
 }
 
-/// inode 内 EA 的隐藏 value 逐项返回，普通内嵌值随本记录清除而不另占块。
+/// 扫描 inode 记录扩展区之后的内联扩展属性表，提取其中引用外部 EA 值 inode 的编号填入 `numbers` 并返回数量。
+///
+/// 直接内联存放值字节的普通扩展属性随 inode 记录本身一同失效，不占用独立块或外部 inode。
 pub(crate) fn inline_ea_inodes(
     g: &Geometry,
     record: &[u8],
@@ -1339,7 +1510,9 @@ pub(crate) fn inline_ea_inodes(
     Ok(0)
 }
 
-/// entry 跨度由名字长度决定；固定数组覆盖 4KiB 块内全部最小 16 字节条目。
+/// 从给定 `offset` 开始顺序遍历 xattr 条目表（以 4 字节全零头结束），收集所有 `e_value_inum != 0` 的 EA 值 inode 编号。
+///
+/// 每个条目长度按 `16 + name_len` 向上对齐到 4 字节边界；`MAX_EA_INODES` 足以容纳单个 4KiB 块内的最大条目数。
 fn xattr_ea_inodes(
     data: &[u8],
     mut offset: usize,
@@ -1360,7 +1533,7 @@ fn xattr_ea_inodes(
     }
 }
 
-/// 准备阶段已验证 entry 跨度；最终清除隐藏引用和值长度，其他 EA 字节保持原样。
+/// 在回收 inode 记录时将内联扩展属性表中指向外部 EA 值 inode 的编号（`e_value_inum`）与值长度清零。
 fn clear_inline_ea_references(record: &mut [u8], extra: usize) {
     let header = GOOD_OLD_INODE_BYTES + extra;
     if record.len() < header + 4
@@ -1379,13 +1552,14 @@ fn clear_inline_ea_references(record: &mut [u8], extra: usize) {
     }
 }
 
-/// 隐藏 EA inode 的引用计数按 ctime 高半与 i_version 低半解码，单位为 EA 引用。
+/// 解码专用于存放大尺寸扩展属性值的隐藏 EA inode 的 64 位引用计数（高 32 位存于 `i_ctime`，低 32 位存于偏移 36 的 `i_version`）。
 pub(crate) fn ea_inode_references(record: &[u8]) -> Result<u64, FsError> {
     Ok((u64::from(le32(record, 12)?) << 32) | u64::from(le32(record, 36)?))
 }
 
-/// canonical 写序列下仅减真实 EA 引用；最后引用清 nlink，存储仍由正常末使用回收。
-/// 准备已验证记录和计数，当前值仍由同卷元数据 WB 序列保护；不读盘或申请容量。
+/// 在目标 EA 值 inode 的写锁与卷元数据更新保护下，将其 64 位 EA 引用计数扣减 `count` 并原地更新记录与校验和。
+///
+/// 当引用计数归零时同步将 `i_links_count` 置为 0，使其在最后一个内存 `InodeRef` 释放时走标准无链接 inode 回收流程释放数据块与位图。
 pub(crate) fn patch_ea_inode_references(
     g: &Geometry,
     record: &mut [u8],
@@ -1412,7 +1586,7 @@ pub(crate) fn patch_ea_inode_references(
     inode_checksum(g, record, next.checksum_seed, next.extra_isize);
 }
 
-/// 共享 EA 只修改当前引用计数并重算物理块 CRC，不复制其余名字和值。
+/// 更新多个 inode 共享的外部扩展属性块头部引用计数（`h_refcount`），并在启用 `METADATA_CSUM` 时重算整块 CRC32C。
 pub(crate) fn patch_xattr_refcount(
     g: &Geometry,
     physical: u64,

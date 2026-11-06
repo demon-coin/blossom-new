@@ -1,9 +1,28 @@
-// 普通用户与文件行为保留原 inline suite，注册完整名仍属于 user::programs。
+// ============================================================================
+// 通用用户态进程、文件系统与信号 ABI 集成测试套件（通过 `include!` 内联进 `user.rs`）
+//
+// 模块职责与架构定位：
+// 本文件定义 `programs` 测试套件模块，上游由 `fs::ktest::user::anchor()` 注册到内核测试框架，
+// 下游驱动 `UserOwner` 在共享块设备库存（`UserSuite`）的基础上，为每个测试用例构建独立的文件系统视图与进程关系图。
+//
+// 核心设计（测试覆盖矩阵与生命周期）：
+// ```text
+// UserSuite (套件级共享块设备库存，不启动网络或串口中断接收)
+//   │
+//   └── UserOwner (每个测试用例独立创建的运行夹具)
+//         ├── 1. 动态链接与 ELF 装载：musl/glibc 动态链接器、PT_INTERP、ET_DYN、低地址入口、稀疏 BSS、重叠段、准备回滚
+//         ├── 2. 管道与多路复用：pipe/pipe2、writev 原子记录、SIGPIPE、poll/select/pselect6/ppoll、epoll (LT/ET/ONESHOT)
+//         ├── 3. 运行时环境与系统视图：uname/chroot、utimensat、硬件时钟与睡眠、RLIMIT_STACK、TLS 跨核迁移、#! 脚本、PID 1 孤儿收养
+//         ├── 4. 磁盘与设备语义：只读挂载点设备 mmap 拒绝优先级、块/字符设备节点 unlink/rename 后释放磁盘 Inode 位、冷重开写回同步、非 root 目录搜索权限
+//         ├── 5. 进程克隆与信号投递：clone 标志轴、保留 fd 隔离、标准/实时信号排队、SA_NODEFER/SA_RESETHAND、ucontext 寄存器/FPU/向量帧修改、COW 信号栈、时钟抢占
+//         └── 6. 同步原语与生命周期：futex 等待/唤醒/重排/clear_child_tid、非主线程 execve 接管、vfork、进程组停止/继续、僵尸收割与在途 DMA 读取取消
+// ```
+// ============================================================================
 #[ktest::suite(fixture = UserOwner, suite_resources = UserSuite, context = "Thread", tags("user-elf", "user-abi", "user-signal", "fs-path", "fs-oom"), resources("root"), timeout_ms = 90000)]
 pub(crate) mod programs {
     use super::*;
 
-    /// 原 musl 聚合程序在真实族根执行 argv/env，主映像与解释器身份从用户栈核对。
+    /// 测试目标：验证 musl 动态链接器（`ld-musl`）在独立根目录下装载动态链接聚合测试程序，并校验用户栈上的 `argv`、`envp` 及主程序与解释器身份。
     #[test]
     #[case("argv", b"argv" as &[u8])]
     #[case("env", b"env" as &[u8])]
@@ -16,7 +35,7 @@ pub(crate) mod programs {
         fixture.runtime_dynamic(context, b"/musl", selector)
     }
 
-    /// 原 glibc PIE 聚合程序在真实族根执行 argv/env，退出与离栈仍由原拥有者消费。
+    /// 测试目标：验证 glibc PIE 动态链接程序在独立根目录下的装载与执行，校验 `argv`/`envp` 传递以及进程退出与内核栈回收。
     #[test]
     #[case("argv", b"argv" as &[u8])]
     #[case("env", b"env" as &[u8])]
@@ -29,7 +48,7 @@ pub(crate) mod programs {
         fixture.runtime_dynamic(context, b"/glibc", selector)
     }
 
-    /// 原 loader 自身作为无 PT_INTERP 的 ET_DYN 入口启动，再由其正常执行原聚合程序。
+    /// 测试目标：验证将动态链接器（Loader）自身作为不含 `PT_INTERP` 段的 `ET_DYN` 可执行文件直接启动，并由其加载并运行目标动态程序。
     #[test]
     #[case("musl", b"/musl" as &[u8])]
     #[case("glibc", b"/glibc" as &[u8])]
@@ -42,7 +61,7 @@ pub(crate) mod programs {
         fixture.runtime_loader(context, family)
     }
 
-    /// 两映像的非 VM fork 保留两份 inode 执行责任，真实末程序退出后才允许写准备。
+    /// 测试目标：验证包含主程序与解释器两个可执行映像的进程在 `fork`（非共享 VM）后，父子进程均持有对两个底层 Inode 的执行写拒绝引用（`ETXTBSY`），直到最后一个进程退出后才允许以写模式打开。
     #[test]
     #[case("musl", b"/musl" as &[u8])]
     #[case("glibc", b"/glibc" as &[u8])]
@@ -55,7 +74,7 @@ pub(crate) mod programs {
         fixture.runtime_fork(context, family)
     }
 
-    /// 解释器普通错误与真实 OOM 只销毁候选，旧两映像随后仍正常运行并完整退出。
+    /// 测试目标：验证在 `execve` 加载解释器阶段遭遇普通错误或堆内存耗尽（OOM）时，仅销毁新创建的候选映像，原进程的旧主程序与解释器映像仍保持完好并能正常执行退出。
     #[test]
     #[case("musl", b"/musl" as &[u8])]
     #[case("glibc", b"/glibc" as &[u8])]
@@ -68,14 +87,14 @@ pub(crate) mod programs {
         fixture.runtime_failures(context, family)
     }
 
-    /// 普通只读日志验证独立 open、共享 dup、覆盖恢复和真实用户复制错误的消费点。
+    /// 测试目标：验证 `/dev/kmsg` 只读内核日志设备在多次独立 `open`、共享 `dup` 描述符、环形缓冲区覆盖恢复以及用户缓冲区缺页错误（`EFAULT`）下的读取游标语义。
     #[test]
     #[ktest(tags("observation-user", "kmsg"))]
     fn observation_kmsg(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.observation_mode(context, b"kmsg")
     }
 
-    /// 真实 ELF 的边缘、BSS、参数和缓存私有性由 loader 与实际用户指令共同验证。
+    /// 测试目标：验证 ELF 装载器对段页边界、BSS 段清零、命令行参数栈布局以及页面缓存写时复制（COW）私有性的综合处理。
     #[test]
     #[ktest(min_cpus = 2)]
     fn load_boundaries_stack_and_disk_program(
@@ -85,7 +104,7 @@ pub(crate) mod programs {
         layout::run(context, fixture)
     }
 
-    /// 0644固定映像实际从页零或0x100进入，跨页程序头和未消费元数据不阻断执行。
+    /// 测试目标：验证固定地址 ELF 映像从零页（`0x0`）或低地址（`0x100`）入口启动，且跨页的程序头表（Program Header）与未使用的扩展元数据不会阻碍装载执行。
     #[test]
     #[case("page_zero", 0)]
     #[case("low_vendor_phdr", 0x100)]
@@ -98,14 +117,14 @@ pub(crate) mod programs {
         layout::direct_low(context, fixture, entry)
     }
 
-    /// 大BSS和远端LOAD只按实际用户触页驻留，仍由原fixture消费退出与全部资源。
+    /// 测试目标：验证包含超大稀疏 BSS 段与远端 `PT_LOAD` 段的 ELF 映像采用按需缺页分配（Demand Paging），仅实际触碰的虚拟页分配物理内存，并在退出时完整回收。
     #[test]
     #[ktest(tags("elf-direct-load"), min_cpus = 2)]
     fn direct_elf_sparse_bss(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         layout::direct_sparse(context, fixture)
     }
 
-    /// 合法重叠LOAD的文件后写与BSS清零由用户指令及完整内存字节共同消费。
+    /// 测试目标：验证合法重叠的 `PT_LOAD` 段在装载时按顺序覆盖写入文件内容并正确清零各自对应的 BSS 尾部字节。
     #[test]
     #[ktest(tags("elf-direct-load"), min_cpus = 2)]
     fn direct_elf_overlapping_segments(
@@ -115,7 +134,7 @@ pub(crate) mod programs {
         layout::direct_overlap(context, fixture)
     }
 
-    /// OOM、坏参数和未发表归还之后仍正常运行原真实程序。
+    /// 测试目标：验证 `execve` 与进程准备阶段遭遇 OOM、非法参数地址及未发布放弃（Abandon）回滚后，原先已加载的正常 ELF 程序仍能正常启动并完成退出。
     #[test]
     fn failed_preparation_keeps_original_program(
         context: &mut TestContext<'_>,
@@ -124,7 +143,7 @@ pub(crate) mod programs {
         preparation::run(context, fixture)
     }
 
-    /// 用户指令核文件真实前缀/cookie、只读边界、映射和堆内容，退出仍由正常图回收。
+    /// 测试目标：验证常规文件的读写偏移、目录项 `d_off` 游标（Cookie）、只读边界、文件内存映射（`mmap`）及 `brk` 堆扩展的用户态 ABI 行为。
     #[test]
     fn file_delivery_and_mapping_abi(
         context: &mut TestContext<'_>,
@@ -136,7 +155,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 两个真实用户进程共享管道OFD，读完最后writer的尾部后才见EOF。
+    /// 测试目标：验证父子两个用户进程通过 `fork` 与 `dup` 共享同一个管道打开文件描述（OFD）时，读者在读完最后一个写者写入的全部尾部数据并关闭所有写端后才观察到 EOF。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
     fn pipe_fork_dup_full_stream_tail_and_eof(
@@ -146,7 +165,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"d")
     }
 
-    /// 两个writer把总长度4096的writev作为一笔请求提交，逐record核字节不交错。
+    /// 测试目标：验证两个并发写进程各自通过 `writev` 提交总长不超过 `PIPE_BUF`（4096 字节）的多段向量写入时，每次 `writev` 作为原子记录写入管道，读者读出的数据块互不交错。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
     fn pipe_small_writev_records_across_writers(
@@ -156,7 +175,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"a")
     }
 
-    /// NONBLOCK容量不足保EAGAIN，零长和跨页故障保已经真正消费的前缀。
+    /// 测试目标：验证非阻塞管道（`O_NONBLOCK`）在剩余容量不足时返回 `EAGAIN`，以及零长度读写与跨页内存拷贝故障（`EFAULT`）时保留已成功传输的前缀字节数。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
     fn pipe_nonblocking_capacity_zero_and_fault_prefix(
@@ -166,7 +185,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"n")
     }
 
-    /// 已解码iov只进入一次普通文件操作，长度边界与共享位置按实际字节推进。
+    /// 测试目标：验证 `readv`/`writev` 导入 `iovec` 数组后作为单次文件操作执行，正确处理长度溢出边界并按实际传输字节数推进共享文件偏移量。
     #[test]
     #[ktest(tags("fs-pipe", "fs-vector-user"))]
     fn file_vector_import_and_shared_position(
@@ -176,7 +195,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"v")
     }
 
-    /// 无reader的非零write由写者线程领取SIGPIPE，忽略、默认和阻塞mask保持各自语义。
+    /// 测试目标：验证向已无读者的管道写入非零字节时，写者线程收到 `SIGPIPE` 信号并按忽略（返回 `EPIPE`）、默认终止或信号掩码阻塞三种配置分别表现正确语义。
     #[test]
     #[case("ignored", b"i" as &[u8])]
     #[case("default_child", b"s" as &[u8])]
@@ -190,7 +209,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, mode)
     }
 
-    /// 已经真正Blocked的read由普通信号中断，SA_RESTART仅由原用户返回协议决定重放。
+    /// 测试目标：验证已进入睡眠阻塞态的管道 `read` 被普通信号中断时，根据信号处理函数是否设置 `SA_RESTART` 分别返回 `EINTR` 或在信号返回后自动重启读取。
     #[test]
     #[case("interrupted", b"e" as &[u8])]
     #[case("restart", b"r" as &[u8])]
@@ -203,7 +222,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, mode)
     }
 
-    /// pipe2输出错误与第二槽不足只取消本次未发表预留，已有描述符与容量不改变。
+    /// 测试目标：验证 `pipe2` 在写回用户态数组发生缺页故障（`EFAULT`）或第二个文件描述符槽位耗尽（`EMFILE`）时，完整回滚本次预留的描述符与管道对象，不污染原有描述符表。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
     fn pipe2_output_fault_and_second_slot_exhaustion(
@@ -213,7 +232,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"f")
     }
 
-    /// 非root用户创建的匿名端点保留真实uid/gid，属性由正常fstat交付。
+    /// 测试目标：验证非 root 凭据进程创建的匿名管道端点记录创建者自身的 `uid`/`gid`，并可通过 `fstat` 准确读取。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user"))]
     fn pipe_creator_credentials_in_anonymous_stat(
@@ -223,7 +242,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"u")
     }
 
-    /// 普通pread/pwrite先按OFD位置能力返回ESPIPE，错误端点和地址不改变优先级。
+    /// 测试目标：验证对管道文件描述符调用带偏移量的 `pread64`/`pwrite64` 时，优先根据不支持随机寻址的 OFD 能力返回 `ESPIPE`，先于文件读写方向与用户缓冲区地址检查。
     #[test]
     #[ktest(tags("fs-pipe", "fs-pipe-user", "fs-pipe-positioned"))]
     fn pipe_positioned_io_error_precedence(
@@ -233,7 +252,7 @@ pub(crate) mod programs {
         fixture.pipe_abi(context, b"p")
     }
 
-    /// 目标指令核对 poll 数组、select 集合跨度、重复 fd 计数及实际错误顺序。
+    /// 测试目标：验证 `poll` 数组、`select` 位图跨度、同一文件描述符重复登记计数以及非法参数错误码的检查优先级。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T10", "T12"))]
     fn poll_select_raw_abi_and_errors(
@@ -243,14 +262,14 @@ pub(crate) mod programs {
         fixture.events_abi(context, b"a")
     }
 
-    /// 零 fd 的有限等待消耗原绝对期限，普通结果不被剩余时间写回错误覆盖。
+    /// 测试目标：验证零文件描述符集合下的定时等待（`poll`/`select`/`pselect6`）准确消耗指定的超时时间，且正常超时返回结果不会被写回剩余时间结构体时的 `EFAULT` 错误覆盖。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T09"))]
     fn zero_fd_deadlines(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.events_abi(context, b"t")
     }
 
-    /// 三种等待各自进入真实 Blocked 后才让子进程写管道，通知通过生产源返回。
+    /// 测试目标：验证 `poll`、`select` 与 `epoll_wait` 三种多路复用等待均在真正进入睡眠阻塞态后，由子进程向管道写入数据触发唤醒，并通过正常事件路径返回就绪。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T11"))]
     fn persistent_event_blocked_notifications(
@@ -260,7 +279,7 @@ pub(crate) mod programs {
         fixture.events_abi(context, b"b")
     }
 
-    /// 真处理函数观察临时 mask，返回后旧 mask 恢复且等待不受 SA_RESTART 重启。
+    /// 测试目标：验证 `pselect6`/`ppoll`/`epoll_pwait` 原子替换临时信号掩码后，信号处理函数执行期间观察到临时掩码，处理函数返回后恢复原掩码且等待调用本身不受 `SA_RESTART` 自动重启。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T09"))]
     fn temporary_mask_handler_restore(
@@ -270,14 +289,14 @@ pub(crate) mod programs {
         fixture.events_abi(context, b"s")
     }
 
-    /// raw 事件交付保留 data 高位，ADD、MOD 和 LT、ET、ONESHOT 消费同一真实管道。
+    /// 测试目标：验证 `epoll` 事件投递完整保留 64 位 `epoll_data_t` 高低位数据，并在同一管道上验证 `EPOLL_CTL_ADD`/`EPOLL_CTL_MOD` 以及水平触发（LT）、边缘触发（ET）和单次触发（`EPOLLONESHOT`）模式。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T12", "T13", "T15"))]
     fn epoll_ready_modes(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.events_abi(context, b"e")
     }
 
-    /// dup 登记与复用后的新 OFD 分别保持身份，末端点关闭同步解除原登记。
+    /// 测试目标：验证通过 `dup` 复制的文件描述符与关闭后复用的同号新文件描述符在 `epoll` 中保持各自独立的底层打开文件（OFD）身份，且仅当底层 OFD 的最后一个引用关闭时才自动从 `epoll` 注销。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T14", "T18"))]
     fn epoll_dup_fd_reuse_final_close(
@@ -287,7 +306,7 @@ pub(crate) mod programs {
         fixture.events_abi(context, b"r")
     }
 
-    /// 首项 EFAULT 与跨页正前缀分别保留未交付候选，下次正常输出继续交付。
+    /// 测试目标：验证 `epoll_wait` 向用户空间写回事件数组时，若首项即发生 `EFAULT` 或在跨页写入部分事件后发生 `EFAULT`，所有尚未成功交付给用户态的就绪事件均会保留在就绪队列中供下次 `epoll_wait` 继续读取。
     #[test]
     #[ktest(tags("fs-events", "fs-events-user", "T17"))]
     fn epoll_output_fault_prefix(
@@ -297,7 +316,7 @@ pub(crate) mod programs {
         fixture.events_abi(context, b"f")
     }
 
-    /// 普通 C 经真实 uname/chroot 系统调用核字节故障、旧 cwd/FD 和独立父子根。
+    /// 测试目标：验证用户态 C 程序通过 `uname` 与 `chroot` 系统调用检验无效缓冲区地址故障、切换根目录后旧 `cwd`/已打开目录描述符的相对解析语义，以及父子进程各自独立的根目录视图。
     #[test]
     #[case("root", Credentials::ROOT)]
     #[case("nonroot", Credentials { uid: 1000, gid: 2000 })]
@@ -310,7 +329,7 @@ pub(crate) mod programs {
         fixture.runtime_view(context, credentials)
     }
 
-    /// 原生 C 在可写卷核时间字段、特殊纳秒和权限，用户操作的实际错误不能由根 fixture 覆盖。
+    /// 测试目标：验证用户态 C 程序在可写挂载卷上通过 `utimensat` 修改文件时间戳、特殊纳秒值（`UTIME_NOW`/`UTIME_OMIT`）及非特权用户的权限拒绝检查。
     #[test]
     #[case("root", Credentials::ROOT)]
     #[case("nonroot", Credentials { uid: 1000, gid: 2000 })]
@@ -326,14 +345,14 @@ pub(crate) mod programs {
         fixture.runtime_file_times(context, credentials)
     }
 
-    /// 原生 C 从硬件 UTC 核日期字段和绝对睡眠，单调与 CPU 账保持各自语义。
+    /// 测试目标：验证用户态 C 程序读取硬件实时时钟（`CLOCK_REALTIME`）转换日期字段、执行基于 `CLOCK_MONOTONIC` 的绝对时间睡眠，并校验单调时钟与进程 CPU 时间账本各自的推进语义。
     #[test]
     #[ktest(tags("runtime-clock", "user-libc", "fs-path"), timeout_ms = 120000)]
     fn runtime_clock(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.runtime_clock(context)
     }
 
-    /// 根凭据从真实 C 程序消费限额、fork 与 exec 主栈范围，退出后沿原用户拥有者归还。
+    /// 测试目标：验证具有 root 凭据的用户态 C 程序查询与修改 `RLIMIT_STACK` 资源限额，并验证该限额对 `fork` 与 `execve` 后新主栈自动增长范围的约束。
     #[test]
     #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
     fn runtime_stack_limits_root(
@@ -343,7 +362,7 @@ pub(crate) mod programs {
         fixture.runtime_limits(context, Credentials::ROOT)
     }
 
-    /// 非根凭据从真实 C 程序核限额权限和 exec 范围，用户错误不被 fixture 根凭据覆盖。
+    /// 测试目标：验证非 root 凭据的用户态 C 程序修改 `RLIMIT_STACK` 硬限额时的权限拒绝（`EPERM`）以及软限额下调后对 `execve` 栈空间的约束。
     #[test]
     #[ktest(tags("runtime-limits"), min_cpus = 1, timeout_ms = 120000)]
     fn runtime_stack_limits_nonroot(
@@ -359,28 +378,28 @@ pub(crate) mod programs {
         )
     }
 
-    /// 普通静态 C 从真实磁盘启动，核 TLS、主栈、标准流和基础文件 ABI。
+    /// 测试目标：验证静态链接的 C 标准库（libc）程序从磁盘启动，完成线程局部存储（TLS）初始化、主栈访问、标准输入输出流读写及基础文件操作。
     #[test]
     #[ktest(tags("T31", "user-libc"), timeout_ms = 120000)]
     fn libc_static_smoke(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.libc_static_smoke(context)
     }
 
-    /// 同一用户 Task 在两次 pipe 唤醒窗口实际迁核并校验 TLS 与浮点现场。
+    /// 测试目标：验证同一个用户态线程在两次管道唤醒之间发生跨 CPU 迁移（Migration）时，其线程局部存储（TLS）指针与浮点/向量寄存器上下文保持完好无损。
     #[test]
     #[ktest(min_cpus = 2, tags("T31", "user-libc"), timeout_ms = 120000)]
     fn libc_migration(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.libc_migration(context)
     }
 
-    /// 普通脚本的解释器参数、环境和原始执行路径由实际用户程序核验。
+    /// 测试目标：验证以 `#!`（Shebang）开头的脚本文件通过 `execve` 启动时，内核正确解析解释器路径、可选参数并向解释器传递原始脚本路径与环境变量。
     #[test]
     #[ktest(tags("T32", "user-script"), timeout_ms = 120000)]
     fn script_exec(context: &mut TestContext<'_>, fixture: &mut UserOwner) -> TestResult {
         fixture.script_exec(context)
     }
 
-    /// 系统根以普通 fork、pipe 和 wait 消费两类孤儿后才请求真实 PowerOff 意图。
+    /// 测试目标：验证作为命名空间初始进程（PID 1）的系统根进程通过 `fork`、`pipe` 与 `wait` 收养并回收两类孤儿进程（直接子进程派生的孙进程与多线程非主线程派生的孤儿）后，正常发起关机（`PowerOff`）请求。
     #[test]
     #[ktest(tags("T33", "fs-system-user", "fs-pid1"), timeout_ms = 120000)]
     fn system_pid1_adopts_orphans(
@@ -390,7 +409,7 @@ pub(crate) mod programs {
         fixture.system_pid1_adopts_orphans(context)
     }
 
-    /// 同号码内核根按普通 SIGKILL 退出，两种真实凭据分别核 reboot 权限与参数错误。
+    /// 测试目标：验证普通测试夹具下的根进程（非系统级 PID 1）仍可被未捕获的 `SIGKILL` 正常终止，并分别在 root 与非 root 凭据下检验 `reboot` 系统调用的权限检查与非法魔数/命令字错误。
     #[test]
     #[case("root", false)]
     #[case("nonroot", true)]
@@ -403,7 +422,7 @@ pub(crate) mod programs {
         fixture.fixture_root_signal_semantics(context, nonroot)
     }
 
-    /// 用户指令从 RO devfs 的 RDWR 设备请求共享写映射，能力拒绝先于挂载写检查。
+    /// 测试目标：验证当用户进程对只读挂载（`ReadOnly`）的 `devfs` 中以读写模式打开的字符设备请求 `MAP_SHARED | PROT_WRITE` 内存映射时，优先因为设备本身不支持共享写映射能力而返回 `ENODEV`/`EACCES`，先于挂载点只读写保护检查。
     #[test]
     #[ktest(tags("T04", "T30", "fs-device-mapping"))]
     fn device_mapping_capability_precedes_mount_write(
@@ -431,7 +450,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 正常盘面设备节点经 unlink 或 rename 覆盖结束链接，末使用归还实际inode位而不解释设备号为块树。
+    /// 测试目标：验证磁盘上的字符设备与块设备节点在通过 `unlink` 删除或被 `rename` 覆盖使硬链接数归零后，当最后一个内存 Inode 引用释放时，正确归还磁盘上的 Inode 位图分配位，且不会将设备号（`rdev`）误当作数据块树去释放。
     #[test]
     #[case("unlink_character", false)]
     #[case("replace_block", true)]
@@ -472,6 +491,7 @@ pub(crate) mod programs {
             true,
         );
 
+        // Step 1: 根据测试用例分支，通过 rename 覆盖或直接 unlink 将目标设备节点的目录硬链接数降为 0。
         if replace {
             drop(checked(
                 context,
@@ -522,6 +542,7 @@ pub(crate) mod programs {
         }
         context.expect_eq(checked(context, inode.metadata_snapshot())?.links, 0);
 
+        // Step 2: 释放内存中持有的 Inode 与 Path 引用，触发 VFS 清理并等待后台写回/回收工作队列完成，验证磁盘 Inode 位图已归零。
         let watch = fixture.path.owner.cache().watch();
         drop(inode);
         drop(path);
@@ -535,7 +556,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 同一磁盘 ELF 的普通写入与同步后冷读取复用原 UserOwner、真实退出和最终资源比较。
+    /// 测试目标：验证对磁盘上的 ELF 文件执行常规写入并同步落盘后，丢弃缓存冷重开（Cold Reopen）该文件仍能正常装载执行且内容完整。
     #[test]
     #[ktest(min_cpus = 2, tags("W35", "fs-writeback"))]
     fn production_writeback_sync_and_cold_reopen(
@@ -545,7 +566,7 @@ pub(crate) mod programs {
         fixture.production_writeback_cold_reopen(context)
     }
 
-    /// 非owner用户指令核目录读DAC、逐组件search及拒绝后原游标和最低空槽。
+    /// 测试目标：验证非文件属主（非 root）的用户进程在读取目录、按路径逐层搜索（Search）时的自主访问控制（DAC）权限拦截，以及访问被拒绝后原有目录读取游标与最低空闲文件描述符槽位保持不变。
     #[test]
     fn nonroot_directory_search_and_access(
         context: &mut TestContext<'_>,
@@ -591,7 +612,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 四个代表路径覆盖私有fork、共享VM、独立组共享动作及线程组，不穷举共享轴。
+    /// 测试目标：验证 `clone` 系统调用在四种典型资源共享组合（传统私有 `fork`、共享地址空间 `CLONE_VM`、独立进程但共享信号处理器 `CLONE_SIGHAND`、以及完整线程组 `CLONE_THREAD`）下的 TLS 设置与资源隔离语义。
     #[test]
     #[ktest(min_cpus = 2)]
     fn clone_tls_and_resource_axes(
@@ -607,7 +628,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 另一真实Task保父fd0预留时rawfork，child普通open获得0且原OFD/flags关系不变。
+    /// 测试目标：验证当父进程有另一个线程正处于文件描述符槽位 `fd 0` 的并发预留阶段（尚未提交打开文件）时执行 `fork`，子进程不会继承该未提交的预留槽位，因此子进程随后调用 `open` 能够直接分配到 `fd 0`。
     #[test]
     #[ktest(min_cpus = 2)]
     fn fork_does_not_inherit_reserved_descriptor(
@@ -620,7 +641,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 普通/private/group合并、RT FIFO及真实队列耗尽由raw程序逐实例核对。
+    /// 测试目标：验证标准信号（合并去重）、线程私有挂起队列与进程组共享挂起队列的优先级、实时信号（RT Signal）按 FIFO 顺序排队以及实时信号队列容量上限耗尽时的处理语义。
     #[test]
     fn signal_pending_and_realtime_queue(
         context: &mut TestContext<'_>,
@@ -632,7 +653,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 同一SIGHAND和VM共享者仍有各自进程组pending，clone后旧pending不继承。
+    /// 测试目标：验证仅共享 `CLONE_VM | CLONE_SIGHAND` 但未设置 `CLONE_THREAD` 的两个独立进程各自维护独立的进程组级挂起信号队列（Group Pending），且 `clone` 创建的子进程不会继承父进程已挂起的未决信号。
     #[test]
     fn signal_shared_vm_distinct_group_pending(
         context: &mut TestContext<'_>,
@@ -644,7 +665,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// NODEFER、动作mask、RESETHAND和默认忽略均观察处理函数实际执行次数。
+    /// 测试目标：验证信号处理动作中的 `SA_NODEFER`（不自动掩蔽当前信号）、自定义 `sa_mask`、`SA_RESETHAND`（进入处理器前重置为默认动作）以及默认忽略信号的实际触发次数。
     #[test]
     fn signal_action_mask_and_selected_consumption(
         context: &mut TestContext<'_>,
@@ -659,7 +680,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// clone已接受的零退出信号不误发SIGCHLD，普通SIGCHLD分支仍真实递送。
+    /// 测试目标：验证通过 `clone` 创建且指定退出通知信号为 `0` 的子进程在退出时不会误向父进程发送 `SIGCHLD`，而指定了 `SIGCHLD` 的普通子进程退出时仍正常投递信号。
     #[test]
     #[ktest(min_cpus = 2)]
     fn signal_clone_exit_notification_semantics(
@@ -670,7 +691,7 @@ pub(crate) mod programs {
         fixture.signal_clone_exit_notification(context)
     }
 
-    /// 无handler停续后参数EFAULT恢复原mask，后续普通handler不消费残留saved_mask。
+    /// 测试目标：验证进程在无自定义处理函数的停止/继续（Stop/Continue）信号往返后，若系统调用因参数 `EFAULT` 失败返回，仍能正确恢复调用前的原始信号掩码，防止后续信号处理函数误消费残留的 `saved_mask`。
     #[test]
     #[ktest(min_cpus = 2)]
     fn signal_sigsuspend_restart_restores_mask(
@@ -681,7 +702,7 @@ pub(crate) mod programs {
         fixture.signal_suspend_restart_mask(context)
     }
 
-    /// 逐个 FP/向量寄存器、FCSR/FCC 和用户修改 PC/SP 经信号往返，LA 还必须经历真实用户 timer。
+    /// 测试目标：验证信号处理帧（Signal Frame）对全部浮点寄存器、向量寄存器、浮点控制状态寄存器（FCSR/FCC）的保存与恢复，以及在信号处理函数中直接修改 `ucontext` 里的 `PC`/`SP` 后经 `rt_sigreturn` 跳转到新位置继续执行（在 LoongArch64 上同时验证跨用户态时钟中断的向量上下文完整性）。
     #[test]
     fn signal_frame_registers_and_edited_context(
         context: &mut TestContext<'_>,
@@ -700,7 +721,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 同步缺页、权限、整页EOF和非法指令核siginfo与发生时PC，用户改帧后实际续行。
+    /// 测试目标：验证匿名缺页、写只读页权限异常、访问超出文件末尾整页映射触发的 `SIGBUS` 以及非法指令触发的 `SIGILL` 均能向信号处理函数提供准确的 `siginfo_t` 与故障指令 `PC`，并在处理函数修正上下文后恢复执行。
     #[test]
     fn signal_synchronous_fault_info_and_resume(
         context: &mut TestContext<'_>,
@@ -712,7 +733,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 子进程嵌套altstack后真实父wait，并逐字核父私有页未被内核frame写入污染。
+    /// 测试目标：验证子进程在备用信号栈（`sigaltstack`）上嵌套触发信号并写入信号帧时，严格遵守写时复制（COW）隔离，父进程的私有物理页内容不被子进程的内核信号帧写入污染。
     #[test]
     fn signal_nested_altstack_and_frame_cow(
         context: &mut TestContext<'_>,
@@ -724,7 +745,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 读取坏sigreturn和写入无效栈均有限SIGSEGV，不把用户异常当框架panic。
+    /// 测试目标：验证用户程序伪造非法的 `rt_sigreturn` 栈帧、将栈指针指向不可写地址后触发信号、或在信号帧中篡改特权状态位时，内核均会安全地以 `SIGSEGV`（信号编号 11）终止该用户进程而不会引发内核 panic。
     #[test]
     fn signal_invalid_frames_terminate(
         context: &mut TestContext<'_>,
@@ -742,7 +763,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// REAL中断相对/绝对sleep，waitid分别核SA_RESTART与EINTR，futex信号沿下一批。
+    /// 测试目标：验证实时定时器信号中断相对睡眠（`nanosleep`）与绝对时钟睡眠（`clock_nanosleep`），以及中断 `waitid` 时根据 `SA_RESTART` 标志分别自动重启或返回 `EINTR`。
     #[test]
     fn signal_sleep_and_wait_restart_policy(
         context: &mut TestContext<'_>,
@@ -754,7 +775,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// stop/continue后restart_syscall仍消费原期限，不把重启当作新相对请求。
+    /// 测试目标：验证相对睡眠在被作业控制停止/继续（Stop/Continue）信号打断并通过 `restart_syscall` 恢复等待时，沿用初次进入睡眠时换算出的原绝对到期时间，而不会将重启当作一次全新的相对时长重新计时。
     #[test]
     fn signal_sleep_restart_keeps_deadline(
         context: &mut TestContext<'_>,
@@ -766,7 +787,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// waitid的stopped/continued来自真实双成员组，父与独立共享VM组不混合。
+    /// 测试目标：验证包含两个线程的子进程组在收到停止/继续信号时，父进程通过 `waitid`（`WSTOPPED | WCONTINUED`）准确观察到组停止与组继续事件，且不会与另一个仅共享 VM 的独立进程组混淆。
     #[test]
     fn signal_group_stop_continue_waitid(
         context: &mut TestContext<'_>,
@@ -778,7 +799,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 两CPU间发送SIGKILL之前，原CPU必须timer抢占无限用户计算并推进另一个内核Task。
+    /// 测试目标：验证当一个 CPU 上的用户进程陷入死循环计算时，本地时钟中断能够正常抢占该用户任务并调度同核上的其他内核任务运行，随后支持从另一个 CPU 发送 `SIGKILL` 将该死循环进程终止。
     #[test]
     #[ktest(min_cpus = 2)]
     fn signal_timer_preempts_infinite_user_and_remote_kill(
@@ -789,7 +810,7 @@ pub(crate) mod programs {
         fixture.preempt_infinite(context)
     }
 
-    /// 用户/内核CPU账、times的USER_HZ和CPU itimer不把offCPU睡眠算成执行。
+    /// 测试目标：验证用户态与内核态 CPU 时间统计（`times` 系统调用的 `USER_HZ` 滴答数与 `ITIMER_PROF`/`ITIMER_VIRTUAL` 间隔定时器）仅累加进程实际在 CPU 上运行的耗时，不会将睡眠阻塞（Off-CPU）时间计入执行账本。
     #[test]
     fn signal_cpu_time_and_interval_timers(
         context: &mut TestContext<'_>,
@@ -801,7 +822,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 不可中断原页加载先完成真实盘责任和用户read，再到返回点处理已经pending的信号。
+    /// 测试目标：验证当进程正在执行不可中断的磁盘文件页读取（等待块设备 I/O 完成）期间收到普通信号时，内核会先完成底层的物理页 DMA 读取并将数据拷贝到用户缓冲区，直到系统调用即将返回用户态时才处理挂起的信号。
     #[test]
     #[ktest(min_cpus = 2)]
     fn signal_wait_keeps_file_read_responsibility(
@@ -812,7 +833,7 @@ pub(crate) mod programs {
         fixture.signal_during_file_wait(context)
     }
 
-    /// 不改用户字的真实唤醒、两种Mm隔离和共享匿名不同VA均由普通用户指令验证。
+    /// 测试目标：验证 `futex` 在等待字未改变时的正常阻塞与唤醒、两个独立地址空间（`Mm`）同虚拟地址的私有 futex 隔离、以及同一共享匿名页映射到不同虚拟地址时的共享 futex 键值匹配。
     #[test]
     #[ktest(min_cpus = 2)]
     fn futex_wait_wake_and_mapping_keys(
@@ -826,7 +847,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 重排保原身份/期限，取消从当前位置消费一次，bitset配额只计被选择者。
+    /// 测试目标：验证 `FUTEX_WAIT_BITSET` 与 `FUTEX_CMP_REQUEUE` 组合操作：重排（Requeue）到目标等待队列后仍保留等待者原有的位掩码与超时绝对期限，因超时或信号取消时仅从当前所在队列移除一次，且位掩码唤醒配额只统计位集匹配的等待者。
     #[test]
     #[ktest(min_cpus = 2)]
     fn futex_bitset_requeue_signal_and_timeout(
@@ -837,7 +858,7 @@ pub(crate) mod programs {
         fixture.futex_program(context, b"r")
     }
 
-    /// 用户以实际child_tid等待join；旧Mm清零唤醒与坏地址退出均完成正常回收。
+    /// 测试目标：验证线程退出时对 `clear_child_tid` 地址执行清零并唤醒其上的 `futex` 等待者（用于 `pthread_join` 同步）；同时验证即使 `clear_child_tid` 指向已解除映射或非法的用户地址，线程也能忽略该写错误并正常完成退出回收。
     #[test]
     #[ktest(min_cpus = 2)]
     fn futex_clear_child_tid_and_bad_exit_address(
@@ -848,7 +869,7 @@ pub(crate) mod programs {
         fixture.futex_program(context, b"t")
     }
 
-    /// SA_RESTART恢复原用户请求，停续后的相对等待保首次期限且不重读已解除参数页。
+    /// 测试目标：验证 `futex` 等待被带 `SA_RESTART` 的信号中断后能按原参数自动重启，且被停止/继续信号打断的相对超时等待在重启时保留首次计算的绝对到期时间，不会重新读取用户空间中可能已被解除映射的 `timespec` 参数页。
     #[test]
     #[ktest(min_cpus = 2)]
     fn futex_signal_restart_parameters_and_deadline(
@@ -862,7 +883,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 非leader沿原Task转移Linux身份；两个实际exec只允许唯一新映像或真实组fatal。
+    /// 测试目标：验证多线程进程中由非主线程（Non-leader）发起 `execve` 时，能够杀死同组其他线程并复用原主线程的 PID 接管进程身份；同时验证两个线程并发发起 `execve` 或与组致命信号并发时的互斥控制。
     #[test]
     #[ktest(min_cpus = 2)]
     fn exec_nonleader_and_concurrent_control(
@@ -873,7 +894,7 @@ pub(crate) mod programs {
         fixture.lifecycle_exec(context)
     }
 
-    /// 外部共享files/sighand不被exec修改，旧根保活，新映像与CLOEXEC由普通程序验证。
+    /// 测试目标：验证当进程与外部进程共享文件描述符表（`CLONE_FILES`）或信号处理器表（`CLONE_SIGHAND`）时执行 `execve`，内核会先解耦（Unshare）对应表而不破坏外部共享者的状态，同时正确处理 `O_CLOEXEC` 关闭与新旧地址空间（`Mm`）交接。
     #[test]
     #[ktest(min_cpus = 2)]
     fn exec_shared_resources_and_mm_handoff(
@@ -884,7 +905,7 @@ pub(crate) mod programs {
         fixture.lifecycle_resources(context)
     }
 
-    /// vfork按旧Mm使用结束恢复父；父被取消后子仍独立退出并完成转亲回收。
+    /// 测试目标：验证 `vfork` 创建的子进程在调用 `execve` 或 `_exit` 释放旧地址空间借用后立即唤醒父进程；若父进程在等待期间被致命信号取消，子进程仍能独立完成执行并转交祖父/初始进程收养回收。
     #[test]
     #[ktest(min_cpus = 2)]
     fn vfork_exec_exit_and_parent_cancellation(
@@ -895,7 +916,7 @@ pub(crate) mod programs {
         fixture.lifecycle_vfork(context)
     }
 
-    /// leader先退出保同组父资格；组退出、转亲和角色释放后才复用号码。
+    /// 测试目标：验证多线程进程的主线程（Thread Group Leader）先行调用 `exit` 退出后，只要同组还有其他存活线程，该进程组仍保有对子进程的父进程等待资格；直到整个线程组全部退出、完成孤儿转亲且僵尸状态被消费后，其 PID/PGID 才允许被新进程复用。
     #[test]
     #[ktest(min_cpus = 2)]
     fn exit_group_parentage_and_pid_role_reuse(
@@ -906,7 +927,7 @@ pub(crate) mod programs {
         fixture.lifecycle_roles(context)
     }
 
-    /// 两个真实阻塞wait者可重复观察，但只能消费一次；坏copyout不恢复僵尸。
+    /// 测试目标：验证两个并发阻塞在 `waitid` 上的等待者：使用 `WNOWAIT` 仅观察状态而不消耗僵尸，不使用 `WNOWAIT` 时只有一个等待者能成功消费该僵尸进程；且当 `waitid` 写回用户态 `siginfo_t` 发生 `EFAULT` 时不会导致僵尸状态丢失或重复消费。
     #[test]
     #[ktest(min_cpus = 2)]
     fn wait_observation_consumption_and_copyout(
@@ -917,7 +938,7 @@ pub(crate) mod programs {
         fixture.lifecycle_wait(context)
     }
 
-    /// 默认忽略仍保wait状态；显式忽略和NOCLDWAIT自动回收由普通用户syscall判定。
+    /// 测试目标：验证当 `SIGCHLD` 处于默认忽略状态时子进程退出仍保留僵尸状态供 `wait` 收集；而显式将 `SIGCHLD` 设为 `SIG_IGN` 或带有 `SA_NOCLDWAIT` 标志时，子进程退出后自动回收且 `wait` 在所有子进程退出后返回 `ECHILD`。
     #[test]
     #[ktest(min_cpus = 2)]
     fn sigchld_autoreap_and_wait_semantics(
@@ -928,7 +949,7 @@ pub(crate) mod programs {
         fixture.lifecycle_sigchld(context)
     }
 
-    /// 普通用户错误按真实wait状态和离栈join验证，内核或夹具错误仍归原框架。
+    /// 测试目标：验证用户态程序触发未处理的段错误（`SIGSEGV`）、总线错误（`SIGBUS`）或非法指令（`SIGILL`）时，仅以对应的致命信号状态码终止该用户进程并由父进程 `wait` 收集，不会影响内核或其他进程。
     #[test]
     fn user_faults_are_wait_status(
         context: &mut TestContext<'_>,
@@ -943,7 +964,7 @@ pub(crate) mod programs {
         Ok(())
     }
 
-    /// 远核read仍保有Mm和真实DMA请求时取消，完成、退出和离栈各自结束后才回收。
+    /// 测试目标：验证当远端 CPU 上的用户线程正处于阻塞式磁盘文件读取（底层块设备 DMA 请求仍在途）时收到致命取消信号，内核必须等待在途的块设备 DMA 完成并安全释放用户地址空间（`Mm`）与内核栈后，才最终完成进程回收。
     #[test]
     #[ktest(min_cpus = 2)]
     fn user_cancel_keeps_inflight_io_and_mm(

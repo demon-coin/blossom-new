@@ -1,4 +1,64 @@
-//! 每个 TCP 端点独立拥有核心、输入和期限；表与退休拥有覆盖回调的完整寿命。
+//! TCP 传输端点（`TcpEndpoint`）与连接生命周期管理。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于网络协议栈的传输层，向上承接 `net::socket` 中的流式套接字文件描述，向下依赖：
+//! - `net::core::TcpCore`：封装单连接 TCP 状态机、收发环形缓冲区与超时计算；
+//! - `net::table::NetTables`：维护全局端口绑定租约（`BindLease`）、监听表与四元组索引；
+//! - `net::NetStack`：负责底层路由解析、IP 报文发送与接收分发，以及端点异步退休回收；
+//! - `workqueue::Work` 与 `timer::Timer`：分别在绑定的目标 CPU 上推进后台协议收发和精确超时重传。
+//!
+//! # 核心设计与状态流转
+//!
+//! ## 1. 操作互斥与后台 Work 交接
+//! 每个 `TcpEndpoint` 拥有一把可睡眠互斥锁 `core: SleepMutex<TcpCore>`，用于在用户态任务和后台 `Work`
+//! 之间串行化协议状态访问。当网卡或回环收到输入报文时，只获取短时间的 `input` 自旋锁将报文推入队列，
+//! 并调度后台 `Work`。若后台 `Work` 执行时发现用户态正持有 `core` 睡眠锁，则将 `input.owner_waiting`
+//! 置为 `true` 后立即退出；用户态操作守卫 `TcpOperationGuard` 释放 `core` 锁时，会检查该标志并替后台
+//! 重新调度 `Work`，避免后台工作线程阻塞等待。
+//!
+//! ```text
+//!   [用户态 syscall]                         [网卡 / 回环收包]
+//!          |                                        |
+//!   lock() / observe()                        enqueue(packet)
+//!   获取 core 睡眠锁                          获取 input 自旋锁入队
+//!          |                                        |
+//!          v                                        v
+//!   修改或观察 TcpCore                       schedule() 投递 Work
+//!          |                                        |
+//!          |                              run_tcp() -> try_lock(core)
+//!          |                              若失败：置 input.owner_waiting = true
+//!          v                                        |
+//!   Drop(TcpOperationGuard) <-----------------------+
+//!   1. 计算 PollMask 增量并唤醒等待者
+//!   2. 解锁 core
+//!   3. 若为 Modify 或 owner_waiting 为 true，调用 schedule() 重新推进后台 Work
+//! ```
+//!
+//! ## 2. 监听套接字与被动连接队列（Backlog）
+//! ```text
+//!   Listener (State::Listen)
+//!     |
+//!     +-- 收到 SYN 报文 (receive_syn)
+//!           |
+//!           v
+//!     创建子端点 (Child TcpEndpoint, State::Listen -> SynReceived)
+//!     加入 listener.children.pending (半连接队列)
+//!           |
+//!           +-- 收到三次握手 ACK (advance -> report_established)
+//!                 |
+//!                 v
+//!           从 pending 移入 listener.children.ready (全连接队列)
+//!           唤醒父监听端点的 POLLIN 等待队列 -> accept() 取出返回给用户态
+//! ```
+//!
+//! # 锁获取顺序（Lock Ordering）与并发契约
+//! 严禁违反以下锁层级顺序，否则会导致死锁：
+//! 1. **连接核心睡眠锁 `TcpEndpoint::core`（`SleepMutex`）**：最外层锁，持锁期间可分配内存，但严禁反向等待自身 `Work` 结束。
+//!    在被动建连 `receive_syn` 初始化尚未发布的子端点时，允许在持有父端点 `core` 锁的情况下短暂获取新子端点的 `child.core` 锁。
+//! 2. **网络栈控制准入锁 `NetStack::admission()`（`SleepMutex`）**：在 `bind`、`listen`、`connect`、`receive_syn`
+//!    及套接字选项修改时获取，位于 `core` 锁之内、所有 `SpinLock` 之外。
+//! 3. **端点内部自旋锁（`SpinLock`）**：包括 `input`、`metadata`、`children` 以及 `NetTables` 内部自旋锁。
+//!    这些自旋锁临界区极短且互不嵌套；必须在释放自旋锁之后才能调用 `PollWaitHead::notify`、`schedule` 或析构子端点 `Arc`。
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -26,71 +86,108 @@ use crate::timer::{Timer, TimerKind};
 use crate::workqueue::Work;
 use crate::{time, trace};
 
-/// 输入在用户持有核心时保持拥有，立即回应未接受时也留在同一节点。
+/// 端点的输入缓冲队列与后台调度交接状态（由 `TcpEndpoint::input` 自旋锁保护）。
 struct Input {
+    /// 端点是否已关闭输入接收；置位后拒绝新报文入队。
     closed: bool,
-    // 真实 Work 正在尝试或等待操作拥有，释放者移交此责任；它不代表另一个 pending 票。
+    /// 标记后台 `Work` 在尝试获取 `core` 睡眠锁时是否因锁被占用而退让；
+    /// 当前持有 `core` 锁的操作守卫在释放锁时负责接力重新调度该 `Work`。
     owner_waiting: bool,
+    /// 待由后台 `Work` 消费的输入 IP/TCP 报文有界队列（容量上限为 `LOOPBACK_CAPACITY`）。
     packets: VecDeque<OwnedPacket>,
+    /// 上一次处理输入报文时产生但因发送通道暂满（`WouldBlock`）尚未发出的立即控制应答报文（如 SYN-ACK、ACK、RST）。
     reply: Option<OwnedPacket>,
 }
 
-/// 绑定和 listener 关联只保存真实拥有，不复制 raw 协议状态。
+/// 端点的绑定租约、父子关联及套接字控制属性（由 `TcpEndpoint::metadata` 自旋锁保护）。
 struct Metadata {
+    /// 当前占用的本地地址与端口绑定租约；未绑定时为 `None`，被接受的子连接与父监听端点共享同一租约。
     lease: Option<Arc<BindLease>>,
+    /// 若当前端点为监听套接字派生的被动连接子端点，指向其父监听端点的弱引用。
     parent: Weak<TcpEndpoint>,
+    /// 标记端点是否已进入活动生命周期（如已执行 `listen`、`connect`、`close`、`abandon` 或作为被动子连接建立）。
     engaged: bool,
+    /// 待由用户态通过读写操作或 `SO_ERROR` 取走的异步协议错误（如 `ConnectionRefused`、`ConnectionReset`）。
     error: Option<FsError>,
+    /// 标记连接是否曾成功完成三次握手进入 `Established` 或 `CloseWait` 状态。
     connected: bool,
+    /// 读方向是否已通过 `shutdown(SHUT_RD)` 或 `close` 关闭。
     read_closed: bool,
+    /// 写方向是否已通过 `shutdown(SHUT_WR)` 或 `close` 关闭。
     write_closed: bool,
+    /// 是否启用 `SO_REUSEADDR` 地址复用选项。
     reuse: bool,
+    /// IPv6 端点是否启用 `IPV6_V6ONLY`（仅限 IPv6 通信，禁止 IPv4 映射地址）。
     v6_only: bool,
+    /// 收发方向的阻塞等待超时配置（`SO_RCVTIMEO` 与 `SO_SNDTIMEO`）。
     timeouts: SocketTimeouts,
 }
 
-/// 半连接与可接受连接共享实际 backlog 上限，只有成熟 Established 才进入 ready。
+/// 监听端点的被动连接子端点队列（由 `TcpEndpoint::children` 自旋锁保护）。
 struct Children {
+    /// 半连接队列与全连接队列共享的容量上限（由 `listen(backlog)` 设定，限制在 `1..=SOMAXCONN`）。
     limit: usize,
+    /// 收到 SYN 后已创建但尚未完成三次握手的半连接子端点列表。
     pending: Vec<Arc<TcpEndpoint>>,
+    /// 已完成三次握手（进入 `Established` 或 `CloseWait`）、等待 `accept` 取走的全连接子端点队列。
     ready: VecDeque<Arc<TcpEndpoint>>,
 }
 
-/// 表强持稳定节点，节点弱指网络域和 listener；普通 Work 固定轮转 CPU。
+/// TCP 传输层端点，封装单条连接或监听套接字的完整协议状态、队列与异步执行上下文。
 pub struct TcpEndpoint {
+    /// 网络栈内全局唯一且不复用的端点标识号。
     id: u64,
+    /// 端点创建时固定的地址族（`AF_INET` 或 `AF_INET6`）。
     family: AddressFamily,
+    /// 所属网络栈实例的弱引用。
     stack: Weak<NetStack>,
+    /// 保护底层 `TcpCore` 协议状态机与收发环形缓冲区的可睡眠互斥锁。
     core: SleepMutex<TcpCore>,
+    /// 保护输入报文队列与后台 `Work` 交接标志的自旋锁。
     input: SpinLock<Input>,
+    /// 保护端口租约、连接标志、异步错误与套接字选项的自旋锁。
     metadata: SpinLock<Metadata>,
+    /// 保护监听套接字半连接与全连接子端点队列的自旋锁。
     children: SpinLock<Children>,
+    /// 供 `poll` / `select` / `epoll` 注册和唤醒的轮询等待队列头。
     source: Arc<PollWaitHead>,
+    /// 发送通道（Egress）容量不足时的轻量级等待链表节点。
     egress_wait: Arc<EgressWait>,
+    /// 端点进入异步退休链表时的侵入式链接状态。
     pub(crate) retirement: RetirementLink,
+    /// 固定在指定 CPU 上推进协议收发处理的后台工作项。
     work: Once<Pin<Arc<Work>>>,
+    /// 固定在同一 CPU 上处理协议重传、延时 ACK 与 `TIME_WAIT` 超时的高精度定时器。
     timer: Once<Pin<Arc<Timer>>>,
+    /// 标记端点是否已进入同步停止流程（`stop_sync`），置位后拒绝新调度请求。
     stopped: AtomicBool,
+    /// 占用网络栈全局端点配额的槽位守卫，随端点析构自动归还配额。
     _slot: EndpointSlot,
 }
 
-/// 修改操作主动安排协议；只读观察只移交已经受阻的真实 Work。
+/// 获取 `TcpEndpoint::core` 睡眠锁时的操作模式。
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum OperationMode {
+    /// 修改模式：操作可能改变协议状态或收发队列，释放锁后需要计算事件通知并主动调度后台 `Work`。
     Modify,
+    /// 观察模式：仅读取协议状态，释放锁时不触发事件通知，仅在后台 `Work` 曾受阻退让（`owner_waiting`）时接力调度。
     Observe,
 }
 
-/// 一次拥有期的原事实快照只用于识别通知，不保存另一份协议状态。
+/// 单次持有 `core` 锁前后的状态快照，用于对比并提取新产生的 `PollMask` 事件通知。
 struct Observation {
+    /// 接收环形缓冲区中的可读字节数。
     received: usize,
+    /// 发送环形缓冲区中尚未发完或未确认的字节数。
     sent: usize,
+    /// 当前端点计算出的完整 `PollMask` 就绪掩码。
     mask: PollMask,
+    /// 监听端点全连接队列（`ready`）中的子连接数量。
     ready_children: usize,
 }
 
 impl Observation {
-    /// 从本次拥有前后的事实提取新就绪方向，队列消费不产生数据到达通知。
+    /// 对比操作前后的两次状态快照，提取本次操作期间新变为就绪的轮询事件掩码。
     fn notification_since(&self, previous: &Self) -> PollMask {
         let mut notification = self.mask & !previous.mask;
         if previous.received < self.received || previous.ready_children < self.ready_children {
@@ -107,33 +204,40 @@ impl Observation {
     }
 }
 
-/// 普通操作保护只在释放核心后安排同一个协议 Work。
+/// TCP 端点核心操作守卫，封装 `core` 睡眠锁并在析构时统一完成状态追踪、轮询唤醒与后台 `Work` 交接。
 pub struct TcpOperationGuard<'a> {
+    /// 所属的 TCP 端点引用。
     endpoint: &'a TcpEndpoint,
+    /// 底层 `TcpCore` 睡眠互斥锁守卫；在 `Drop::drop` 中提前 `take()` 释放，以便在锁外执行通知和调度。
     core: Option<SleepMutexGuard<'a, TcpCore>>,
+    /// 本次持锁的操作模式（修改或只读观察）。
     mode: OperationMode,
+    /// 刚获取 `core` 锁时采集的初始状态快照。
     initial: Observation,
+    /// 若开启了内核追踪（`trace`）且处于修改模式，记录操作开始时的 TCP 协议状态。
     initial_trace_state: Option<State>,
 }
 
 impl Deref for TcpOperationGuard<'_> {
     type Target = TcpCore;
-    /// 借用本次真正持有的核心保护，不创建第二个协议对象。
+    /// 不可变借用受保护的 `TcpCore` 实例。
     fn deref(&self) -> &TcpCore {
         self.core.as_deref().unwrap()
     }
 }
 
 impl DerefMut for TcpOperationGuard<'_> {
-    /// 可变借用仅在本连接 SleepMutex 的操作拥有期间存在。
+    /// 可变借用受保护的 `TcpCore` 实例。
     fn deref_mut(&mut self) -> &mut TcpCore {
         self.core.as_deref_mut().unwrap()
     }
 }
 
 impl Drop for TcpOperationGuard<'_> {
-    /// 核心保护内采实际修改后的状态，释放后记录变化并通知方向；只读保护仅移交已有 Work。
+    /// 在持有 `core` 锁的末尾采集最新状态快照并计算新增就绪事件，随后释放 `core` 锁，
+    /// 在锁外记录状态迁移追踪、唤醒 `PollWaitHead` 等待者并按需调度后台 `Work`。
     fn drop(&mut self) {
+        // Step 1: 在释放 core 锁前更新连接建立标志，并对比快照计算新增的轮询就绪位。
         let notification = if self.mode == OperationMode::Modify {
             let core = self.core.as_deref().unwrap();
             self.endpoint.record_connected(core);
@@ -144,8 +248,10 @@ impl Drop for TcpOperationGuard<'_> {
         };
         let state_change =
             observed_state_change(self.initial_trace_state, self.core.as_deref().unwrap());
+        // Step 2: 释放 core 睡眠锁，确保后续唤醒和队列调度不在持锁状态下执行。
         drop(self.core.take());
 
+        // Step 3: 记录 TCP 状态机变迁事件，并检查持锁期间是否有后台 Work 受阻退让。
         if let Some(value) = state_change {
             trace::record(trace::Kind::TcpState, self.endpoint.id, value);
         }
@@ -153,6 +259,7 @@ impl Drop for TcpOperationGuard<'_> {
             let mut input = self.endpoint.input.lock();
             core::mem::take(&mut input.owner_waiting)
         };
+        // Step 4: 唤醒轮询等待者，并在修改操作后或后台 Work 退让时调度后台协议任务。
         if !notification.is_empty() {
             self.endpoint.source.notify(notification);
         }
@@ -163,7 +270,10 @@ impl Drop for TcpOperationGuard<'_> {
 }
 
 impl TcpEndpoint {
-    /// 在原域环境准备唯一核心和异步节点，Work 与 Timer 固定在独立轮转的同一 CPU。
+    /// 在指定网络栈中创建并初始化一个新的 `TcpEndpoint` 实例。
+    ///
+    /// 在普通可睡眠上下文中调用。预分配输入报文队列、轮询等待队列头和出口等待节点，
+    /// 并为该端点分配固定的协议执行 CPU，将后台 `Work` 和高精度 `Timer` 绑定到同一 CPU 上。
     pub(crate) fn try_new(
         net: &NetStackRef,
         id: u64,
@@ -215,6 +325,7 @@ impl TcpEndpoint {
         })
         .map_err(|_| FsError::NoMemory)?;
 
+        // 将端点的后台 Work 与超时 Timer 固定到同一个轮转分配的 CPU，减少跨核竞争。
         let cpu = net.allocate_protocol_cpu();
         let context = Arc::as_ptr(&endpoint) as usize;
         let work = Work::try_new(net.work_queue(), cpu, run_tcp, context)
@@ -226,59 +337,67 @@ impl TcpEndpoint {
         Ok(endpoint)
     }
 
-    /// 两向等待值属于同一端点，查询不取得可睡协议操作权。
+    /// 读取当前端点的收发超时时间配置（`SO_RCVTIMEO` / `SO_SNDTIMEO`）。
+    ///
+    /// 仅获取 `metadata` 自旋锁，无需等待 `core` 睡眠锁。
     pub(crate) fn timeouts(&self) -> SocketTimeouts {
         self.metadata.lock().timeouts
     }
 
-    /// 控制属性只在 metadata 短锁内修改，监听子对象独立持有握手时的快照。
+    /// 设置收发方向的阻塞等待超时时间（单位：纳秒，`None` 表示无限等待）。
+    ///
+    /// 仅修改当前端点的 `metadata`；被动监听子连接在收到 SYN 创建时会复制当时的超时配置快照。
     pub(crate) fn set_timeout(&self, receive: bool, timeout: Option<u64>) {
         self.metadata.lock().timeouts.set(receive, timeout);
     }
 
-    /// 返回本域不复用的身份，描述符编号不进入协议索引。
+    /// 返回端点在所属网络栈中的唯一标识号。
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// 等待登记只借创建期准备的轻量节点，不延长协议对象寿命。
+    /// 返回端点的发送通道（Egress）容量等待链表节点引用。
     pub(crate) fn egress_wait(&self) -> &Arc<EgressWait> {
         &self.egress_wait
     }
 
-    /// 测试只观察当前真实租约身份，不取得会延长端口占用的强引用。
+    /// 供内核测试（`ktest`）读取当前端点持有的端口绑定租约 ID。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_binding_identity(&self) -> Option<u64> {
         self.metadata.lock().lease.as_ref().map(|lease| lease.id())
     }
 
-    /// 返回普通 Work 和精确 Timer 共同固定的执行 CPU。
+    /// 供内核测试（`ktest`）查询后台 `Work` 与高精度 `Timer` 共同绑定的目标 CPU 编号。
     #[cfg(feature = "ktest")]
     pub fn work_cpu(&self) -> usize {
         self.work.get().unwrap().cpu()
     }
 
-    /// 只比较弱域与真实 Arc 的身份，不延长域的服务寿命。
+    /// 检查当前端点是否隶属于指定的网络栈实例 `net`。
     pub fn belongs_to(&self, net: &NetStackRef) -> bool {
         self.stack.as_ptr() == Arc::as_ptr(net)
     }
 
-    /// 普通任务取得本连接拥有，结束后由 guard 安排积存输入和发送责任。
+    /// 以修改模式（`OperationMode::Modify`）获取 `core` 睡眠锁，返回操作守卫 `TcpOperationGuard`。
+    ///
+    /// 守卫析构时会自动比对操作前后的状态差异、唤醒就绪等待者并调度后台 `Work`。
     pub fn lock(&self) -> TcpOperationGuard<'_> {
         self.operation(self.core.lock(), OperationMode::Modify)
     }
 
-    /// 只观察成熟状态；释放时仅移交已经因本操作拥有受阻的真实 Work，不主动开始协议进度。
+    /// 查询当前 TCP 状态机的状态（如 `Closed`、`Listen`、`Established` 等）。
     pub fn state(&self) -> State {
         self.observe().state()
     }
 
-    /// 普通只读访问也参与操作拥有交接，未有真实 Work 受阻时不安排后台票。
+    /// 以只读观察模式（`OperationMode::Observe`）获取 `core` 睡眠锁，返回操作守卫 `TcpOperationGuard`。
+    ///
+    /// 守卫析构时不会主动发起新的协议处理，仅在持锁期间有后台 `Work` 受阻退让时负责接力调度。
     pub(crate) fn observe(&self) -> TcpOperationGuard<'_> {
         self.operation(self.core.lock(), OperationMode::Observe)
     }
 
-    /// 本保护的前后事实用于通知；仅采集开启时保存真实修改操作的起始协议状态。
+    /// 构造 `TcpOperationGuard` 操作守卫，并在持锁初期采集状态快照与追踪起点。
     fn operation<'a>(
         &'a self,
         core: SleepMutexGuard<'a, TcpCore>,
@@ -299,7 +418,9 @@ impl TcpEndpoint {
         }
     }
 
-    /// 就绪位只来自本核心、关闭事实与 child 队列；读取不安排协议处理。
+    /// 根据 `TcpCore` 状态机、本地关闭标志及监听子连接队列，计算当前的 `PollMask` 事件就绪掩码。
+    ///
+    /// 调用方必须已持有 `core` 睡眠锁。
     fn ready_mask(&self, core: &TcpCore) -> PollMask {
         if core.state() == State::Listen {
             return if self.children.lock().ready.is_empty() {
@@ -330,7 +451,7 @@ impl TcpEndpoint {
         mask
     }
 
-    /// 读取原收发队列、完整就绪位与 ready child 数量，快照只存活于本次拥有期。
+    /// 采集当前 `TcpCore` 收发队列长度、轮询就绪掩码及全连接子队列长度的观察快照。
     fn observation(&self, core: &TcpCore) -> Observation {
         Observation {
             received: core.receive_queue(),
@@ -340,14 +461,16 @@ impl TcpEndpoint {
         }
     }
 
-    /// 曾建立连接只在成熟核心确认握手后记录，正常关闭不删除这一 ABI 事实。
+    /// 若底层状态机已进入 `Established` 或 `CloseWait`，将 `metadata.connected` 标记为 `true`。
+    ///
+    /// 该标志一旦置位，即使后续连接正常关闭回到 `Closed` 也会保留，用于区分“从未连接”与“连接后已关闭（EOF/EPIPE）”。
     fn record_connected(&self, core: &TcpCore) {
         if matches!(core.state(), State::Established | State::CloseWait) {
             self.metadata.lock().connected = true;
         }
     }
 
-    /// 先登记唯一持续源再观察，不从查询路径收包、dispatch 或主动通知。
+    /// 注册可选的轮询等待表，并查询当前端点的 `PollMask` 就绪掩码。
     pub fn poll(&self, table: Option<&mut PollTable>) -> Result<PollMask, FsError> {
         if let Some(table) = table {
             table.register(&self.source)?;
@@ -356,7 +479,11 @@ impl TcpEndpoint {
         Ok(self.ready_mask(&core))
     }
 
-    /// 返回同一次真实握手的结果，错误查询不消费 SO_ERROR 或重新发表 tuple。
+    /// 查询非阻塞或阻塞 `connect` 的当前握手结果：
+    /// - 若存在异步错误，返回 `Err(error)`（不清除 `SO_ERROR`）；
+    /// - 若仍在 `SynSent` 或 `SynReceived` 握手中，返回 `Ok(None)`；
+    /// - 若已完成握手进入 `Established` 或 `CloseWait`，返回 `Ok(Some(()))`；
+    /// - 其他未连接状态返回 `Err(FsError::NotConnected)`。
     pub fn connection_result(&self) -> Result<Option<()>, FsError> {
         let core = self.observe();
         let metadata = self.metadata.lock();
@@ -372,7 +499,10 @@ impl TcpEndpoint {
         Err(FsError::NotConnected)
     }
 
-    /// 同一连接拥有覆盖暂存、copyout 和消费；已有数据先于错误及 EOF 交付。
+    /// 从 TCP 接收缓冲区读取数据到 `target`（支持 `MSG_PEEK` 预览模式）。
+    ///
+    /// 在可睡眠任务上下文中调用。若接收缓冲区中已有可读数据，优先交付数据；
+    /// 当缓冲区为空时，依次检查并消费挂起的异步错误（`SO_ERROR`）或返回读关闭 EOF。
     pub fn receive(&self, target: &mut ReadBuffer<'_>, peek: bool) -> Result<IoProgress, FsError> {
         if target.copied() == target.len() {
             return Ok(IoProgress::Ready(0));
@@ -393,7 +523,10 @@ impl TcpEndpoint {
         core.receive(target, peek)
     }
 
-    /// 先查询关闭和错误事实，再由原核心核发送许可及真正接受量，零请求也保留 EPIPE。
+    /// 将 `source` 中的数据写入 TCP 发送缓冲区。
+    ///
+    /// 在可睡眠任务上下文中调用。写操作前先检查并消费异步错误；若写方向已关闭或连接已断开，
+    /// 即使请求写入长度为 0 也会返回 `Err(FsError::BrokenPipe)`（触发上层 `EPIPE` / `SIGPIPE`）。
     pub fn send(&self, source: &mut WriteBuffer<'_>) -> Result<IoProgress, FsError> {
         let mut core = self.lock();
         let mut metadata = self.metadata.lock();
@@ -407,7 +540,9 @@ impl TcpEndpoint {
         core.send(source)
     }
 
-    /// 关闭指定方向；发送关闭沿 raw FIN，接收方向仍能在 SHUT_WR 后独立推进。
+    /// 关闭连接的指定传输方向（`SHUT_RD`、`SHUT_WR` 或 `SHUT_RDWR`）。
+    ///
+    /// 关闭写方向会向 `TcpCore` 发起 FIN 挥手流程，此时读方向仍可继续接收对端发来的数据。
     pub fn shutdown(&self, how: u32) -> Result<(), FsError> {
         if SHUT_RDWR < how {
             return Err(FsError::InvalidOperation);
@@ -428,7 +563,9 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 已连接返回实际路由源，绑定保原通配，未绑定返回零地址及零端口。
+    /// 获取当前端点的本地绑定地址与端口（`getsockname`）。
+    ///
+    /// 若已建立连接则返回路由选定的具体源地址；若仅完成 `bind` 则返回租约记录的地址；未绑定时返回通配零地址和 0 端口。
     pub fn local_address(&self) -> Result<InetEndpoint, FsError> {
         let core = self.observe();
         Ok(core
@@ -446,7 +583,7 @@ impl TcpEndpoint {
             }))
     }
 
-    /// 只返回真正建立连接且 raw 仍拥有的远端端点。
+    /// 获取当前已连接对端的远端地址与端口（`getpeername`）。
     pub fn peer_address(&self) -> Result<InetEndpoint, FsError> {
         let core = self.observe();
         if !self.metadata.lock().connected {
@@ -455,7 +592,7 @@ impl TcpEndpoint {
         core.remote_endpoint().ok_or(FsError::NotConnected)
     }
 
-    /// 在只读核心保护下消费一次 pending error，不主动通知或安排握手。
+    /// 读取并清除挂起的异步套接字错误（对应 `getsockopt(SO_ERROR)`）。
     pub fn take_error(&self) -> Option<FsError> {
         let core = self.observe();
         let error = self.metadata.lock().error.take();
@@ -463,17 +600,17 @@ impl TcpEndpoint {
         error
     }
 
-    /// 只观察原核心是否仍为 Listen。
+    /// 判断当前端点是否处于 `Listen` 监听状态（对应 `SO_ACCEPTCONN`）。
     pub fn is_listener(&self) -> bool {
         self.state() == State::Listen
     }
 
-    /// 复用选项属于这个打开端点，accepted child 不读取 parent 的后来修改。
+    /// 查询当前端点是否开启了 `SO_REUSEADDR` 地址复用选项。
     pub fn reuse_address(&self) -> bool {
         self.metadata.lock().reuse
     }
 
-    /// 本核心串行控制选项；child 共享租约时只改自己的事实，不修改 parent 绑定。
+    /// 设置 `SO_REUSEADDR` 地址复用选项，并在当前端点直接拥有端口租约时同步更新全局绑定表策略。
     pub fn set_reuse_address(&self, reuse: bool) -> Result<(), FsError> {
         let _core = self.observe();
         let net = self.net()?;
@@ -488,12 +625,12 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 只读原 raw Nagle 标志，不驱动发送或产生就绪通知。
+    /// 查询当前端点是否开启了 `TCP_NODELAY`（即禁用 Nagle 算法）。
     pub fn nodelay(&self) -> Result<bool, FsError> {
         Ok(!self.observe().nagle_enabled())
     }
 
-    /// 修改真实 raw 标志，保护释放后由既有 Work 处理受策略影响的发送。
+    /// 设置 `TCP_NODELAY` 选项（启用时关闭底层 `TcpCore` 的 Nagle 合并算法）。
     pub fn set_nodelay(&self, enabled: bool) -> Result<(), FsError> {
         let mut core = self.lock();
         let net = self.net()?;
@@ -502,28 +639,28 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 观察本连接原接收 ring 容量，listener child 使用相同真实容量。
+    /// 返回底层接收环形缓冲区的物理总容量（字节）。
     pub fn receive_capacity(&self) -> usize {
         self.observe().receive_capacity()
     }
 
-    /// 观察本连接原发送 ring 容量，不给已接受量增加用户准备前缀。
+    /// 返回底层发送环形缓冲区的物理总容量（字节）。
     pub fn send_capacity(&self) -> usize {
         self.observe().send_capacity()
     }
 
-    /// 端点族由创建时确定，mapped child 不从实际报文族改写 OFD 身份。
+    /// 返回端点创建时固定的地址族（`AF_INET` 或 `AF_INET6`）。
     pub fn family(&self) -> AddressFamily {
         self.family
     }
 
-    /// 与绑定及 raw 配置共用本连接的操作拥有，观察不驱动协议。
+    /// 查询 IPv6 端点是否开启了 `IPV6_V6ONLY` 选项。
     pub fn v6_only(&self) -> bool {
         let _core = self.observe();
         self.metadata.lock().v6_only
     }
 
-    /// 只允许未绑定的 IPv6 端点修改双族策略。
+    /// 设置 IPv6 端点的 `IPV6_V6ONLY` 选项（仅允许在未绑定且未进入活动状态的 `AF_INET6` 端点上修改）。
     pub fn set_v6_only(&self, enabled: bool) -> Result<(), FsError> {
         let _core = self.lock();
         if self.family != AddressFamily::Ipv6 {
@@ -539,12 +676,12 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 查询原核心的探测配置，不保存第二份 KEEPALIVE 开关。
+    /// 查询当前端点是否开启了 `SO_KEEPALIVE` 保活探测。
     pub fn keepalive(&self) -> bool {
         self.observe().keepalive()
     }
 
-    /// 释放修改保护后沿原 Work 和方向通知安排探测配置变化。
+    /// 设置 `SO_KEEPALIVE` 保活探测开关。
     pub fn set_keepalive(&self, enabled: bool) -> Result<(), FsError> {
         let mut core = self.lock();
         let net = self.net()?;
@@ -553,17 +690,17 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 返回真实接收接纳预算，独立于 child 所需的物理后备容量。
+    /// 返回当前接收缓冲区的通告窗口接纳预算（字节，对应 `SO_RCVBUF`）。
     pub fn receive_budget(&self) -> usize {
         self.observe().receive_budget()
     }
 
-    /// 返回 raw 未 ACK 字节共同占用的发送接纳预算。
+    /// 返回当前发送缓冲区的写入接纳预算（字节，对应 `SO_SNDBUF`）。
     pub fn send_budget(&self) -> usize {
         self.observe().send_budget()
     }
 
-    /// 在同一 raw 对象上调节窗口预算，原数据和旧信用保持拥有。
+    /// 调整接收缓冲区的接纳预算（`SO_RCVBUF`）。
     pub fn set_receive_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut core = self.lock();
         let net = self.net()?;
@@ -571,7 +708,7 @@ impl TcpEndpoint {
         core.set_receive_budget(budget)
     }
 
-    /// 在同一 raw 对象上调节发送预算，真实恢复的 OUT 在核心解锁后通知。
+    /// 调整发送缓冲区的接纳预算（`SO_SNDBUF`）；若扩容后恢复可写，守卫释放时会自动唤醒 `POLLOUT` 等待者。
     pub fn set_send_budget(&self, budget: usize) -> Result<(), FsError> {
         let mut core = self.lock();
         let net = self.net()?;
@@ -579,17 +716,19 @@ impl TcpEndpoint {
         core.set_send_budget(budget)
     }
 
-    /// 使用原分段决策查询 MSS，已连接 tuple 由 raw 选择实际协议族。
+    /// 查询当前连接生效的最大报文段长度（`TCP_MAXSEG` / MSS，单位：字节）。
     pub fn effective_mss(&self) -> usize {
         self.observe().effective_mss(self.family)
     }
 
-    /// 返回该端点实际启用的原拥塞控制器。
+    /// 查询当前连接启用的拥塞控制算法（如 Reno）。
     pub fn congestion_control(&self) -> CongestionControl {
         self.observe().congestion_control()
     }
 
-    /// ABI 已完成 mapped 正规化，端点仅核对核心小值与本端点策略。
+    /// 校验目标或本地 IP 地址是否符合当前端点的地址族与 `IPV6_V6ONLY` 策略。
+    ///
+    /// 当 `IPV6_V6ONLY` 开启的 IPv6 端点尝试使用 IPv4 地址时，连接操作返回 `NetworkUnreachable`，绑定操作返回 `InvalidOperation`。
     fn check_address(&self, address: IpAddress, connecting: bool) -> Result<(), FsError> {
         match (self.family, address) {
             (AddressFamily::Ipv4, IpAddress::Ipv6(_)) => Err(FsError::AddressFamilyNotSupported),
@@ -604,12 +743,15 @@ impl TcpEndpoint {
         }
     }
 
-    /// 取得仍存在的网络域，停止后的操作不得再发表新索引。
+    /// 将弱引用升级为所属网络栈的强引用；若网络栈已销毁则返回 `Err(FsError::NotConnected)`。
     fn net(&self) -> Result<NetStackRef, FsError> {
         self.stack.upgrade().ok_or(FsError::NotConnected)
     }
 
-    /// 同一操作拥有核对族及绑定策略，成功具体 IPv6 绑定同时固定 V6ONLY。
+    /// 将端点显式绑定到指定的本地地址与端口（`bind` 系统调用）。
+    ///
+    /// 在持有 `core` 睡眠锁与网络栈 `admission` 准入锁的情况下向全局表申请端口租约；
+    /// 若成功绑定到具体的非通配 IPv6 地址，则同时将 `v6_only` 固定为 `true`。
     pub fn bind(self: &Arc<Self>, local: InetEndpoint) -> Result<InetEndpoint, FsError> {
         let core = self.lock();
         if core.state() != State::Closed || self.metadata.lock().engaged {
@@ -642,8 +784,9 @@ impl TcpEndpoint {
         Ok(local)
     }
 
-    /// 重复 listen 只更新有限 backlog，既有半连接及 ready 仍由原队列拥有。
-    /// backlog 零保留一项正常队列容量；扩容准备不持 child 短锁。
+    /// 将端点转换为 `Listen` 监听状态，或更新已处于监听状态的端点的全/半连接队列容量上限（`backlog`）。
+    ///
+    /// 在获取 `children` 自旋锁前先完成新队列容量的堆内存预分配；首次进入监听时自动完成未绑定端点的临时端口分配并在全局表中发布监听索引。
     pub fn listen(self: &Arc<Self>, backlog: usize) -> Result<(), FsError> {
         let limit = backlog.clamp(1, SOMAXCONN);
         let mut core = self.lock();
@@ -652,6 +795,7 @@ impl TcpEndpoint {
             return Err(FsError::InvalidOperation);
         }
 
+        // Step 1: 计算需要预分配的队列容量，并在自旋锁外完成堆内存预留。
         let capacity = {
             let children = self.children.lock();
             if limit <= children.pending.capacity() && limit <= children.ready.capacity() {
@@ -671,6 +815,7 @@ impl TcpEndpoint {
                 .map_err(|_| FsError::NoMemory)?;
         }
 
+        // Step 2: 若尚未处于 Listen 状态，准备底层缓冲区、获取绑定租约并在全局表中发布监听端点。
         let net = self.net()?;
         let _admission = net.admission()?;
         if !listening {
@@ -683,6 +828,7 @@ impl TcpEndpoint {
             }
         }
 
+        // Step 3: 将旧队列中的子连接迁移到扩容后的容器中，并更新 backlog 上限与 engaged 标志。
         {
             let mut children = self.children.lock();
             if 0 < capacity {
@@ -697,8 +843,12 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 首次发表实际双族 tuple；路由选源及 MTU 更新发生在同一核心握手之前。
+    /// 发起主动 TCP 连接握手（`connect` 系统调用）。
+    ///
+    /// 依次完成连接状态检查、对端地址族校验、底层收发缓冲区分配、本地端口租约获取、
+    /// 路由源地址与路径 MTU 解析，随后启动 `TcpCore` 握手并在全局表中注册 TCP 四元组。
     pub fn connect(self: &Arc<Self>, peer: InetEndpoint) -> Result<(), FsError> {
+        // Step 1: 检查当前连接状态，排除已连接、正在握手或已关闭过的端点。
         let mut core = self.lock();
         let metadata = self.metadata.lock();
         if metadata.connected {
@@ -712,6 +862,7 @@ impl TcpEndpoint {
         }
         drop(metadata);
 
+        // Step 2: 校验对端地址，准备收发环形缓冲区、本地端口租约并解析出口路由与 MTU。
         self.check_address(peer.address, true)?;
         let net = self.net()?;
         let admission = net.admission()?;
@@ -724,6 +875,7 @@ impl TcpEndpoint {
         };
         core.set_ip_mtu(route.mtu);
 
+        // Step 3: 启动底层 TCP 状态机三次握手（进入 SynSent），并在全局连接表中注册四元组。
         core.connect(local, peer, time::now())?;
         if let Err(error) = net
             .tables()
@@ -743,7 +895,9 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 调用者持本核心及控制准入，首次自动绑定保留本端点族的通配地址及双面责任。
+    /// 获取当前已有的绑定租约；若尚未绑定，则向全局表申请本地址族通配地址上的临时端口租约。
+    ///
+    /// 调用方必须已持有当前端点的 `core` 睡眠锁及网络栈 `admission` 准入锁。
     fn binding_or_ephemeral(&self, net: &NetStackRef) -> Result<Arc<BindLease>, FsError> {
         if let Some(lease) = self.metadata.lock().lease.as_ref().cloned() {
             return Ok(lease);
@@ -764,7 +918,7 @@ impl TcpEndpoint {
         Ok(lease)
     }
 
-    /// 只领取已完成握手的真实 child，不替换 listener 或提前创建用户描述符。
+    /// 从监听端点的全连接队列（`ready`）队首取出一个已完成三次握手的子连接端点。
     pub fn accept(&self) -> Result<Option<Arc<TcpEndpoint>>, FsError> {
         let core = self.lock();
         if core.state() != State::Listen {
@@ -774,7 +928,7 @@ impl TcpEndpoint {
         Ok(child)
     }
 
-    /// 最后打开对象请求双方向关闭；FIN 和 TIME_WAIT 继续由原 Work/Timer 推进。
+    /// 当最后一个关联的套接字文件描述关闭时调用，关闭读写双方向并触发底层 TCP 优雅关闭挥手（FIN / `TIME_WAIT`）。
     pub fn close(&self) {
         let mut core = self.lock();
         core.close();
@@ -784,14 +938,16 @@ impl TcpEndpoint {
         metadata.write_closed = true;
     }
 
-    /// 未交给打开对象的节点终止协议，仍保留真实待发 RST 的 dispatch 责任。
+    /// 强制中止尚未被用户态接受的被动子连接，向对端触发 RST 并丢弃协议连接。
     pub fn abandon(&self) {
         let mut core = self.lock();
         core.abort();
         self.metadata.lock().engaged = true;
     }
 
-    /// 输入接收不等待用户核心，只在预留队列发表完整拥有，然后安排同 Work。
+    /// 将收到的 IP/TCP 报文推入端点的有界输入队列，并调度后台 `Work` 异步消费。
+    ///
+    /// 仅获取 `input` 自旋锁，无需等待用户态释放 `core` 睡眠锁；若队列已满则返回 `Err(FsError::WouldBlock)`。
     pub(crate) fn enqueue(&self, packet: OwnedPacket) -> Result<(), FsError> {
         {
             let mut input = self.input.lock();
@@ -808,7 +964,9 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// 原 Work 的 pending 协议负责合并；停止时拒绝新增票，不维护第二 scheduled 位。
+    /// 将端点的后台协议处理任务排入工作队列。
+    ///
+    /// 若端点已同步停止或网络栈正在停止，则直接忽略调度请求；重复入队由 `Work::queue` 内部自动去重合并。
     pub(crate) fn schedule(&self) {
         if self.stopped.load(Ordering::Acquire) {
             return;
@@ -822,7 +980,7 @@ impl TcpEndpoint {
         let _ = self.work.get().unwrap().as_ref().queue();
     }
 
-    /// 先登记真实拥有责任；核心保护内采协议前后状态，释放后记录变化并通知原持续源。
+    /// 后台 `Work` 的核心执行入口：尝试获取 `core` 睡眠锁，批量处理输入报文与待发数据，更新定时器并唤醒等待队列。
     fn run(&self) {
         let Some(net) = self.stack.upgrade() else {
             return;
@@ -831,6 +989,8 @@ impl TcpEndpoint {
             return;
         }
 
+        // Step 1: 登记 owner_waiting 标志并尝试非阻塞获取 core 睡眠锁；
+        // 若用户态正持有 core 锁，则立即返回，由 TcpOperationGuard::drop 负责在解锁后重新调度。
         self.input.lock().owner_waiting = true;
         let Some(mut core) = self.core.try_lock() else {
             return;
@@ -839,6 +999,7 @@ impl TcpEndpoint {
         let previous = self.observation(&core);
         let initial_trace_state = trace::enabled().then(|| core.state());
 
+        // Step 2: 推进一轮输入报文处理与输出报文分发；若发生非阻塞类致命错误则中止连接并记录错误。
         let mut notification = None;
         let result = self.advance(&net, &mut core, &mut notification);
         let blocked = result == Err(FsError::WouldBlock);
@@ -855,6 +1016,7 @@ impl TcpEndpoint {
             }
         }
 
+        // Step 3: 采集处理后的状态快照、下一步超时时间及队列剩余情况，随后释放 core 睡眠锁。
         self.record_connected(&core);
         let current = self.observation(&core);
         let mask = current.notification_since(&previous);
@@ -870,6 +1032,7 @@ impl TcpEndpoint {
         let state_change = observed_state_change(initial_trace_state, &core);
         drop(core);
 
+        // Step 4: 在锁外记录追踪事件，唤醒当前端点及父监听端点的轮询等待者。
         if let Some(value) = state_change {
             trace::record(trace::Kind::TcpState, self.id, value);
         }
@@ -882,6 +1045,7 @@ impl TcpEndpoint {
                 .notify(PollMask::POLLIN | PollMask::POLLRDNORM);
         }
 
+        // Step 5: 若连接已彻底结束则移交异步退休；若因出口通道满受阻则等待容量恢复；否则按协议期限设置定时器或继续调度。
         if ended {
             net.retire_tcp(self.id);
             return;
@@ -914,14 +1078,16 @@ impl TcpEndpoint {
         }
     }
 
-    /// 每轮先交付旧应答，再处理有限输入；未接受应答禁止继续消费 backlog。
+    /// 在单轮 `PROTOCOL_BUDGET` 配额内，依次发送挂起的立即应答、处理输入报文队列并分发待发送的 TCP 报文段。
     fn advance(
         &self,
         net: &NetStackRef,
         core: &mut TcpCore,
         notification: &mut Option<Arc<TcpEndpoint>>,
     ) -> Result<(), FsError> {
+        // Step 1: 优先发出上一轮因发送通道满而暂存的立即应答包（如 SYN-ACK / ACK / RST）。
         self.emit_reply(net)?;
+        // Step 2: 在 PROTOCOL_BUDGET 配额内消费输入队列中的报文。
         let mut remaining = PROTOCOL_BUDGET;
         while 0 < remaining {
             let packet = self.input.lock().packets.pop_front();
@@ -957,7 +1123,8 @@ impl TcpEndpoint {
                     }
                 }
                 if previous == State::SynReceived && core.state() == State::Listen {
-                    // 被动 child 的原握手已失败，不能将其回到 Listen 后留在半连接队列。
+                    // 若被动子连接在 SynReceived 阶段握手失败（如收到 RST）回退到了 Listen 状态，
+                    // 立即将其关闭为 Closed，避免子连接以 Listen 状态滞留在半连接队列中。
                     if self.metadata.lock().parent.upgrade().is_some() {
                         core.close();
                     }
@@ -972,6 +1139,7 @@ impl TcpEndpoint {
             }
         }
 
+        // Step 3: 使用剩余配额分发协议栈中待发送的数据段、重传段或 FIN 控制段。
         while 0 < remaining {
             remaining -= 1;
             core.dispatch(time::now(), |packet| net.send_ip(packet))?;
@@ -982,7 +1150,7 @@ impl TcpEndpoint {
         Ok(())
     }
 
-    /// try_emit 的失败完整包重新成为 pending，成功才结束立即应答责任。
+    /// 尝试向网络栈发送 `input.reply` 中暂存的立即控制应答报文；若发送通道暂满则将报文放回 `input.reply` 留待下次重试。
     fn emit_reply(&self, net: &NetStackRef) -> Result<(), FsError> {
         let reply = self.input.lock().reply.take();
         let Some(reply) = reply else {
@@ -997,13 +1165,14 @@ impl TcpEndpoint {
         }
     }
 
-    /// listener 操作拥有提供 raw 配置；metadata 同次快照在 child 发表前继承。
+    /// 处理监听端点收到的 SYN 握手请求：创建并初始化被动子连接端点，将其注册到全局连接表并加入半连接队列。
     fn receive_syn(
         &self,
         net: &NetStackRef,
         core: &TcpCore,
         packet: OwnedPacket,
     ) -> Result<(), FsError> {
+        // Step 1: 解析 TCP 头部，忽略非 SYN 报文，校验本地地址策略并排查已有四元组连接。
         let (_, repr) = packet.tcp()?;
         if repr.control != TcpControl::Syn {
             return Ok(());
@@ -1014,6 +1183,7 @@ impl TcpEndpoint {
         if let Some(child) = net.tables().lookup_tcp(tuple) {
             return child.enqueue(packet);
         }
+        // Step 2: 检查监听端点的半连接与全连接总队列长度是否已达 backlog 上限。
         {
             let children = self.children.lock();
             if children.limit <= children.pending.len() + children.ready.len() {
@@ -1021,6 +1191,7 @@ impl TcpEndpoint {
             }
         }
 
+        // Step 3: 快照父监听端点的绑定租约与选项，分配新端点槽位并初始化子连接的 TcpCore 与 Metadata。
         let (lease, reuse, v6_only, timeouts) = {
             let metadata = self.metadata.lock();
             (
@@ -1069,6 +1240,7 @@ impl TcpEndpoint {
             metadata.timeouts = timeouts;
         }
 
+        // Step 4: 获取网络栈准入锁，二次确认四元组未被并发创建后，在全局表中发布子连接并推入半连接队列，最后将 SYN 包入队给子连接处理。
         let admission = net.admission()?;
         if let Some(existing) = net.tables().lookup_tcp(tuple) {
             drop(admission);
@@ -1086,7 +1258,8 @@ impl TcpEndpoint {
         child.enqueue(packet)
     }
 
-    /// child 完成被动握手后转移同一 pending Arc，返回锁外通知所需的真实 parent 拥有。
+    /// 当被动子连接完成三次握手（进入 `Established` 或 `CloseWait`）时，将其从父监听端点的 `pending` 半连接队列移入 `ready` 全连接队列，
+    /// 并返回父监听端点强引用以便在释放 `core` 锁后唤醒 `accept` 等待者。
     fn report_established(&self, state: State) -> Option<Arc<TcpEndpoint>> {
         if !matches!(state, State::Established | State::CloseWait) {
             return None;
@@ -1113,16 +1286,21 @@ impl TcpEndpoint {
         }
     }
 
-    /// 退休者或根拥有局部 Arc 后才能调用，先停 Timer 再等 Work，不持核心或短锁等待。
+    /// 同步停止端点并清理所有后台活动与挂起资源。
+    ///
+    /// 由网络栈异步退休任务或网络栈整体销毁流程在持有端点局部 `Arc` 强引用的前提下调用。
+    /// 先关闭高精度 `Timer` 并等待后台 `Work` 彻底执行完毕，再中止底层 `TcpCore`、清空报文队列与子连接队列。
     pub(crate) fn stop_sync(&self) {
         assert!(
             !self.stopped.swap(true, Ordering::AcqRel),
             "TCP endpoint stopped twice"
         );
+        // Step 1: 封闭输入队列，并同步停止 Timer 与后台 Work，等待正在执行的回调彻底退出。
         self.input.lock().closed = true;
         self.timer.get().unwrap().as_ref().close_sync();
         self.work.get().unwrap().as_ref().close_sync();
 
+        // Step 2: 获取 core 睡眠锁，将未关闭的连接标记为 NotConnected 并强制中止协议状态机。
         {
             let mut core = self.core.lock();
             if core.state() != State::Closed {
@@ -1134,11 +1312,12 @@ impl TcpEndpoint {
             core.abort();
         }
 
+        // Step 3: 取出未处理的输入报文、挂起应答、父端点引用及所有半连接/全连接子端点。
         let (packets, reply) = {
             let mut input = self.input.lock();
             (core::mem::take(&mut input.packets), input.reply.take())
         };
-        // 已退休协议仍可由 OFD 查询绑定；租约仅随 endpoint 最后拥有归还。
+        // 端口绑定租约保留在 metadata.lease 中供存活的套接字文件描述查询 getsockname，待 TcpEndpoint 最终析构时自动归还。
         let parent = {
             let mut metadata = self.metadata.lock();
             core::mem::take(&mut metadata.parent)
@@ -1152,6 +1331,7 @@ impl TcpEndpoint {
             )
         };
 
+        // Step 4: 在自旋锁外中止所有子连接、从父监听队列中移除自身、释放报文并唤醒所有轮询等待者。
         for child in children.0.into_iter().chain(children.1) {
             child.abandon();
         }
@@ -1163,7 +1343,7 @@ impl TcpEndpoint {
             .notify(PollMask::POLLIN | PollMask::POLLOUT | PollMask::POLLERR | PollMask::POLLHUP);
     }
 
-    /// 撤下已结束的 child 只缩减队列，不产生新增读事件；最后 Arc 析构在锁外发生。
+    /// 从监听端点的半连接或全连接队列中移除指定 ID 的子连接，并在释放 `children` 自旋锁后再析构其 `Arc` 引用。
     fn remove_child(&self, id: u64) {
         let removed = {
             let mut children = self.children.lock();
@@ -1180,7 +1360,7 @@ impl TcpEndpoint {
     }
 }
 
-/// 只在采集开启的操作边界读取末状态，编码已观察到的变化，不补造中间协议状态。
+/// 若开启了内核追踪且操作前后 TCP 状态发生变化，将旧状态与新状态打包为 16 位整数（高 8 位旧状态、低 8 位新状态）返回。
 fn observed_state_change(previous: Option<State>, core: &TcpCore) -> Option<u64> {
     let previous = previous?;
     if !trace::enabled() {
@@ -1193,7 +1373,7 @@ fn observed_state_change(previous: Option<State>, core: &TcpCore) -> Option<u64>
     Some((trace_state_code(previous) << u8::BITS) | trace_state_code(current))
 }
 
-/// 固定事件文本使用独立于库枚举布局的协议状态码。
+/// 将 `smoltcp` 的 TCP `State` 枚举映射为内核追踪事件使用的固定数值编码。
 fn trace_state_code(state: State) -> u64 {
     match state {
         State::Closed => 0,
@@ -1210,16 +1390,21 @@ fn trace_state_code(state: State) -> u64 {
     }
 }
 
-/// 表、退休队列或停止者的局部 Arc 保活节点，Work 本身不猜测业务 Arc 控制块。
+/// 后台工作队列回调入口：还原 `TcpEndpoint` 引用并推进协议收发。
 fn run_tcp(work: Pin<&Work>) {
-    // SAFETY: context 来自构造期稳定 Arc；发表后真实表/退休/停止局部拥有一直覆盖 Work 全尾。
+    // SAFETY:
+    // 1. `work.context()` 在 `TcpEndpoint::try_new` 中由 `Arc::as_ptr(&endpoint) as usize` 初始化，指向堆上地址稳定的 `TcpEndpoint`；
+    // 2. 端点发布后由全局连接表、异步退休队列或调用 `stop_sync` 的局部 `Arc` 强引用保活；
+    // 3. 在最后一个 `Arc` 强引用释放前，`stop_sync` 必定先调用 `work.close_sync()` 等待本回调彻底执行完毕并退出，因此解引用在回调生命周期内始终有效。
     let endpoint = unsafe { &*(work.context() as *const TcpEndpoint) };
     endpoint.run();
 }
 
-/// 精确期限在时间基准维护结束后到达，记录实际到期并安排同一普通 Work，不运行协议。
+/// 高精度协议定时器到期回调：记录超时追踪事件并调度端点的后台 `Work`。
 fn tcp_expired(timer: Pin<&Timer>) {
-    // SAFETY: Timer context 来自稳定节点 Arc；退休与根停止均先等本 Timer 全尾再释放节点。
+    // SAFETY:
+    // 1. `timer.context()` 在 `TcpEndpoint::try_new` 中由 `Arc::as_ptr(&endpoint) as usize` 初始化，指向堆上地址稳定的 `TcpEndpoint`；
+    // 2. 端点在最后释放前必定经过 `stop_sync`，其中先调用 `timer.close_sync()` 停止定时器并等待正在运行的到期回调彻底执行完毕，保证解引用期间 `TcpEndpoint` 始终存活。
     let endpoint = unsafe { &*(timer.context() as *const TcpEndpoint) };
     trace::record(trace::Kind::ProtocolDeadline, endpoint.id, 0);
     endpoint.schedule();

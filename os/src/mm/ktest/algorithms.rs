@@ -1,4 +1,37 @@
-//! 启动区间与受控 buddy 池逐行为验收，直接消费生产算法。
+//! 启动期区间账本（`BootMemory`）、受控伙伴分配器（`buddy`）与物理页描述符映射（`PageMap`）的算法单元测试。
+//!
+//! ## 模块职责与架构定位
+//! 本模块位于 `mm::ktest` 下，负责在不干扰全局伙伴分配器运行状态的前提下，
+//! 直接对物理内存管理的核心数据结构与算法进行白盒与实机双重验证：
+//! 1. `boot_ranges`：验证 `BootMemory` 对固件提供的字节级 RAM 区间与保留区（Reserved）的取整、合并、交集扣除与元数据（Metadata）分配。
+//! 2. `controlled_buddy`：通过 `buddy::with_test_zone` 在受控内存池上验证伙伴系统的跨阶拆分（Split）、伙伴合并（Merge）、地址窗口受限分配与稀疏段（Section）空洞跳过。
+//! 3. `real_page_map`：遍历实机全局 `mm::pages()`（`PageMap`），核对每一个物理页帧（PFN）的四类状态（`Absent` / `Reserved` / `Metadata` / `Available`）互斥性与计数守恒。
+//!
+//! ## 核心机制与布局图解
+//!
+//! ### 1. `BootMemory` 字节区间向物理页帧（PFN）取整与扣除规则
+//! ```text
+//! 原始字节 RAM 区间:     [Page 1 + 1B .......... Page 5) U [Page 4 .......... Page 12 - 1B)
+//! 1) 先合并相邻/重叠字节: [Page 1 + 1B ...................................... Page 12 - 1B)
+//! 2) RAM 向内页对齐:            [PFN 2 ............................... PFN 11) (丢弃首尾不满一页的残片)
+//! 3) Reserved 向外页对齐:             [PFN 3 ........ PFN 6)    [PFN 10 . PFN 11)
+//! 4) 扣除交集得初始 Free:       [2..3)                      [6..10)
+//! 5) 分配 Metadata (4页):                                   [6..10) -> 转为 Metadata
+//! ```
+//!
+//! ### 2. 稀疏 `PageMap` 二级段表（Section Table）与頁分类
+//! ```text
+//! PFN 拆解: [ Section 索引 (pfn / 32768) | 段内偏移 (pfn % 32768) ]
+//!
+//! PageMap::sections
+//!   +-- Section 0: Some(&[PageDesc; 32768])  --> 含有效 RAM 页，按页标记 Reserved / Metadata / Available
+//!   +-- Section 1: None                      --> 整段 128 MiB 无 RAM，查询直接返回 None (Absent)
+//!   +-- Section 2: Some(&[PageDesc; 32768])  --> 稀疏高地址 RAM 段
+//! ```
+//!
+//! ## 锁获取顺序与并发契约
+//! - `boot_ranges` 与 `controlled_buddy` 均在栈上或函数局部构造独立状态，不获取全局锁。
+//! - `real_page_map` 只读访问引导期完成后即冻结的 `boot::info()` 与 `PageMap` 静态元数据布局，无需加锁即可并发安全读取。
 
 use crate::boot::{BootInfo, Region, MAX_MEMORY_REGIONS, MAX_RESERVED_REGIONS};
 use crate::mm::{
@@ -7,7 +40,7 @@ use crate::mm::{
     page::{PageDesc, PageKind, PageMap},
 };
 
-/// 在调用方的空账本中填写原区间边界输入，不构造完整固件快照或返回账本副本。
+/// 用精心构造的跨页、重叠、未对齐及含空洞的 RAM 与 Reserved 字节区间初始化调用方传入的空 `BootMemory` 账本。
 fn ranges(memory: &mut BootMemory) {
     let ram = [
         Region {
@@ -56,7 +89,7 @@ fn ranges(memory: &mut BootMemory) {
     memory.initialize(&ram, &reserved).unwrap();
 }
 
-/// 执行原两次实际metadata扣除，保留对齐前缀与尾部空洞，全部状态留在调用方账本。
+/// 在 `ranges` 初始化的基础上，连续执行两次带对齐要求的元数据（Metadata）页分配，将 PFN `[6, 10)` 从空闲区间转为元数据区间。
 fn deducted(memory: &mut BootMemory) {
     ranges(memory);
     assert_eq!(memory.allocate(2, 4), Ok(PageRange { start: 8, end: 10 }));
@@ -66,7 +99,12 @@ fn deducted(memory: &mut BootMemory) {
 #[ktest::suite(context = "Boot", tags("mm", "bootmem"), timeout_ms = 10000)]
 mod boot_ranges {
     use super::*;
-    /// RAM 先合并原字节区间后向内取整，保留真实空洞。
+    /// 测试目标：验证 `BootMemory` 对多段重叠或未对齐的原始字节 RAM 区间先合并再向内页对齐（向下取整终点、向上取整起点）的规则。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个空的 `BootMemory` 账本。
+    /// 2. When：调用 `ranges(&mut memory)` 载入包含重叠、跨页未对齐以及不足一页碎片的 5 段 RAM 区间。
+    /// 3. Then：重叠区间合并并向内收缩到完整页边界后得到 `[PFN 2, 11)` 与 `[PFN 20, 24)`，第 40 页内仅 1 字节的碎片被丢弃。
     #[test]
     fn ram_union() {
         let mut memory = const { BootMemory::empty() };
@@ -79,7 +117,12 @@ mod boot_ranges {
             ]
         );
     }
-    /// reserved 向外取整后仅扣除与 RAM 的交集。
+    /// 测试目标：验证 `BootMemory` 对保留（Reserved）字节区间向外页对齐后，仅保留其与有效 RAM 区间的交集。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个空的 `BootMemory` 账本。
+    /// 2. When：调用 `ranges(&mut memory)` 载入跨页未对齐、相邻以及落在 RAM 空洞中的保留区间。
+    /// 3. Then：保留区间向外扩展到页边界并与 RAM 求交集后，合并为 `[3, 6)`、`[10, 11)` 和 `[20, 22)`，完全位于 RAM 外的 `[30, 31)` 被忽略。
     #[test]
     fn reserved_intersection() {
         let mut memory = const { BootMemory::empty() };
@@ -93,7 +136,12 @@ mod boot_ranges {
             ]
         );
     }
-    /// 原 free 与分类账务互斥且总数守恒。
+    /// 测试目标：验证初始化后的空闲页区间（Free）等于有效 RAM 扣除保留区（Reserved），且四类页统计满足总数守恒。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个空的 `BootMemory` 账本并调用 `ranges(&mut memory)` 完成初始化。
+    /// 2. When：读取空闲区间列表 `memory.free()` 与统计信息 `memory.stats()`。
+    /// 3. Then：空闲区间为 `[2, 3)`、`[6, 10)`、`[22, 24)` 共 7 页；总有效页 `present_pages`（13）等于 `reserved_pages`（6）加 `free_pages`（7），`metadata_pages` 为 0。
     #[test]
     fn initial_free() {
         let mut memory = const { BootMemory::empty() };
@@ -116,7 +164,12 @@ mod boot_ranges {
             }
         );
     }
-    /// 对齐申请合并 metadata，free 真实扣除四页。
+    /// 测试目标：验证从 `BootMemory` 分配对齐的元数据页后，相邻元数据区间自动合并，且空闲页计数相应扣减。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个空的 `BootMemory` 账本。
+    /// 2. When：调用 `deducted(&mut memory)` 先分配 4 页对齐的 2 页（落入 `[8, 10)`），再分配 2 页对齐的 2 页（落入 `[6, 8)`）。
+    /// 3. Then：两段分配合并为单一元数据区间 `[6, 10)`；原 `[6, 10)` 空闲区间被完全消耗，剩余空闲页减少 4 页变为 3 页。
     #[test]
     fn metadata_deduction() {
         let mut memory = const { BootMemory::empty() };
@@ -139,7 +192,12 @@ mod boot_ranges {
             }
         );
     }
-    /// 每个非法或不可满足参数独立失败，原 metadata 与账务不变。
+    /// 测试目标：验证 `BootMemory::allocate` 对连续空闲页不足、零页数、零对齐、非 2 的幂次对齐及整数溢出的请求均返回错误且不破坏既有状态。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：初始化并执行 `deducted(&mut memory)`，此时剩余空闲区间为 `[2, 3)`（1 页）和 `[22, 24)`（2 页）。
+    /// 2. When：使用参数化用例依次尝试分配 3 页（碎片化无法满足）、0 页、0 对齐、对齐为 3、页数溢出和对齐溢出。
+    /// 3. Then：`allocate` 均返回 `Err`，且调用前后的 `stats()` 与 `metadata()` 区间保持不变。
     #[test]
     #[case("fragmented", 3, 1)]
     #[case("zero_pages", 0, 1)]
@@ -155,7 +213,12 @@ mod boot_ranges {
         assert_eq!(memory.stats(), before);
         assert_eq!(memory.metadata(), [PageRange { start: 6, end: 10 }]);
     }
-    /// 两片未对齐且相邻的字节 RAM 共同覆盖一页，metadata 居中切分 free。
+    /// 测试目标：验证两段在页内半页边界处首尾相接的字节 RAM 能够先合并再向内取整，避免丢失交界处的完整物理页，并支持从空闲区间中部切分元数据。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：构造两段在 `PAGE_SIZE + PAGE_SIZE / 2` 处无缝拼接的 RAM 字节区间 `[1.0 页, 1.5 页)` 与 `[1.5 页, 8.0 页)`。
+    /// 2. When：初始化 `BootMemory` 后，请求分配 4 页对齐的 2 页元数据。
+    /// 3. Then：第 1 页完整保留，有效 RAM 为 `[1, 8)` 共 7 页；4 页对齐分配命中 `[4, 6)`，将原空闲区间居中切分为 `[1, 4)` 与 `[6, 8)`。
     #[test]
     fn adjacent_byte_fragments() {
         let ram = [
@@ -190,7 +253,12 @@ mod boot_ranges {
             }
         );
     }
-    /// 原始输入的对齐溢出、片段数量与无效区间分别独立拒绝。
+    /// 测试目标：验证 `BootMemory::initialize` 对地址向上取整溢出、区间数量超限以及空区间（`start == end`）等非法输入的拒绝行为。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：构造测试用的 RAM 与 Reserved 区间数组。
+    /// 2. When：根据用例类型分别注入接近 `usize::MAX` 的溢出地址、超过 `MAX_MEMORY_REGIONS` / `MAX_RESERVED_REGIONS` 的区间切片，以及 `start == end` 的空区间。
+    /// 3. Then：`memory.initialize(...)` 均返回 `Err`。
     #[test]
     #[case("ram_overflow", 0)]
     #[case("reserved_overflow", 1)]
@@ -230,7 +298,12 @@ mod boot_ranges {
             .initialize(&ram[..ram_count], &reserved[..reserved_count])
             .is_err());
     }
-    /// 每次成功申请消费一个固定 metadata 额度，超限不改已分配页。
+    /// 测试目标：验证当不连续的元数据分配耗尽 `BootMemory` 内部固定容量槽位时，后续无法合并的新分配会失败且不修改已分配账本。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：初始化一段包含 `limit + 1` 页的连续 RAM，并循环逐页分配 `[0, limit)` 共 `limit` 页（合并为单一段 `[0, limit)`）。
+    /// 2. When：继续尝试分配最后第 `limit` 页时，验证容量上限边界与账本状态。
+    /// 3. Then：超出容量上限的分配返回 `Err`，已有的统计信息与元数据区间 `[0, limit)` 保持不变。
     #[test]
     fn metadata_capacity() {
         let limit = 1 + MAX_MEMORY_REGIONS;
@@ -269,7 +342,12 @@ mod boot_ranges {
 #[ktest::suite(context = "Boot", tags("mm", "buddy"), timeout_ms = 10000)]
 mod controlled_buddy {
     use super::*;
-    /// 每阶独立真实拆分和合并，最大块恢复不依赖上一参数。
+    /// 测试目标：验证伙伴分配器在 `0..=10` 各个阶数（Order）下的块拆分、对齐不变量以及释放后的伙伴合并恢复能力。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：通过 `buddy::with_test_zone(false, ...)` 创建一个包含 1024 页（单个 Order 10 块）的连续受控伙伴内存池。
+    /// 2. When：先分配一个指定 `order` 的块并检查其起始页帧对齐与剩余空闲页数，随后将其释放，再尝试分配一个完整的 Order 10 最大块。
+    /// 3. Then：首次分配得到的块阶数等于 `order`、起始页号按 `1 << order` 对齐且空闲页数精确减少 `1 << order`；释放后伙伴链逐级完整合并回单个 Order 10 块，最终释放后 1024 页全部恢复空闲。
     #[test]
     #[case("order0", 0)]
     #[case("order1", 1)]
@@ -299,10 +377,16 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 1024);
         });
     }
-    /// 混阶填满原池，live 块不重叠，非顺序归还后恢复原最大块。
+    /// 测试目标：验证混合阶数（Order 0..=9 再加一个 Order 0）恰好耗尽整个 1024 页内存池时各块互不重叠，且按乱序释放后仍能完整合并回单个 Order 10 大块。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个 1024 页的连续受控伙伴内存池，先验证超阶请求（Order 11）失败且 Order 10 分配释放正常。
+    /// 2. When：依次分配 Order `0, 1, 2, ..., 9` 以及最后一个 Order `0` 共 11 个块（总页数 $1 + 2 + 4 + \dots + 512 + 1 = 1024$），验证池耗尽后，按固定乱序 `[9, 0, 7, 2, 10, 4, 1, 8, 3, 6, 5]` 逐一释放全部块。
+    /// 3. Then：已分配的 11 个块两两物理区间互不重叠，分配完后空闲页为 0 且新分配失败；乱序释放完成后空闲页恢复为 1024，且可再次分配出完整的 Order 10 块。
     #[test]
     fn mixed_orders() {
         buddy::with_test_zone(false, |zone| {
+            // Step 1: 验证超最大阶（Order 11）分配失败，且完整 Order 10 块可正常分配与释放。
             assert!(!zone.allocate(0, 11));
             assert_eq!(zone.free(), 1024);
             assert!(zone.allocate(0, 10));
@@ -310,6 +394,7 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 0);
             zone.release(0);
 
+            // Step 2: 依次分配 Order 0..=9 及最后一个 Order 0 块以耗尽全部 1024 页，并校验已分配块两两不重叠。
             for index in 0..=10 {
                 let order = if index == 10 { 0 } else { index };
                 let before = zone.free();
@@ -327,6 +412,7 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 0);
             assert!(!zone.allocate(11, 0));
 
+            // Step 3: 按固定乱序释放全部 11 个块，验证伙伴系统能够逐级合并恢复回完整的 Order 10 块。
             for index in [9, 0, 7, 2, 10, 4, 1, 8, 3, 6, 5] {
                 zone.release(index);
             }
@@ -337,10 +423,16 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 1024);
         });
     }
-    /// 原保留页及 section 空洞切断连续块，耗尽与归还只消费实际可用描述符。
+    /// 测试目标：验证含保留页（Reserved）与稀疏段（Section）空洞的碎片化伙伴池在初始化、单页耗尽、乱序释放及最大可合并阶数上的正确性。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：通过 `buddy::with_test_zone(true, ...)` 创建含保留页（PFN 3, 7, 11, 15）与跨段高地址页（PFN 65536..65538）的稀疏测试池（共 14 个可用页）。
+    /// 2. When：先尝试分配 Order 3（8 页连续块），随后循环分配 14 个单页（Order 0）耗尽内存池；接着按步长 5 乱序释放全部 14 页，再尝试分配 Order 2（4 页块）和 5 个 Order 1（2 页块）。
+    /// 3. Then：因每 4 页中都有保留页打断，Order 3 和 Order 2 均无法分配；14 个单页均避开保留页与空洞且互不重复；乱序释放后恰好可合并出 5 个 Order 1 块（共 10 页），剩余 4 个孤立单页。
     #[test]
     fn fragmented_exhaustion() {
         buddy::with_test_zone(true, |zone| {
+            // Step 1: 验证保留页阻断了 Order 3 连续块，随后循环分配 14 个单页（Order 0）耗尽稀疏池。
             assert_eq!(zone.free(), 14);
             assert!(!zone.allocate(0, 3));
             assert_eq!(zone.free(), 14);
@@ -358,6 +450,7 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 0);
             assert!(!zone.allocate(14, 0));
 
+            // Step 2: 乱序释放全部 14 页后，验证保留页仍阻断 Order 2，但可分配出 5 个 Order 1 块并最终归还。
             for step in 0..14 {
                 zone.release((step * 5) % 14);
             }
@@ -376,7 +469,12 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 14);
         });
     }
-    /// 可达窗口在原大块内选择右子块，拒绝越界后仍按原阶完整合并。
+    /// 测试目标：验证带物理页帧窗口限制的分配接口 `allocate_in` 能在大块拆分时精准挑选落在窗口内的右子块，并在释放后恢复完整大块。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建一个 1024 页的连续受控伙伴内存池。
+    /// 2. When：请求在窗口 `[9, 20)` 内分配 Order 2（4 页对齐块），接着请求在不足以容纳 4 页对齐块的窗口 `[13, 19)` 内分配 Order 2，再在 `[16, 20)` 内分配 Order 2，最后释放两个块并尝试分配 Order 10。
+    /// 3. Then：第一次分配跳过未对齐的前缀，拆分并选中窗口内的 `[12, 16)`；第二次因 `[13, 19)` 内无 4 页对齐的完整块而失败；第三次成功选中 `[16, 20)`；全部释放后完整合并回 `[0, 1024)` 的 Order 10 大块。
     #[test]
     fn constrained_split_merge() {
         buddy::with_test_zone(false, |zone| {
@@ -396,7 +494,12 @@ mod controlled_buddy {
         });
     }
 
-    /// 受限选择跳过保留页和 section 孔洞，不因存在高地址空页越过 mask。
+    /// 测试目标：验证窗口受限分配 `allocate_in` 在含保留页与稀疏空洞的内存池中严格遵守 `[start, end)` 上下界，不会误分配高地址段中的空闲页。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：创建稀疏测试池（低地址段 `[0, 16)` 内含 12 个可用单页和 4 个保留页，高地址段 `65536..65538` 含 2 个可用页，总计 14 页）。
+    /// 2. When：限定在低地址窗口 `[0, 16)` 内尝试分配 Order 2，随后连续分配 12 个单页（Order 0），并尝试分配第 13 个单页。
+    /// 3. Then：Order 2 因保留页阻断而失败；12 次单页分配全部落在 `[0, 16)` 内且避开保留页 `[3, 7, 11, 15]`；第 13 次分配因窗口外的高地址 2 页不在 `[0, 16)` 范围内而被拒绝，此时全局仍剩 2 页空闲。
     #[test]
     fn constrained_reserved_and_holes() {
         buddy::with_test_zone(true, |zone| {
@@ -417,7 +520,12 @@ mod controlled_buddy {
             assert_eq!(zone.free(), 14);
         });
     }
-    /// PageMap 逐 section 定位独立描述符，无 backing 的整 section 返回 None。
+    /// 测试目标：验证 `PageMap` 的稀疏二级段表（Section Table）能够按 `PFN / 32768` 独立定位页描述符，并对未分配后台数组的空洞段或段内越界偏移返回 `None`。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：构造包含 3 个 Section 槽位的测试 `PageMap`：Section 0 含 2 页（`Reserved`、`Metadata`），Section 1 为 `None`（空洞），Section 2（起始 PFN 65536）含 1 页（`Available`）。
+    /// 2. When：分别查询 PFN `0`、`1`、`2`（Section 0 内越界）、`32768`（Section 1 空洞）、`usize::MAX`、`65536` 和 `65537`（Section 2 内越界）。
+    /// 3. Then：有效 PFN 返回对应的 `PageKind`，段内越界、空洞段及 `usize::MAX` 均安全返回 `None`。
     #[test]
     fn pfn_holes() {
         let low = [
@@ -437,7 +545,7 @@ mod controlled_buddy {
     }
 }
 
-/// 判断原字节 RAM 是否完整覆盖该页，允许相邻资源联合覆盖。
+/// 检查原始引导信息 `BootInfo` 中的字节级 RAM 区间是否完整覆盖了物理页帧 `pfn` 对应的 `[pfn * PAGE_SIZE, (pfn + 1) * PAGE_SIZE)` 范围（支持多段相邻区间拼接覆盖）。
 fn ram_page(info: &BootInfo, pfn: usize) -> bool {
     let mut covered = pfn * PAGE_SIZE;
     let end = covered + PAGE_SIZE;
@@ -456,7 +564,7 @@ fn ram_page(info: &BootInfo, pfn: usize) -> bool {
     true
 }
 
-/// 检查真实不可变启动范围包含 PFN，不赋予物理访问权。
+/// 判断给定的半开页帧区间列表 `ranges` 中是否包含指定的物理页帧号 `pfn`。
 fn contains(ranges: &[PageRange], pfn: usize) -> bool {
     ranges.iter().any(|r| r.start <= pfn && pfn < r.end)
 }
@@ -464,9 +572,15 @@ fn contains(ranges: &[PageRange], pfn: usize) -> bool {
 #[ktest::suite(context = "Thread", tags("mm", "pagemap"), timeout_ms = 10000)]
 mod real_page_map {
     use super::*;
-    /// 逐 PFN 原分类、空洞、reserved/metadata/free 互斥与六分类计数。
+    /// 测试目标：验证实机全局 `PageMap` 中所有 Section 的每个 PFN 状态分类与引导信息严格一致，且 `Reserved`、`Metadata`、`Available` 互斥并与统计汇总完全吻合。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：获取内核全局 `mm::pages()`（`PageMap`）与 `boot::info()`。
+    /// 2. When：遍历所有 Section 及其内部的 32768 个 PFN，根据 `boot::info()` 独立计算每个 PFN 是否属于 RAM、Reserved、Metadata 或 Free，并与 `map.get(pfn)` 返回的 `PageDesc::kind()` 逐一比对，同时累加各分类页数。
+    /// 3. Then：每个 PFN 的分类与预期完全一致，不存在无 RAM 却分配了 Section 数组的空段；`present_pages == reserved_pages + metadata_pages + free_pages` 恒成立，且 `free_ranges()` 严格递增不重叠、总页数等于 `free_pages`。
     #[test]
     fn classifications() {
+        // Step 1: 遍历二级段表中的所有 Section 与段内 32768 个 PFN，逐页核对状态分类互斥性并累加计数。
         let map = crate::mm::pages();
         let info = crate::boot::info();
         let (sections, metadata_ranges) = map.test_layout_parts();
@@ -509,6 +623,7 @@ mod real_page_map {
             present_sections += usize::from(section.is_some());
         }
 
+        // Step 2: 校验累加的四类页帧计数与 PageMap::stats() 统计快照完全相等且总数守恒。
         let stats = map.stats();
         assert_eq!(
             counts,
@@ -522,6 +637,7 @@ mod real_page_map {
         assert_eq!(counts[0], counts[1] + counts[2] + counts[3]);
         assert_eq!(present_sections, map.present_sections());
 
+        // Step 3: 校验 free_ranges() 列表严格递增不重叠，且区间长度之和等于空闲页总数。
         let mut previous = 0;
         let mut listed = 0;
         for range in map.free_ranges() {
@@ -531,7 +647,12 @@ mod real_page_map {
         }
         assert_eq!(listed, counts[3]);
     }
-    /// 根索引长度来自实际 RAM 最大完整页，边界与 usize::MAX 不越界。
+    /// 测试目标：验证实机 `PageMap` 的根 Section 数组长度恰好覆盖最高有效 RAM 页所在的段，且段表上界与 `usize::MAX` 查询均安全返回 `None`。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：读取全局 `mm::pages()` 与 `boot::info()`。
+    /// 2. When：找出 `boot::info()` 中最后一个完整有效 RAM 页帧的上界 `maximum`，计算所需 Section 数量 `maximum.div_ceil(32768)`，并查询越界 PFN `section_count * 32768` 与 `usize::MAX`。
+    /// 3. Then：`map.section_count()` 与计算值严格相等，越界 PFN 查询均返回 `None`。
     #[test]
     fn index_boundaries() {
         let map = crate::mm::pages();
@@ -550,7 +671,12 @@ mod real_page_map {
         assert!(map.get(map.section_count() * 32768).is_none());
         assert!(map.get(usize::MAX).is_none());
     }
-    /// 永久根/范围/描述符 backing 均属于 metadata，绝不出现在 free。
+    /// 测试目标：验证承载 `PageMap` 自身数据结构（根 Section 切片、`free_ranges` 切片、`metadata` 切片及各段 `PageDesc` 数组）的物理页全部被标记为 `PageKind::Metadata`，绝不会混入空闲页池。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：从 `mm::pages()` 提取根段表、空闲区间表、元数据区间表以及所有非空 Section 的 `PageDesc` 切片虚拟地址与字节长度。
+    /// 2. When：将每段切片的虚拟地址转换为物理地址，遍历其跨越的所有物理页帧 `pfn`。
+    /// 3. Then：每一个承载 `PageMap` 元数据的物理页在 `map.get(pfn)` 中均标记为 `PageKind::Metadata`，包含在 `metadata` 区间内，且不在 `free_ranges()` 中。
     #[test]
     fn permanent_metadata() {
         let map = crate::mm::pages();
@@ -585,7 +711,12 @@ mod real_page_map {
             }
         }
     }
-    /// 内核及 DTB 与 RAM 交集均保留，不随 suite 选择顺序改变。
+    /// 测试目标：验证内核镜像（Kernel）与设备树（DTB）所占用的物理页帧均被排除在可分配空闲区间之外，且在 `PageMap` 中标记为 `Reserved`（或位于 RAM 外的 `Absent`）。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：通过参数化用例分别传入 `boot::kernel_region()` 与 `boot::info().dtb` 物理字节区间。
+    /// 2. When：若区间非空，遍历其向外页对齐覆盖的所有物理页帧 `pfn`。
+    /// 3. Then：没有任何一个 `pfn` 出现在 `map.free_ranges()` 中，且 `map.get(pfn)` 仅可能为 `None`、`PageKind::Absent` 或 `PageKind::Reserved`。
     #[test]
     #[case("kernel", crate::boot::kernel_region())]
     #[case("dtb", crate::boot::info().dtb)]

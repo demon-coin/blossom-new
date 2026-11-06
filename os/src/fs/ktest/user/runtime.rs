@@ -1,4 +1,54 @@
-//! 原比赛聚合 ELF 从真实族目录建立 FS 快照，装载断言读取实际用户栈和磁盘程序头。
+//! 动态链接 ELF64 程序装载、辅助向量（`auxv`）初始用户栈布局、`PT_INTERP` 解释器映射与写互斥（`ETXTBSY`）生命周期的内核单元测试（ktest）。
+//!
+//! # 模块职责与架构定位
+//! 本模块位于 `os/src/fs/ktest/user/runtime.rs`，作为 `UserOwner` 夹具的方法集合，
+//! 专门验证内核 ELF 装载器（`exec::prepare` / `exec::load`）在装载动态链接可执行文件（如 `/entry-dynamic.exe`）与动态链接器（`ld-musl`）时的完整语义。
+//! 上游由用户态运行时测试套件调用，下游直接读取磁盘上的 ELF64 文件头/程序头（`Phdr`），并通过 `Mm::copyin`、`Mm::fault` 与 `Mm::mapping` 检验目标虚拟地址空间的内存布局。
+//!
+//! # 核心设计与动态链接装载内存布局 / 初始用户栈
+//!
+//! ## 1. 动态链接双映像（主程序 + 解释器）虚拟地址空间与寄存器布局
+//! ```text
+//! 虚拟地址空间 (Mm)
+//! +---------------------------------------------------------------+ 高地址
+//! | 初始用户栈 (Initial User Stack, SP 16 字节对齐)               |
+//! |   [sp + 0]        : argc                                      |
+//! |   [sp + 8 ..]     : argv[0..argc], NULL                       |
+//! |   [...]           : envp[0..envc] ("LD_LIBRARY_PATH=/lib"), 0 |
+//! |   [...]           : auxv[] 辅助向量键值对:                    |
+//! |                       AT_PHDR (3)  -> bias + main.phdr_vaddr  |
+//! |                       AT_PHENT(4)  -> 56 (ELF64 Phdr 字节大小)|
+//! |                       AT_PHNUM(5)  -> main.e_phnum            |
+//! |                       AT_BASE (7)  -> loader_base (无解释器=0)|
+//! |                       AT_ENTRY(9)  -> bias + main.e_entry     |
+//! |                       AT_EXECFN(31)-> 栈上可执行文件路径字符串|
+//! |                       AT_NULL (0)  -> 0                       |
+//! |   [...]           : argv / envp / filename 原始 NUL 结尾字符串|
+//! +---------------------------------------------------------------+
+//! | 动态链接器 (PT_INTERP, ET_DYN) 各 PT_LOAD 段                  |
+//! |   基址: AT_BASE (> 0), 初始 PC = AT_BASE + loader.e_entry     |
+//! +---------------------------------------------------------------+
+//! | 进程堆起点 (brk) = page_end(main 最高 PT_LOAD 结束地址)       |
+//! +---------------------------------------------------------------+
+//! | 主程序 (ET_EXEC: bias = 0; ET_DYN: bias > 0) 各 PT_LOAD 段    |
+//! |   文件数据前缀: [vaddr, vaddr + filesz) 映射磁盘文件内容      |
+//! |   BSS 零扩展尾: [vaddr + filesz, vaddr + memsz) 零填充        |
+//! +---------------------------------------------------------------+ 低地址
+//! ```
+//!
+//! ## 2. 可执行文件写互斥（`TextBusy` / `ETXTBSY`）引用计数生命周期
+//! ```text
+//! exec::prepare 装载成功 ──► 主文件与解释器 Inode 均绑定 ExecAccess（acquire_write 返回 TextBusy）
+//!   │
+//!   ├──► Mm::fork 复制地址空间 ──► 子 Mm 克隆 VMA 中的 ExecAccess 强引用
+//!   │                              └──► 释放父 Mm 后，子 Mm 仍存活 ──► 主文件与解释器依旧拒绝写入
+//!   │
+//!   └──► 用户进程退出且最后一个 Mm 强引用被 Drop ──► ExecAccess 全部释放 ──► acquire_write 恢复成功
+//! ```
+//!
+//! # 锁获取顺序与并发契约
+//! - 在内存耗尽（OOM）注入测试中，通过 `spawn_kernel_on` 在独立内核线程中持有 `pressure.exhaust()` 并执行 `exec::load`；
+//!   子线程将观测结果写入 `observed`（`SpinLock<Option<...>>`）前必须先释放 `pressure`，父线程通过 `child.join()` 同步回收子线程后再读取结果，避免跨线程死锁或页帧泄漏。
 
 use crate::arch::UserAccess;
 use crate::mm::PAGE_SIZE;
@@ -7,26 +57,44 @@ use core::convert::TryInto;
 
 use crate::fs::ktest::user::*;
 
+/// 动态链接运行时测试的主可执行文件路径。
 const ENTRY: &[u8] = b"/entry-dynamic.exe";
+/// 动态链接器查找共享库所使用的环境变量字符串。
 const LIBRARY_ENV: &[u8] = b"LD_LIBRARY_PATH=/lib";
 
+/// 从磁盘 ELF64 文件头（`Ehdr`）解码出的核心元数据摘要。
 struct Header {
+    /// ELF 文件类型（`e_type`）：`2` 表示 `ET_EXEC`（固定地址可执行文件），`3` 表示 `ET_DYN`（位置无关可执行文件或共享库）。
     kind: u16,
+    /// 程序入口虚拟地址（`e_entry`，未加装载偏移 `bias`）。
     entry: usize,
+    /// 程序头表（Program Header Table）在文件中的字节偏移量（`e_phoff`）。
     phoff: u64,
+    /// 程序头表中的条目数量（`e_phnum`）。
     phnum: usize,
 }
 
+/// 从初始用户栈辅助向量（Auxiliary Vector，`auxv`）中提取的关键条目集合。
 struct Auxv {
+    /// `AT_PHDR`（类型 3）：主程序程序头表在用户虚拟地址空间中的映射地址。
     phdr: usize,
+    /// `AT_PHENT`（类型 4）：单个程序头表条目的字节大小（ELF64 标准为 56 字节）。
     phent: usize,
+    /// `AT_PHNUM`（类型 5）：主程序程序头表条目总数。
     phnum: usize,
+    /// `AT_BASE`（类型 7）：动态链接器（解释器）的装载基地址；若直接装载无解释器的映像则为 `0`。
     base: usize,
+    /// `AT_ENTRY`（类型 9）：主程序在虚拟地址空间中的实际入口地址（`bias + e_entry`）。
     entry: usize,
 }
 
 impl UserOwner {
-    /// 仅用户 Runtime 取得族根快照，父 PathOwner 保持原盘 root/cwd 和既有失败清理责任。
+    /// 测试目标：验证在指定测试族目录（`family`）作为独立根命名空间快照时，动态链接程序 `/entry-dynamic.exe` 的完整装载布局、初始栈 `auxv` 及用户态运行退出，且不影响父 `PathOwner` 原有的根目录与当前工作目录。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：初始化夹具并将 `family` 目录解析为新 `FsContext` 的根目录与当前工作目录，打开 `/entry-dynamic.exe` 读取其 ELF64 头与 `PT_INTERP` 解释器路径；
+    /// 2. When：构造包含 `LD_LIBRARY_PATH=/lib` 与选择器参数（`"argv"` 或 `"env"`）的 `Arguments`，调用 `prepare_image` 装载双映像，并通过 `verify_image` 逐项校验初始栈、主程序及解释器的 `PT_LOAD` 权限、BSS 清零与入口指令字节，随后启动进程运行；
+    /// 3. Then：用户进程以状态码 `0` 正常退出，地址空间活动用户计数归零（`mm.user_count() == 0`），且父 `PathOwner` 的 `root` 与 `cwd` 保持原目录不变。
     pub(super) fn runtime_dynamic(
         &mut self,
         context: &mut TestContext<'_>,
@@ -37,6 +105,7 @@ impl UserOwner {
             matches!(selector, b"argv" | b"env"),
             "unknown runtime selector"
         );
+        // Step 1: 为本次运行构造以 `family` 为根的独立文件系统上下文（FsContext），解析主程序头与动态链接器路径。
         self.prepare(context)?;
         let parent = self.path.context().clone();
         let root = checked(
@@ -60,6 +129,7 @@ impl UserOwner {
             context.diagnostic(format_args!("runtime-arguments error={:?}", error));
             TestError("runtime arguments preparation failed")
         })?;
+        // Step 2: 装载动态链接程序映像，并核对初始用户栈、auxv、主程序与解释器各 PT_LOAD 段的映射内容和页表权限。
         let image = prepare_image(self, context, &fs_context, arguments)?;
         verify_image(
             context,
@@ -74,6 +144,7 @@ impl UserOwner {
         )?;
         drop(main);
 
+        // Step 3: 启动用户进程并等待其退出，验证子任务完全回收且父夹具的 root/cwd 未被篡改。
         let mm = image.mm.clone();
         self.start_program(context, image, fs_context, false, false, Credentials::ROOT)?;
         let event = self.wait(context)?;
@@ -100,12 +171,18 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 直接装载同族原 loader，初始 auxv 将它作为主映像，随后用户 loader 自己装入原程序。
+    /// 测试目标：验证直接将动态链接器（`PT_INTERP` 指向的 `ET_DYN` 解释器本身）作为主程序装载时，内核将其作为无解释器的单映像处理（`AT_BASE = 0`），且动态链接器在用户态能够自行加载并执行 `/entry-dynamic.exe`。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：从 `/entry-dynamic.exe` 的 `PT_INTERP` 段读取动态链接器路径，直接打开该动态链接器并验证其为不包含嵌套 `PT_INTERP` 的 `ET_DYN`（`kind == 3`）文件；
+    /// 2. When：以 `[interpreter, "/entry-dynamic.exe", "argv"]` 作为命令行参数直接调用 `prepare_image` 装载该动态链接器；
+    /// 3. Then：`verify_image` 确认 `AT_BASE == 0`、初始 `PC == AT_ENTRY` 且各段映射正确；随后启动运行，动态链接器在用户态成功加载目标程序并以状态码 `0` 退出。
     pub(super) fn runtime_loader(
         &mut self,
         context: &mut TestContext<'_>,
         family: &[u8],
     ) -> TestResult {
+        // Step 1: 从主程序的 PT_INTERP 中提取动态链接器路径，并验证动态链接器自身是无 PT_INTERP 的 ET_DYN 映像。
         self.prepare(context)?;
         let fs_context = family_context(self, context, family)?;
         let main = open(context, self, &fs_context, ENTRY)?;
@@ -120,6 +197,7 @@ impl UserOwner {
             assert_ne!(phdr_kind(&phdr), 3, "direct loader has PT_INTERP");
         }
 
+        // Step 2: 将动态链接器作为主映像装载，验证 AT_BASE=0 的直接装载布局并启动运行。
         let argv = [interpreter, ENTRY, b"argv" as &[u8]];
         let arguments = runtime_arguments(context, interpreter, &argv)?;
         let image = prepare_image(self, context, &fs_context, arguments)?;
@@ -139,12 +217,19 @@ impl UserOwner {
         self.run_runtime(context, image, fs_context)
     }
 
-    /// fork 的两映像真实执行占用随 Mm 复制；父释放、用户退出与末拥有释放分别观察。
+    /// 测试目标：验证动态链接双映像（主程序与解释器）的可执行文件写互斥（`FsError::TextBusy`）会随 `Mm::fork` 复制地址空间而延续，直到父 `Mm`、运行进程以及最后一个子 `Mm` 强引用全部释放后才恢复可写。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：装载 `/entry-dynamic.exe` 及其解释器，验证此时对主文件和解释器文件调用 `acquire_write()` 均返回 `Err(FsError::TextBusy)`；
+    /// 2. When：调用 `image.mm.fork()` 复制出子地址空间 `child`，并立即 `drop` 原父地址空间 `image.mm`；
+    /// 3. Then：尽管父 `Mm` 已销毁，子 `Mm` 仍持有主程序和解释器的执行映射引用，两个文件依旧返回 `TextBusy`；且子 `Mm` 中的栈与代码段映射通过 `verify_image` 完整校验；
+    /// 4. When & Then：使用子 `Mm` 启动进程运行至退出并回收任务后，只要测试手中还持有 `child: Arc<Mm>`，两个文件仍保持 `TextBusy`；当 `drop(child)` 释放最后一个 `Mm` 强引用后，主程序与解释器的 `acquire_write()` 立即恢复成功。
     pub(super) fn runtime_fork(
         &mut self,
         context: &mut TestContext<'_>,
         family: &[u8],
     ) -> TestResult {
+        // Step 1: 装载主程序与解释器双映像，验证两者均已处于拒绝写入（TextBusy）状态。
         self.prepare(context)?;
         let fs_context = family_context(self, context, family)?;
         let main = open(context, self, &fs_context, ENTRY)?;
@@ -167,6 +252,7 @@ impl UserOwner {
         )?;
         assert_denied(&main, &loader);
 
+        // Step 2: 通过 `Mm::fork` 克隆地址空间并立即释放原父 `Mm`，验证子 `Mm` 独立维持双映像内容与 `TextBusy` 写互斥。
         let child = Arc::try_new(image.mm.fork().map_err(|error| {
             context.diagnostic(format_args!("runtime-fork error={:?}", error));
             TestError("runtime two-image Mm fork failed")
@@ -190,6 +276,7 @@ impl UserOwner {
             ENTRY,
             &[ENTRY, b"argv"],
         )?;
+        // Step 3: 运行子 `Mm` 直至进程退出，验证唯有当最后一个 `Arc<Mm>` 强引用被 Drop 时，主程序与解释器才恢复可写。
         self.run_runtime(context, image, fs_context)?;
         assert_eq!(child.user_count(), 0, "runtime fork still has users");
         assert_denied(&main, &loader);
@@ -205,12 +292,20 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 普通解释器准备错误与真实页堆耗尽不修改旧现场，也不归还旧主文件和 loader 的占用。
+    /// 测试目标：验证解释器路径错误（不存在或指向目录）以及 `exec::load` 过程中的物理内存耗尽（OOM）不会破坏已装载的旧进程映像现场，也不会泄漏候选文件的执行写互斥锁。
+    ///
+    /// 场景步骤（Given-When-Then）：
+    /// 1. Given：预先成功装载一份 `/entry-dynamic.exe` 映像 `image`，记录其初始 `PC` 与 `brk`，此时主文件与解释器处于 `TextBusy` 状态；
+    /// 2. When（解释器路径异常）：依次尝试装载解释器不存在的 `/elf-missing-interpreter` 与解释器为目录的 `/elf-directory-interpreter`；
+    /// 3. Then：分别返回 `ExecError::File(FsError::NotFound)` 与 `ExecError::File(FsError::Permission)`，候选可执行文件本身的写锁未被残留占用（`acquire_write` 成功），且原 `image` 的主文件与解释器仍保持 `TextBusy`；
+    /// 4. When（装载期间物理页耗尽）：预热主文件首页缓存后，在独立内核线程中耗尽空闲物理页（`pressure.exhaust()`）并调用 `exec::load`；
+    /// 5. Then：`exec::load` 返回 `Err(ExecError::NoMemory)`；原 `image` 的 `PC`、`brk`、内存映像及 `TextBusy` 状态完好无损，随后仍可正常启动运行并以状态码 `0` 退出，最后释放所有写互斥。
     pub(super) fn runtime_failures(
         &mut self,
         context: &mut TestContext<'_>,
         family: &[u8],
     ) -> TestResult {
+        // Step 1: 预先装载一份正常的主程序与解释器映像作为受保护的旧现场基准。
         self.prepare(context)?;
         let fs_context = family_context(self, context, family)?;
         let main = open(context, self, &fs_context, ENTRY)?;
@@ -238,6 +333,7 @@ impl UserOwner {
         let original_pc = image.context.pc;
         let original_break = image.mm.brk(0);
 
+        // Step 2: 依次测试解释器缺失（NotFound）与解释器为目录（Permission）的装载失败回滚，确认候选文件未泄漏执行写互斥。
         for (pathname, expected) in [
             (b"/elf-missing-interpreter" as &[u8], FsError::NotFound),
             (b"/elf-directory-interpreter" as &[u8], FsError::Permission),
@@ -258,6 +354,7 @@ impl UserOwner {
             assert_denied(&main, &loader);
         }
 
+        // Step 3: 在独立内核线程中注入物理内存耗尽（OOM）并执行 `exec::load`，验证返回 `ExecError::NoMemory`。
         let arguments = runtime_arguments(context, ENTRY, &[ENTRY, b"argv"])?;
         let vfs = self.path.vfs().clone();
         let candidate = main.clone();
@@ -277,7 +374,7 @@ impl UserOwner {
             .map_err(|_| TestError("runtime OOM result owner allocation failed"))?;
         let child_observed = observed.clone();
         let candidate_context = fs_context.clone();
-        // 控制任务的唯一 join 责任由 fixture 持有，须在文件系统资源比较前完整消费。
+        // 子线程的唯一 join 句柄保存在 `self.observer` 中，必须在比对文件系统资源基线前完整回收。
         self.observer = Some(
             crate::task::spawn_kernel_on(cpu::current().id, move || {
                 let evidence = pressure.exhaust();
@@ -295,6 +392,7 @@ impl UserOwner {
             .map_err(|_| TestError("runtime OOM controller allocation failed"))?,
         );
 
+        // Step 4: 回收 OOM 测试线程并核对结果，验证事先装载的旧映像 `image` 未受任何破坏且能正常执行至退出。
         let child = self.observer.take().expect("runtime OOM controller absent");
         context.expect_eq(child.join(), 0);
         let (evidence, result) = observed
@@ -336,7 +434,7 @@ impl UserOwner {
         Ok(())
     }
 
-    /// 用户退出事件消费后完成真实 join 和余子回收，Mm 观察不代替执行者停止。
+    /// 启动已准备好的用户态映像 `image`，等待其退出并回收所有子进程，验证地址空间用户计数归零且退出码为 `0`。
     fn run_runtime(
         &mut self,
         context: &mut TestContext<'_>,
@@ -361,7 +459,7 @@ impl UserOwner {
     }
 }
 
-/// 族根只属于本次用户快照，父 PathOwner 的 root 和 cwd 保持原身份。
+/// 将指定测试族路径 `family` 解析为新的独立 `FsContext`（同时作为根目录与当前工作目录），不修改父 `PathOwner` 自身的路径上下文。
 fn family_context(
     owner: &UserOwner,
     context: &TestContext<'_>,
@@ -377,7 +475,7 @@ fn family_context(
     checked(context, FsContext::new(root.clone(), root))
 }
 
-/// 原始参数与唯一库路径进入正式 Arguments，直接 loader 与主程序共用用户栈核对。
+/// 使用给定的可执行文件路径 `filename`、参数数组 `argv` 以及固定的 `LD_LIBRARY_PATH=/lib` 环境变量构造内核 `Arguments`。
 fn runtime_arguments(
     context: &TestContext<'_>,
     filename: &[u8],
@@ -391,7 +489,7 @@ fn runtime_arguments(
     )
 }
 
-/// 根调用者显式采用默认栈限额，装载错误保留生产原因。
+/// 以 `ROOT` 凭据调用 `exec::prepare` 装载可执行文件映像，失败时记录诊断信息。
 fn prepare_image(
     owner: &UserOwner,
     context: &TestContext<'_>,
@@ -404,7 +502,7 @@ fn prepare_image(
     })
 }
 
-/// 排写仅由真实 Mm 内的执行占用产生，检查者不创建自己的 ExecAccess。
+/// 断言主程序文件 `main` 与解释器文件 `loader` 当前均因存在活动的执行映射而拒绝写入（返回 `FsError::TextBusy`）。
 fn assert_denied(main: &FileRef, loader: &FileRef) {
     for file in [main, loader] {
         assert_eq!(
@@ -414,7 +512,7 @@ fn assert_denied(main: &FileRef, loader: &FileRef) {
     }
 }
 
-/// 最后 Mm 释放后取得并结束两份真实 WriteAccess，不修改原程序字节。
+/// 断言在最后一个 `Mm` 释放后，主程序文件 `main` 与解释器文件 `loader` 均可成功获取并释放写访问权（`WriteAccess`）。
 fn assert_writable(context: &TestContext<'_>, main: &FileRef, loader: &FileRef) -> TestResult {
     let main_write = checked(context, main.mapping_inode().unwrap().acquire_write())?;
     let loader_write = checked(context, loader.mapping_inode().unwrap().acquire_write())?;
@@ -423,7 +521,7 @@ fn assert_writable(context: &TestContext<'_>, main: &FileRef, loader: &FileRef) 
     Ok(())
 }
 
-/// 在同一真实族视图中打开文件，绝对解释器路径不作前缀重写。
+/// 在给定的文件系统上下文 `fs_context` 中解析路径 `pathname`（跟随符号链接）并打开文件。
 fn open(
     context: &TestContext<'_>,
     owner: &UserOwner,
@@ -440,7 +538,7 @@ fn open(
     checked(context, crate::fs::open_path(owner.path.vfs(), path))
 }
 
-/// 真实文件的短读和错误保留位置与已交付长度，不将未读尾部解释为 ELF 元数据。
+/// 从文件 `file` 的指定偏移 `offset` 处读取完整填满 `bytes` 的数据，若发生短读则触发断言失败。
 fn read_file(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -452,7 +550,7 @@ fn read_file(
     Ok(())
 }
 
-/// 用户地址只通过已拥有 Mm 的 copyin 消费，未发表的映像同样走真实缺页读取。
+/// 通过虚拟地址空间 `mm` 的 `copyin` 接口（按需触发缺页装入）从用户地址 `address` 读取完整填满 `bytes` 的数据。
 fn read_mm(context: &TestContext<'_>, mm: &Mm, address: usize, bytes: &mut [u8]) -> TestResult {
     let progress = mm.copyin(bytes, address);
     if progress.error.is_some() || progress.copied != bytes.len() {
@@ -468,19 +566,19 @@ fn read_mm(context: &TestContext<'_>, mm: &Mm, address: usize, bytes: &mut [u8])
     Ok(())
 }
 
-/// ELF64 的固定字段仅从已完整读取的字节数组解码。
+/// 从字节切片 `bytes` 的 `offset` 偏移处按小端序解码一个 64 位机器字并转换为 `usize`。
 fn word(bytes: &[u8], offset: usize) -> usize {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize
 }
 
-/// 初始栈机器字经 copyin 读取，不借内核生成 auxv 的临时数组证明用户栈。
+/// 通过 `read_mm`（底层 `copyin`）从用户栈地址 `address` 读取一个 8 字节小端序机器字。
 fn stack_word(context: &TestContext<'_>, mm: &Mm, address: usize) -> Result<usize, TestError> {
     let mut bytes = [0; 8];
     read_mm(context, mm, address, &mut bytes)?;
     Ok(word(&bytes, 0))
 }
 
-/// 栈参数比较完整原字节和 NUL，读取范围由本例固定字符串长度决定。
+/// 从用户栈地址 `address` 读取字节序列，断言其前缀与 `expected` 完全一致且紧随其后为 NUL（`\0`）终止符。
 fn stack_string(context: &TestContext<'_>, mm: &Mm, address: usize, expected: &[u8]) -> TestResult {
     let mut bytes = [0; 64];
     assert!(expected.len() < bytes.len());
@@ -490,7 +588,12 @@ fn stack_string(context: &TestContext<'_>, mm: &Mm, address: usize, expected: &[
     Ok(())
 }
 
-/// 从两架构实际 SP 验证 argc/argv/envp 后逐项取得必要 auxv，重复或缺项均失败。
+/// 从架构栈指针寄存器（RISC-V `x2` / LoongArch `r3`）出发，在用户栈上依次校验 `argc`、`argv`、`envp` 并解析返回 `Auxv` 辅助向量。
+///
+/// # 校验规则
+/// 1. 栈指针 `sp` 必须满足 16 字节对齐；
+/// 2. 栈顶依次存放 `argc`、`argv` 字符串指针数组（以 `0` 结尾）、`envp` 字符串指针数组（包含 `LD_LIBRARY_PATH=/lib` 并以 `0` 结尾）；
+/// 3. 随后扫描 `auxv` 键值对直到遇到 `AT_NULL (0, 0)`，确保必需的 6 项辅助向量（`AT_PHDR`、`AT_PHENT`、`AT_PHNUM`、`AT_BASE`、`AT_ENTRY`、`AT_EXECFN`）全部存在且无重复项。
 fn read_auxv(
     context: &TestContext<'_>,
     image: &LoadedImage,
@@ -501,6 +604,7 @@ fn read_auxv(
     let sp = image.context.gpr[2];
     #[cfg(target_arch = "loongarch64")]
     let sp = image.context.gpr[3];
+    // Step 1: 校验初始栈指针 16 字节对齐，并依次核对栈上的 argc、argv 字符串指针表与 envp 环境变量指针表。
     assert_eq!(sp & 15, 0, "runtime stack alignment");
     assert_eq!(
         stack_word(context, &image.mm, sp)?,
@@ -537,6 +641,7 @@ fn read_auxv(
     );
     cursor += 8;
 
+    // Step 2: 遍历栈上的辅助向量（auxv）表直至 AT_NULL，校验必需条目完整性与 AT_EXECFN 文件名字符串。
     let kinds = [3, 4, 5, 7, 9, 31];
     let mut values = [None; 6];
     for slot in 0..32 {
@@ -568,7 +673,7 @@ fn read_auxv(
     Err(TestError("runtime auxv lacks AT_NULL"))
 }
 
-/// 只保留本例需要的真实 ELF64 首头字段，程序头逐项读取，不复制完整映像。
+/// 读取并校验文件头部的 64 字节 ELF64 文件头（`Ehdr`），提取文件类型、入口地址与程序头表位置。
 fn read_header(context: &TestContext<'_>, file: &FileRef) -> Result<Header, TestError> {
     let mut bytes = [0; 64];
     read_file(context, file, 0, &mut bytes)?;
@@ -594,7 +699,7 @@ fn read_header(context: &TestContext<'_>, file: &FileRef) -> Result<Header, Test
     })
 }
 
-/// 固定大小程序头来自真实文件位置，偏移沿已验证首头计算。
+/// 根据已解析的 ELF64 文件头 `header`，从文件中读取第 `index` 个 56 字节的程序头（`Phdr`）。
 fn read_phdr(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -606,7 +711,7 @@ fn read_phdr(
     Ok(bytes)
 }
 
-/// PT_INTERP 字节由真实主文件给出，只有终止 NUL 前的绝对路径参与正式查找。
+/// 遍历文件的程序头表查找 `PT_INTERP`（类型 `3`）段，读取并校验以 `/` 开头、以单个 NUL 结尾的动态链接器绝对路径。
 fn read_interpreter<'a>(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -631,7 +736,7 @@ fn read_interpreter<'a>(
     Err(TestError("real runtime entry has no PT_INTERP"))
 }
 
-/// AT_PHDR 的主文件位置关系推导实际主 bias；解释器 PC 与 AT_BASE 独立核对真实 loader LOAD。
+/// 全面校验已装载映像 `image` 的初始栈 `auxv`、主程序与动态链接器的装载偏移（`bias`/`AT_BASE`）、各 `PT_LOAD` 段的页表权限与 BSS 清零、进程 `brk` 起点以及入口指令字节。
 #[expect(
     clippy::too_many_arguments,
     reason = "直接比较装载结果、真实主文件与解释器及原 argv，不把被测结果和独立预期装成同一对象"
@@ -647,6 +752,7 @@ fn verify_image(
     filename: &[u8],
     argv: &[&[u8]],
 ) -> TestResult {
+    // Step 1: 解析初始用户栈上的 auxv，并根据主程序包含程序头表的可读 PT_LOAD 段推导主程序实际装载偏移（bias）。
     let auxv = read_auxv(context, image, filename, argv)?;
     assert_eq!(auxv.phent, 56, "runtime AT_PHENT");
     assert_eq!(auxv.phnum, header.phnum, "runtime main AT_PHNUM");
@@ -673,6 +779,7 @@ fn verify_image(
     } else {
         assert!(0 < bias, "runtime ET_DYN main bias");
     }
+    // Step 2: 校验主程序映射在用户空间的程序头表、各 PT_LOAD 段权限与 BSS 零填充、初始 brk 位置以及 AT_ENTRY 入口指令字节。
     assert_eq!(auxv.entry, bias + header.entry, "runtime main AT_ENTRY");
     let mut executable_entry = false;
     for index in 0..header.phnum {
@@ -693,6 +800,7 @@ fn verify_image(
         "runtime brk is not main end"
     );
     verify_entry(context, &image.mm, main, header, bias, auxv.entry)?;
+    // Step 3: 若为无解释器的直接装载模式（如直接运行动态链接器），验证 AT_BASE == 0 且初始 PC 指向主入口后直接返回。
     if interpreter.is_none() {
         assert_eq!(auxv.base, 0, "direct loader AT_BASE");
         assert_eq!(image.context.pc, auxv.entry, "direct loader initial PC");
@@ -708,6 +816,7 @@ fn verify_image(
         return Ok(());
     }
 
+    // Step 4: 若存在 PT_INTERP 动态链接器，打开解释器文件并校验 AT_BASE > 0、初始 PC 指向解释器入口以及解释器自身的 PT_LOAD 段映射。
     let interpreter = interpreter.unwrap();
     assert!(0 < auxv.base, "runtime AT_BASE is zero");
     let loader = open(context, owner, fs_context, interpreter)?;
@@ -738,7 +847,7 @@ fn verify_image(
     Ok(())
 }
 
-/// 入口须位于真实可读可执行 LOAD 的文件前缀，零尾不作为文件指令证据。
+/// 判断虚拟地址 `address` 是否落在给定程序头 `phdr`（加上偏移 `bias`）所描述的可读可执行（`PF_R | PF_X == 5`）`PT_LOAD` 段的文件数据前缀范围内。
 fn executable_address(phdr: &[u8; 56], bias: usize, address: usize) -> bool {
     u32::from_le_bytes(phdr[..4].try_into().unwrap()) == 1
         && u32::from_le_bytes(phdr[4..8].try_into().unwrap()) & 5 == 5
@@ -746,17 +855,17 @@ fn executable_address(phdr: &[u8; 56], bias: usize, address: usize) -> bool {
         && address < bias + word(phdr, 16) + word(phdr, 32)
 }
 
-/// 基本页上界只用于真实 LOAD 末端与主 brk 的几何关系。
+/// 将地址 `address` 向上对齐到页边界（`PAGE_SIZE` 的整数倍）。
 fn page_end(address: usize) -> usize {
     address.checked_add(PAGE_SIZE - 1).unwrap() & !(PAGE_SIZE - 1)
 }
 
-/// 程序头类型直接解码真实文件字节，测试不消费生产 Elf 的私有字段。
+/// 解码 56 字节 ELF64 程序头 `phdr` 的前 4 字节段类型（`p_type`）。
 fn phdr_kind(phdr: &[u8; 56]) -> u32 {
     u32::from_le_bytes(phdr[..4].try_into().unwrap())
 }
 
-/// 同一页重叠 LOAD 的声明权限取并集，边缘页按真实文件几何计算。
+/// 计算虚拟地址 `address` 所在物理页在所有覆盖该页的非空 `PT_LOAD` 段中的合并权限标志位（`p_flags` 按位或）。
 fn page_flags(
     context: &TestContext<'_>,
     file: &FileRef,
@@ -778,7 +887,7 @@ fn page_flags(
     Ok(flags)
 }
 
-/// 正式 fault 与实际页表叶解码共同核许可，拒绝方向不改 VMA；不代替架构硬件 NX 实测。
+/// 通过触发虚拟地址空间 `mm` 的读/写/执行缺页（`Mm::fault`）并查询硬件页表叶子项（`Mm::mapping`），联合校验虚拟地址 `address` 的页权限是否与 ELF 段标志 `flags` 一致。
 fn verify_permissions(mm: &Mm, address: usize, flags: u32) {
     for (access, flag) in [
         (UserAccess::Read, 4),
@@ -808,7 +917,7 @@ fn verify_permissions(mm: &Mm, address: usize, flags: u32) {
     );
 }
 
-/// 每个真实 LOAD 的边缘和首个内页核权限，完整 BSS 零尾经 copyin 消费，并返回偏移后末端。
+/// 遍历文件的全部非空 `PT_LOAD` 段，校验段对齐约束、首尾及内部页的软件/页表权限、以及 `[filesz, memsz)` 区间内 BSS 段的零填充，返回所有加载段经 `bias` 偏移后的最高结束虚拟地址。
 fn verify_loads(
     context: &TestContext<'_>,
     mm: &Mm,
@@ -821,6 +930,7 @@ fn verify_loads(
     let mut bss_bytes = 0;
     let mut loads = 0;
     let mut bytes = [0xa7; 512];
+    // Step 1: 遍历每个非空 PT_LOAD 段，检查 filesz <= memsz 与段对齐几何关系。
     for index in 0..header.phnum {
         let phdr = read_phdr(context, file, header, index)?;
         if phdr_kind(&phdr) != 1 || word(&phdr, 40) == 0 {
@@ -842,6 +952,7 @@ fn verify_loads(
             );
         }
 
+        // Step 2: 对当前 PT_LOAD 段的首个页、末尾页及第二个页验证读/写/执行缺页行为与页表 PTE 权限位。
         let first_page = start & !(PAGE_SIZE - 1);
         let last_page = (memory_end - 1) & !(PAGE_SIZE - 1);
         for address in [
@@ -856,6 +967,7 @@ fn verify_loads(
             );
         }
 
+        // Step 3: 通过 `read_mm`（copyin）完整读取该段的 `[file_end, memory_end)` BSS 扩展区间，断言所有字节均已清零。
         let mut cursor = file_end;
         while cursor < memory_end {
             let length = bytes.len().min(memory_end - cursor);
@@ -884,7 +996,7 @@ fn verify_loads(
     Ok(end)
 }
 
-/// 真实入口的指令前缀同时来自磁盘 LOAD 与候选 Mm，不用地址关系替代实际映射内容。
+/// 校验可执行入口虚拟地址 `address` 处的首条 4 字节指令与磁盘 ELF 文件对应 `PT_LOAD` 段偏移处的原始字节完全一致。
 fn verify_entry(
     context: &TestContext<'_>,
     mm: &Mm,

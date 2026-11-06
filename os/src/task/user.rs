@@ -1,4 +1,37 @@
-//! 私有用户现场与独立 MM 引用；反向执行关联不保活 Task 或内核栈。
+//! 用户线程执行现场（`UserThread`）、运行时资源绑定（`UserRuntime`）与用户态陷入/返回主循环。
+//!
+//! ## 模块职责与架构定位
+//! 本模块将内核调度任务 `Task`、虚拟地址空间 `Mm`、进程关系身份 `UserIdentity` 以及文件系统/信号/网络运行时资源组装成完整的 Linux 用户线程执行体，并驱动从首次进入用户态到线程退出的全生命周期循环。
+//! - **上游调用者**：系统初始化启动入口、`clone` 子进程/新线程派生（`crate::task::clone`）、`execve` 映像替换（`crate::task::exec`）以及系统调用处理器（`crate::syscall`）。
+//! - **下游依赖**：`crate::arch`（切换用户态寄存器上下文与硬件陷入返回 `run_user`、LoongArch 未对齐访存模拟）、`crate::mm::space`（地址空间绑定、缺页处理、`copyout`）、`crate::task::process` 与 `crate::task::signal`（作业停止确认、信号领取与退出汇报）、`crate::fs`（打开初始控制台标准流、`O_CLOEXEC` 清理）。
+//!
+//! ## 核心设计与主循环（`run_program`）状态流转
+//! 1. **两阶段准备与发布（`PreparedProgram`）**：所有可能因内存不足或资源超限失败的分配（`UserIdentity`、`UserThread`、内核栈 `PreparedTask`、离栈观察器 `PreparedExecution`）全部在任务发布前完成；任一步失败均由 RAII 自动回滚。发布时先写入 `TaskGraph`，可选向父进程地址空间拷贝 `parent_tid`，最后将 `Task` 移交就绪队列。
+//! 2. **用户态执行与返回点安全协议**：
+//!
+//! ```text
+//!   [run_program 入口: 按需 copyout child_tid]
+//!                       |
+//!                       v
+//!       +-----> 1. wait_control(): 响应组退出或挂起暂停 (SIGSTOP/SIGCONT)
+//!       |       2. cond_resched() + settle_current() + flush_cpu_timers()
+//!       |       3. signals.select():
+//!       |          - Exit(code) ------> 跳出循环 -> release_process() -> graph.exit()
+//!       |          - Stop ------------> continue 回到步骤 1 挂起
+//!       |          - Handler(args) ---> 结算 syscall restart -> 压入用户信号栈帧
+//!       |          - None ------------> 结算 syscall restart -> 恢复临时 saved_mask
+//!       |       4. 关中断复查 pending 信号与 need_resched -> arch::run_user(&mut ctx)
+//!       |       5. 硬件陷入返回内核 (UserTrap):
+//!       |          - Interrupt -------> 计数后回到步骤 1
+//!       |          - Syscall ---------> syscall::dispatch (Return / Restart / NewImage / Exit)
+//!       |          - PageFault -------> mm.fault() 调页/COW；失败转 SIGSEGV/SIGBUS/SIGKILL
+//!       +--------- - Exception -------> (LoongArch ALE 模拟或) 注入同步强制故障信号
+//! ```
+//!
+//! ## 锁获取顺序（Lock Ordering）与并发契约
+//! - **单执行者独占字段**：`UserThread` 的 `context`（`RefCell`）、`user_timer_interrupts`、`restart`、`saved_mask` **仅允许其绑定的唯一 `Running` `Task` 访问**（入口通过 `assert_current()` 强制校验）；严禁跨越睡眠或调度点持有 `context` 的 `RefMut` 借用。
+//! - **跨线程共享快照锁**：`UserThread::mm` 与 `UserThread::process` 为极短临界区自旋锁，仅用于克隆或取走 `Arc` / 句柄；严禁在持有这两把锁时执行用户内存拷贝（如 `clear_tid`、`copyout`）、获取 `TaskGraph` 锁、获取文件表睡眠锁或触发最后一次 `Arc` 析构。
+//! - **`execve` 切换契约（`install_image`）**：先在原地址空间执行 `clear_tid`，随后在关中断临界区内原子切换当前 CPU 活动页表、`UserThread::mm`、`UserContext` 与 `UserRuntime`，最后在开中断锁外释放旧地址空间并唤醒阻塞的 `vfork` 父进程。
 
 #[cfg(feature = "ktest")]
 use crate::cpu::AtomicCpuSet;
@@ -37,55 +70,78 @@ use crate::task::time::UserTime;
 use crate::task::{self, JoinHandle, Placement, PreparedTask, Task};
 use crate::wait::{WaitMode, Waiter};
 
+/// `SIGILL` 的 `si_code`：遇到非法或未定义的操作码。
 const ILL_ILLOPC: i32 = 1;
+/// `SIGBUS` 的 `si_code`：访存虚拟地址未满足硬件要求的对齐边界。
 const BUS_ADRALN: i32 = 1;
+/// `SIGBUS` 的 `si_code`：访问不存在的物理地址或越过文件映射有效范围（Beyond EOF）。
 const BUS_ADRERR: i32 = 2;
+/// `SIGBUS` 的 `si_code`：底层映射文件发生硬件或文件系统 I/O 错误。
 const BUS_OBJERR: i32 = 3;
+/// `SIGSEGV` 的 `si_code`：访问未建立映射的虚拟地址。
 const SEGV_MAPERR: i32 = 1;
+/// `SIGSEGV` 的 `si_code`：访问权限违例（如向只读页写入或执行不可执行页）。
 const SEGV_ACCERR: i32 = 2;
+/// `SIGTRAP` 的 `si_code`：命中软件或硬件断点指令。
 const TRAP_BRKPT: i32 = 1;
+/// `SIGFPE` 的 `si_code`：浮点除以零异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTDIV: i32 = 3;
+/// `SIGFPE` 的 `si_code`：浮点运算上溢异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTOVF: i32 = 4;
+/// `SIGFPE` 的 `si_code`：浮点运算下溢异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTUND: i32 = 5;
+/// `SIGFPE` 的 `si_code`：浮点运算结果不精确异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTRES: i32 = 6;
+/// `SIGFPE` 的 `si_code`：无效浮点操作异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTINV: i32 = 7;
+/// `SIGFPE` 的 `si_code`：未归类的浮点异常（LoongArch FPE）。
 #[cfg(target_arch = "loongarch64")]
 const FPE_FLTUNK: i32 = 14;
 
-/// 当前用户的不可变凭据；目录和文件权限判断使用真实 inode uid/gid/mode。
+/// 用户进程/线程的自主访问控制凭据（UID / GID）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Credentials {
+    /// 用户 ID（`0` 代表超级用户 root）。
     pub(crate) uid: u32,
+    /// 主用户组 ID。
     pub(crate) gid: u32,
 }
 
 impl Credentials {
+    /// 超级用户（root，`uid = 0, gid = 0`）默认凭据常量。
     pub(crate) const ROOT: Self = Self { uid: 0, gid: 0 };
 }
 
-/// 同一文件系统上下文保留完整挂载视图以及可独立共享的 root/cwd。
+/// 用户任务持有的文件系统命名空间视图及当前根目录/工作目录上下文。
 pub(crate) struct UserFs {
+    /// 虚拟文件系统挂载树实例。
     pub(crate) vfs: Arc<Vfs>,
+    /// 进程当前的根目录（root）、当前工作目录（cwd）与 `umask` 上下文。
     pub(crate) context: FsContext,
 }
 
-/// 文件、FS、信号各保留明确拥有；可选网络引用随派生程序共享。
+/// 用户线程运行期绑定的外部内核子系统资源集合（支持按 `clone` 标志细粒度共享或独立复制）。
 #[derive(Clone)]
 pub(crate) struct UserRuntime {
+    /// 打开文件描述符表（可通过 `CLONE_FILES` 共享）。
     pub(crate) files: Arc<FileTable>,
+    /// 文件系统根目录、工作目录与 `umask` 状态（可通过 `CLONE_FS` 共享）。
     pub(crate) fs: Arc<SleepMutex<UserFs>>,
+    /// 当前线程的用户与组身份凭据。
     pub(crate) credentials: Credentials,
+    /// 信号处置动作表（可通过 `CLONE_SIGHAND` 共享）。
     pub(crate) sighand: Arc<Sighand>,
+    /// 可选的网络协议栈实例引用（无网络测试环境为 `None`，派生子任务自动继承同一引用）。
     pub(crate) net: Option<NetStackRef>,
 }
 
 impl UserRuntime {
-    /// 在普通任务锁外准备运行资源；无网络夹具显式传入 None，失败不发表用户身份。
+    /// 在任务发布前分配并初始化全新的文件描述符表、文件系统上下文锁与默认信号处置表。
     pub(crate) fn try_new(
         vfs: Arc<Vfs>,
         context: FsContext,
@@ -106,7 +162,7 @@ impl UserRuntime {
         })
     }
 
-    /// 在尚未发表的用户表中一次准备并发表共享 console 标准流，失败时保留空表契约。
+    /// 在尚未对外发布的空文件描述符表中打开 `/dev/console`，并依次安装为标准输入（fd 0）、标准输出（fd 1）和标准错误（fd 2）。
     pub(crate) fn install_console(&self) -> Result<(), FsError> {
         let (vfs, context) = {
             let fs = self.fs.lock();
@@ -134,7 +190,7 @@ impl UserRuntime {
         Ok(())
     }
 
-    /// 按三个独立共享轴复制运行资源；可选网络引用保持原值，所有分配在短锁外。
+    /// 按 `clone` 系统调用指定的三个共享维度（`CLONE_FILES`、`CLONE_FS`、`CLONE_SIGHAND`）共享或深拷贝运行时资源。
     pub(crate) fn try_fork(
         self,
         share_files: bool,
@@ -179,7 +235,7 @@ impl UserRuntime {
         })
     }
 
-    /// 其他实际执行者仍共享时才私有化；普通资源快照不触发复制。
+    /// 为 `execve` 准备独占资源：若文件描述符表或信号处置表当前正被其他活跃线程共享（`user_count() > 1`），则复制出独立副本以解除共享。
     pub(crate) fn try_exec(self) -> Result<Self, FsError> {
         let Self {
             files,
@@ -208,11 +264,13 @@ impl UserRuntime {
     }
 }
 
-/// 只计真实用户运行绑定，未发表失败与正常退出共用同一归还责任。
+/// RAII 包装器：记录当前活跃用户线程对 `FileTable` 与 `Sighand` 的绑定引用计数（用于判定是否被多线程共享）。
+///
+/// 无论是准备阶段中途失败丢弃，还是线程正常退出解绑，`Drop` 都会对称归还活跃用户计数。
 struct RuntimeBinding(UserRuntime);
 
 impl RuntimeBinding {
-    /// 在发表前移动完整资源，并取得两项独立运行责任。
+    /// 绑定运行时资源，递增 `FileTable` 与 `Sighand` 的活跃执行者计数。
     fn new(runtime: UserRuntime) -> Self {
         runtime.files.add_user();
         runtime.sighand.add_user();
@@ -221,41 +279,58 @@ impl RuntimeBinding {
 }
 
 impl Drop for RuntimeBinding {
-    /// 先解除运行责任，字段最后拥有由原锁外调用者释放。
+    /// 解除运行时绑定责任，递减 `FileTable` 与 `Sighand` 的活跃执行者计数。
     fn drop(&mut self) {
         self.0.files.remove_user();
         self.0.sighand.remove_user();
     }
 }
 
+/// 用户线程在存活期间持有的进程身份、运行时资源及线程退出/启动同步钩子。
 struct UserProcess {
+    /// 进程关系图中的线程/进程唯一身份句柄（含 PID/TID 与信号控制块）。
     identity: Arc<UserIdentity>,
+    /// 计入活跃共享计数的文件、文件系统、凭据、信号处置表与网络资源绑定。
     runtime: RuntimeBinding,
+    /// `CLONE_CHILD_SETTID` 指定的子线程用户态地址；子线程首次进入 `run_program` 时写入自身 TID 并取空。
     child_set_tid: Option<usize>,
+    /// `CLONE_CHILD_CLEARTID` 或 `set_tid_address` 注册的用户态地址；线程退出或 `execve` 脱离旧地址空间时向其写 0 并唤醒 1 个 Futex 等待者。
     clear_child_tid: usize,
+    /// `vfork` 创建子进程时绑定的完成同步量；子进程执行 `execve` 或退出释放旧地址空间后触发 `complete()` 唤醒父进程。
     vfork: Option<Arc<Completion>>,
 }
 
+/// 内核 `Task` 挂载的用户态线程扩展控制块，保存用户态寄存器上下文、地址空间与进程资源绑定。
 pub struct UserThread {
+    /// 指向承载本用户线程的唯一内核 `Task` 的弱引用（避免 `Task <-> UserThread` 循环强引用导致内核栈无法释放）。
     executor: Once<Weak<Task>>,
+    /// 当前线程持有的用户虚拟地址空间活跃引用（计入 `Mm::user_count`）；线程退出解绑后置为 `None`。
     mm: SpinLock<Option<MmUser>>,
+    /// 用户态通用/浮点/控制寄存器保存区，仅允许绑定的 `Running` `Task` 在本地独占借用。
     context: RefCell<UserContext>,
+    /// 进程身份、运行时资源与 TID/vfork 钩子状态；线程退出进入 `release_process` 时整体取出。
     process: SpinLock<Option<UserProcess>>,
+    /// 统计本线程在用户态执行期间遭遇本地时钟中断的次数。
     user_timer_interrupts: Cell<usize>,
+    /// 任务就绪前一次性初始化的线程私有与组共享 CPU 时间统计器。
     user_time: Once<UserTime>,
+    /// 最近一次被信号打断的可重启系统调用保存块（供 `ERESTARTSYS` / `restart_syscall` 恢复）。
     restart: Cell<Option<Restart>>,
+    /// `rt_sigsuspend` / `ppoll` / `pselect6` 等系统调用临时替换信号掩码期间保存的原信号掩码。
     saved_mask: Cell<Option<u64>>,
+    /// 内核测试（`ktest`）记录本线程曾经在哪些物理 CPU 核上实际进入并运行过用户态指令。
     #[cfg(feature = "ktest")]
     user_cpu_mask: AtomicCpuSet,
 }
 
-// SAFETY: context、user_timer_interrupts、restart与saved_mask仅由弱关联指定的唯一Running Task访问；
-// 现场/重启访问核对当前身份，RefCell排除现场重叠借用，任务迁核由原调度交接串行化。
-// mm/process远端拥有快照由短锁保护；Ready前初始化的UserTime仅通过同步原子记账接口共享。
+// SAFETY:
+// 1. 非线程安全内部可变字段（`context`、`user_timer_interrupts`、`restart`、`saved_mask`）均在访问入口通过 `assert_current()` 严格限制为仅能由 `executor` 指向的唯一 `Running` `Task` 访问；`Task` 跨核迁移由调度器上下文切换屏障串行化，`RefCell` 在单线程内消除重叠可变借用；
+// 2. 跨线程并发访问的 `mm` 与 `process` 字段均受 `SpinLock` 保护；
+// 3. `executor` 与 `user_time` 在任务发布为 `Ready` 前通过 `Once` 完成初始化，后续仅并发读取（`UserTime` 内部采用原子变量记账）。
 unsafe impl Sync for UserThread {}
 
 impl UserThread {
-    /// 在发表 Task 前准备完整私有用户现场和地址空间拥有。
+    /// 在创建新用户任务时分配 `UserThread`，保存初始用户态上下文并登记对 `mm` 的活跃用户引用。
     pub(crate) fn try_new(mm: Arc<Mm>, context: UserContext) -> Result<Arc<Self>, AllocError> {
         Arc::try_new(Self {
             executor: Once::new(),
@@ -271,7 +346,7 @@ impl UserThread {
         })
     }
 
-    /// 在唯一 PreparedTask 尚未发表时建立弱反向关联，不产生强引用环。
+    /// 在底层 `PreparedTask` 尚未发布到调度器前建立指回 `Task` 的弱引用（仅允许绑定一次）。
     pub(crate) fn bind_executor(&self, executor: Weak<Task>) {
         assert!(
             self.executor.get().is_none(),
@@ -280,7 +355,7 @@ impl UserThread {
         self.executor.call_once(|| executor);
     }
 
-    /// 取得当前实际资源快照，退出解绑后的诊断引用不再保有 MM。
+    /// 获取当前线程绑定的用户地址空间 `Arc<Mm>` 快照；若线程已退出解绑则返回 `None`。
     pub(crate) fn mm(&self) -> Option<Arc<Mm>> {
         self.mm
             .lock()
@@ -288,7 +363,7 @@ impl UserThread {
             .map(|binding| Arc::clone(binding.mm()))
     }
 
-    /// 完整运行资源与child入口/退出TID地址在原PreparedTask发表之前绑定。
+    /// 在任务发布前绑定进程身份、CPU 时间账本、运行时资源以及启动/退出 TID 钩子地址。
     pub(crate) fn bind_process(
         &self,
         identity: Arc<UserIdentity>,
@@ -310,7 +385,7 @@ impl UserThread {
         });
     }
 
-    /// 只有绑定的当前Task消费一次child_tid地址，用户访问必须在此短锁外执行。
+    /// 由当前线程在首次进入用户态前一次性取出 `child_set_tid` 地址（后续实际的用户内存写入在锁外执行）。
     fn take_child_tid(&self) -> Option<usize> {
         self.assert_current();
         self.process
@@ -321,7 +396,7 @@ impl UserThread {
             .take()
     }
 
-    /// 只记录本线程退出时的用户清零地址；是否可写在实际旧Mm清理处决定。
+    /// 更新当前线程退出或 `execve` 时需要清零并唤醒 Futex 的用户态地址（实现 `set_tid_address` 系统调用），返回当前线程 TID。
     pub(crate) fn set_tid_address(&self, address: usize) -> usize {
         self.assert_current();
         let mut process = self.process.lock();
@@ -332,7 +407,7 @@ impl UserThread {
         process.identity.tid()
     }
 
-    /// 当前用户执行者生成线程定向异步信号，siginfo保留真实发送者，动作与mask沿原private协议处理。
+    /// 向当前用户线程自身发送由内核事件触发的线程定向信号（如 `SIGPIPE`）。
     pub fn send_kernel_signal(&self, signum: u8) {
         self.assert_current();
         let identity = self
@@ -344,7 +419,7 @@ impl UserThread {
             .expect("current kernel signal delivery failed");
     }
 
-    /// 在关系和信号操作前取得身份快照，不跨图锁保存用户资源锁。
+    /// 克隆获取当前线程的 `UserIdentity` 快照（若线程尚未解绑退出）。
     pub(crate) fn identity(&self) -> Option<Arc<UserIdentity>> {
         self.process
             .lock()
@@ -352,7 +427,7 @@ impl UserThread {
             .map(|process| Arc::clone(&process.identity))
     }
 
-    /// 短锁中只克隆独立文件/FS引用，I/O、用户访问与最后拥有释放由锁外调用者完成。
+    /// 在短临界区内克隆当前线程的 `UserRuntime` 资源句柄集合，供锁外执行文件 I/O 或系统调用逻辑。
     pub(crate) fn runtime(&self) -> Option<UserRuntime> {
         self.process
             .lock()
@@ -360,7 +435,7 @@ impl UserThread {
             .map(|process| process.runtime.0.clone())
     }
 
-    /// child尚未Ready时绑定双方拥有的完成对象，不借父Task栈。
+    /// 在 `vfork` 子进程发布运行前绑定用于唤醒父进程的完成量句柄。
     pub(crate) fn bind_vfork(&self, completion: Arc<Completion>) {
         let mut process = self.process.lock();
         let process = process.as_mut().expect("vfork child has no process");
@@ -368,7 +443,7 @@ impl UserThread {
         process.vfork = Some(completion);
     }
 
-    /// 父致命取消只解绑本次关系，child资源与执行仍走自己的正常清理。
+    /// 当阻塞等待中的 `vfork` 父进程因致命信号提前终止时，解除子进程身上绑定的同一 `Completion` 句柄。
     pub(crate) fn cancel_vfork(&self, completion: &Arc<Completion>) {
         let removed = {
             let mut process = self.process.lock();
@@ -388,15 +463,17 @@ impl UserThread {
         drop(removed);
     }
 
-    /// 在同一执行者提交新现场与活动根，旧MM实际使用结束后才恢复vfork父。
+    /// 在当前线程上提交 `execve` 加载完成的新程序映像与独占运行时资源，释放旧地址空间并唤醒可能存在的 `vfork` 父进程。
     pub(crate) fn install_image(&self, image: LoadedImage, runtime: UserRuntime) {
         self.assert_current();
+        // Step 1: 绑定新运行时资源，关闭带有 O_CLOEXEC 的文件描述符，并重置信号处置表与备用栈。
         let runtime = RuntimeBinding::new(runtime);
         runtime.0.files.close_on_exec();
         self.signals()
             .expect("exec has no signals")
             .reset_for_exec(runtime.0.sighand.clone());
 
+        // Step 2: 在脱离旧地址空间之前，向旧 MM 中注册的 clear_child_tid 地址写 0 并执行 futex 唤醒。
         let old_mm = self.mm().expect("exec has no old MM");
         let clear_child_tid = {
             let mut process = self.process.lock();
@@ -405,6 +482,7 @@ impl UserThread {
         };
         clear_tid(&old_mm, clear_child_tid);
 
+        // Step 3: 清除上一程序的系统调用重启状态与临时信号掩码，关中断原子切换当前活动地址空间、寄存器现场与运行时绑定。
         let binding = MmUser::new(image.mm);
         let active = binding.mm().clone();
         self.restart.set(None);
@@ -428,6 +506,7 @@ impl UserThread {
             (old_runtime, old_binding, old_active, completion)
         };
 
+        // Step 4: 在锁外与开中断状态下释放旧运行时、旧地址空间引用，并通知 vfork 父进程子进程已不再共享其内存。
         drop(old_runtime);
         drop(old_binding);
         drop(old_active);
@@ -437,48 +516,48 @@ impl UserThread {
         }
     }
 
-    /// 身份拥有private信号状态；裸内核probe没有Linux信号绑定。
+    /// 获取当前线程的私有信号控制块句柄（若已绑定用户进程身份）。
     pub(crate) fn signals(&self) -> Option<Arc<ThreadSignals>> {
         self.identity().map(|identity| identity.signals())
     }
 
-    /// 升级原弱执行关联以观察稳定Task，不建立另一个线程表或改变调度状态。
+    /// 尝试将弱引用升级为承载本用户线程的内核 `Arc<Task>`（若任务尚未彻底销毁）。
     pub(crate) fn executor(&self) -> Option<Arc<Task>> {
         self.executor.get().and_then(Weak::upgrade)
     }
 
-    /// 通知稳定执行者在自己的安全返回点处理工作，不远端改现场或调度状态。
+    /// 请求承载本用户线程的内核 `Task` 在安全点尽快返回内核重新检查信号与控制状态（跨核时发送重调度/提醒）。
     pub(crate) fn kick(&self) {
         if let Some(executor) = self.executor() {
             crate::sched::request_user_work(&executor);
         }
     }
 
-    /// 借用Ready前绑定的线程账；accounting短段不克隆拥有或取得业务锁。
+    /// 借用本线程的 `UserTime` 统计对象（供 `accounting` 在关中断路径零分配读取）。
     pub(crate) fn user_time(&self) -> Option<&UserTime> {
         self.user_time.get()
     }
 
-    /// 累计已结束的真实执行片段；无进程身份的内核probe不产生LinuxCPU账。
+    /// 将一段已结束的用户态或内核态执行时长（纳秒）记入本线程及所属线程组的 CPU 时间账本。
     pub(crate) fn account_execution(&self, user: bool, ns: u64) {
         if let Some(time) = self.user_time.get() {
             time.account_execution(user, ns);
         }
     }
 
-    /// 当前执行者保存原请求及首次deadline，供restart_syscall领取。
+    /// 保存被信号打断的系统调用重启参数块（供后续 `restart_syscall` 系统调用读取）。
     pub(crate) fn save_restart(&self, state: Restart) {
         self.assert_current();
         self.restart.set(Some(state));
     }
 
-    /// restart_syscall和sigreturn各自一次取走旧restart block。
+    /// 一次性取出已保存的系统调用重启参数块（由 `restart_syscall` 或 `rt_sigreturn` 消费）。
     pub(crate) fn take_restart(&self) -> Option<Restart> {
         self.assert_current();
         self.restart.take()
     }
 
-    /// 临时等待保存进入前 mask，由普通返回恢复或下一实际 handler 帧消费一次。
+    /// 保存系统调用（如 `rt_sigsuspend`）临时更改阻塞掩码前的原始信号掩码（若此前尚未保存）。
     pub(crate) fn save_mask(&self, mask: u64) {
         self.assert_current();
         if self.saved_mask.get().is_none() {
@@ -486,7 +565,7 @@ impl UserThread {
         }
     }
 
-    /// 普通返回或无 handler 重放前结束临时 mask 责任，参数交付失败也不遗留保存值。
+    /// 若存在尚未被信号处理帧消费的临时保存掩码，将其恢复为当前线程的正式信号阻塞掩码。
     pub(crate) fn restore_saved_mask(&self) {
         self.assert_current();
         if let Some(mask) = self.saved_mask.take() {
@@ -496,12 +575,12 @@ impl UserThread {
         }
     }
 
-    /// 实际 handler 帧保存临时等待之前的 mask，否则保留选择时的快照。
+    /// 决定压入用户态信号处理栈帧的恢复掩码：优先取走临时等待前保存的原始掩码 `saved_mask`，否则使用信号选中时的掩码快照。
     fn mask_to_restore(&self, selected: u64) -> u64 {
         self.saved_mask.take().unwrap_or(selected)
     }
 
-    /// 当前用户循环先解除运行拥有，再用返回的身份发表退出；CPU仍独立保活活动根。
+    /// 在线程退出路径上解除 CPU 记账关联，移出并释放 `Mm` 与 `UserRuntime`，执行 `clear_child_tid` 唤醒与 `vfork` 完成通知，最后返回 `UserIdentity` 供向 `TaskGraph` 汇报退出。
     pub(crate) fn release_process(&self) -> Arc<UserIdentity> {
         self.assert_current();
         crate::accounting::detach_user();
@@ -531,13 +610,13 @@ impl UserThread {
         identity
     }
 
-    /// 只由所绑定的 Running Task 短暂访问现场，不得持此 guard 睡眠或调度。
+    /// 获取当前线程用户态寄存器现场的可变借用（仅限绑定的当前 `Running` `Task` 短暂持有，严禁持借用睡眠或跨调度点）。
     pub(crate) fn context(&self) -> RefMut<'_, UserContext> {
         self.assert_current();
         self.context.borrow_mut()
     }
 
-    /// 真正执行用户指令并返回原 Rust 调用栈；中断分派结束后才归还现场独占借用。
+    /// 切换到用户态执行指令直至发生下一次硬件中断、系统调用、缺页或同步异常后返回当前内核栈。
     pub(crate) fn run_user(&self) -> UserTrap {
         self.assert_current();
         let mm = self.mm().expect("running user thread has no MM");
@@ -551,9 +630,10 @@ impl UserThread {
         let local = crate::cpu::current();
         crate::accounting::user_enter(self);
         let timer_before = local.timer_interrupts.load(Ordering::Relaxed);
-        // SAFETY: 弱关联已核对当前唯一 Running Task，RefCell 的独占借用排除现场别名；
-        // IRQ guard 关闭本地中断，MM 与 CPU 活动拥有保证全部根、用户页及内核映射存活。
-        // 架构在同一调用栈返回，IRQ 关闭且硬中断 guard 已结束，期间不切换 Task。
+        // SAFETY:
+        // 1. 入口 `assert_current()` 已校验当前 CPU 正在运行本 `UserThread` 绑定的唯一 `Task`，且 `context.borrow_mut()` 保证了 `&mut UserContext` 无别名冲突；
+        // 2. `_irq` 守卫已关闭本地中断，且上方 `Arc::ptr_eq(&active, &mm)` 已校验当前硬件激活页表与本线程持有的 `Mm` 一致，用户页表与内核栈映射在陷入返回前全程有效；
+        // 3. `arch::run_user` 保存内核被调用者保存寄存器并在同一内核栈帧上返回，期间不会发生内核任务切换，返回时本地中断仍保持关闭状态。
         let trap = unsafe { arch::run_user(&mut context) };
         #[cfg(feature = "ktest")]
         self.user_cpu_mask.insert(local.id, Ordering::Relaxed);
@@ -569,19 +649,19 @@ impl UserThread {
         trap
     }
 
-    /// 取走自上次观察以来真实返回用户入口的 CPU 位集合。
+    /// 原子取走并清零自上次采样以来本用户线程实际进入运行过的物理 CPU 集合（供 `ktest` 亲和性与负载均衡验证）。
     #[cfg(feature = "ktest")]
     pub(crate) fn ktest_take_user_cpu_mask(&self) -> crate::cpu::CpuSet {
         self.user_cpu_mask.take(Ordering::AcqRel)
     }
 
-    /// 用户入口正常结束时先解绑运行资源，最后 MM 拥有在锁外释放。
+    /// 单独移出并在自旋锁外释放本线程持有的 `MmUser` 地址空间引用。
     pub(crate) fn release_mm(&self) {
         let mm = self.mm.lock().take();
         drop(mm);
     }
 
-    /// 核对稳定执行者身份，并拒绝中断域或没有普通 Task 的调用。
+    /// 校验当前正在执行的内核 `Task` 必须与本 `UserThread` 绑定的唯一 `executor` 一致，防止跨线程或中断上下文非法访问线程私有状态。
     fn assert_current(&self) {
         let executor = self
             .executor
@@ -597,60 +677,69 @@ impl UserThread {
     }
 }
 
-/// 尚未发表的完整程序只保留本次身份、用户对象和原调度任务，失败由普通拥有关系归还。
+/// 已完成全部内存与身份预分配、尚未发布到 `TaskGraph` 与调度器的新用户程序句柄。
+///
+/// 若在调用 `publish` / `publish_child` 前发生错误丢弃，其包含的全部句柄通过常规 `Drop` 自动归还配额与内存。
 pub(crate) struct PreparedProgram {
+    /// 尚未挂入全局进程关系图的预备进程/线程身份。
     identity: PreparedIdentity,
+    /// 已初始化好寄存器上下文与运行时资源的用户线程扩展控制块。
     user: Arc<UserThread>,
+    /// 已分配好内核栈与入口闭包的预备调度任务。
     task: PreparedTask,
+    /// 用于跟踪线程彻底离开内核栈的预备观察器节点。
     execution: Box<PreparedExecution>,
 }
 
+/// 准备新用户程序（`prepare_program` / `prepare_bound_user`）阶段的失败原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramError {
+    /// ELF 映像加载、文件系统读取或地址空间/内核栈内存分配失败。
     Image(ExecError),
+    /// 进程数超限（`RLIMIT_NPROC`）、PID 耗尽或父进程已处于退出状态。
     Identity(ProcessError),
 }
 
 impl From<ExecError> for ProgramError {
-    /// 保留映像准备的格式、参数、文件与 VM 原因。
+    /// 将 ELF 映像准备阶段的错误包装为 `ProgramError::Image`。
     fn from(error: ExecError) -> Self {
         Self::Image(error)
     }
 }
 
 impl From<FsError> for ProgramError {
-    /// 根文件准备错误沿映像文件原因传递，不替换成缺失程序。
+    /// 将文件系统访问错误转为 `ExecError::File` 并包装为 `ProgramError::Image`。
     fn from(error: FsError) -> Self {
         Self::Image(ExecError::File(error))
     }
 }
 
 impl From<ProcessError> for ProgramError {
-    /// 身份预算及父关系错误保持可区分。
+    /// 将进程关系与配额检查错误包装为 `ProgramError::Identity`。
     fn from(error: ProcessError) -> Self {
         Self::Identity(error)
     }
 }
 
 impl From<AllocError> for ProgramError {
-    /// 未发表用户对象、入口和执行栈的分配失败按真实 NoMemory 返回。
+    /// 将内核堆分配失败（`AllocError`）统一映射为 `ExecError::NoMemory`。
     fn from(_: AllocError) -> Self {
         Self::Image(ExecError::NoMemory)
     }
 }
 
 impl PreparedProgram {
-    /// 在发表前取得稳定用户号码，供协调者之后选择同一子进程事件。
+    /// 在正式发布前读取已预留的新进程/线程 TID（PID）。
     pub(crate) fn pid(&self) -> usize {
         self.identity.identity().tid()
     }
 
-    /// 身份发表成功后才移交Ready；没有parent_tid交付的普通启动走同一提交。
+    /// 将预备身份发布到 `TaskGraph` 并将内核 `Task` 投入就绪队列（用于无需写回 `parent_tid` 的初始程序或普通派生）。
     pub(crate) fn publish(self) -> Result<JoinHandle, ProcessError> {
         self.publish_to(None)
     }
 
-    /// 创建已成功时parent_tid写失败不撤child，尝试写入完成后才允许child运行。
+    /// 发布子进程/线程并在放入就绪队列前按需向父进程地址空间写入 `CLONE_PARENT_SETTID`（即使向父地址拷贝失败也不回滚已建立的子任务）。
     pub(crate) fn publish_child(
         self,
         parent_mm: &Mm,
@@ -659,8 +748,7 @@ impl PreparedProgram {
         self.publish_to(parent_tid.map(|address| (parent_mm, address)))
     }
 
-    /// 在合法关系发表和Ready之间向父Mm复制小端TID；部分写入或错误不撤销创建。
-    /// 用户访问可处理COW并睡眠，期间不持图锁或用户现场借用。
+    /// 内部统一发布流程：先提交 `TaskGraph` 关系身份，随后在无锁可睡眠上下文向父 `Mm` 写出小端 32 位 TID，最后唤醒新 `Task` 开始调度。
     fn publish_to(self, parent_tid: Option<(&Mm, usize)>) -> Result<JoinHandle, ProcessError> {
         let pid = self.pid();
         let Self {
@@ -671,20 +759,20 @@ impl PreparedProgram {
         } = self;
         identity.publish(Arc::downgrade(&user), execution)?;
         if let Some((mm, address)) = parent_tid {
-            // child已经建立，父地址错误不改变创建结果；写入仍走父自己的COW/uaccess。
+            // 子身份已在关系图中正式确立，此处向父空间 copyout 即使触发缺页错误也不撤销子任务。
             let bytes = (pid as u32).to_le_bytes();
             let _ = mm.copyout(address, &bytes);
         }
         Ok(task.publish())
     }
 
-    /// 内核协调者在Ready前取得拥有快照，可为真实并发测试保留原文件表预留责任。
+    /// 在发布前克隆获取内部 `Arc<UserThread>` 快照（供内核协调或并发测试预置状态）。
     pub(crate) fn user(&self) -> Arc<UserThread> {
         self.user.clone()
     }
 }
 
-/// 在普通任务锁外完成身份、私有现场、独立运行资源和内核栈的全部 fallible 准备。
+/// 在所有任务锁外完成独立新进程的完整准备（分配进程身份、绑定用户线程、分配内核栈与退出观察器）。
 pub(crate) fn prepare_program(
     graph: &Arc<TaskGraph>,
     parent: Option<&Arc<ThreadGroup>>,
@@ -702,7 +790,7 @@ pub(crate) fn prepare_program(
     prepare_bound_user(identity, image, runtime, placement, None, 0)
 }
 
-/// 将进程或线程身份与完整私有现场绑定，成员离栈观察同样在发表前fallible准备。
+/// 将已准备好的进程或线程身份（`PreparedIdentity`）与加载好的映像、运行时资源及内核调度任务组装为 `PreparedProgram`。
 pub(crate) fn prepare_bound_user(
     identity: PreparedIdentity,
     image: LoadedImage,
@@ -723,12 +811,13 @@ pub(crate) fn prepare_bound_user(
     })
 }
 
+/// LoongArch 64 用户态地址未对齐异常（ALE）软件模拟器所使用的单字节访存适配器。
 #[cfg(target_arch = "loongarch64")]
 struct AleMemory<'a>(&'a Mm);
 
 #[cfg(target_arch = "loongarch64")]
 impl AleMemory<'_> {
-    /// 短映射读侧只访问一个字节，缺页或 COW 在回调外完成后重试。
+    /// 在目标虚拟页驻留且权限就绪的前提下对单字节直映地址执行 `visit`；若页未驻留或需写时复制，则在页表锁外执行 `mm.fault` 后重试。
     fn with_byte<R>(
         &self,
         address: usize,
@@ -746,28 +835,30 @@ impl AleMemory<'_> {
 
 #[cfg(target_arch = "loongarch64")]
 impl UserMemory for AleMemory<'_> {
-    /// 只在可读页保活期间执行原始字节复制，不构造用户内容引用。
+    /// 从用户虚拟地址安全读取 1 个字节（不构造指向用户内存的 Rust 引用）。
     fn read_byte(&mut self, address: usize) -> Result<u8, VmError> {
         self.with_byte(address, UserAccess::Read, |source| {
             let mut value = 0u8;
-            // SAFETY: with_page 保活当前可读映射，单字节必定位于页内；
-            // 内核目标独占且已初始化，两侧不重叠，原始用户指针不逃逸。
+            // SAFETY:
+            // 1. `with_page` 持有映射与页表锁，保证 `source` 为可读驻留物理页内的有效直映地址（单字节访问绝不跨页）；
+            // 2. `value` 为当前栈上已初始化的局部变量，与用户物理页内存无重叠，且裸指针不逃逸出闭包。
             unsafe { arch::copy_user_bytes(&mut value, source as *const u8, 1) };
             value
         })
     }
 
-    /// 只在可写且非 COW 的驻留页保活期间提交一个字节。
+    /// 向用户虚拟地址安全写入 1 个字节（写时复制已在 `with_byte` 重试路径中提前解开）。
     fn write_byte(&mut self, address: usize, value: u8) -> Result<(), VmError> {
         self.with_byte(address, UserAccess::Write, |target| {
-            // SAFETY: with_page 保活当前可写非 COW 映射，单字节位于页内；
-            // 源来自已初始化内核局部量，两侧不重叠，用户指针不逃逸。
+            // SAFETY:
+            // 1. `with_page` 以 `UserAccess::Write` 保活当前可写且非 COW 的驻留物理页，`target` 单字节访问位于页内；
+            // 2. `value` 为栈上局部变量，源与目标内存不重叠且裸指针仅在当前回调内使用。
             unsafe { arch::copy_user_bytes(target as *mut u8, &value, 1) };
         })
     }
 }
 
-/// 取指、源快照与结果提交各自短暂借用现场；访存错误与未支持指令分别返回。
+/// 在 LoongArch 64 上尝试软件模拟用户态触发的未对齐访存指令（ALE）：依次取指、译码、逐字节访存并写回寄存器结果。
 #[cfg(target_arch = "loongarch64")]
 fn emulate_ale(user: &UserThread, address: usize) -> EmulationResult {
     let pc = user.context().pc;
@@ -777,8 +868,9 @@ fn emulate_ale(user: &UserThread, address: usize) -> EmulationResult {
     let mm = user.mm().expect("user ALE has no MM");
     let mut bytes = [0u8; 4];
     let fetched = mm.with_page(pc, UserAccess::Read, |source| {
-        // SAFETY: PC 已按四字节对齐，四字节指令不会跨越 4KiB 页；
-        // with_page 保活可读页，内核目标独占且足够大，指针只在回调内使用。
+        // SAFETY:
+        // 1. 上方已校验 `pc & 3 == 0`（4 字节自然对齐），因此 4 字节指令必定完整落在单个 4 KiB 物理页内；
+        // 2. `with_page` 保活该可读驻留页，`bytes` 为栈上独占的 4 字节缓冲区，内存不重叠且裸指针不逃逸。
         unsafe { arch::copy_user_bytes(bytes.as_mut_ptr(), source as *const u8, 4) };
     });
     if !matches!(fetched, Ok(Some(()))) {
@@ -795,13 +887,11 @@ fn emulate_ale(user: &UserThread, address: usize) -> EmulationResult {
     EmulationResult::Emulated
 }
 
-/// 同一真实Task先向自身Mm尝试复制小端child_tid，部分写入或错误不取消创建。
-/// 随后循环执行用户现场，只有返回 Rust 并结束 IRQ/现场借用后才允许等待或调度。
-/// 临时 mask 保留至真实信号选择；没有 handler 时恢复尚未领取的旧 mask。
+/// 用户线程在内核态的顶层入口函数：完成首次 `child_tid` 写回后，循环驱动控制确认、定时器与信号处理、进入用户态及硬件陷入分发，直至线程退出。
 fn run_program(user: Arc<UserThread>) -> i32 {
     let identity = user.identity().expect("user entry has no identity");
     if let Some(address) = user.take_child_tid() {
-        // child在自己的Mm首次入口尝试写入；地址错误不取消已经成功的创建。
+        // Step 1: 若设置了 CLONE_CHILD_SETTID，在首次进入用户态前向自身地址空间写入小端 32 位 TID（即使地址无效也不中止线程启动）。
         let bytes = (identity.tid() as u32).to_le_bytes();
         let _ = user
             .mm()
@@ -813,6 +903,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
     let signals = identity.signals();
     let mut restart = None;
     let status = loop {
+        // Step 2: 安全点检查作业控制（暂停/退出）、主动让出 CPU、结算 CPU 时间片段并触发到期的进程 CPU 定时器。
         if let Some(status) = wait_control(&identity) {
             break status;
         }
@@ -822,6 +913,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             .expect("user loop has no CPU time")
             .flush_cpu_timers();
 
+        // Step 3: 领取待处理信号或退出/暂停指令；若命中用户处理函数则结算系统调用重启并在用户栈上构造信号帧。
         match signals.select() {
             Some(SignalSelection::Exit(status)) => {
                 identity.group().signals().notify();
@@ -863,6 +955,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             }
         }
 
+        // Step 4: 关中断复查待处理信号与重调度标志，确认无误后进入用户态执行直至硬件陷入返回。
         let trap = {
             let _irq = IrqSaveGuard::new();
             if signals.interruption_pending(WaitMode::Interruptible)
@@ -873,6 +966,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
             user.run_user()
         };
 
+        // Step 5: 根据陷入原因分发处理外部中断、系统调用、缺页异常或同步架构异常。
         match trap {
             UserTrap::Interrupt => {
                 interrupts = interrupts
@@ -968,6 +1062,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
         }
     };
 
+    // Step 6: 跳出主循环后先释放局部身份克隆，解绑地址空间与运行时资源，最后通知 TaskGraph 完成线程退出登记。
     drop(identity);
     let identity = user.release_process();
     identity.graph().exit(
@@ -979,7 +1074,7 @@ fn run_program(user: Arc<UserThread>) -> i32 {
     status
 }
 
-/// 地址失效仍完成退出或exec；CPU独立拥有旧根，真实用户数不包含诊断引用。
+/// 在线程退出或 `execve` 脱离旧地址空间时处理 `clear_child_tid`：仅当地址非零且仍有其他活跃线程共享该 `Mm`（`user_count() > 1`）时，向该地址写 0 并唤醒 1 个共享 Futex 等待者。
 fn clear_tid(mm: &Arc<Mm>, address: usize) {
     if address != 0 && mm.user_count() > 1 {
         let _ = mm.store_user_u32(address, 0);
@@ -987,7 +1082,7 @@ fn clear_tid(mm: &Arc<Mm>, address: usize) {
     }
 }
 
-/// 真实成员确认停止后在原控制源登记，登记后重查关闭CONT/KILL早通知窗口。
+/// 在返回用户态前同步线程组作业控制状态：若组已退出则返回退出码；若组处于停止状态则挂入控制等待队列睡眠，直至收到 `SIGCONT` 或致命退出信号。
 fn wait_control(identity: &UserIdentity) -> Option<i32> {
     loop {
         match identity.graph().acknowledge_control(identity) {
@@ -998,8 +1093,9 @@ fn wait_control(identity: &UserIdentity) -> Option<i32> {
 
         let waiter = Waiter::new();
         let mut node = core::pin::pin!(crate::wait::WaitNode::new(waiter.waker()));
-        // SAFETY: identity保活原图和控制源；node固定本Task栈，登记先于node和Waiter撤除，
-        // 所有控制检查和通知不持登记源锁，返回和重试都先撤链再退栈。
+        // SAFETY:
+        // 1. `identity` 强引用保活所属 `TaskGraph` 及其内部的 `control_waiters` 等待队列；
+        // 2. `node` 已通过 `pin!` 固定在当前任务栈上，`_registration` 守卫作用域严格位于 `node` 与 `waiter` 之内，任何返回或下一轮循环都会先在队列锁下完成解链再销毁栈上 `node`。
         let _registration = unsafe { identity.graph().control_waiters().register(node.as_mut()) };
         match identity.graph().acknowledge_control(identity) {
             SignalControl::Run => return None,
@@ -1009,7 +1105,7 @@ fn wait_control(identity: &UserIdentity) -> Option<i32> {
     }
 }
 
-/// 将发生时VM原因保存为siginfo，EOF与IO保持SIGBUS，内存耗尽请求合法点退出。
+/// 将无法通过 `mm.fault` 解决的用户态缺页错误映射为对应的同步信号编号与 `si_code`（内核内存耗尽时映射为 `SIGKILL` 请求退出）。
 fn fault_signal(error: VmError) -> (u8, i32) {
     match error {
         VmError::NoMemory
@@ -1024,7 +1120,7 @@ fn fault_signal(error: VmError) -> (u8, i32) {
     }
 }
 
-/// 将实际同步异常保存为目标信号与si_code，不改变内核fatal路径。
+/// 将 RISC-V 64 用户态同步硬件异常码（`scause`）映射为对应的信号编号与 `si_code`。
 #[cfg(target_arch = "riscv64")]
 fn exception_signal(code: usize, _fcsr: usize) -> (u8, i32) {
     match code {
@@ -1039,7 +1135,7 @@ fn exception_signal(code: usize, _fcsr: usize) -> (u8, i32) {
     }
 }
 
-/// 对齐异常、断点和非法指令保持目标同步事实，内核异常仍由架构独立处理。
+/// 将 LoongArch 64 用户态同步硬件异常码（`ESTAT.Ecode`）及浮点控制状态字（`FCSR`）映射为对应的信号编号与 `si_code`。
 #[cfg(target_arch = "loongarch64")]
 fn exception_signal(code: usize, fcsr: usize) -> (u8, i32) {
     match code {

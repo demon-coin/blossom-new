@@ -1,18 +1,65 @@
-//! 真实 timer IRQ 的寄存器探针；手工栈帧同时保存原控制状态。
+//! LoongArch64 时钟中断上下文保存与恢复的硬件寄存器自检探针。
+//!
+//! # 模块职责与架构定位
+//! 本模块服务于 LoongArch64 架构层的中断上下文自检测试，提供裸函数 [`la_test_register_preservation`]。
+//! 它在内核态（PLV0）预置已知的通用寄存器、栈指针、`CSR_KS0` 以及可选的标量浮点寄存器（`$f0`、`$f24`、`FCSR0`、`FCC0`..`FCC7`）测试图样，
+//! 随后临时编程并使能硬件定时器、开启全局中断（`CRMD.IE`），自旋等待一次真实的时钟中断触发并由内核异常入口完成上下文保存与恢复。
+//! 中断返回后，探针逐一比对各寄存器是否与中断前布置的图样完全一致，并在返回前无损还原调用者的原始寄存器与控制状态。
+//!
+//! # 手工栈帧布局（192 字节，16 字节对齐）
+//! ```text
+//! 高地址 (进入函数前的原始 $sp)
+//! +---------------------------------------------------------------+ +192
+//! | (未用对齐填充)                                                | +184
+//! | $fcc7 原始值 (movcf2gr 扩展为 64 位)                          | +176
+//! | $fcc6 原始值                                                  | +168
+//! | $fcc5 原始值                                                  | +160
+//! | $fcc4 原始值                                                  | +152
+//! | $fcc3 原始值                                                  | +144
+//! | $fcc2 原始值                                                  | +136
+//! | $fcc1 原始值                                                  | +128
+//! | $fcc0 原始值                                                  | +120
+//! | $fcsr0 原始值 (movfcsr2gr)                                    | +112
+//! | $f24 原始双精度浮点值 (callee-saved FP)                       | +104
+//! | $f0  原始双精度浮点值 (caller-saved FP)                       | +96
+//! | 分配栈帧后的基准 $sp 快照 (用于校验中断返回后栈指针未偏移)    | +88
+//! | CSR_KS0 原始值                                                | +80
+//! | $a3 (fp 测试使能标志: 0=仅整数, 非0=含标量浮点)               | +72
+//! | $a2 (fcc 8 位测试图样)                                        | +64
+//! | $a1 (ticks 定时器周期配置值)                                  | +56
+//! | *counter 初始计数值快照 (用于忙等检测时钟中断已发生)          | +48
+//! | $a0 (counter 原子计数器地址)                                  | +40
+//! | CSR_CRMD 原始值 (用于退出前恢复进入时的 IE 状态)              | +32
+//! | CSR_EUEN 原始值 (用于退出前恢复扩展单元使能状态)              | +24
+//! | $s1 原始值 (callee-saved)                                     | +16
+//! | $s0 原始值 (callee-saved)                                     | +8
+//! | $ra 返回地址                                                  | +0
+//! +---------------------------------------------------------------+ <-- 当前 $sp
+//! 低地址
+//! ```
+//!
+//! # 锁与并发契约
+//! - 本函数本身不获取任何锁，但要求调用方已绑定当前 CPU 核且禁止任务切换。
+//! - 调用方在调用期间严禁持有时钟中断处理路径可能获取的任何自旋锁，否则在开启 `CRMD.IE` 等待中断时会发生同核死锁。
 
 use crate::arch::loongarch64::register as reg;
 use core::arch::naked_asm;
 use core::sync::atomic::AtomicUsize;
 
-/// 等待本核真实 timer IRQ 并比较整数、SP、KS0 及所选 FP/FCSR/FCC 图样。
+/// 触发一次本核硬件时钟中断，并校验中断前后通用寄存器、`SP`、`CSR_KS0` 及可选标量浮点寄存器（`FP`/`FCSR0`/`FCC`）是否被完整保存与恢复。
+///
+/// - `counter`：指向本核时钟中断处理函数递增的 `AtomicUsize` 计数器指针。
+/// - `ticks`：写入 `CSR_TCFG` 的定时器触发周期（必须满足硬件要求的低位对齐）。
+/// - `fcc`：当 `fp != 0` 时写入 `$fcc0..$fcc7` 的 8 位测试图样（每位对应一个条件标志寄存器）。
+/// - `fp`：是否同时测试标量浮点上下文（`0` 表示关闭 `EUEN` 仅测试整数与控制寄存器，非 `0` 表示开启 `EUEN_FP` 并测试标量浮点寄存器）。
+/// - 返回值：所有被测寄存器在中断返回后均与预期图样一致时返回 `1`，任一寄存器被破坏时返回 `0`。
 ///
 /// # Safety
-/// 必须处于 PLV0，本核异常入口、timer IRQ 源、CpuLocal 和当前 ABI 栈均已建立；
-/// counter 须指向本核永久、自然对齐的 timer 原子计数，ticks 为有效的四字节对齐周期。
-/// 调用期间须固定 CPU、禁止调度，不得持 handler 所需锁或有活跃 FP 上下文；
-/// fp 仅取零或一，非零时硬件须支持标量 FP，fcc 须为八位值。
-/// 返回恢复进入时的 IE/EUEN，但临时 timer deadline 须由调用者在同核 IRQ-off 下交还生产层，
-/// 包括检查失败后的清理；不得跨此裸帧展开。
+/// 1. 调用时必须处于内核态（`PLV0`），且本核的异常入口、`CpuLocal`、时钟中断源以及当前线程的 C ABI 调用栈均已正确初始化。
+/// 2. `counter` 必须指向生命周期覆盖整个调用过程、按 `usize` 自然对齐的有效 `AtomicUsize` 实例；`ticks` 必须为合法的定时器周期值。
+/// 3. 调用期间必须固定在当前 CPU 核且禁止任务抢占或切换，不得持有时钟中断处理程序需要获取的任何锁，也不得依赖当前尚未保存的活跃浮点上下文。
+/// 4. `fp` 只能取值 `0` 或 `1`（非零时当前硬件必须支持基础标量浮点扩展），`fcc` 必须为 `0..=0xff` 范围内的 8 位无符号整数。
+/// 5. 函数返回前会恢复进入时的 `CRMD.IE` 与 `CSR_EUEN`，但被改写的定时器配置（`CSR_TCFG`）必须由调用方在同核关中断状态下重新编程恢复（无论本函数返回 `1` 还是 `0`），且严禁跨越此裸汇编栈帧触发栈展开（unwind）。
 #[naked]
 #[no_mangle]
 pub(super) unsafe extern "C" fn la_test_register_preservation(
@@ -21,11 +68,13 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     fcc: usize,
     fp: usize,
 ) -> usize {
-    // SAFETY: 调用者保证本核异常/timer、永久计数器及 ABI 栈有效，期间不调度；
-    // 手动帧保留原整数、控制和被测 FP 现场，临时 IRQ/FP 开关均在本次调用内恢复。
+    // SAFETY:
+    // 1. 调用方契约保证了当前处于 PLV0、栈指针 `$sp` 有效且对齐、`counter` 可安全解引用。
+    // 2. 栈帧在入口处分配 192 字节，完整保存了 `$ra`、`$s0`、`$s1`、`CSR_EUEN`、`CSR_CRMD`、`CSR_KS0` 以及（当 `fp != 0` 时）被修改的浮点寄存器，并在标号 `8`/`9` 处悉数恢复后平衡栈指针返回。
+    // 3. 开启 `CRMD.IE` 仅发生在测试图样就绪之后，且在检测到 `*counter` 递增后立即关闭 `CRMD.IE`。
     unsafe {
         naked_asm!(
-            // 192 字节栈帧保留调用者整数、原 EUEN/CRMD、KS0 及真实计数器快照。
+            // Step 1: 分配 192 字节栈帧，保存调用者保存/被调用者保存整数寄存器、原始 EUEN/CRMD/KS0 状态及计数器初始快照。
             r#"
     addi.d $sp, $sp, -192
     st.d $ra, $sp, 0
@@ -45,7 +94,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     st.d $t2, $sp, 80
     st.d $sp, $sp, 88
 "#,
-            // FP 分支暂开标量单元并保存 f0/f24、FCSR 与全部 FCC，再布置独立图样。
+            // Step 2: 若启用浮点测试（$a3 != 0），临时开启 EUEN.FP，保存原始 $f0/$f24/FCSR0/FCC0..7，并写入双精度与条件码测试图样；否则关闭 EUEN。
             r#"
     beqz $a3, 2f
     li.w $t2, {reg_euen_fp}
@@ -104,7 +153,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
 2:
     csrwr $zero, {csr_euen}
 "#,
-            // 布置整数图样并安装 timer，临时开 IE 等待真实计数变化后重新关 IE。
+            // Step 3: 在通用寄存器中写入测试图样，配置 CSR_TCFG 启动定时器，并临时开启 CRMD.IE 自旋等待中断计数器递增，触发后立即关闭 CRMD.IE。
             r#"
 3:
     li.d $t0, 0x123
@@ -126,7 +175,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
     li.w $t2, {reg_crmd_ie}
     csrxchg $zero, $t2, {csr_crmd}
 "#,
-            // 检查全部被测整数与扩展现场，未启用 FP 时只核 EUEN 保持关闭。
+            // Step 4: 逐项校验中断返回后的通用寄存器、$sp、CSR_KS0 以及浮点寄存器（或未启用浮点时验证 EUEN 仍为 0）；任一不匹配则跳转至标号 7 返回 0。
             r#"
     li.d $t4, 0x123
     bne $t0, $t4, 7f
@@ -191,7 +240,7 @@ pub(super) unsafe extern "C" fn la_test_register_preservation(
 7:
     move $a0, $zero
 "#,
-            // 按原模式恢复 FP、EUEN、KS0、IE 和调用者整数现场，然后退还手工栈帧。
+            // Step 5: 恢复原始浮点寄存器（若曾开启 FP）、CSR_EUEN、CSR_KS0、CRMD.IE 及调用者整数寄存器，释放 192 字节栈帧并返回测试结果（$a0）。
             r#"
 8:
     ld.d $t2, $sp, 72

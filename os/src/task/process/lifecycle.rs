@@ -1,12 +1,49 @@
-//! exec 身份交接、线程退出、转亲与 wait；僵尸和离栈观察保留各自独立拥有。
+//! `execve` 线程组收拢与身份交接、线程退出、孤儿过继（Reparenting）及子进程等待（`wait`）。
+//!
+//! ## 模块职责与架构定位
+//! 本模块实现 [`super::TaskGraph`] 中涉及进程/线程消亡与身份演变的核心生命周期协议。
+//! - **上游调用者**：`exec` 子系统调用 [`super::TaskGraph::de_thread`] 收拢同组其余线程并接管组首 `TID`，在新映像装载完毕后调用 [`super::TaskGraph::complete_exec`] 释放独占状态；用户线程退出入口调用 [`super::TaskGraph::exit`] 解绑线程、过继子进程并投递 `SIGCHLD`；系统调用 `wait4`/`waitid` 与内核协调器分别通过 `try_wait`、`wait`、`wait_root` 回收子进程。
+//! - **下游依赖**：`crate::sched` 与 `crate::wait` 提供阻塞等待队列；`crate::fs::tty` 在会话首进程退出时执行控制终端挂断（`hangup_session`）；`crate::task::signal` 处理信号队列回收、`SA_NOCLDWAIT` 自动回收判定与唤醒；`crate::task::time` 停止进程组定时器并累加已回收子进程的 CPU 时间。
+//!
+//! ## 核心设计与状态流转
+//! 1. **僵尸状态（`ProcessEntry::exit`）与内核栈完成观察（`PreparedExecution`）分离**：
+//!    用户线程调用 `exit()` 时仍运行在自己的内核栈上，真正的内核栈释放发生在后续调度器切回 CPU 静态调度栈之后。因此：
+//!    - 用户态 `wait4`/`waitid` 或 `SA_NOCLDWAIT` 自动回收只需读取并销毁 `ProcessEntry` 僵尸记录以立即归还 PID 号码，而将尚未确认切离内核栈的 `PreparedExecution` 链表转移到 `Slot::completed` 暂存，不在用户 `wait` 中阻塞等待内核栈释放；
+//!    - `de_thread`（多线程 `execve`）与内核协调器（`wait` / `wait_root`）则会显式遍历 `PreparedExecution` 调用 `join()`，确保所有旧线程彻底切离内核栈后再复用组首身份或销毁整个任务图。
+//! 2. **多线程 `execve` 身份交接与组退出流转**：
+//!
+//! ```text
+//! [多线程 execve: de_thread -> complete_exec]
+//!   调用线程抢占 exec_owner ──► 向同组其余线程发出 exec_exit 请求并唤醒
+//!     ──► 在 control_waiters 上睡眠，等待 process.members 降至 1
+//!     ──► 锁外逐个 join() 确认其余线程已彻底切离各自内核栈
+//!     ──► 若调用者非组首，将其 ThreadEntry 移至 tgid 槽位并接管组首 Pid 对象（重置 exit_signal = SIGCHLD）
+//!     ──► 装载新映像后调用 complete_exec() 置位 did_exec = true 并清空 exec_owner
+//!
+//! [最后一个线程退出: exit()]
+//!   槽位锁内摘除 ThreadEntry、归还 TID 角色、累加中断计数（此时暂不写入 process.exit）
+//!     ──► 锁外停止组定时器 group.time.stop()，确保异步定时回调彻底执行完毕并退出
+//!     ──► 若为拥有控制终端的会话首进程，锁外执行 tty::hangup_session()
+//!     ──► 锁外调用 reparent_children() 将全部直属子进程过继给 PID 1（System 模式）或内核根（Kernel 模式）
+//!     ──► 重新加锁发布 process.exit，检查当前父进程的 SIGCHLD 处置（若触发 autoreap 则当场回收）
+//!     ──► 锁外唤醒父进程信号队列与全局 waiters / control_waiters
+//! ```
+//!
+//! ## 锁获取顺序与并发契约
+//! - **锁层级顺序**：`TaskGraph::slots` ➔ `ThreadGroup::relations` / `UserIdentity::tid` ➔ 信号子系统内部锁（`SignalGroup` / `ThreadSignals`）。
+//! - **严禁持自旋锁睡眠或等待回调**：`group.time.stop()`、`tty::hangup_session()`、`Waiter::park()`、`JoinObserver::join()` 以及可能释放最后一个强引用的 `drop()` 均必须在释放 `TaskGraph::slots` 自旋锁后执行。
+//! - **禁止嵌套 `Waiter`**：同一内核任务同一时刻只能激活一个栈上 `Waiter`。因此 `de_thread`、`wait` 与 `wait_root` 必须先结束在 `WaitQueue` 上的 `Waiter` 作用域，随后才能调用内部同样使用 `Waiter` 的 `execution.join.join()`。
 
 use super::*;
 
 impl TaskGraph {
-    /// 当前实际Task独占exec，其他成员在自己的合法点退出并真正离栈后才交接TID。
+    /// 在多线程进程执行 `execve` 前终止同组所有其他线程，并在它们彻底切离内核栈后将调用线程切换为线程组组首。
+    ///
+    /// 必须在普通可睡眠任务上下文中由当前运行线程调用。若同组已有其他线程正在执行 `execve`、或进程组已收到退出请求，则返回 [`ProcessError::Busy`]。
     pub(crate) fn de_thread(&self, identity: &UserIdentity) -> Result<(), ProcessError> {
         sched::assert_switchable();
         let owner = crate::task::current_task_id().ok_or(ProcessError::NoProcess)?;
+        // Step 1: 在关系锁内校验调用线程身份并登记 exec_owner，排斥并发的同组 execve 或新线程创建。
         let capacity = {
             let mut slots = self.slots.lock();
             let process = self.exec_process(&mut slots, identity, owner)?;
@@ -17,6 +54,7 @@ impl TaskGraph {
             slots.len()
         };
 
+        // Step 2: 逐槽扫描同组的其他存活线程，请求它们在内核安全点退出并打断其阻塞状态。
         for index in 0..capacity {
             let member = {
                 let slots = self.slots.lock();
@@ -36,9 +74,10 @@ impl TaskGraph {
                 }
             }
         }
-        // 已停止成员使用图的控制等待源，private通知之外还须唤醒其原停驻登记。
+        // 唤醒停驻在作业控制停止队列上的同组成员，使其尽快响应 exec_exit 请求并退出。
         self.control_waiters.wake_all();
 
+        // Step 3: 等待同组其余成员全部走完 exit() 将 members 减至 1，随后在无 Waiter 状态下逐个等待它们切离内核栈。
         loop {
             let completed = {
                 let mut slots = self.slots.lock();
@@ -49,7 +88,7 @@ impl TaskGraph {
                 (process.members == 1).then(|| process.completed.take())
             };
             if let Some(mut completed) = completed {
-                // 成员已解绑资源；此处没有本栈Waiter，逐个确认真正归还执行栈。
+                // 此时当前栈上未激活任何 Waiter，可以安全调用内部同样使用 Waiter 的 join() 等待旧线程归还内核栈。
                 while let Some(mut execution) = completed.take() {
                     completed = execution.next.take();
                     execution.join.join();
@@ -58,7 +97,10 @@ impl TaskGraph {
             }
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: 图和栈节点保活，登记先于node/waiter析构；登记后重查防止早通知。
+            // SAFETY:
+            // 1. `&self` 在整个调用期间保持有效，`self.control_waiters` 队列不会被销毁；
+            // 2. `node` 通过 `pin!` 固定在当前任务栈帧上，`_registration` 守卫先于 `node` 与 `waiter` 析构并自动摘除链表节点；
+            // 3. 注册后立即重新获取 `self.slots` 复查 `process.members == 1`，消除检查与睡眠之间的唤醒丢失窗口。
             let _registration = unsafe { self.control_waiters.register(node.as_mut()) };
             {
                 let mut slots = self.slots.lock();
@@ -73,6 +115,7 @@ impl TaskGraph {
             waiter.park();
         }
 
+        // Step 4: 重置组首元数据与退出信号为 SIGCHLD；若调用线程原本不是组首，将其槽位迁移至 tgid 并接管组首 Pid 对象。
         let released = {
             let mut slots = self.slots.lock();
             let process = self.exec_process(&mut slots, identity, owner)?;
@@ -102,11 +145,14 @@ impl TaskGraph {
             }
         };
 
+        // Step 5: 在关系锁外释放被替换的旧 TID 引用及旧组首遗留的 NPROC 计费凭据。
         drop(released);
         Ok(())
     }
 
-    /// 新映像已在同一Task发表后释放exec控制，并记录父setpgid不可越过的exec边界。
+    /// 在新程序映像装载并绑定到当前任务后，标记进程已完成 `execve`（`did_exec = true`）并解除 `exec_owner` 独占锁。
+    ///
+    /// 此后父进程调用 `setpgid` 修改该子进程组 ID 将按 POSIX 规范被拒绝（返回 `EACCES`）。
     pub(crate) fn complete_exec(&self, identity: &UserIdentity) -> Result<(), ProcessError> {
         let owner = crate::task::current_task_id().ok_or(ProcessError::NoProcess)?;
         {
@@ -126,7 +172,7 @@ impl TaskGraph {
         Ok(())
     }
 
-    /// 关系锁内核对原组、私有身份和当前实际Task，不把同号复用或组退出视为成功。
+    /// 在持有 `self.slots` 锁的前提下，校验 `identity` 属于本图、对应槽位仍绑定当前 `owner` 任务，且进程组未处于退出状态。
     fn exec_process<'a>(
         &self,
         slots: &'a mut Numbers,
@@ -166,7 +212,9 @@ impl TaskGraph {
         Ok(process)
     }
 
-    /// 最后成员锁外停稳定时器并转完全部直属子，随后重查父处置发表最终退出事件。
+    /// 处理当前用户线程退出：摘除线程运行登记、归还 `TID` 角色，并在线程组最后一个成员退出时完成定时器停止、会话终端挂断、子进程过继与父进程通知。
+    ///
+    /// 参数 `status` 为符合 Linux `wait` 编码格式的 16 位退出状态字，`user_interrupts` 与 `user_timer_interrupts` 为本线程累计的用户态中断与时钟中断次数。调用时不能持有任何自旋锁；函数返回后调用方将进入调度器最终切离当前内核栈。
     pub(crate) fn exit(
         &self,
         identity: &UserIdentity,
@@ -187,6 +235,7 @@ impl TaskGraph {
             "invalid Linux exit status"
         );
 
+        // Step 1: 在关系锁内摘除当前线程槽位，归还非组首 NPROC 配额，累加统计信息并判断是否为组内最后一个成员。
         let (user, group, released, exit, stopped, parent, hangup, charge) = {
             let mut slots = self.slots.lock();
             let old_pgid = identity.group.pgid_object();
@@ -301,6 +350,7 @@ impl TaskGraph {
             (user, group, released, exit, stopped, parent, hangup, charge)
         };
 
+        // Step 2: 在自旋锁外释放线程弱引用、解绑的 TID 对象、非组首计费凭据并清理排队信号节点。
         drop(user);
         drop(released);
         drop(charge);
@@ -308,7 +358,7 @@ impl TaskGraph {
         group.signals.reclaim_pending();
 
         if let Some(exit) = exit {
-            // 先在锁外确认定时回调尾部，随后才允许用户wait回收组身份与时间拥有。
+            // Step 3: 若为组内最后一个成员，先在锁外停止组定时器（等待正在执行的定时回调彻底退出）、挂断控制终端并过继所有直属子进程。
             group.time.stop();
             if let Some((_tty, session)) = hangup {
                 tty::hangup_session(self, &session);
@@ -316,6 +366,7 @@ impl TaskGraph {
             self.flush_group_notifications();
             self.reparent_children(&group);
 
+            // Step 4: 重新获取关系锁发布最终退出事件 `process.exit`，并根据此刻父进程的信号处置决定投递 SIGCHLD 或直接自动回收（autoreap）。
             let (parent, mut retired) = {
                 let mut slots = self.slots.lock();
                 let process = slots[identity.tgid() - 1]
@@ -349,7 +400,7 @@ impl TaskGraph {
                     .as_mut()
                     .expect("retiring group disappeared");
                 process.exit = Some(exit);
-                // 父可能在timer.stop期间最后退出并转亲；最终发布只使用此刻的关系与动作表。
+                // 在锁外执行 timer.stop() 期间原父进程可能也已退出并把本进程过继给新父进程，因此必须重新读取最新的 parent 与 exit_signal。
                 let signum = group.relations.lock().exit_signal;
                 let parent = parent_number
                     .filter(|_| signum == SIGCHLD)
@@ -372,12 +423,12 @@ impl TaskGraph {
             if let Some(parent) = parent {
                 parent.signals.notify();
             }
-            // 无退出信号或已自动回收仍须唤醒原wait，让其重查事件或返回ECHILD。
+            // 即使不发送 SIGCHLD 或已被 SA_NOCLDWAIT 自动回收，也必须唤醒阻塞在 wait 上的父线程，使其重新扫描子进程并及时返回 ECHILD。
             self.waiters.wake_all();
             if let Some(retired) = retired.as_mut() {
                 self.complete_retired_notification(retired);
             }
-            // 小完成观察只释放不join；scheduler继续持有本Task与栈至真实离栈。
+            // 此处仅销毁已自动回收进程的元数据而不调用 join_members()，因为当前线程正运行在自己的内核栈上，将由调度器在最终切出后回收栈页。
             drop(retired);
         } else if let Some(event) = stopped {
             send_parent_event(parent.as_deref(), event);
@@ -389,7 +440,9 @@ impl TaskGraph {
         drop(group);
     }
 
-    /// 逐槽转亲并递送已有完整僵尸事件，每次关系与处置同锁提交，最后拥有锁外释放。
+    /// 将正在退出的线程组 `group` 名下所有直属子进程过继给系统 `init` 进程（`System` 模式）或转为无父根进程（`Kernel` 模式）。
+    ///
+    /// 对过继前已处于僵尸态的子进程，向新父进程补发 `SIGCHLD` 并按新父进程的 `SA_NOCLDWAIT` 处置执行自动回收；每次槽位变更独立加锁，析构与唤醒均在锁外执行。
     fn reparent_children(&self, group: &ThreadGroup) {
         let capacity = self.slots.lock().len();
         for index in 0..capacity {
@@ -446,7 +499,7 @@ impl TaskGraph {
                     ),
                     _ => false,
                 };
-                // 原槽或移出的回收拥有持续保活child_group，临时引用不会在图锁中成为最后拥有。
+                // 若未触发自动回收则原槽位继续持有 child.group，若触发自动回收则所有权转移至 retired，确保不会在持有 slots 自旋锁期间释放最后一个强引用。
                 let retired = autoreap.then(|| reap_child(&mut slots, index, false));
                 (parent.filter(|_| event.is_some()), retired)
             };
@@ -462,7 +515,9 @@ impl TaskGraph {
         self.waiters.wake_all();
     }
 
-    /// 用户等待只消费退出信息，不等待成员离栈；nowait保留事件，具体子PID只允许一次消费。
+    /// 非阻塞地尝试读取或回收指定 `pid` 子进程的退出事件（供内核测试及候选回收路径检查退出状态）。
+    ///
+    /// 当 `nowait` 为 `true` 时仅拷贝退出事件快照而不移除僵尸记录；为 `false` 时回收僵尸记录但将未切离内核栈的观察节点暂存回槽位，不在当前上下文阻塞等待内核栈释放。
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -480,7 +535,9 @@ impl TaskGraph {
             .map(|child| child.map(|child| child.event))
     }
 
-    /// 同锁消费亲缘与事件，kernel等待保留离栈链，用户消费把未确认观察转给原槽。
+    /// 在关系锁内校验父子关系并提取指定 `pid` 子进程的退出事件。
+    ///
+    /// 当 `nowait == false` 时将子进程 CPU 时间并入父进程并调用 `reap_child` 移除僵尸槽位：`kernel_join == true` 时保留 `PreparedExecution` 链表供内核调用方在锁外 `join`；`kernel_join == false` 时将该链表挂回 `Slot::completed` 延迟清理。
     fn collect_child(
         &self,
         parent: Option<&ThreadGroup>,
@@ -525,7 +582,9 @@ impl TaskGraph {
         Ok(Some(collected))
     }
 
-    /// 内核协调者先消费组事件，再在原登记已撤除后确认各成员离栈，不能嵌套两个Waiter。
+    /// 阻塞等待指定 `pid` 子进程退出，回收其僵尸槽位并逐一等待其全部成员线程彻底切离内核栈（供内核协调器使用）。
+    ///
+    /// 先在 `wait_collection` 中完成事件等待并销毁本层 `Waiter`，随后再调用 `join_members()` 等待各成员线程归还内核栈，避免在同一任务上嵌套两个 `Waiter`。
     pub(crate) fn wait(
         &self,
         parent: Option<&ThreadGroup>,
@@ -540,7 +599,7 @@ impl TaskGraph {
         Ok(collected.event)
     }
 
-    /// 登记后复查关闭早通知窗口；返回拥有快照时本栈登记与Waiter已全部结束。
+    /// 在普通可睡眠上下文中循环等待并回收指定 `pid` 子进程的僵尸记录，返回时当前栈上的 `WaitQueue` 注册节点与 `Waiter` 均已析构。
     fn wait_collection(
         &self,
         parent: Option<&ThreadGroup>,
@@ -554,8 +613,10 @@ impl TaskGraph {
 
             let waiter = Waiter::new();
             let mut node = pin!(WaitNode::new(waiter.waker()));
-            // SAFETY: self借用保活固定源；node固定当前Task栈，registration先于
-            // node/waiter析构，复查关闭早通知窗口，返回前撤链后才可等待成员join。
+            // SAFETY:
+            // 1. `&self` 在整个方法内有效，`self.waiters` 队列生命周期覆盖 `_registration`；
+            // 2. `node` 通过 `pin!` 固定在当前栈帧上，`_registration` 在本轮循环末尾或提前 `return` 时先于 `node` 和 `waiter` 析构并摘除节点；
+            // 3. 注册完成后立即再次调用 `collect_child` 复查退出状态，防止错过注册前刚刚发生的唤醒通知。
             let _registration = unsafe { self.waiters.register(node.as_mut()) };
             if let Some(collected) = self.collect_child(parent, pid, false, true)? {
                 return Ok(collected);
@@ -564,7 +625,7 @@ impl TaskGraph {
         }
     }
 
-    /// 回收kernel根的真实树；无残余组时仍逐个确认用户wait与autoreap留下的原执行者离栈。
+    /// 等待并回收任务图中的无父根进程；若根进程已不存在，则收集并等待所有由用户 `wait` 或自动回收遗留在槽位中的线程彻底切离内核栈，最后返回 [`ProcessError::NoChild`]。
     pub(crate) fn wait_root(&self) -> Result<WaitEvent, ProcessError> {
         let (pid, mut completed) = {
             let mut slots = self.slots.lock();
@@ -593,7 +654,7 @@ impl TaskGraph {
         if let Some(pid) = pid {
             return self.wait(None, pid);
         }
-        // 原图已无已发表组，节点全部移出锁后才能建立join等待登记。
+        // 图内已无任何进程记录，在释放 slots 自旋锁后逐个等待残余线程完成内核栈切换与释放。
         while let Some(mut execution) = completed.take() {
             completed = execution.next.take();
             execution.join.join();

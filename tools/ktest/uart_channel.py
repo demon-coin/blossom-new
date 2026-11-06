@@ -1,4 +1,11 @@
-"""独占测试串口的原始日志、字节游标和具体执行日志观察。"""
+"""ktest 串口字节流通道、行协议读取器与原始 UART I/O 测试执行器。
+
+本模块封装了单台 QEMU 虚拟机独占的串口通信细节：
+- 将客体发出的所有原始串口字节实时写入 `uart.log`，并提供最大 64KiB 的行缓冲解码与 `ExecutionUART` 观察钩子；
+- 在收到 `# KTEST io ...` 声明后，接管串口执行单向（rx/tx/pause/slow）或双工（duplex）原始字节流测试，
+  维护跨阶段的发送/接收文件偏移游标，并逐段核对文件长度、期望字节与 Castagnoli CRC32C 校验和；
+- 所有阻塞等待均通过会话注入的 `check(deadline)` 回调受绝对截止时刻与取消标志约束。
+"""
 
 import select
 import time
@@ -9,18 +16,18 @@ from .resources import crc32c_update
 
 
 class DeadlineExpired(RuntimeError):
-    """宿主单调绝对期限已经到达。"""
+    """表示当前操作的宿主单调时钟已达到或超过预设的绝对截止时刻。"""
 
 
 class VMExited(RuntimeError):
-    """QEMU 已退出或其 UART socket 已关闭。"""
+    """表示 QEMU 子进程已退出，或其关联的 UART Unix 域套接字已关闭（读到 EOF）。"""
 
 
 class UartChannel:
-    """持有串口和原始字节状态；期限与取消由会话提供的 check 判断。"""
+    """管理单台虚拟机串口套接字、行读取缓冲区、原始日志落盘以及测试负载游标状态。"""
 
     def __init__(self, args, directory, check):
-        """准备日志与独立 RX/TX 游标；真实 socket 由会话连接时交付。"""
+        """初始化行缓冲区、RX/TX 负载文件游标、`ExecutionUART` 观察器及 `uart.log` 原始日志文件；底层套接字由会话在连接时绑定。"""
         self.args = args
         self.directory = directory
         self.check = check
@@ -34,7 +41,7 @@ class UartChannel:
         self.raw = (directory / "uart.log").open("xb", buffering=0)
 
     def receive(self, deadline, limit=65536):
-        """逐块落盘原文；UART EOF 后仍由调用者确认 QEMU 真实退出。"""
+        """在绝对截止时刻前从串口接收单块原始数据并同步写入 `uart.log`；若遇到对端关闭则抛出 `VMExited`。"""
         while True:
             self.check(deadline)
             readable, _, _ = select.select([self.serial], [], [], max(0, min(0.1, deadline - time.monotonic())))
@@ -52,7 +59,7 @@ class UartChannel:
 
 
     def line(self, deadline):
-        """最多保留 64KiB 单行；raw fixture 字节走独立长度路径。"""
+        """从串口缓冲读取并 UTF-8 解码单行协议文本（上限 64KiB），同时将原始行字节通知 `ExecutionUART` 观察器。"""
         while True:
             self.check(deadline)
             newline = self.buffer.find(b"\n")
@@ -69,7 +76,7 @@ class UartChannel:
 
 
     def send(self, data, deadline):
-        """非阻塞发送在同一绝对期限内完成，不开启另一个 RX 通道。"""
+        """在绝对截止时刻内通过 select 循环非阻塞发送完整字节序列，确保每次可写事件都有实际字节发出。"""
         view = memoryview(data)
         while view:
             self.check(deadline)
@@ -85,7 +92,7 @@ class UartChannel:
 
 
     def delay(self, seconds, deadline):
-        """故意停读阶段仍遵守宿主期限，不能借 sleep 延期。"""
+        """在遵守宿主绝对截止时刻与取消检查的前提下暂停读取指定秒数（用于模拟串口慢速消费或暂停场景）。"""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             self.check(deadline)
@@ -93,7 +100,7 @@ class UartChannel:
 
 
     def raw_io(self, declaration, deadline, names):
-        """H 后独占原始段；RX 按本 VM 游标逐段核对长度与 CRC。"""
+        """执行客体声明的原始 UART I/O 测试阶段：发送握手字节 `H`，按游标发送或接收指定长度的原始字节流并核对 CRC32C，最后回发完成状态。"""
         require("uart" in names, "UART IO without declared resource")
         direction = declaration["direction"]
         length = declaration["length"] if direction != "duplex" else 0
@@ -103,6 +110,7 @@ class UartChannel:
         expected_path = self.args.uart_expect
         expected = None
         try:
+            # 双工模式或反压观察模式单独分发处理
             if direction == "duplex":
                 self._duplex_io(declaration, deadline)
                 return
@@ -112,6 +120,7 @@ class UartChannel:
                         "backpressure fixture requires --execution-uart")
                 fixture.capture(self, declaration, deadline)
                 return
+            # 正式发送握手字节 H 之前，预先校验输入负载（rx）的 CRC32C 或期望输出文件（tx）的长度
             if direction == "rx":
                 require(payload is not None, "UART receive fixture requires --uart-payload")
                 input_state = 0xFFFFFFFF
@@ -130,6 +139,7 @@ class UartChannel:
                 require(expected_path is not None, "UART transmit fixture requires --uart-expect")
                 require(expected_path.stat().st_size == length, "UART expected length mismatch")
                 expected = expected_path.open("rb")
+            # 发送单字节 H 通知客体开始原始字节流传输，并按方向执行发送或接收校验
             self.send(b"H", deadline)
             if direction == "pause":
                 self.delay(declaration["delay_ms"] / 1000, deadline)
@@ -176,11 +186,12 @@ class UartChannel:
 
 
     def _duplex_io(self, declaration, deadline):
-        """同一原始串口交错收发 payload，按本次真实偏移逐段校验。"""
+        """在同一个串口上通过单线程 select 交错执行双工（duplex）收发，维护各自的延迟窗口、文件游标并校验双向 CRC32C。"""
         rx_length = declaration["rx_length"]
         tx_length = declaration["tx_length"]
         payload = self.args.uart_payload
         expected_path = self.args.uart_expect
+        # 启动双工传输前，预先核对本次接收段（宿主发往客体）的输入文件 CRC32C 与发送段（客体发往宿主）的期望文件剩余长度
         if rx_length:
             require(payload is not None, "UART duplex receive requires --uart-payload")
             state = 0xFFFFFFFF
@@ -214,6 +225,7 @@ class UartChannel:
                 output = (self.directory / f"uart-{declaration['case']}-{time.monotonic_ns()}.raw").open("xb")
 
 
+            # 发送握手字节 H 启动双工阶段，并在单循环中按延迟窗口交错驱动串口读写与 CRC32C 累积
             self.send(b"H", deadline)
             receive_at = time.monotonic() + declaration["rx_delay_ms"] / 1000
             receive_after = time.monotonic()
@@ -292,7 +304,7 @@ class UartChannel:
 
 
     def verify_consumed(self):
-        """真实退出后检查声明输入和 duplex 预期都已按游标完整消费。"""
+        """在 QEMU 进程退出后，校验所有启用过的输入负载文件（`--uart-payload`）与期望输出文件（`--uart-expect`）均已按游标完整消费到末尾。"""
         if self.rx_used:
             require(self.args.uart_payload.stat().st_size == self.rx_offset,
                     "UART input has unconsumed bytes at VM exit")
@@ -301,7 +313,7 @@ class UartChannel:
                     "UART expected output has unconsumed bytes at VM exit")
 
     def close(self):
-        """会话已 wait 且 peer 已 join 后关闭串口和原文日志。"""
+        """关闭串口套接字（若已连接）与 `uart.log` 原始日志文件句柄。"""
         if self.serial is not None:
             self.serial.close()
         self.raw.close()

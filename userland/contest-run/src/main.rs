@@ -1,4 +1,41 @@
-//! 正式计划与显式命令共用同一运行根、执行函数和释放路径。
+//! `contest-run` 二进制主入口模块。
+//!
+//! ## 模块职责与架构定位
+//! 本模块是比赛用户态测试执行器（`contest-run`）的命令行入口与顶层编排器。
+//! 上游接收内核初始进程或用户传入的命令行参数（如块设备路径、测试计划文件、或单条显式命令），
+//! 下游调用 `config`、`selection`、`runtime`、`execute` 与 `process` 等子模块，
+//! 完成工作盘挂载、测试用例解析与筛选、测试根目录（chroot 环境）生命周期管理、逐例执行以及最终的 `sync` 与关机控制。
+//!
+//! ## 核心执行流程与状态机
+//! 正式测试计划模式与单条显式命令模式共用同一套挂载根、执行函数与资源释放路径：
+//!
+//! ```text
+//!   parse_cli()
+//!       │
+//!       ├── 显式命令模式 (--root ... --cwd ... -- CMD) ──► explicit_config()
+//!       └── 计划文件模式 (--plan / --file / --list)   ──► config::load()
+//!                                                             │
+//!                                                             ▼
+//!                                            挂载比赛外置盘至 CONTEST_ROOT (/mnt/contest)
+//!                                                             │
+//!                                                             ▼
+//!                                           ┌─────────── mounted() ───────────┐
+//!                                           │ --list: 仅解析并打印选中用例    │
+//!                                           │ 正常执行: run_cases()           │
+//!                                           │   ├─ 按 root 分组准备与释放挂载 │
+//!                                           │   ├─ 打印协议分组起止边界标记   │
+//!                                           │   └─ 循环 repeat 次调用 execute │
+//!                                           └─────────────────┬───────────────┘
+//!                                                             │
+//!                                                             ▼
+//!                                                卸载 CONTEST_ROOT 工作盘
+//!                                                             │
+//!                                                             ▼
+//!                                       非 --list 模式执行 finish() (sync 及可选 poweroff)
+//! ```
+//!
+//! ## 并发与锁契约
+//! 本模块在单线程顺序控制流中运行，不持有跨线程共享锁；测试子进程与输出转发辅助进程的同步由 `process` 模块通过进程组信号与管道 EOF 集中管理。
 
 use contest_run::config;
 use contest_run::custom;
@@ -15,16 +52,26 @@ use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+/// 命令行参数解析结果。
 struct Cli {
+    /// 承载比赛测试套件的块设备路径（必须位于 `/dev` 目录下，如 `/dev/vda`）。
     device: PathBuf,
+    /// 主测试计划 TOML 配置文件路径（默认为 `/etc/contest/plan.toml`）。
     plan: PathBuf,
+    /// 附加的覆盖或补充测试计划文件路径列表（通过 `--file` 传入）。
     files: Vec<PathBuf>,
+    /// 是否处于仅列出选中测试用例的干跑模式（`--list`）。
     list: bool,
+    /// 显式单命令执行模式参数：`Some((root目录, 工作目录cwd, 命令及参数数组))`。
     command: Option<(PathBuf, PathBuf, Vec<String>)>,
 }
 
-/// 参数错误在挂载前结束；设备名称由实际挂载边界检验，命令数组不经 shell 重拆。
+/// 解析命令行参数并校验基础格式约束。
+///
+/// 在普通运行上下文中调用。参数格式错误会在挂载任何文件系统前直接返回错误说明；
+/// 块设备路径需位于 `/dev` 下，显式命令模式的命令参数数组直接透传给 `exec`，不经过 shell 二次拆分。
 fn parse_cli() -> Result<Cli, String> {
+    // Step 1: 收集全部命令行参数并校验 UTF-8 编码与必填的块设备参数。
     let args = env::args_os()
         .skip(1)
         .map(|arg| {
@@ -43,6 +90,7 @@ fn parse_cli() -> Result<Cli, String> {
         list: false,
         command: None,
     };
+    // Step 2: 顺序扫描可选标志或显式单命令模式（`--root ROOT --cwd CWD -- COMMAND...`）。
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -88,7 +136,10 @@ fn parse_cli() -> Result<Cli, String> {
     Ok(cli)
 }
 
-/// 显式命令只构造普通 Config/ResolvedCase，完成后返回原状态。
+/// 将命令行显式指定的单条命令包装为标准的 `Config` 与单个 `ResolvedCase`。
+///
+/// 使单命令调试模式与正式 TOML 计划文件模式复用相同的挂载准备与进程执行逻辑；
+/// 执行完毕后默认采用 `Finish::Return` 返回调用方，不触发系统关机。
 fn explicit_config(
     cli: &Cli,
     root: &Path,
@@ -136,7 +187,9 @@ fn explicit_config(
     (config, vec![case])
 }
 
-/// 固定旧协议只在连续 root/协议段输出一次原组边界。
+/// 提取测试用例所属的旧版比赛分组标识 `(协议名, 根名称)`。
+///
+/// 仅 `Basic` 与 `Pre2025Libctest` 协议需要输出分组边界标记；其余协议返回 `None`。
 fn group(case: &ResolvedCase) -> Option<(String, String)> {
     let name = match case.protocol {
         Protocol::Basic { .. } => "basic",
@@ -146,7 +199,9 @@ fn group(case: &ResolvedCase) -> Option<(String, String)> {
     Some((name.into(), case.root.clone()))
 }
 
-/// 原组边界用于外部输出，不输入单测例协议观察器。
+/// 向标准输出打印旧版比赛协议的测试分组起始（`START`）或结束（`END`）标记行。
+///
+/// 该标记仅供宿主判题脚本识别分组边界，在单个测试用例启动前或结束后由主进程直接打印，不经过单测例的流式输出观察器。
 fn group_marker(group: &(String, String), start: bool) {
     println!(
         "#### OS COMP TEST GROUP {} {}-{} ####",
@@ -156,7 +211,9 @@ fn group_marker(group: &(String, String), start: bool) {
     );
 }
 
-/// 每一轮都输出真实状态与独立错误，重复运行不覆盖先前记录。
+/// 打印单次测试用例迭代的执行结果摘要与各类基础设施或 I/O 错误日志。
+///
+/// 每次重复执行（`iteration`）都会独立输出一行 `CONTEST result` 记录，后续迭代不会覆盖先前的记录。
 fn print_record(case: &ResolvedCase, record: &CaseRecord) {
     if let Some(run) = &record.execution {
         println!(
@@ -196,7 +253,9 @@ fn print_record(case: &ResolvedCase, record: &CaseRecord) {
     }
 }
 
-/// 命令模式保留 Unix shell 可表示的退出状态，同时另行打印完整原状态。
+/// 将子进程退出结果转换为符合 Unix shell 惯例的进程退出码。
+///
+/// 正常退出返回原状态码；信号终止返回 `128 + signal`；超时返回 `124`；启动或管道 I/O 错误返回 `125`。
 fn command_status(outcome: &ExitOutcome) -> i32 {
     match outcome {
         ExitOutcome::Exited { code, .. } => *code,
@@ -206,7 +265,10 @@ fn command_status(outcome: &ExitOutcome) -> i32 {
     }
 }
 
-/// 执行真实展开结果；根段结束时先释放自己取得的挂载再切换下一根。
+/// 按顺序执行展开后的全部测试用例列表，管理测试根环境的切换与分组边界输出。
+///
+/// 当相邻测试用例切换 `root` 时，会先卸载并清理上一个测试根挂载的伪文件系统（`dev`/`proc`/`tmp`），
+/// 再准备下一个测试根。若遇到致命基础设施错误（`must_stop()`），后续未执行的用例及剩余轮次均记录为 `NotRun`。
 fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<i32, String> {
     let mut mounts = Mounts::default();
     let mut active_root: Option<&str> = None;
@@ -215,6 +277,7 @@ fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<
     let mut failure = None;
     let mut stopped = false;
     for case in cases {
+        // Step 1: 若先前用例触发了不可恢复的基础设施故障，跳过实际执行并直接登记 NotRun。
         if stopped {
             for iteration in 1..=case.repeat {
                 println!(
@@ -224,6 +287,7 @@ fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<
             }
             continue;
         }
+        // Step 2: 当协议分组或所属测试根发生变化时，关闭旧分组标记并切换测试根挂载环境。
         if active_group != group(case) {
             if let Some(previous) = active_group.take() {
                 group_marker(&previous, false);
@@ -256,12 +320,14 @@ fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<
             }
             continue;
         }
+        // Step 3: 若进入新的旧版协议分组，输出分组起始标记。
         if active_group.is_none() {
             active_group = group(case);
             if let Some(current) = &active_group {
                 group_marker(current, true);
             }
         }
+        // Step 4: 按用例配置的 repeat 次数循环执行，收集判定结果、诊断信息与停止条件。
         let root = &config.roots[&case.root];
         for iteration in 1..=case.repeat {
             if stopped {
@@ -297,6 +363,7 @@ fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<
             }
         }
     }
+    // Step 5: 闭合末尾活动的分组标记，并释放最后一个测试根持有的挂载点。
     if !stopped {
         if let Some(current) = &active_group {
             group_marker(current, false);
@@ -315,7 +382,9 @@ fn run_cases(config: &Config, cases: &[ResolvedCase], explicit: bool) -> Result<
     }
 }
 
-/// list 只读取实际输入，不执行根准备、Hook 或关机动作。
+/// 在比赛块设备已挂载的前提下，完成用例筛选并根据模式执行列表展示或实际测试。
+///
+/// `--list` 模式只解析并输出选中用例的元数据与可执行文件诊断信息，不执行测试根准备脚本、自定义钩子或关机动作。
 fn mounted(config: &Config, cli: &Cli, explicit: Option<Vec<ResolvedCase>>) -> Result<i32, String> {
     let cases = match explicit {
         Some(cases) => cases,
@@ -331,9 +400,13 @@ fn mounted(config: &Config, cli: &Cli, explicit: Option<Vec<ResolvedCase>>) -> R
     run_cases(config, &cases, cli.command.is_some())
 }
 
-/// 同步和关机沿既有 BusyBox 请求，不把普通命令返回变为默认关机。
+/// 在全部测试执行并卸载工作盘后，执行 `/bin/busybox sync` 落盘并根据配置决定是否关机。
+///
+/// 若 `mode` 为 `Finish::Poweroff`，在同步完成后继续调用 `/bin/busybox poweroff`；
+/// 若 `mode` 为 `Finish::Return`，仅输出完成状态码并返回。
 fn finish(mode: Finish, status: i32) -> i32 {
     let env = BTreeMap::new();
+    // Step 1: 调用 `/bin/busybox sync` 将页缓存中的脏数据刷回存储设备。
     let sync = CommandSpec::Exec {
         program: "/bin/busybox".into(),
         args: vec!["sync".into()],
@@ -355,6 +428,7 @@ fn finish(mode: Finish, status: i32) -> i32 {
         }
     }
     println!("CONTEST finished status={status}");
+    // Step 2: 若配置要求运行结束后关机，则调用 `/bin/busybox poweroff`。
     if mode == Finish::Poweroff {
         let poweroff = CommandSpec::Exec {
             program: "/bin/busybox".into(),
@@ -383,7 +457,9 @@ fn finish(mode: Finish, status: i32) -> i32 {
     status
 }
 
-/// 挂载后的所有普通返回都经过实际拥有的释放与明确 finish 选择。
+/// 执行 `contest-run` 的完整生命周期：解析参数、加载配置、挂载比赛盘、运行或列出用例、卸载清理与收尾。
+///
+/// 挂载比赛块设备后的所有退出路径都会先调用 `contest.release()` 卸载挂载点，再根据是否为 `--list` 模式决定是否进入 `finish()`。
 fn run() -> Result<i32, String> {
     let cli = parse_cli()?;
     let (config, explicit) = match &cli.command {
@@ -393,13 +469,14 @@ fn run() -> Result<i32, String> {
         }
         None => (config::load(&cli.plan, &cli.files)?, None),
     };
-    // 同一工作盘的卷可由 canonical 缓存继续保活，list 不切换卷的读写模式。
+    // Step 1: 挂载比赛块设备到 CONTEST_ROOT，并在挂载期间执行用例列表或测试主循环。
     let mut contest = Mounts::default();
     contest
         .mount(&cli.device, Path::new(CONTEST_ROOT), "ext4", false)
         .map_err(|error| format!("mount contest {}: {error}", cli.device.display()))?;
     let result = mounted(&config, &cli, explicit);
     let released = contest.release();
+    // Step 2: 汇总测试执行状态与挂载卸载结果，非 --list 模式下执行最终的 sync 与 finish 动作。
     let mut status = match result {
         Ok(status) => status,
         Err(error) => {
@@ -420,7 +497,7 @@ fn run() -> Result<i32, String> {
     }
 }
 
-/// 只在全部尾部完成后返回进程状态，参数和配置错误保留英文诊断。
+/// 进程主入口：运行顶层流程并将结果或参数/配置错误映射为进程退出码（错误码 `2` 表示顶层配置或启动失败）。
 fn main() {
     let status = match run() {
         Ok(status) => status,
